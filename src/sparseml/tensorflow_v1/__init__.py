@@ -11,6 +11,6 @@ try:
         raise Exception
 except:
     raise RuntimeError(
-        "Unable to import tensorflow_v1 v1. tensorflow_v1>=1.8,<2.0 is required"
-        " to use sparseml.tensorflow_v1_v1."
+        "Unable to import tensorflow. tensorflow>=1.8,<2.0 is required"
+        " to use sparseml.tensorflow_v1."
     )
