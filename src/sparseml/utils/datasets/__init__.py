@@ -18,5 +18,9 @@ General utilities for datasets in sparseml
 
 # flake8: noqa
 
+from .cifar import *
+from .coco import *
 from .helpers import *
+from .imagenet import *
 from .imagenette import *
+from .voc import *
