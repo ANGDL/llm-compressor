@@ -17,8 +17,9 @@ Tooling to help train, test, and optimize models for better performance
 """
 
 # flake8: noqa
+# isort: skip_file
 
-__version__ = "0.2.0"
+from .version import *
 
 # be sure to import all logging first and at the root
 # this keeps other loggers in nested files creating from the root logger setups
