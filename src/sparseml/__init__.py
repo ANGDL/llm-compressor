@@ -31,4 +31,4 @@ from .base import (
     execute_in_sparseml_framework,
 )
 from .framework import FrameworkInferenceProviderInfo, FrameworkInfo, framework_info
-from .sparsification import sparsification_info
+from .sparsification import SparsificationInfo, sparsification_info
