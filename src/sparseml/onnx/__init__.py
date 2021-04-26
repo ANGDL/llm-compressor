@@ -13,8 +13,11 @@
 # limitations under the License.
 
 """
-Code for working with the ONNX framework for creating /
-editing models for performance in the Neural Magic System
+Functionality for working with and sparsifying Models in the ONNX/ONNXRuntime framework
 """
 
 # flake8: noqa
+
+from .base import *
+from .framework import detect_framework, framework_info, is_supported
+from .sparsification import sparsification_info
