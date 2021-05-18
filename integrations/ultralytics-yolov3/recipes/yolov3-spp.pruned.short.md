@@ -16,14 +16,18 @@ limitations under the License.
 
 ---
 # General Epoch/LR variables
-num_epochs: &num_epochs 75.0
+num_epochs: &num_epochs 80
 
 # pruning hyperparameters
 init_sparsity: &init_sparsity 0.05
-pruning_start_epoch: &pruning_start_epoch 0.0
-pruning_end_epoch: &pruning_end_epoch 35.0
+pruning_start_epoch: &pruning_start_epoch 0
+pruning_end_epoch: &pruning_end_epoch 40
 update_frequency: &pruning_update_frequency 0.5
 
+prune_none_target_sparsity: &prune_none_target_sparsity 0.4
+prune_low_target_sparsity: &prune_low_target_sparsity 0.75
+prune_mid_target_sparsity: &prune_mid_target_sparsity 0.8
+prune_high_target_sparsity: &prune_high_target_sparsity 0.85
 
 # modifiers
 training_modifiers:
@@ -38,7 +42,7 @@ pruning_modifiers:
       - model.19.cv1.conv.weight
       - model.26.cv2.conv.weight
     init_sparsity: *init_sparsity
-    final_sparsity: 0.6
+    final_sparsity: *prune_none_target_sparsity
     start_epoch: *pruning_start_epoch
     end_epoch: *pruning_end_epoch
     update_frequency: *pruning_update_frequency
@@ -71,7 +75,7 @@ pruning_modifiers:
       - model.8.6.cv1.conv.weight
       - model.8.7.cv1.conv.weight
     init_sparsity: *init_sparsity
-    final_sparsity: 0.75
+    final_sparsity: *prune_low_target_sparsity
     start_epoch: *pruning_start_epoch
     end_epoch: *pruning_end_epoch
     update_frequency: *pruning_update_frequency
@@ -102,7 +106,7 @@ pruning_modifiers:
       - model.6.2.cv2.conv.weight
       - model.6.3.cv2.conv.weight
     init_sparsity: *init_sparsity
-    final_sparsity: 0.8
+    final_sparsity: *prune_mid_target_sparsity
     start_epoch: *pruning_start_epoch
     end_epoch: *pruning_end_epoch
     update_frequency: *pruning_update_frequency
@@ -134,43 +138,44 @@ pruning_modifiers:
       - model.8.7.cv2.conv.weight
       - model.9.conv.weight
     init_sparsity: *init_sparsity
-    final_sparsity: 0.92
+    final_sparsity: *prune_high_target_sparsity
     start_epoch: *pruning_start_epoch
     end_epoch: *pruning_end_epoch
     update_frequency: *pruning_update_frequency
 ---
 
-# YOLOv3-SPP Pruned
+# YOLOv3-SPP Pruned Short
 
-This recipe creates a sparse, [YOLOv3-SPP](https://arxiv.org/abs/1804.02767) model that 
-achieves 97% recovery of its baseline accuracy on the COCO detection dataset.
-Training was done using 4 GPUs at half precision using a total training batch size of 256
-using an the
-[SparseML integration with ultralytics/yolov5](https://github.com/neuralmagic/sparseml/tree/main/integrations/ultralytics-yolov3).
+This recipe creates a sparse [YOLOv3-SPP](https://arxiv.org/abs/1804.02767) model in a shortened schedule as compared to the original pruned recipe.
+It will train faster, but will recover slightly worse.
+Use the following [SparseML integration with ultralytics/yolov3](https://github.com/neuralmagic/sparseml/tree/main/integrations/ultralytics-yolov3) to run.
 
 When running, adjust hyperparameters based on training environment and dataset.
 
+## Weights and Biases
+
+- [YOLOv3-SPP LeakyReLU on VOC](https://wandb.ai/neuralmagic/yolov3-spp-lrelu-voc/runs/jktw650n)
+
 ## Training
-To set up the training environment, follow the instructions on the
-[integration README](https://github.com/neuralmagic/sparseml/blob/main/integrations/ultralytics-yolov3/README.md).
-Using the given training script from the `yolov3` directory the following command can be used
-to launch this recipe.  The contents of the `hyp.prune.yaml` hyperparameters file is given below.
-Adjust the script command for your GPU device setup. Ultralytics supports both DataParallel and DDP.
+
+To set up the training environment, follow the instructions on the [integration README](https://github.com/neuralmagic/sparseml/blob/main/integrations/ultralytics-yolov3/README.md).
+Using the given training script from the `yolov3` directory the following command can be used to launch this recipe.  
+The contents of the `hyp.pruned.yaml` hyperparameters file is given below.
+Adjust the script command for your GPU device setup. 
+Ultralytics supports both DataParallel and DDP.
 
 *script command:*
 
 ```
 python train.py \
-  --recipe ../recipes/yolov3-spp.pruned.short.md \
-  --weights PRETRAINED_WEIGHTS \
-  --cfg ../models/yolov3-spp.lrelu.yaml \
-  --data coco.yaml \
-  --hyp ../data/hyp.pruned.yaml \
-  --batch-size 256 \
-  --name yolov3-spp-lrelu-pruned-short
+    --recipe ../recipes/yolov3-spp.pruned.short.md \
+    --weights PRETRAINED_WEIGHTS \
+    --data voc.yaml \
+    --hyp ../data/hyp.pruned.yaml \
+    --name yolov3-spp-lrelu-pruned
 ```
 
-hyp.prune.yaml:
+hyp.pruned.yaml:
 ```yaml
 lr0: 0.005
 lrf: 0.1
