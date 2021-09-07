@@ -19,5 +19,6 @@ Functionality for working with and sparsifying Models in the ONNX/ONNXRuntime fr
 # flake8: noqa
 
 from .base import *
+from .benchmark import *
 from .framework import detect_framework, framework_info, is_supported
 from .sparsification import sparsification_info
