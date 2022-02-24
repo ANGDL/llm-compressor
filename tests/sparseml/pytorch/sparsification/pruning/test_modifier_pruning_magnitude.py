@@ -289,7 +289,7 @@ def test_magnitude_pruning_yaml():
     update_frequency = 1.0
     params = "__ALL_PRUNABLE__"
     inter_func = "cubic"
-    mask_type = "filter"
+    mask_type = "block"
     yaml_str = f"""
     !MagnitudePruningModifier
         init_sparsity: {init_sparsity}
