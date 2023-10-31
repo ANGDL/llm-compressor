@@ -18,3 +18,4 @@ from .distillation import *
 from .obcq import *
 from .pruning import *
 from .quantization import *
+from .smoothquant import *
