@@ -20,3 +20,4 @@ Utilities for applying sparsification algorithms to Hugging Face transformers fl
 from .helpers import *
 from .metrics import *
 from .sparse_model import *
+from .sparse_tokenizer import *
