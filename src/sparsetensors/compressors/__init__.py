@@ -16,4 +16,4 @@
 
 from .base import ModelCompressor
 from .dense import DenseCompressor
-from .sparse_bitmask import BitmaskCompressor
+from .sparse_bitmask import BitmaskCompressor, BitmaskTensor
