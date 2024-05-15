@@ -35,7 +35,7 @@ num_calibration_samples = 512
 max_seq_length = 1024
 pad_to_max_length = False
 output_dir = "./llama1.1b_new_quant_out"
-device = "cuda:0" if torch.cuda_is_available() else "cpu"
+device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
 model = AutoModelForCausalLM.from_pretrained(model_name, device_map=device)
 model.eval()  # no grad or updates needed for base model
@@ -68,18 +68,20 @@ data_loader = DataLoader(
 )
 
 # run calibration
-for idx, sample in tqdm(enumerate(data_loader), desc="Running calibration"):
-    sample = tensors_to_device(sample, "cuda:0")
-    _ = model(**sample)
+with torch.no_grad():
+    for idx, sample in tqdm(enumerate(data_loader), desc="Running calibration"):
+        sample = tensors_to_device(sample, "cuda:0")
+        _ = model(**sample)
 
-    if idx >= num_calibration_samples:
-        break
+        if idx >= num_calibration_samples:
+            break
 
 # freeze params after calibration
 model.apply(freeze_module_quantization)
 
-# this functionality will move but for now we need to get the save override from
-# SparseML in order to save the config
-from sparseml.transformers.compression import modify_save_pretrained
+# save quantized model
+from sparseml.transformers.sparsification.compressed_tensors_utils import (
+    modify_save_pretrained,
+)
 modify_save_pretrained(model) 
 model.save_pretrained(output_dir)
