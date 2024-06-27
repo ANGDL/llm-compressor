@@ -34,7 +34,7 @@ recipe = """
 quant_stage:
     quant_modifiers:
         GPTQModifier:
-            sequential_update: false
+            sequential_update: true
             ignore: ["lm_head"]
             config_groups:
                 group_0:
@@ -65,6 +65,6 @@ print(tokenizer.decode(output[0]))
 print("==========================================\n\n")
 
 # Save to disk compressed.
-SAVE_DIR = MODEL_ID.split("/")[1] + "-W4A16"
+SAVE_DIR = MODEL_ID.split("/")[1] + "-W4A16-SEQUENTIAL-UPDATE"
 model.save_pretrained(SAVE_DIR, save_compressed=True)
 tokenizer.save_pretrained(SAVE_DIR)
