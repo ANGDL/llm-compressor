@@ -19,7 +19,7 @@ pip install -e .
 The example includes an end-to-end script for applying the quantization algorithm.
 
 ```bash
-python3 llama-3-8b-example.py
+python3 llama3_example.py
 ```
 
 The resulting model `Meta-Llama-3-8B-Instruct-W8A8-FP8` is ready to be loaded into vLLM.
