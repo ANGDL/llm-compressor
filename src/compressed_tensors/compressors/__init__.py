@@ -14,15 +14,9 @@
 
 # flake8: noqa
 
-from .base import BaseCompressor
-from .dense import DenseCompressor
-from .helpers import load_compressed, save_compressed, save_compressed_model
-from .marlin_24 import Marlin24Compressor
-from .model_compressor import ModelCompressor, map_modules_to_quant_args
-from .naive_quantized import (
-    FloatQuantizationCompressor,
-    IntQuantizationCompressor,
-    QuantizationCompressor,
-)
-from .pack_quantized import PackedQuantizationCompressor
-from .sparse_bitmask import BitmaskCompressor, BitmaskTensor
+from .base import *
+from .helpers import *
+from .model_compressors import *
+from .quantized_compressors import *
+from .sparse_compressors import *
+from .sparse_quantized_compressors import *
