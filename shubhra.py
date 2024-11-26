@@ -1,24 +1,28 @@
 import torch
 from datasets import load_dataset
-from transformers import AutoProcessor, MllamaForConditionalGeneration, LlavaForConditionalGeneration, AutoModel
+from transformers import AutoProcessor, MllamaForConditionalGeneration, LlavaForConditionalGeneration, AutoModelForCausalLM, Qwen2VLForConditionalGeneration
 
 from llmcompressor.modifiers.quantization import GPTQModifier
 from llmcompressor.transformers import oneshot
 import os
 
 # Load model.
-#model_id = "meta-llama/Llama-3.2-11B-Vision-Instruct"
+model_id = "meta-llama/Llama-3.2-11B-Vision-Instruct"
 #model = MllamaForConditionalGeneration.from_pretrained(model_id)
-model_id = "mgoin/pixtral-12b"
-model = LlavaForConditionalGeneration.from_pretrained(model_id, torch_dtype="auto", device_map="cuda:0", _attn_implementation="eager")
-#model = AutoModel.from_pretrained("meta-llama/Meta-Llama-3-8B-Instruct", device_map="auto", torch_dtype="auto")
+#model_id = "mgoin/pixtral-12b"
+#model_id = "Qwen/Qwen2-VL-2B-Instruct"
+
+#model = LlavaForConditionalGeneration.from_pretrained(model_id, torch_dtype="auto", device_map="cuda:0", _attn_implementation="eager")
+#model = Qwen2VLForConditionalGeneration.from_pretrained(model_id, device_map="auto", torch_dtype="auto")
+#model = AutoModelForCausalLM.from_pretrained(model_id, device_map="cuda:0", torch_dtype="auto")
+model = MllamaForConditionalGeneration.from_pretrained(model_id, device_map="auto", torch_dtype="auto")
 processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
 
 print("Loading dataset")
 DATASET_ID = "lmms-lab/flickr30k"
 DATASET_SPLIT = "test[:512]"
 
-NUM_CALIBRATION_SAMPLES = 512
+NUM_CALIBRATION_SAMPLES = 1
 MAX_SEQUENCE_LENGTH = 2048
 
 # Load dataset and preprocess.
@@ -83,7 +87,7 @@ ignore=["re:.*lm_head", "re:multi_modal_projector.*", "re:vision_model.*"]
 
 recipe = [
     # SmoothQuantModifier(smoothing_strength=0.8, ignore=ignore),
-    GPTQModifier(targets="Linear", scheme="W8A8", ignore=ignore),
+    GPTQModifier(targets="Linear", scheme="W8A8", ignore=ignore, update_size=NUM_CALIBRATION_SAMPLES),
 ]
 
 save_name = model_id.split("/")[1] + "-W8A8"
