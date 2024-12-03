@@ -3,6 +3,7 @@ from typing import TYPE_CHECKING
 
 from llmcompressor.transformers.finetune.data import TextGenerationDataset
 from llmcompressor.utils import Processor
+from llmcompressor.utils.helpers import getattr_chain
 
 if TYPE_CHECKING:
     from llmcompressor.transformers import DataTrainingArguments as DataArgs
@@ -39,22 +40,26 @@ class UltraChatDataset(TextGenerationDataset):
         if split in ["train", "test"]:
             split += "_sft"
 
-        super().__init__(
-            data_args=data_args,
-            split=split,
-            processor=processor,
-        )
+        super().__init__(data_args=data_args, split=split, processor=processor)
 
-        if getattr(self.tokenizer, "chat_template", None) is None:
+        if (
+            self.tokenizer is not None and
+            getattr(self.tokenizer, "chat_template", None) is None
+        ):
+            # note that since tokenizer is a member of processor,
+            # this change affects processor.apply_chat_template
             self.tokenizer.chat_template = self.DEFAULT_CHAT_TEMPLATE
 
     def dataset_template(self, sample):
-        messages = sample["messages"]
+        if self.processor is None:
+            raise ValueError("TODO")
 
+        messages = sample["messages"]
         if messages[0]["role"] != "system":
             messages.insert(0, {"role": "system", "content": ""})
 
-        text = self.tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=False
-        )
-        return {"text": text}
+        return {
+            "text": self.processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=False
+            )
+        }
