@@ -8,18 +8,16 @@ from llmcompressor.transformers import oneshot
 
 # Load model.
 model_id = "Qwen/Qwen2-VL-2B-Instruct"
-model = Qwen2VLForConditionalGeneration.from_pretrained(
-    model_id, device_map="auto", torch_dtype="auto"
-)
+model = Qwen2VLForConditionalGeneration.from_pretrained(model_id, device_map="auto", torch_dtype="auto")
 processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
 
-# oneshot arguments
+# Oneshot arguments
 DATASET_ID = "flickr30k"
-DATASET_SPLIT = "test[:512]"
+DATASET_SPLIT = "test[:3]"
 NUM_CALIBRATION_SAMPLES = 1
 MAX_SEQUENCE_LENGTH = 2048
 
-
+# TODO: define real collators in utils
 def data_collator(batch):
     assert len(batch) == 1
     return {
@@ -31,16 +29,13 @@ def data_collator(batch):
         "image_grid_thw": torch.tensor(batch[0]["image_grid_thw"]),
     }
 
-
-ignore = ["re:.*lm_head"]
-
+# Recipe
 from compressed_tensors.quantization import (
     QuantizationArgs,
     QuantizationScheme,
     QuantizationStrategy,
     QuantizationType,
 )
-
 recipe = GPTQModifier(
     targets="Linear",
     config_groups={
@@ -57,11 +52,12 @@ recipe = GPTQModifier(
             ),
         ),
     },
-    ignore=ignore,
+    ignore=["re:.*lm_head"],
     update_size=NUM_CALIBRATION_SAMPLES,
     dampening_frac=0.5,
 )
 
+# Perform oneshot
 save_name = model_id.split("/")[1] + "-W8A8"
 save_path = os.path.join("./my_test/", save_name)
 print("Starting quantization")
@@ -79,7 +75,7 @@ oneshot(
     data_collator=data_collator,
 )
 
-# processor.save_pretrained(save_path)
+processor.save_pretrained(save_path)
 
 # Confirm generations of the quantized model look sane.
 print("========== SAMPLE GENERATION ==============")
