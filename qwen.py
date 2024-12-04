@@ -57,7 +57,6 @@ def tokenize(sample):
         return_tensors="pt"
     )
 
-
 ds = ds.map(tokenize, remove_columns=ds.column_names)
 
 def data_collator(batch):
@@ -65,7 +64,7 @@ def data_collator(batch):
     return {
         "input_ids": torch.LongTensor(batch[0]["input_ids"]),
         "attention_mask": torch.tensor(batch[0]["attention_mask"]),
-        "pixel_values": torch.tensor(batch[0]["pixel_values"]),  # torch.Size([14308, 1176])
+        "pixel_values": torch.tensor(batch[0]["pixel_values"]),
         "image_grid_thw": torch.tensor(batch[0]["image_grid_thw"]),
     }
 
