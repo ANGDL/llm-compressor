@@ -1,6 +1,7 @@
 import os
 import shutil
 from pathlib import Path
+from typing import Callable
 
 import pytest
 import yaml
@@ -20,7 +21,13 @@ except ImportError:
     logger.warning("vllm is not installed. This test will be skipped")
 
 HF_MODEL_HUB_NAME = "nm-testing"
-TEST_DATA_FILE = os.environ.get("TEST_DATA_FILE", None)
+TEST_DATA_FILE = os.environ.get("TEST_DATA_FILE", "")
+
+
+@pytest.fixture
+def record_config_file(record_testsuite_property: Callable[[str, object], None]):
+    test_data_file_name = TEST_DATA_FILE.split("configs/")[-1]
+    record_testsuite_property("TEST_DATA_FILE_NAME", test_data_file_name)
 
 
 # Will run each test case in its own process through run_tests.sh
@@ -33,13 +40,12 @@ class TestvLLM:
     runs the model using vLLM, and then pushes the model to the hub for
     future use. Each test case is focused on a specific quantization type
     (e.g W4A16 with grouped quantization, W4N16 with channel quantization).
-    To add a new test case, a new config has to be added to one of the folders
-    listed in the `CONFIGS` folder. If the test case is for a data type not listed
-    in `CONFIGS`, a new folder can be created and added to the list. The tests
-    run on a cadence defined by the `cadence` field. Each config defines the model
-    to quantize. Optionally, a dataset id and split can be provided for calibration.
-    Finally, all config files must list a scheme. The scheme can be a preset scheme
-    from https://github.com/neuralmagic/compressed-tensors/blob/main/src/compressed_tensors/quantization/quant_scheme.py
+    To add a new test case, a new config has to be added to the `configs` folder.
+    The tests run on a cadence defined by the `cadence` field. Each config defines
+    the model to quantize. Optionally, a dataset id and split can be provided for
+    calibration. Finally, all config files must list a scheme. The scheme can be a
+    preset scheme from
+    https://github.com/neuralmagic/compressed-tensors/blob/main/src/compressed_tensors/quantization/quant_scheme.py
     or another identifier which can be used for the particular test case. If a recipe
     is not provided, it is assumed that the scheme provided is a preset scheme and will
     be used for quantization. Otherwise, the recipe will always be used if given.
@@ -73,6 +79,7 @@ class TestvLLM:
         ]
         self.api = HfApi()
 
+    @pytest.mark.usefixtures("record_config_file")
     def test_vllm(self):
         # Run vLLM with saved model
         import torch
