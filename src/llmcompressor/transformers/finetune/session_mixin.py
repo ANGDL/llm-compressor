@@ -11,10 +11,9 @@ from torch.utils.data import DataLoader, IterableDataset
 from transformers.trainer_callback import TrainerState
 from transformers.trainer_utils import get_last_checkpoint
 
-from llmcompressor.core import (
+from llmcompressor.core import (  # callbacks,
     active_session,
     apply,
-    callbacks,
     create_session,
     finalize,
     initialize,
