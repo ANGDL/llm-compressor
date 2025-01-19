@@ -18,8 +18,9 @@ model.config.forced_decoder_ids = None
 processor = WhisperProcessor.from_pretrained(MODEL_ID)
 
 # Select calibration dataset.
-DATASET_ID = "hf-internal-testing/librispeech_asr_dummy"
-DATASET_SPLIT = "validation[:512]"
+DATASET_ID = "MLCommons/peoples_speech"
+DATASET_SUBSET = "test"
+DATASET_SPLIT = "test"
 
 # Select number of samples. 512 samples is a good place to start.
 # Increasing the number of samples can improve accuracy.
@@ -27,7 +28,12 @@ NUM_CALIBRATION_SAMPLES = 512
 MAX_SEQUENCE_LENGTH = 2048
 
 # Load dataset and preprocess.
-ds = load_dataset(DATASET_ID, "clean", split=DATASET_SPLIT)
+ds = load_dataset(
+    DATASET_ID,
+    DATASET_SUBSET,
+    split=f"{DATASET_SPLIT}[:{NUM_CALIBRATION_SAMPLES}]",
+    trust_remote_code=True,
+)
 
 
 def preprocess(example):
@@ -91,8 +97,8 @@ sample_input = whisper_data_collator([next(iter(ds))])
 sample_input = {k: v.to("cuda:0") for k, v in sample_input.items()}
 output = model.generate(**sample_input, language="en")
 print(processor.batch_decode(output, skip_special_tokens=True))
-# Mr. Quilter is the apostle of the middle classes and we are glad to welcome his gospel
 print("==========================================\n\n")
+# The track appears on the compilation album "Kraftworks"
 
 # Save to disk compressed.
 SAVE_DIR = MODEL_ID.split("/")[1] + "-W4A16-G128"
