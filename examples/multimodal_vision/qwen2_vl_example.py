@@ -1,3 +1,4 @@
+import torch
 import base64
 from io import BytesIO
 
@@ -7,15 +8,24 @@ from transformers import AutoProcessor
 
 from llmcompressor.modifiers.quantization import GPTQModifier
 from llmcompressor.transformers import oneshot
+from llmcompressor.transformers.compression.helpers import calculate_offload_device_map
 from llmcompressor.transformers.tracing import TraceableQwen2VLForConditionalGeneration
 from llmcompressor.transformers.utils.data_collator import qwen2_vl_data_collator
 
 # Load model.
-model_id = "Qwen/Qwen2-VL-2B-Instruct"
+model_id = "Qwen/Qwen2-VL-72B-Instruct"
+device_map = calculate_offload_device_map(
+    model_id,
+    reserve_for_hessians=True,
+    num_gpus=3,
+    torch_dtype=torch.bfloat16,
+    trust_remote_code=True,
+    model_cls=TraceableQwen2VLForConditionalGeneration
+)
 model = TraceableQwen2VLForConditionalGeneration.from_pretrained(
     model_id,
-    device_map="auto",
-    torch_dtype="auto",
+    device_map=device_map,
+    torch_dtype=torch.bfloat16,
 )
 processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
 
