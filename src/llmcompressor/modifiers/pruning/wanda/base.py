@@ -11,7 +11,7 @@ from pydantic import PrivateAttr
 
 from llmcompressor.core import State
 from llmcompressor.modifiers import Modifier
-from llmcompressor.modifiers.obcq.sgpt_mixin import SparsityModifierMixin
+from llmcompressor.modifiers.pruning.sparsegpt.sgpt_mixin import SparsityModifierMixin
 from llmcompressor.modifiers.pruning.wanda.wanda_sparsify import (
     accumulate_row_scalars,
     make_empty_row_scalars,
