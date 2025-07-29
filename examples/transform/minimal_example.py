@@ -129,16 +129,16 @@ if __name__ == "__main__":
     print("transformed and quanted")
 
     # save model
-    SAVE_DIR = MODEL_ID.split("/")[1] + f"T{TRANSFORM:d}-Q{QUANT:d}"
-    print(f"saving: {SAVE_DIR}")
-    model.save_pretrained(SAVE_DIR)
-    tokenizer.save_pretrained(SAVE_DIR)
+    # SAVE_DIR = MODEL_ID.split("/")[1] + f"T{TRANSFORM:d}-Q{QUANT:d}"
+    # print(f"saving: {SAVE_DIR}")
+    # model.save_pretrained(SAVE_DIR)
+    # tokenizer.save_pretrained(SAVE_DIR)
 
-    # sanity check
-    print("\n\n")
-    print("========== SAMPLE GENERATION ==============")
-    sample = tokenizer("Hello my name is", return_tensors="pt")
-    sample = {key: value.to("cuda") for key, value in sample.items()}
-    output = model.generate(**sample, max_new_tokens=100)
-    print(tokenizer.decode(output[0]))
-    print("==========================================\n\n")
+    # # sanity check
+    # print("\n\n")
+    # print("========== SAMPLE GENERATION ==============")
+    # sample = tokenizer("Hello my name is", return_tensors="pt")
+    # sample = {key: value.to("cuda") for key, value in sample.items()}
+    # output = model.generate(**sample, max_new_tokens=100)
+    # print(tokenizer.decode(output[0]))
+    # print("==========================================\n\n")
