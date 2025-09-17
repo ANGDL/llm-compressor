@@ -240,11 +240,28 @@ class MovingAverageMSEObserver(Observer):
         :param observed: observed tensor to calculate quantization parameters for
         :return: updated global scale derived from the observed tensor
         """
+        print(f"[MSE GLOBAL SCALE DEBUG] calculate_gparam called")
+        print(f"[MSE GLOBAL SCALE DEBUG]   observed.shape: {observed.shape}")
+        print(f"[MSE GLOBAL SCALE DEBUG]   observed.dtype: {observed.dtype}")
+        print(f"[MSE GLOBAL SCALE DEBUG]   observed range: [{observed.min():.6f}, {observed.max():.6f}]")
+        print(f"[MSE GLOBAL SCALE DEBUG]   quantization_args.strategy: {self.quantization_args.strategy}")
+        print(f"[MSE GLOBAL SCALE DEBUG]   quantization_args.group_size: {self.quantization_args.group_size}")
+        
         from compressed_tensors.quantization.utils import generate_gparam
         
         updated_min_val, updated_max_val = self.calculate_updated_min_max(
             observed=observed
         )
-        return generate_gparam(
+        
+        print(f"[MSE GLOBAL SCALE DEBUG]   MSE-optimized min_val: {updated_min_val}")
+        print(f"[MSE GLOBAL SCALE DEBUG]   MSE-optimized max_val: {updated_max_val}")
+        
+        global_scale = generate_gparam(
             updated_min_val=updated_min_val, updated_max_val=updated_max_val
         )
+        
+        print(f"[MSE GLOBAL SCALE DEBUG]   final global_scale: {global_scale}")
+        print(f"[MSE GLOBAL SCALE DEBUG]   global_scale.shape: {global_scale.shape}")
+        print(f"[MSE GLOBAL SCALE DEBUG]   global_scale.dtype: {global_scale.dtype}")
+        
+        return global_scale
