@@ -145,6 +145,7 @@ setup(
             else "compressed-tensors>=0.12.3a2"
         ),
         ("auto-round==0.9.1"),
+        "tensorly",
     ],
     extras_require={
         "dev": [
