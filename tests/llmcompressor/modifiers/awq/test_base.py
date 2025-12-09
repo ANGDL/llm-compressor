@@ -190,7 +190,7 @@ def test_get_lowest_common_parent():
     "n_balance_layers, group_size, n_input_features",
     [
         (5, None, 32),
-        (4, 10, 40),
+        (4, 10, 40), # TODO ADD TESTS FOR BLOCK AND TENSOR
     ],
 )
 def test_compute_layer_means(n_balance_layers, group_size, n_input_features):
