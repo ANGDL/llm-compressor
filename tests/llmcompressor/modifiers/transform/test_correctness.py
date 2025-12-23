@@ -31,7 +31,7 @@ def test_apply_correctness(
     modifier, model_dtype, precision, transform_block_size, exp_mse
 ):
     model = AutoModelForCausalLM.from_pretrained(
-        "meta-llama/Llama-3.2-1B-Instruct", device_map="cuda", torch_dtype=model_dtype
+        "meta-llama/Llama-3.2-1B-Instruct", device_map="cuda", dtype=model_dtype
     )
 
     state = State(model=model)
@@ -45,7 +45,8 @@ def test_apply_correctness(
     with torch.no_grad():
         true_output = model(**input)
 
-    modifier.initialize(state)
+    modifier.on_initialize(state)
+    modifier.on_start(state, None)
 
     with torch.no_grad():
         output = model(**input)
