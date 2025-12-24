@@ -45,10 +45,10 @@ from llmcompressor.utils.pytorch.module import (
     get_module_to_name_dict,
 )
 
-__all__ = ["AWQModifier"]
+__all__ = ["AutoSmoothModifier"]
 
 
-class AWQModifier(Modifier, QuantizationMixin):
+class AutoSmoothModifier(Modifier, QuantizationMixin):
     """
     Implements the AWQ (Activation-Weighted Quantization) algorithm,
     as described in https://arxiv.org/pdf/2306.00978. The algorithm
@@ -67,7 +67,7 @@ class AWQModifier(Modifier, QuantizationMixin):
 
     example recipe:
     ```yaml
-    AWQModifier:
+    AutoSmoothModifier:
       mappings:
         - smooth_layer: "re:.*self_attn_layer_norm"
           balance_layers: ["re:.*q_proj", "re:.*k_proj", "re:.*v_proj"]
@@ -136,6 +136,16 @@ class AWQModifier(Modifier, QuantizationMixin):
         this specifies how many grid points should be used. To decrease the runtime,
         at the possible cost of slightly worse scales, this can be decreased.
         Defaults to 20
+    :param norm_func: normalization function to apply to scales during grid search.
+        Currently only "adaptive" is supported, which applies an adaptive
+        normalization to push scales closer to 1.0. Defaults to None, which applies
+        standard awq normalization.
+    :param norm_func_param: parameters for the normalization function.
+        Currently only supports parameters for "adaptive" normalization.
+        Defaults to {"adaptive": {"alpha": 6.0, "beta": 0.15}}
+    :param activation_scale_type: method to compute activation scale.
+        One of "mean", "max", or "minmax". Defaults to "mean"
+
     """
 
     # Allow arbitrary types because AWQMapping has fields of type torch.nn.Module
@@ -147,6 +157,11 @@ class AWQModifier(Modifier, QuantizationMixin):
     offload_device: torch.device | None = None
     duo_scaling: bool | Literal["both"] = True
     n_grid: int = 20
+    norm_func: str = None
+    norm_func_param: dict = {
+        "adaptive": {"alpha": 6.0, "beta": 0.15},
+    }
+    activation_scale_type: Literal["mean", "max", "minmax"] = "mean"
 
     # Private vars set during initialization, cleared during finalization
     _resolved_mappings: list[ResolvedMapping] = PrivateAttr(default_factory=list)
@@ -155,7 +170,7 @@ class AWQModifier(Modifier, QuantizationMixin):
         default_factory=dict
     )
     # Dict[smooth layer name, (activation means, activation counts)]
-    _smooth_activation_means: dict[str, tuple[torch.FloatTensor, int]] = PrivateAttr(
+    _smooth_activation_scales: dict[str, tuple[torch.FloatTensor, int]] = PrivateAttr(
         default_factory=dict
     )
 
@@ -191,7 +206,7 @@ class AWQModifier(Modifier, QuantizationMixin):
                     )
 
         if self.mappings is None:
-            logger.info("No AWQModifier.mappings provided, inferring from model...")
+            logger.info("No AutoSmoothModifier.mappings provided, inferring from model...")
             self.mappings = get_layer_mappings_from_architecture(
                 architecture=state.model.__class__.__name__
             )
@@ -232,21 +247,10 @@ class AWQModifier(Modifier, QuantizationMixin):
 
     def on_end(self, state: State, event: Event, **kwargs):
         """
-        Finish calibrating by setting scales and zero-points,
-         removing observers and calibration hooks
+        removing observers and calibration hooks
         """
         self._assert_all_activations_consumed()
-
         self.ended_ = True
-
-        for _, module in tqdm(
-            match_named_modules(state.model, self.resolved_targets, self.ignore),
-            desc="Calibrating weights",
-        ):
-            update_weight_zp_scale(module)
-
-        QuantizationMixin.end_calibration(self, state.model)
-
         # remove activation hooks
         self.remove_hooks()
 
@@ -261,7 +265,7 @@ class AWQModifier(Modifier, QuantizationMixin):
             self.on_end(state, None)
 
         self._parent_args_cache.clear()
-        self._smooth_activation_means.clear()
+        self._smooth_activation_scales.clear()
         self._resolved_mappings.clear()
 
         return True
@@ -355,11 +359,25 @@ class AWQModifier(Modifier, QuantizationMixin):
                 args: tuple[torch.Tensor, ...],
                 _output: torch.Tensor,
             ):
-                self._smooth_activation_means[smooth_name] = _accumulate_mean(
-                    # Assume that first argument is the input
-                    args[0].cpu().abs().detach().flatten(0, -2),
-                    self._smooth_activation_means.get(smooth_name, None),
-                )
+                match self.activation_scale_type:
+                    case "max":
+                        self._smooth_activation_scales[smooth_name] = _accumulate_max(
+                            # Assume that first argument is the input
+                            args[0].cpu().abs().detach().flatten(0, -2),
+                            self._smooth_activation_scales.get(smooth_name, None),
+                        )
+                    case "minmax":
+                        self._smooth_activation_scales[smooth_name] = _minmax(
+                            # Assume that first argument is the input
+                            args[0].cpu().abs().detach().flatten(0, -2),
+                            self._smooth_activation_scales.get(smooth_name, None),
+                        )
+                    case _:
+                        self._smooth_activation_scales[smooth_name] = _accumulate_mean(
+                            # Assume that first argument is the input
+                            args[0].cpu().abs().detach().flatten(0, -2),
+                            self._smooth_activation_scales.get(smooth_name, None),
+                        )
 
             return cache_smooth_activations_hook
 
@@ -401,7 +419,7 @@ class AWQModifier(Modifier, QuantizationMixin):
         mappings_to_smooth = [
             mapping
             for mapping in self._resolved_mappings
-            if mapping.smooth_name in self._smooth_activation_means
+            if mapping.smooth_name in self._smooth_activation_scales
         ]
         for mapping in tqdm(mappings_to_smooth, desc="Smoothing"):
             smooth_layer = mapping.smooth_layer
@@ -421,7 +439,7 @@ class AWQModifier(Modifier, QuantizationMixin):
                         "found to scale. This can occasionally occur in MoE models "
                         "when certain experts are not activated by calibration samples."
                     )
-                    del self._smooth_activation_means[mapping.smooth_name]
+                    del self._smooth_activation_scales[mapping.smooth_name]
                     continue
                 if not all(
                     [fp16_output.isfinite().all() for fp16_output in fp16_outputs]
@@ -435,7 +453,7 @@ class AWQModifier(Modifier, QuantizationMixin):
                         "ways. If you encounter this consistently, raise an issue at "
                         "https://github.com/vllm-project/llm-compressor/issues"
                     )
-                    del self._smooth_activation_means[mapping.smooth_name]
+                    del self._smooth_activation_scales[mapping.smooth_name]
                     continue
 
                 best_scales = self._compute_best_scale(mapping, fp16_outputs)
@@ -483,7 +501,7 @@ class AWQModifier(Modifier, QuantizationMixin):
                     _smooth(smooth_layer)
 
                 # remove caches needed to smooth this mapping
-                del self._smooth_activation_means[mapping.smooth_name]
+                del self._smooth_activation_scales[mapping.smooth_name]
 
         for v in self._parent_args_cache.values():
             v.batch_intermediates.clear()
@@ -533,9 +551,14 @@ class AWQModifier(Modifier, QuantizationMixin):
 
         device = get_execution_device(mapping.parent)
 
-        x_mean = self._smooth_activation_means[mapping.smooth_name][0].to(device)
+        if self.activation_scale_type == "minmax":
+            x_scales = self._smooth_activation_scales[mapping.smooth_name][0]
+            x_scales = x_scales[0].to(device) - x_scales[1].to(device)
+        else:
+            x_scales = self._smooth_activation_scales[mapping.smooth_name][0].to(device)
+        
         if self.duo_scaling:
-            w_mean = self._compute_layer_means(mapping.balance_layers).to(device)
+            w_scales = self._compute_layer_scales(mapping.balance_layers).to(device)
 
         match self.duo_scaling:
             # if self.duo_scaling is "both", perform half the grid search with
@@ -574,12 +597,18 @@ class AWQModifier(Modifier, QuantizationMixin):
 
                 # NOTE: s^-1 * x is fused here, according to paper
                 if use_duo_scaling:
-                    scales = (x_mean.pow(ratio) / (w_mean.pow(1 - ratio) + 1e-4)).clamp(
+                    scales = (x_scales.pow(ratio) / (w_scales.pow(1 - ratio) + 1e-4)).clamp(
                         min=1e-4
                     )
                 else:
-                    scales = x_mean.pow(ratio).clamp(min=1e-4).view(-1)
-                scales = scales / (scales.max() * scales.min()).sqrt()
+                    scales = x_scales.pow(ratio).clamp(min=1e-4).view(-1)
+                
+                match self.norm_func:
+                    case "adaptive":
+                        scales = _adaptive_norm(scales, **self.norm_func_param["adaptive"])
+                    case "awq":
+                        scales = scales / (scales.max() * scales.min()).sqrt()
+                    
                 _scalesview = scales.view(1, -1).to(device)
 
                 # avoid scaling values that overflow
@@ -656,7 +685,7 @@ class AWQModifier(Modifier, QuantizationMixin):
         # Compute the MSE loss for each batch
         for fp16_batch, int_w_batch in zip(fp16_outputs, int_w_outputs):
             loss += torch.nn.functional.mse_loss(
-                fp16_batch, int_w_batch.to(fp16_batch.device)
+                fp16_batch, int_w_batch.to(fp16_batch.device), reduction="sum"
             ).item()
             num_elements += fp16_batch.numel()
 
@@ -670,11 +699,11 @@ class AWQModifier(Modifier, QuantizationMixin):
         Confirm all activations have been consumed
         If not, something has gone wrong
         """
-        if len(self._smooth_activation_means) != 0:
+        if len(self._smooth_activation_scales) != 0:
             raise RuntimeError("Some cached activations were not used")
 
     @staticmethod
-    def _compute_layer_means(layers: list[Module]) -> torch.Tensor:
+    def _compute_layer_scales(layers: list[Module]) -> torch.Tensor:
         """
         Compute per-channel/group/block/tensor mean of normalised weights
         for all passed in layers taking into account the quantization_scheme.
@@ -804,6 +833,15 @@ def get_lowest_common_ancestor_with_avoid(
         ancestor_name = ".".join(ancestor_name.split(".")[:-1])
 
 
+def _adaptive_norm(scales: torch.Tensor, alpha=6.0, beta=0.15) -> torch.Tensor:
+    below_one = scales < 1.0
+    delta_low = 1.0 - scales
+    push_near_one = 1.0 - delta_low / (1.0 + alpha * delta_low)
+    delta_high = scales - 1.0
+    tamed_high = 1.0 + delta_high / (1.0 + beta * delta_high)
+    scales = torch.where(below_one, push_near_one, tamed_high)
+    return scales
+
 def _accumulate_mean(
     inp: torch.Tensor,
     prev_mean_and_count: tuple[torch.FloatTensor, int] | None,
@@ -811,7 +849,7 @@ def _accumulate_mean(
     sum_added = inp.sum(dim=0)
     num_added = inp.size(0)
     if prev_mean_and_count is None:
-        return sum_added, num_added
+        return sum_added / num_added, num_added
 
     prev_mean, prev_count = prev_mean_and_count
 
@@ -819,3 +857,28 @@ def _accumulate_mean(
     new_count = prev_count + num_added
 
     return (prev_sum + sum_added) / new_count, new_count
+
+def _accumulate_max(
+    inp: torch.Tensor,
+    prev_max_and_count: tuple[torch.FloatTensor, int] | None,
+) -> tuple[torch.FloatTensor, int]:
+    current_max = inp.to(torch.float32).amax(dim=0)
+    num_added = inp.size(0)
+    if prev_max_and_count is None:
+        return current_max, num_added
+    prev_max, prev_count = prev_max_and_count
+    new_count = prev_count + num_added
+    return torch.maximum(prev_max, current_max), new_count
+
+def _minmax(
+    inp: torch.Tensor,
+    prev_minmax_and_count: tuple[(torch.FloatTensor, torch.FloatTensor), int] | None,
+) -> tuple[(torch.FloatTensor, torch.FloatTensor), int]:
+    current_min = inp.to(torch.float32).amin(dim=0)
+    current_max = inp.to(torch.float32).amax(dim=0)
+    num_added = inp.size(0)
+    if prev_minmax_and_count is None:
+        return (current_min, current_max), num_added
+    (prev_min, prev_max), prev_count = prev_minmax_and_count
+    new_count = prev_count + num_added
+    return (torch.minimum(prev_min, current_min), torch.maximum(prev_max, current_max)), new_count
