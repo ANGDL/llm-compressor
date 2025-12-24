@@ -86,7 +86,7 @@ class Subgraph:
                 f"```\n{add_line_numbers(self._code.src)}\n```"
             ) from exception
 
-        return modules
+        return outputs
 
     def submodules(self, model: Module, recurse: bool = False) -> Set[Module]:
         nodes = self.graph.find_nodes(op="call_module")
