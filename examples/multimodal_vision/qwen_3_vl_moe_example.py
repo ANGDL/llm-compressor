@@ -1,27 +1,30 @@
 import base64
 import argparse
 from io import BytesIO
+import os
 
 import torch
 from datasets import load_dataset
-from qwen_vl_utils import process_vision_info
 from transformers import AutoProcessor, Qwen3VLMoeForConditionalGeneration
+from qwen_vl_utils import process_vision_info
 
 from llmcompressor import oneshot
 from llmcompressor.modifiers.quantization import GPTQModifier 
 from llmcompressor.modifiers.awq import AWQModifier
 from llmcompressor.utils import dispatch_for_generation
+from llmcompressor.modifiers.autosmooth import AutoSmoothModifier
+from llmcompressor.modifiers.awq import AWQMapping
 
 # Load model.
-model_id = "/data/models/Qwen3-VL-30B-A3B-Instruct"
+model_id = "/ssd3/models/Qwen3-VL-30B-A3B-Instruct"
 model = Qwen3VLMoeForConditionalGeneration.from_pretrained(model_id, device_map=None, dtype="auto",local_files_only=True)
 processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
 # for name, module in model.named_modules():
 #     print(name, ":", module)
 
 # Oneshot arguments
-NUM_CALIBRATION_SAMPLES = 128
-MAX_SEQUENCE_LENGTH = 2048
+NUM_CALIBRATION_SAMPLES = 256
+MAX_SEQUENCE_LENGTH = 4096
 
 DATASET_ID = "lmms-lab/flickr30k"
 DATASET_SPLIT = f"test[:{NUM_CALIBRATION_SAMPLES}]"
@@ -72,36 +75,6 @@ def data_collator(batch):
     assert len(batch) == 1
     return {key: torch.tensor(value) for key, value in batch[0].items()}
 
-# Recipe
-# recipe = [
-#     GPTQModifier(
-#         targets="Linear",
-#         scheme="W4A16",
-#         ignore=["lm_head", "re:visual.*", "re:model.visual.*"],
-#     ),
-# ]
-
-# recipe = [
-#     AWQModifier(
-#         ignore=["lm_head", "re:visual.*", "re:model.visual.*"],
-#         duo_scaling=False,
-#         config_groups={
-#              "group_0": {
-#                  "targets":{"Linear"},
-#                  "input_activations" : None,
-#                  "output_activations": None,
-#               "weights": {
-#                   "num_bits": 4,
-#                   "type": "int",
-#                   "symmetric": True,
-#                   "strategy": "group",
-#                   "group_size": 32,
-#                   "observer": "mse"
-#                 },
-#               },       
-#          }
-#     ),
-# ]
 
 parser = argparse.ArgumentParser(description="vision block range")
 parser.add_argument('--max_id', type=int, default=-1, help='block id')
@@ -113,37 +86,28 @@ for i in range(args.max_id):
     vit_ignore.append('"re:model.visual.blocks.{}.mlp.*"'.format(i))
 vit_ignore_str = ",".join(vit_ignore)
 
-# recipe = """
-# quant_stage:
-#     quant_modifiers:
-#         GPTQModifier:
-#             ignore: [
-#                         "lm_head",
-#                         {}
-#                         "re:model.visual.deepstack_merger_list.*",
-#                         "re:model.visual.*"
-#                     ]
-#             config_groups:
-#                 group_0:
-#                     weights:
-#                         num_bits: 8
-#                         type: int
-#                         strategy: channel
-#                         dynamic: false
-#                         symmetric: true
-#                     input_activations:
-#                         num_bits: 8
-#                         type: int
-#                         strategy: token
-#                         dynamic: true
-#                         symmetric: true
-#                     targets: ["re:model.language_model.layers.*self_attn.q_proj.*", "re:model.language_model.layers.*self_attn.k_proj.*", "re:model.language_model.layers.*self_attn.v_proj.*", "re:model.language_model.layers.*self_attn.o_proj.*", "re:model.language_model.layers.*mlp.gate_proj.*", "re:model.language_model.layers.*mlp.up_proj.*", "re:model.language_model.layers.*mlp.down_proj.*","remodel.language_model.*"]
-# """.format(vit_ignore_str + "," if vit_ignore_str else "")
+mapping = [
+    AWQMapping(
+        "re:.*input_layernorm$",
+        ["re:.*q_proj$", "re:.*k_proj$", "re:.*v_proj$"],
+    ),
+    AWQMapping("re:.*v_proj$", ["re:.*o_proj$"]),
+    AWQMapping(
+        "re:.*post_attention_layernorm$",
+        ["re:.*mlp.experts.*.gate_proj$", "re:.*mlp.experts.*.up_proj$"],
+    ),
+    AWQMapping(
+        "re:.*up_proj$",
+        ["re:.*down_proj$"],
+    ),
+]
 
 recipe = [
+    #AutoSmoothModifier(activation_scale_type="minmax", norm_func='awq', mappings=mapping),
     GPTQModifier(
         targets="Linear",
         scheme="W8A8",
+        offload_hessians=True,
         ignore=["lm_head", "re:visual.*", "re:model.visual.*"],
     ),
 ]
@@ -195,5 +159,6 @@ print("==========================================")
 
 # Save to disk compressed.
 SAVE_DIR = model_id.rstrip("/").split("/")[-1] + "-W8A8_LLM"
+SAVE_DIR = os.path.join("/ssd3/models", SAVE_DIR)
 model.save_pretrained(SAVE_DIR, save_compressed=True)
 processor.save_pretrained(SAVE_DIR)
