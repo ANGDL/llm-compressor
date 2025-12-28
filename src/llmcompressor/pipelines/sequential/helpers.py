@@ -72,21 +72,12 @@ class Subgraph:
 
         forward_fn = self._code.globals.get("forward")
 
-        try:
-            # PATCH: Materialize meta tensors in model before execution
-            # Prevents "Tensor.item() on meta tensors" from offloaded modules
-            # Only materialize once per subgraph to avoid conflicts
+        with append_autowrap_source_on_fail():
             if not self._materialized:
                 self._materialize_model_meta_tensors(args[0] if args else None)
                 self._materialized = True
             outputs = forward_fn(*args, **kwargs)
-        except Exception as exception:
-            raise RuntimeError(
-                "Raised an exception during execution of the following code:\n"
-                f"```\n{add_line_numbers(self._code.src)}\n```"
-            ) from exception
-
-        return outputs
+            return outputs
 
     def submodules(self, model: Module, recurse: bool = False) -> Set[Module]:
         nodes = self.graph.find_nodes(op="call_module")
@@ -110,19 +101,10 @@ class Subgraph:
                     try:
                         # Create materialized tensor on target device
                         materialized = torch.zeros_like(param, device=device)
-                        # Integer dtypes can't require grad, convert to buffer
-                        int_dtypes = (torch.int32, torch.int64, torch.int8, torch.uint8)
-                        if param.dtype in int_dtypes:
-                            # Remove parameter first, then add as buffer
-                            if name in module._parameters:
-                                del module._parameters[name]
-                            if name not in module._buffers:
-                                module._buffers[name] = materialized
-                        else:
-                            new_param = torch.nn.Parameter(
-                                materialized, requires_grad=param.requires_grad
-                            )
-                            module._parameters[name] = new_param
+                        new_param = torch.nn.Parameter(
+                            materialized, requires_grad=param.requires_grad
+                        )
+                        module._parameters[name] = new_param
                     except Exception as e:
                         logger.warning(
                             f"Failed to materialize parameter {name} in "
