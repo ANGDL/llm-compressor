@@ -73,11 +73,18 @@ class Subgraph:
         forward_fn = self._code.globals.get("forward")
 
         with append_autowrap_source_on_fail():
-            if not self._materialized:
-                self._materialize_model_meta_tensors(args[0] if args else None)
-                self._materialized = True
-            outputs = forward_fn(*args, **kwargs)
-            return outputs
+            try:
+                return forward_fn(*args, **kwargs)
+            except Exception as e:
+                logger.warning(
+                    f"Error caused by autowrap_forwards: {e},"
+                    f"trying to materialize model meta tensors."
+                )
+                if not self._materialized:
+                    self._materialize_model_meta_tensors(args[0] if args else None)
+                    self._materialized = True
+                outputs = forward_fn(*args, **kwargs)
+                return outputs
 
     def submodules(self, model: Module, recurse: bool = False) -> Set[Module]:
         nodes = self.graph.find_nodes(op="call_module")
