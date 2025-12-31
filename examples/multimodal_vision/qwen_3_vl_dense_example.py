@@ -1,5 +1,4 @@
 import base64
-import argparse
 from io import BytesIO
 
 import torch
@@ -8,22 +7,25 @@ from qwen_vl_utils import process_vision_info
 from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 
 from llmcompressor import oneshot
-from llmcompressor.modifiers.quantization import GPTQModifier 
-from llmcompressor.modifiers.awq import AWQModifier
+from llmcompressor.modifiers.quantization import GPTQModifier
 from llmcompressor.utils import dispatch_for_generation
+from llmcompressor.modifiers.autosmooth import AutoSmoothModifier
+from llmcompressor.modifiers.awq import AWQMapping
+
+import os
 
 # Load model.
-model_id = "/data/models/Qwen3-VL-4B-Instruct"
-model = Qwen3VLForConditionalGeneration.from_pretrained(model_id, device_map=None, dtype="auto",local_files_only=True)
+model_id = "/data/models/Qwen3-VL-8B-Instruct"
+model =Qwen3VLForConditionalGeneration.from_pretrained(model_id, dtype="auto")
 processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
-# for name, module in model.named_modules():
-#     print(name, ":", module)
 
 # Oneshot arguments
-DATASET_ID = "lmms-lab/flickr30k"
-DATASET_SPLIT = "test[:128]"
 NUM_CALIBRATION_SAMPLES = 128
 MAX_SEQUENCE_LENGTH = 2048
+
+DATASET_ID = "lmms-lab/flickr30k"
+DATASET_SPLIT = f"test[:{NUM_CALIBRATION_SAMPLES}]"
+
 
 # Load dataset and preprocess.
 ds = load_dataset(DATASET_ID, split=DATASET_SPLIT)
@@ -71,82 +73,32 @@ def data_collator(batch):
     assert len(batch) == 1
     return {key: torch.tensor(value) for key, value in batch[0].items()}
 
+mapping = [
+    AWQMapping(
+        "re:.*input_layernorm$",
+        ["re:.*q_proj$", "re:.*k_proj$", "re:.*v_proj$"],
+    ),
+    AWQMapping("re:.*v_proj$", ["re:.*o_proj$"]),
+    AWQMapping(
+        "re:.*post_attention_layernorm$",
+        ["re:.*gate_proj$", "re:.*up_proj$"],
+    ),
+    AWQMapping(
+        "re:.*up_proj$",
+        ["re:.*down_proj$"],
+    ),
+]
+
 # Recipe
-# recipe = [
-#     GPTQModifier(
-#         targets="Linear",
-#         scheme="W4A16",
-#         ignore=["lm_head", "re:visual.*", "re:model.visual.*"],
-#     ),
-# ]
-
-# recipe = [
-#     AWQModifier(
-#         ignore=["lm_head", "re:visual.*", "re:model.visual.*"],
-#         duo_scaling=False,
-#         config_groups={
-#              "group_0": {
-#                  "targets":{"Linear"},
-#                  "input_activations" : None,
-#                  "output_activations": None,
-#               "weights": {
-#                   "num_bits": 4,
-#                   "type": "int",
-#                   "symmetric": True,
-#                   "strategy": "group",
-#                   "group_size": 32,
-#                   "observer": "mse"
-#                 },
-#               },       
-#          }
-#     ),
-# ]
-
-parser = argparse.ArgumentParser(description="vision block range")
-parser.add_argument('--max_id', type=int, default=-1, help='block id')
-args = parser.parse_args()
-
-vit_ignore = list()
-for i in range(args.max_id):
-    vit_ignore.append('"re:model.visual.blocks.{}.attn.*"'.format(i))
-    vit_ignore.append('"re:model.visual.blocks.{}.mlp.*"'.format(i))
-vit_ignore_str = ",".join(vit_ignore)
-
-recipe = """
-quant_stage:
-    quant_modifiers:
-        GPTQModifier:
-            ignore: [
-                        "lm_head",
-                        {}
-                        "re:model.visual.deepstack_merger_list.*",
-                        "re:model.visual.*"
-                    ]
-            config_groups:
-                group_0:
-                    weights:
-                        num_bits: 8
-                        type: int
-                        strategy: channel
-                        dynamic: false
-                        symmetric: true
-                    input_activations:
-                        num_bits: 8
-                        type: int
-                        strategy: token
-                        dynamic: true
-                        symmetric: true
-                    targets: ["re:model.language_model.layers.*self_attn.q_proj.*", "re:model.language_model.layers.*self_attn.k_proj.*", "re:model.language_model.layers.*self_attn.v_proj.*", "re:model.language_model.layers.*self_attn.o_proj.*", "re:model.language_model.layers.*mlp.gate_proj.*", "re:model.language_model.layers.*mlp.up_proj.*", "re:model.language_model.layers.*mlp.down_proj.*","remodel.language_model.*"]
-""".format(vit_ignore_str + "," if vit_ignore_str else "")
-
 recipe = [
+    AutoSmoothModifier(activation_scale_type="mean", norm_func='adaptive', mappings=mapping),
     GPTQModifier(
         targets="Linear",
         scheme="W8A8",
         ignore=["lm_head", "re:visual.*", "re:model.visual.*"],
+        offload_hessians=True,
     ),
 ]
-
 
 # Perform oneshot
 oneshot(
@@ -193,6 +145,7 @@ print("==========================================")
 
 
 # Save to disk compressed.
-SAVE_DIR = model_id.rstrip("/").split("/")[-1] + "-W8A8_LLM"
+SAVE_DIR = model_id.rstrip("/").split("/")[-1] + "-W8A8"
+SAVE_DIR = os.path.join("/data/models", SAVE_DIR)
 model.save_pretrained(SAVE_DIR, save_compressed=True)
 processor.save_pretrained(SAVE_DIR)
