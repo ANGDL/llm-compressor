@@ -553,7 +553,7 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
 
         if self.activation_scale_type == "minmax":
             x_scales = self._smooth_activation_scales[mapping.smooth_name][0]
-            x_scales = x_scales[0].to(device) - x_scales[1].to(device)
+            x_scales = x_scales[1].to(device) - x_scales[0].to(device)  # max - min
         else:
             x_scales = self._smooth_activation_scales[mapping.smooth_name][0].to(device)
         
