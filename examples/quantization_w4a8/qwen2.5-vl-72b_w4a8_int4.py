@@ -29,7 +29,7 @@ from datasets import load_dataset
 MODEL_ID = "/data/models/Qwen2.5-VL-72B-Instruct"
 BASE_NAME = MODEL_ID.rstrip("/").split("/")[-1]
 
-OUTPUT_DIR = f"{BASE_NAME}-w4a8-smooth-gptq-max"
+OUTPUT_DIR = f"{BASE_NAME}-w4a8-smooth-gptq-mean"
 OUTPUT_DIR = os.path.join("/data/models", OUTPUT_DIR)
 
 model = Qwen2_5_VLForConditionalGeneration.from_pretrained(MODEL_ID, dtype="auto", device_map=None)
@@ -146,7 +146,7 @@ mapping = [
 
 recipe = [
     AutoSmoothModifier(
-        activation_scale_type="max", 
+        activation_scale_type="mean", 
         norm_func='adaptive', 
         mappings=mapping,
     ),
