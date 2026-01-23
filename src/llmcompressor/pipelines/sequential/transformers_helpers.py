@@ -1464,7 +1464,22 @@ class HFTracer(Tracer):
 
         # This is necessary because concrete args are added as input to the traced module since
         # https://github.com/pytorch/pytorch/pull/55888.
+        nodes_to_delete = set()
         for node in self.graph.nodes:
+            if node.op == "placeholder" and node.target not in input_names:
+                to_visit = [node]
+                while to_visit:
+                    n = to_visit.pop(0)
+                    if n in nodes_to_delete:
+                        continue
+                    nodes_to_delete.add(n)
+                    to_visit.extend(list(n.users.keys()))
+
+        for node in reversed(list(self.graph.nodes)):
+            if node in nodes_to_delete:
+                self.graph.erase_node(node)
+                continue
+
             if node.op == "placeholder":
                 # Removing default values for inputs as the forward pass will fail with them.
                 if node.target in input_names:
@@ -1472,17 +1487,6 @@ class HFTracer(Tracer):
                     # Without this, torch.jit.script fails because the inputs type is Optional[torch.Tensor].
                     # It cannot infer on the attributes and methods the input should have, and fails.
                     node.type = torch.Tensor
-                # It is a concrete arg so it is not used and should be removed.
-                else:
-                    to_visit = [node]
-                    to_delete = collections.OrderedDict()
-                    while to_visit:
-                        n = to_visit.pop(0)
-                        to_delete[n] = None
-                        to_visit += list(n.users.keys())
-
-                    for user in reversed(to_delete.keys()):
-                        self.graph.erase_node(user)
 
             # TODO: solves GraphModule creation.
             # Without this, return type annotation "Tuple" is causing code execution failure.
