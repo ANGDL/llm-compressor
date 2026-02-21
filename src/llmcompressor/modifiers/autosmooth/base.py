@@ -24,7 +24,7 @@ from torch.nn import Module
 from torch.utils._pytree import tree_leaves
 from tqdm import tqdm
 
-from llmcompressor.core import Event, EventType, State
+from llmcompressor.core import Event, EventType, State, active_session
 from llmcompressor.modifiers import Modifier
 from llmcompressor.modifiers.awq.mappings import (
     AWQMapping,
@@ -37,8 +37,10 @@ from llmcompressor.modifiers.quantization.calibration import (
 from llmcompressor.modifiers.quantization.quantization import QuantizationMixin
 from llmcompressor.modifiers.utils import update_fused_layer_weight_global_scales
 from llmcompressor.modifiers.utils.hooks import HooksMixin
+from llmcompressor.modifiers.utils.pytorch_helpers import is_moe_model
 from llmcompressor.observers.base import Observer
 from llmcompressor.pipelines.cache import IntermediatesCache
+from llmcompressor.sentinel import Sentinel
 from llmcompressor.utils.helpers import calibration_forward_context
 from llmcompressor.utils.pytorch.module import (
     get_module_to_name_dict,
@@ -153,7 +155,7 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
     # User-provided vars (in addition to QuantizationMixin args)
     sequential_targets: str | list[str] | None = None
     mappings: list[AWQMapping] | None = None
-    offload_device: torch.device | None = None
+    offload_device: torch.device | None | Sentinel = Sentinel("not_provided")
     duo_scaling: bool | Literal["both"] = True
     n_grid: int = 20
     norm_func: str = None
@@ -212,12 +214,38 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
                 architecture=state.model.__class__.__name__
             )
 
+        # Set default offload_device
+        if self.offload_device == Sentinel("not_provided"):
+            # Check if we have a MoE model
+            if is_moe_model(state.model):
+                self.offload_device = torch.device("cpu")
+                logger.info(
+                    "MoE model detected: setting offload_device to 'cpu' by default "
+                    "to reduce memory usage. You can override this by explicitly "
+                    "setting offload_device in your recipe."
+                )
+            else:
+                # For non-MoE models, convert sentinel to None
+                # (no offloading by default)
+                self.offload_device = None
+
         self._set_resolved_mappings(state.model)
 
         return True
 
     def on_start(self, state: State, event: Event, **kwargs):
         self.started_ = True
+
+        # Check for unsupported token masking with MoE up_proj -> down_proj mappings
+        if state.loss_masks is not None and self._has_moe_up_down_proj_mapping():
+            raise ValueError(
+                "Token masking (use_loss_mask=True) is not supported with "
+                "up_proj -> down_proj mappings in MoE models. The MoE routing "
+                "mechanism dispatches tokens to different experts, and the loss mask "
+                "cannot be properly aligned with this dispatch. Please either "
+                "disable token masking or exclude the up_proj -> down_proj mapping "
+                "for MoE layers from the AutoSmooth configuration."
+            )
 
         # register quantization calibration hooks
         # assume quantization has been initialized by this modifier or one before it
@@ -349,6 +377,17 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
                     balance_names, model, torch.nn.ModuleList
                 )
 
+                activation_hook_target = None
+                if mapping.activation_hook_target:
+                    activation_hook_target = getattr_chain(
+                        ancestor, mapping.activation_hook_target
+                    )
+                    if activation_hook_target is None:
+                        raise ValueError(
+                            f"activation_hook_target '{mapping.activation_hook_target}'"
+                            f" not found on parent module '{ancestor_name}'"
+                        )
+
                 resolved_mappings.append(
                     ResolvedMapping(
                         smooth_name,
@@ -357,6 +396,7 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
                         balance_names=balance_names,
                         parent=ancestor,
                         parent_name=ancestor_name,
+                        activation_hook_target=activation_hook_target,
                     )
                 )
         self._resolved_mappings = resolved_mappings
@@ -382,23 +422,40 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
                 args: tuple[torch.Tensor, ...],
                 _output: torch.Tensor,
             ):
+                activations = args[0].abs().detach()
+
+                # Get loss mask for current batch from state
+                session = active_session()
+                state = session.state
+                loss_masks = state.loss_masks if state else None
+                batch_idx = state.current_batch_idx if state else -1
+                loss_mask = (
+                    loss_masks[batch_idx] if loss_masks and batch_idx >= 0 else None
+                )
+
+                if loss_mask is not None:
+                    # Mask: [batch, seq] -> [batch, seq, 1]
+                    mask = loss_mask.to(activations.device).unsqueeze(-1)
+                    flat_activations = activations.flatten(0, -2)  # [batch*seq, hidden]
+                    flat_mask = mask.flatten(0, -2).squeeze(-1)
+                    cached_activations = flat_activations[flat_mask.bool()]
+                else:
+                    cached_activations = activations.flatten(0, -2)
+
                 match self.activation_scale_type:
                     case "max":
                         self._smooth_activation_scales[smooth_name] = _accumulate_max(
-                            # Assume that first argument is the input
-                            args[0].abs().detach().flatten(0, -2),
+                            cached_activations,
                             self._smooth_activation_scales.get(smooth_name, None),
                         )
                     case "minmax":
                         self._smooth_activation_scales[smooth_name] = _minmax(
-                            # Assume that first argument is the input
-                            args[0].abs().detach().flatten(0, -2),
+                            cached_activations,
                             self._smooth_activation_scales.get(smooth_name, None),
                         )
                     case _:
                         self._smooth_activation_scales[smooth_name] = _accumulate_mean(
-                            # Assume that first argument is the input
-                            args[0].abs().detach().flatten(0, -2),
+                            cached_activations,
                             self._smooth_activation_scales.get(smooth_name, None),
                         )
 
@@ -422,8 +479,13 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
             # input activations to balance layers needed for loss function
             # storing inputs to first balance layer is sufficient
             # other balance layers get the same input
+            #
+            # For parallel transformer blocks the first balance layer may not
+            # receive the right activations. When activation_hook_target is set
+            # on the mapping, hook that module instead of balance_layers[0].
+            layer_to_hook = mapping.activation_hook_target or mapping.balance_layers[0]
             self.register_hook(
-                mapping.balance_layers[0],
+                layer_to_hook,
                 create_cache_smooth_activations_hook_fn(mapping.smooth_name),
                 "forward",
             )
@@ -577,7 +639,10 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
             x_scales = self._smooth_activation_scales[mapping.smooth_name][0].to(device)
         
         if self.duo_scaling:
-            w_scales = self._compute_layer_scales(mapping.balance_layers).to(device)
+            w_scales = self._compute_layer_scales(
+                mapping.balance_layers,
+                mapping.balance_names,
+            ).to(device)
 
         match self.duo_scaling:
             # if self.duo_scaling is "both", perform half the grid search with
@@ -795,8 +860,31 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
         if len(self._smooth_activation_scales) != 0:
             raise RuntimeError("Some cached activations were not used")
 
+    def _has_moe_up_down_proj_mapping(self) -> bool:
+        """
+        Check if any resolved mapping is an up_proj -> down_proj mapping
+        where the balance layers are MoE experts (indicated by '.experts.'
+        in the name).
+
+        Token masking is not supported for such mappings because the MoE
+        routing mechanism dispatches tokens to different experts, and the
+        loss mask cannot be properly aligned with this dispatch.
+        """
+        for mapping in self._resolved_mappings:
+            if mapping.smooth_name.endswith("up_proj"):
+                for balance_name in mapping.balance_names:
+                    if (
+                        balance_name.endswith("down_proj")
+                        and ".experts." in balance_name
+                    ):
+                        return True
+        return False
+
     @staticmethod
-    def _compute_layer_scales(layers: list[Module]) -> torch.Tensor:
+    def _compute_layer_scales(
+        layers: list[Module],
+        layer_names: list[str] | None = None,
+    ) -> torch.Tensor:
         """
         Compute per-channel/group/block/tensor mean of normalised weights
         for all passed in layers taking into account the quantization_scheme.
@@ -808,11 +896,16 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
         weight_total_count = 0
         weight_total_sum = 0
 
-        for layer in layers:
+        for idx, layer in enumerate(layers):
+            layer_name = (
+                layer_names[idx]
+                if layer_names is not None and idx < len(layer_names)
+                else layer.__class__.__name__
+            )
             if not hasattr(layer, "weight"):
                 logger.warning(
                     "Unable to find weight param for targeted"
-                    f" layer {type(layer)}, skipping"
+                    f" layer {layer_name} ({type(layer)}), skipping"
                 )
                 continue
             weight = layer.weight.clone()
@@ -822,9 +915,8 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
             if not q_args:
                 logger.warning(
                     "Unable to find quantization scheme for "
-                    f"targeted layer {type(layer)}, skipping"
+                    f"targeted layer {layer_name} ({type(layer)}), but autosmooth will use it to compute scales"
                 )
-                continue
 
             match q_args.strategy:
                 # chunk size is the size of the size of the
@@ -950,7 +1042,7 @@ def _accumulate_mean(
     prev_sum = prev_mean * prev_count
     new_count = prev_count + num_added
 
-    return (prev_sum + sum_added) / new_count, new_count
+    return ((prev_sum + sum_added) / new_count).cpu(), new_count
 
 def _accumulate_max(
     inp: torch.Tensor,

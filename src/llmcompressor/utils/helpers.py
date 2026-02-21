@@ -191,25 +191,53 @@ def disable_lm_head(model: torch.nn.Module):
         yield
         return
 
-    elif not isinstance(lm_head, torch.nn.Linear):
+    elif not hasattr(lm_head, "weight"):
         logger.warning(f"Cannot disable LM head of type {lm_head.__class__.__name__}")
         yield
         return
 
     else:
-        dummy_weight = lm_head.weight.to("meta")
+        weight = lm_head.weight
+        if not isinstance(weight, torch.Tensor) or weight.ndim != 2:
+            logger.warning(
+                f"Cannot disable LM head of type {lm_head.__class__.__name__}: "
+                "expected a 2D weight tensor"
+            )
+            yield
+            return
+
+        dummy_weight = weight.to("meta")
+
+        def _infer_out_features(input: torch.Tensor) -> int:
+            if hasattr(lm_head, "out_features"):
+                out_features = getattr(lm_head, "out_features")
+                if isinstance(out_features, int):
+                    return out_features
+            if input.shape[-1] == dummy_weight.shape[1]:
+                return int(dummy_weight.shape[0])
+            if input.shape[-1] == dummy_weight.shape[0]:
+                return int(dummy_weight.shape[1])
+            return int(dummy_weight.shape[0])
 
         def dummy_forward(self, input: torch.Tensor) -> torch.Tensor:
-            return input.to("meta") @ dummy_weight.T
+            input_meta = input.to("meta")
+            if input_meta.shape[-1] == dummy_weight.shape[1]:
+                return input_meta @ dummy_weight.T
+            output_shape = (*input_meta.shape[:-1], _infer_out_features(input_meta))
+            return torch.empty(output_shape, device="meta", dtype=input_meta.dtype)
 
         with contextlib.ExitStack() as stack:
             lm_head_forward = dummy_forward.__get__(lm_head)
             stack.enter_context(patch_attr(lm_head, "forward", lm_head_forward))
+            lm_head.apply(disable_quantization)
 
             if hasattr(model, "_hf_hook"):
                 stack.enter_context(patch_attr(model._hf_hook, "io_same_device", False))
 
-            yield
+            try:
+                yield
+            finally:
+                lm_head.apply(enable_quantization)
 
 
-DISABLE_QAC_MODIFIERS = ["GPTQModifier", "AWQModifier", "AutoRoundModifier"]
+DISABLE_QAC_MODIFIERS = ["GPTQModifier", "AWQModifier", "AutoRoundModifier", 'AutoSmoothModifier']
