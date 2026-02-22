@@ -162,7 +162,7 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
     norm_func_param: dict = {
         "adaptive": {"alpha": 6.0, "beta": 0.15},
     }
-    activation_scale_type: Literal["mean", "max", "minmax"] = "mean"
+    activation_scale_type: str = "mean"
 
     # Private vars set during initialization, cleared during finalization
     _resolved_mappings: list[ResolvedMapping] = PrivateAttr(default_factory=list)
