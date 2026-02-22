@@ -63,7 +63,6 @@ def accumulate_hessian(
     inp = inp.to(dtype=GPTQ_PRECISION)
     inp = math.sqrt(2) * inp
     H += inp.matmul(inp.t())
-
     return H, num_samples
 
 

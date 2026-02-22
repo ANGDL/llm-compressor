@@ -162,7 +162,7 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
     norm_func_param: dict = {
         "adaptive": {"alpha": 6.0, "beta": 0.15},
     }
-    activation_scale_type: Literal["mean", "max", "minmax"] = "mean"
+    activation_scale_type: str = "mean"
 
     # Private vars set during initialization, cleared during finalization
     _resolved_mappings: list[ResolvedMapping] = PrivateAttr(default_factory=list)
@@ -915,8 +915,9 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
             if not q_args:
                 logger.warning(
                     "Unable to find quantization scheme for "
-                    f"targeted layer {layer_name} ({type(layer)}), but autosmooth will use it to compute scales"
+                    f"targeted layer {layer_name} ({type(layer)}), skipping"
                 )
+                continue
 
             match q_args.strategy:
                 # chunk size is the size of the size of the
