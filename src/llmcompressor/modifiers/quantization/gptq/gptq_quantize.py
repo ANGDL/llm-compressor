@@ -1,5 +1,6 @@
 import math
 from copy import copy
+import os
 
 import torch
 import transformers
@@ -20,6 +21,20 @@ GPTQ_PRECISION = torch.float32
 
 __all__ = ["make_empty_hessian", "accumulate_hessian", "quantize_weight"]
 
+_USE_INPLACE_HESSIAN = os.getenv("LLM_COMPRESSOR_USE_INPLACE_HESSIAN", "0") in ["1", "true", "True"]
+
+if _USE_INPLACE_HESSIAN:
+    logger.info("Using inplace hessian accumulation for GPTQ. This may reduce memory usage but can lead to numerical instability. Use with caution.")
+    def _hessian_update(H: torch.Tensor, inp: torch.Tensor):
+        inp.mul_(math.sqrt(2))
+        H.addmm_(inp, inp.t())
+        return H
+else:
+    def _hessian_update(H: torch.Tensor, inp: torch.Tensor):
+        inp = math.sqrt(2) * inp
+        H += inp.matmul(inp.t())
+        return H
+
 
 def make_empty_hessian(
     module: torch.nn.Module, device: torch.device | None = None
@@ -33,7 +48,7 @@ def make_empty_hessian(
 def accumulate_hessian(
     inp: torch.Tensor,
     module: torch.nn.Module,
-    H: torch.Tensor | None,
+    H: torch.Tensor,
     num_samples: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     inp = inp.to(device=H.device)
@@ -61,8 +76,9 @@ def accumulate_hessian(
     num_samples += num_added
 
     inp = inp.to(dtype=GPTQ_PRECISION)
-    inp = math.sqrt(2) * inp
-    H += inp.matmul(inp.t())
+
+    H = _hessian_update(H, inp)
+
     return H, num_samples
 
 
