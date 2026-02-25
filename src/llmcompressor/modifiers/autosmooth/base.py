@@ -198,6 +198,7 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
                 if (
                     hasattr(module, "quantization_scheme")
                     and hasattr(module.quantization_scheme, "weights")
+                    and hasattr(module.quantization_scheme.weights, "strategy")
                     and module.quantization_scheme.weights.strategy
                     == QuantizationStrategy.TENSOR
                 ):
@@ -1035,7 +1036,7 @@ def _accumulate_mean(
     sum_added = inp.sum(dim=0)
     num_added = inp.size(0)
     if prev_mean_and_count is None:
-        return (sum_added / num_added).cpu(), num_added
+        return (sum_added / num_added), num_added
 
     prev_mean, prev_count = prev_mean_and_count
     prev_mean = prev_mean.to(inp.device)
@@ -1043,7 +1044,7 @@ def _accumulate_mean(
     prev_sum = prev_mean * prev_count
     new_count = prev_count + num_added
 
-    return ((prev_sum + sum_added) / new_count).cpu(), new_count
+    return (prev_sum + sum_added) / new_count, new_count
 
 def _accumulate_max(
     inp: torch.Tensor,
@@ -1052,13 +1053,13 @@ def _accumulate_max(
     current_max = inp.to(torch.float32).amax(dim=0)
     num_added = inp.size(0)
     if prev_max_and_count is None:
-        return current_max.cpu(), num_added
+        return current_max, num_added
 
     prev_max, prev_count = prev_max_and_count
     prev_max = prev_max.to(inp.device)
     new_count = prev_count + num_added
 
-    return torch.maximum(prev_max, current_max).cpu(), new_count
+    return torch.maximum(prev_max, current_max), new_count
 
 def _minmax(
     inp: torch.Tensor,
@@ -1068,11 +1069,11 @@ def _minmax(
     current_max = inp.to(torch.float32).amax(dim=0)
     num_added = inp.size(0)
     if prev_minmax_and_count is None:
-        return (current_min.cpu(), current_max.cpu()), num_added
+        return (current_min, current_max), num_added
 
     (prev_min, prev_max), prev_count = prev_minmax_and_count
     prev_min = prev_min.to(inp.device)
     prev_max = prev_max.to(inp.device)
 
     new_count = prev_count + num_added
-    return (torch.minimum(prev_min, current_min).cpu(), torch.maximum(prev_max, current_max).cpu()), new_count
+    return (torch.minimum(prev_min, current_min), torch.maximum(prev_max, current_max)), new_count
