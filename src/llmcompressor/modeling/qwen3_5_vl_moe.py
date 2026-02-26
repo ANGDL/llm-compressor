@@ -43,6 +43,8 @@ else:
             self.gate = original.gate
             self.experts = SequentialQwen3VLMoeTextExperts(text_config, original.experts)
             self.calibrate_all_experts = calibrate_all_experts
+            del original.experts
+            original.experts = None
         
         def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
             batch_size, sequence_length, hidden_dim = hidden_states.shape
