@@ -35,7 +35,7 @@ class NameAnalyzer(ast.NodeVisitor):
     _omit: set[str]
 
     def __init__(self, omit: set[str]):
-        self._omit = builtins.__dict__.keys() | omit
+        self._omit = builtins.__dict__.keys() | omit | {"_"}
 
     def analyze(self, node: ast.AST) -> tuple[set[str], set[str], set[str]]:
         """

@@ -212,3 +212,26 @@ def test_walrus():
         (x,) = wrapped_0()  # skip: some envs use "(x,)" -> "x,"
     """
     check_wrapping(source, output)
+
+
+def test_ignore_discard_underscore_name():
+    """Checks that `_` discard targets are not propagated through wrappers"""
+
+    source = """
+    def forward(hidden_states):
+        if isinstance(hidden_states, tuple):
+            hidden_states, _ = hidden_states
+        return hidden_states
+    """
+    output = """
+    @torch.fx.wrap
+    def wrapped_0(hidden_states):
+        if isinstance(hidden_states, tuple):
+            hidden_states, _ = hidden_states
+        return (hidden_states,)
+
+    def forward(hidden_states):
+        (hidden_states,) = wrapped_0(hidden_states)  # skip: some envs use "(hidden_states,)" -> "hidden_states,"
+        return hidden_states
+    """
+    check_wrapping(source, output)
