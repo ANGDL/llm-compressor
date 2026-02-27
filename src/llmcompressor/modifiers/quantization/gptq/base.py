@@ -1,4 +1,5 @@
 import contextlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
@@ -115,6 +116,8 @@ class GPTQModifier(Modifier, QuantizationMixin):
         There is an explicit assumption that the model contains modules with
         `k_proj` and `v_proj` in their names. If this is not the case
         and kv_cache_scheme != None, the quantization of kv cache will fail
+    :param muti_gpu_compression: Whether to use multiple GPUs to compress the model in parallel. 
+        Only has an effect if more than 1 GPU is available.
     """
 
     # gptq modifier arguments
@@ -124,6 +127,7 @@ class GPTQModifier(Modifier, QuantizationMixin):
     # TODO: this does not serialize / will be incorrectly written
     actorder: Optional[Union[ActivationOrdering, Sentinel]] = Sentinel("static")
     offload_hessians: bool = False
+    muti_gpu_compression: bool = False
 
     # private variables
     _module_names: Dict[torch.nn.Module, str] = PrivateAttr(default_factory=dict)
@@ -274,7 +278,11 @@ class GPTQModifier(Modifier, QuantizationMixin):
         """
         ### Not Distributed
         if not is_distributed():
-            self.compress_module_list(list(self._num_samples.keys()))
+            module_list = list(self._num_samples.keys())
+            if self.muti_gpu_compression and torch.cuda.is_available() and torch.cuda.device_count() > 1:
+                self.compress_module_list_muti_gpu(module_list)
+            else:
+                self.compress_module_list(module_list)
             return
 
         ### Distributed
@@ -295,6 +303,87 @@ class GPTQModifier(Modifier, QuantizationMixin):
 
         # broadcast compressed modules to each rank
         self._broadcast_quantized_params(module_list, module_to_rank)
+
+    def compress_module_list_muti_gpu(self, module_list):
+        n_gpus = torch.cuda.device_count()
+
+        if n_gpus <= 1 or len(module_list) <= 1:
+            self.compress_module_list(module_list)
+            return
+
+        module_payloads: List[Tuple[torch.nn.Module, torch.Tensor, torch.Tensor]] = []
+        for module in module_list:
+            module_payloads.append(
+                (
+                    module,
+                    self._hessians.pop(module),
+                    self._num_samples.pop(module),
+                )
+            )
+
+        modules_by_device: Dict[torch.device, List[Tuple[torch.nn.Module, torch.Tensor, torch.Tensor]]] = {
+            torch.device(f"cuda:{gpu_idx}"): [] for gpu_idx in range(n_gpus)
+        }
+        for i, payload in enumerate(module_payloads):
+            device = torch.device(f"cuda:{i % n_gpus}")
+            modules_by_device[device].append(payload)
+
+        active_devices = sum(1 for payloads in modules_by_device.values() if payloads)
+        if active_devices <= 1:
+            self.compress_module_list(module_list)
+            return
+
+        logger.info(
+            "Running GPTQ compression in parallel across "
+            f"{active_devices} devices"
+        )
+
+        def _compress_device_modules(
+            device: torch.device,
+            payloads: List[Tuple[torch.nn.Module, torch.Tensor, torch.Tensor]],
+        ):
+            if device.type == "cuda":
+                torch.cuda.set_device(device)
+
+            for module, hessian, num_samples in payloads:
+                name = self._module_names[module]
+                quant_args = getattr_chain(module, "quantization_scheme.weights")
+                original_device = get_execution_device(module)
+
+                logger.info(f"Quantizing {name} on {device} using {num_samples} samples")
+
+                with torch.no_grad():
+                    if original_device != device:
+                        module.to(device=device)
+
+                    hessian = hessian.to(device=device)
+                    num_samples = num_samples.to(device=device)
+
+                    with CompressionLogger(module) as comp_logger:
+                        loss, q_param_dict = quantize_weight(
+                            module=module,
+                            quant_args=quant_args,
+                            hessian=hessian / num_samples,
+                            blocksize=self.block_size,
+                            percdamp=self.dampening_frac,
+                        )
+                        comp_logger.set_loss(loss)
+
+                    if original_device != device:
+                        module.to(device=original_device)
+
+                for attr, val in q_param_dict.items():
+                    update_offload_parameter(module, attr, val)
+
+        max_workers = min(active_devices, n_gpus)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [
+                executor.submit(_compress_device_modules, device, payloads)
+                for device, payloads in modules_by_device.items()
+                if len(payloads) > 0
+            ]
+            for future in as_completed(futures):
+                future.result()
 
     def compress_module_list(self, module_list):
         for module in module_list:
