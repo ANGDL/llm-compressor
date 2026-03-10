@@ -1,9 +1,12 @@
 import inspect
 from itertools import product
 from typing import Iterator, Literal
+from copy import deepcopy
+from collections import OrderedDict
 
 import torch
 from compressed_tensors.quantization import (
+    QuantizationArgs,
     QuantizationStrategy,
     disable_quantization,
     forward_quantize,
@@ -14,10 +17,18 @@ from compressed_tensors.utils import (
     get_lowest_common_ancestor_name,
     getattr_chain,
     match_modules_set,
-    match_named_modules,
     patch_attrs,
     update_offload_parameter,
 )
+from compressed_tensors.quantization.quant_config import (
+    QuantizationConfig,
+    QuantizationStatus,
+)
+from compressed_tensors.utils.match import match_named_modules, match_targets
+from llmcompressor.modifiers.quantization.group_size_validation import (
+    validate_group_size_divisibility,
+)
+
 from loguru import logger
 from pydantic import ConfigDict, PrivateAttr, field_validator
 from torch.nn import Module
@@ -45,7 +56,6 @@ from llmcompressor.utils.helpers import calibration_forward_context
 from llmcompressor.utils.pytorch.module import (
     get_module_to_name_dict,
 )
-
 __all__ = ["AutoSmoothModifier"]
 
 
@@ -123,6 +133,11 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
     :param ignore: list of layers to ignore during quantization (not smoothed).
         It should match the name of layers whose outputs are scaled to achieve
         smoothing (the second entry of the mappings list).
+    :param scheme: a single quantization scheme to apply to the model. This is a
+        dictionary that supports all keys from QuantizationScheme except targets, which
+        will be set to the targets parameter set at the modifier level. Can also be set
+        to a dictionary of the format `preset_scheme_name: targets` for example:
+        `W8A8: ['Linear']` for weight and activation 8-bit.
     :param offload_device: offload cached args to this device, which reduces memory
         requirements but requires more time to move data between cpu and execution
         device. Defaults to None, so cached args are not offloaded. Consider setting
@@ -174,8 +189,62 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
     _smooth_activation_scales: dict[str, tuple[torch.FloatTensor, int]] = PrivateAttr(
         default_factory=dict
     )
+    # Snapshot of AutoSmooth-targeted modules and their weight qargs at init time.
+    # This isolates grid search from later quantization modifier mutations.
+    _autosmooth_target_modules: set[Module] = PrivateAttr(default_factory=set)
+    _autosmooth_weight_qargs: dict[Module, QuantizationArgs] = PrivateAttr(
+        default_factory=dict
+    )
     # List to store error metrics for each layer
     _error_metrics: list[dict] = PrivateAttr(default_factory=list)
+
+
+    def initialize_quantization(self, model: torch.nn.Module):
+        def _apply_quantization_config(model: Module, config: QuantizationConfig | None):
+            from compressed_tensors.quantization.lifecycle.apply import _scheme_from_targets, _apply_kv_cache_scheme
+            # copy form compressed_tensors/quantization/lifecycle/apply.py
+            config = deepcopy(config)
+            if config is None:
+                return dict()
+
+            # apply and initialize kv cache quantization
+            if config.kv_cache_scheme is not None:
+                _apply_kv_cache_scheme(
+                    model, config.kv_cache_scheme, config.quantization_status
+                )
+
+            # build mapping of targets to schemes for easier matching
+            # use ordered dict to preserve target ordering in config
+            target_to_scheme = OrderedDict()
+            for scheme in config.config_groups.values():
+                for target in scheme.targets:
+                    target_to_scheme[target] = scheme
+
+            # mark appropriate layers for quantization by setting their quantization schemes
+            for name, submodule in match_named_modules(
+                model, target_to_scheme, config.ignore, warn_on_fail=True
+            ):
+                # mark modules to be quantized by adding
+                # quant scheme to the matching layers
+                matched_targets = match_targets(name, submodule, target_to_scheme)
+                scheme = _scheme_from_targets(target_to_scheme, matched_targets, name)
+                # target matched - add layer and scheme to target list
+                submodule.quantization_scheme = scheme
+                submodule.quantization_status = config.quantization_status
+
+        # Clear status only on modules targeted by this modifier.
+        # Doing this inline avoids repeatedly traversing subtrees per target.
+        for _, module in match_named_modules(model, self.resolved_targets, self.ignore):
+            if hasattr(module, "quantization_status"):
+                delattr(module, "quantization_status")
+
+        _apply_quantization_config(model, self.resolved_config)
+
+        if not self.bypass_divisibility_checks:
+            validate_group_size_divisibility(model, self.resolved_targets, self.ignore)
+
+        model.apply(disable_quantization)
+
 
     def on_initialize(self, state: State, **kwargs) -> bool:
         """
@@ -188,7 +257,7 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
 
         # apply config to model and prepare calibration hooks
         if QuantizationMixin.has_config(self):
-            QuantizationMixin.initialize_quantization(self, state.model)
+            self.initialize_quantization(state.model)
 
         # Validate that duo_scaling is only used with per-channel quantization
         if self.duo_scaling is not False:
@@ -230,9 +299,31 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
                 # (no offloading by default)
                 self.offload_device = None
 
+        self._capture_autosmooth_quantization_state(state.model)
         self._set_resolved_mappings(state.model)
 
         return True
+
+    def _capture_autosmooth_quantization_state(self, model: Module) -> None:
+        """
+        Capture AutoSmooth's own target modules and their weight qargs once.
+
+        This keeps AutoSmooth stable even if later modifiers overwrite
+        quantization configs or use different ignore lists.
+        """
+        self._autosmooth_target_modules = set()
+        self._autosmooth_weight_qargs = {}
+
+        for _, module in match_named_modules(model, self.resolved_targets, self.ignore):
+            self._autosmooth_target_modules.add(module)
+            qargs = getattr_chain(module, "quantization_scheme.weights", None)
+            if qargs is not None:
+                if hasattr(qargs, "model_copy"):
+                    qargs = qargs.model_copy(deep=True)
+                else:
+                    qargs = deepcopy(qargs)
+                self._autosmooth_weight_qargs[module] = qargs
+                delattr(module, "quantization_scheme")
 
     def on_start(self, state: State, event: Event, **kwargs):
         self.started_ = True
@@ -283,7 +374,7 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
         self.ended_ = True
         # remove activation hooks
         self.remove_hooks()
-
+ 
     def on_finalize(self, state: State, **kwargs) -> bool:
         """
         Clean up by clearing the activations and mapping data
@@ -299,6 +390,8 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
         self._parent_args_cache.clear()
         self._smooth_activation_scales.clear()
         self._resolved_mappings.clear()
+        self._autosmooth_target_modules.clear()
+        self._autosmooth_weight_qargs.clear()
 
         self._error_metrics.clear()
 
@@ -638,11 +731,56 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
             x_scales = x_scales[1].to(device) - x_scales[0].to(device)  # max - min
         else:
             x_scales = self._smooth_activation_scales[mapping.smooth_name][0].to(device)
+
+        # Resolve quantization args with AutoSmooth's own snapshot first, so
+        # different ignore/config from later modifiers won't break this stage.
+        balance_layers_to_patch: list[tuple[Module, str, QuantizationArgs]] = []
+        skipped_non_targeted: list[str] = []
+        missing_qscheme: list[str] = []
+
+        for balance_layer, balance_name in zip(mapping.balance_layers, mapping.balance_names):
+            if (
+                self._autosmooth_target_modules
+                and balance_layer not in self._autosmooth_target_modules
+            ):
+                skipped_non_targeted.append(balance_name)
+                continue
+
+            w_qscheme = self._autosmooth_weight_qargs.get(balance_layer)
+            if w_qscheme is None:
+                w_qscheme = getattr_chain(balance_layer, "quantization_scheme.weights", None)
+
+            if w_qscheme is None:
+                missing_qscheme.append(balance_name)
+                continue
+
+            balance_layers_to_patch.append((balance_layer, balance_name, w_qscheme))
+
+        if skipped_non_targeted:
+            logger.debug(
+                "Skipping non-targeted balance layers for AutoSmooth in "
+                f"{mapping.smooth_name}: {skipped_non_targeted}"
+            )
+
+        if missing_qscheme:
+            raise ValueError(
+                "AutoSmooth could not resolve weight quantization args for targeted "
+                f"balance layers in {mapping.smooth_name}: {missing_qscheme}. "
+                "Please ensure AutoSmooth can access quantization config for these "
+                "layers."
+            )
+
+        if len(balance_layers_to_patch) == 0:
+            raise ValueError(
+                f"No AutoSmooth-targeted balance layers remain for {mapping.smooth_name}. "
+                "Please align AutoSmooth targets/ignore with mapping balance layers."
+            )
         
         if self.duo_scaling:
             w_scales = self._compute_layer_scales(
-                mapping.balance_layers,
-                mapping.balance_names,
+                [balance_layer for balance_layer, _, _ in balance_layers_to_patch],
+                [balance_name for _, balance_name, _ in balance_layers_to_patch],
+                [w_qscheme for _, _, w_qscheme in balance_layers_to_patch],
             ).to(device)
 
         match self.duo_scaling:
@@ -657,23 +795,17 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
 
         # Where appropriate, replace observers with memoryless_minmax
         # for duration of grid search
-        balance_layers_to_patch = [
-            balance_layer
-            for balance_layer in mapping.balance_layers
-            if hasattr(balance_layer, "quantization_scheme")
-            and hasattr(balance_layer.quantization_scheme, "weights")
-        ]
         with patch_attrs(
-            balance_layers_to_patch,
+            [balance_layer for balance_layer, _, _ in balance_layers_to_patch],
             "weight_observer",
             [
                 Observer.load_from_registry(
                     "memoryless_minmax",
                     base_name="weight",
-                    args=balance_layer.quantization_scheme.weights,
+                    args=w_qscheme,
                     module=balance_layer,
                 )
-                for balance_layer in balance_layers_to_patch
+                for balance_layer, _, w_qscheme in balance_layers_to_patch
             ],
         ):
             total_iterations = n_grid * len(duo_scalings)
@@ -708,13 +840,7 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
                 scales[torch.isnan(scales)] = 1
 
                 # Q(W * s)
-                for balance_layer in balance_layers_to_patch:
-                    if not hasattr(balance_layer, "quantization_scheme") or not hasattr(
-                        balance_layer.quantization_scheme, "weights"
-                    ):
-                        continue
-
-                    w_qscheme = balance_layer.quantization_scheme.weights
+                for balance_layer, _, w_qscheme in balance_layers_to_patch:
                     balance_layer.weight.mul_(_scalesview)
                     # For TENSOR_GROUP (nvfp4), need to calculate global scale
                     should_calculate_gparam = (
@@ -741,9 +867,8 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
                 # Apply fused global scales for TENSOR_GROUP during grid search
                 # to match inference behavior
                 if balance_layers_to_patch and all(
-                    getattr(layer.quantization_scheme.weights, "strategy", None)
-                    == QuantizationStrategy.TENSOR_GROUP
-                    for layer in balance_layers_to_patch
+                    w_qscheme.strategy == QuantizationStrategy.TENSOR_GROUP
+                    for _, _, w_qscheme in balance_layers_to_patch
                 ):
                     update_fused_layer_weight_global_scales(mapping.parent)
 
@@ -799,6 +924,14 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
             torch.isnan(best_scales).sum() == 0
         ), f"Nan found in scales: {best_scales}"
 
+        for balance_layer, _, _ in balance_layers_to_patch:
+            if hasattr(balance_layer, "weight_scale"):
+                delattr(balance_layer, "weight_scale")
+            for name in ("weight", "q", "k", "v"):
+                obs_name = f"{name}_observer"
+                if hasattr(balance_layer, obs_name):
+                    delattr(balance_layer, obs_name)
+
         return best_scales.detach().cpu()
 
     @torch.no_grad()
@@ -839,6 +972,10 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
 
         # Save to disk
         logger.debug(f"AWQ per-mapping error metrics: {metrics_data}")
+
+        if len(self._error_metrics) == 0:
+            logger.debug("No AutoSmooth error metrics collected; skipping summary")
+            return
 
         # Also print summary statistics
         reductions = [m["reduction"] for m in self._error_metrics]
@@ -885,6 +1022,7 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
     def _compute_layer_scales(
         layers: list[Module],
         layer_names: list[str] | None = None,
+        layer_qargs: list[QuantizationArgs] | None = None,
     ) -> torch.Tensor:
         """
         Compute per-channel/group/block/tensor mean of normalised weights
@@ -912,7 +1050,14 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
             weight = layer.weight.clone()
             orig_shape = weight.shape
 
-            q_args = getattr_chain(layer, "quantization_scheme.weights", None)
+            q_args = (
+                layer_qargs[idx]
+                if layer_qargs is not None and idx < len(layer_qargs)
+                else None
+            )
+            if q_args is None:
+                q_args = getattr_chain(layer, "quantization_scheme.weights", None)
+
             if not q_args:
                 logger.warning(
                     "Unable to find quantization scheme for "
@@ -954,6 +1099,12 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
             weight_total_count += weight.size(0)
             weight_sum = weight.sum(0, dtype=torch.float64)
             weight_total_sum += weight_sum
+
+        if weight_total_count == 0:
+            raise ValueError(
+                "Unable to compute layer scales: no valid quantization args "
+                "found for targeted balance layers"
+            )
 
         return weight_total_sum / weight_total_count
 
