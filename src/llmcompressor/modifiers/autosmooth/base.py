@@ -185,7 +185,7 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
     _parent_args_cache: dict[Module, IntermediatesCache] = PrivateAttr(
         default_factory=dict
     )
-    # Dict[smooth layer name, (activation means, activation counts)]
+    # Dict[smooth layer name, (activation scales, activation counts)]
     _smooth_activation_scales: dict[str, tuple[torch.FloatTensor, int]] = PrivateAttr(
         default_factory=dict
     )
@@ -536,6 +536,12 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
                 else:
                     cached_activations = activations.flatten(0, -2)
 
+                if cached_activations.numel() == 0:
+                    logger.debug(
+                        f"No activations cached for {smooth_name} in batch {batch_idx}."
+                    )
+                    return
+                
                 match self.activation_scale_type:
                     case "max":
                         self._smooth_activation_scales[smooth_name] = _accumulate_max(
@@ -600,10 +606,33 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
             for mapping in self._resolved_mappings
             if mapping.smooth_name in self._smooth_activation_scales
         ]
+
+        def _log_with_tqdm(level: str, message: str) -> None:
+            with tqdm.external_write_mode():
+                getattr(logger, level)(message)
+
         for mapping in tqdm(mappings_to_smooth, desc="Smoothing"):
             smooth_layer = mapping.smooth_layer
             balance_layers = mapping.balance_layers
             parent_module = mapping.parent
+            num_samples = int(self._smooth_activation_scales[mapping.smooth_name][1])
+
+            if num_samples == 0:
+                _log_with_tqdm(
+                    "info",
+                    f"Skipping smooth_layer {mapping.smooth_name}, "
+                    "no activation samples available for smoothing",
+                )
+                del self._smooth_activation_scales[mapping.smooth_name]
+                continue
+
+            device = get_execution_device(parent_module)
+
+            _log_with_tqdm(
+                "debug",
+                f"Smoothing {mapping.smooth_name} on {device} using "
+                f"{num_samples} activation tokens",
+            )
 
             with (
                 align_modules([parent_module, smooth_layer, *balance_layers]),
@@ -613,24 +642,26 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
                 # Compute output of unquantized module
                 fp16_outputs = self._run_samples(parent_module)
                 if len(fp16_outputs) == 0 or all(f.numel() == 0 for f in fp16_outputs):
-                    logger.info(
+                    _log_with_tqdm(
+                        "info",
                         f"Skipping smooth_layer {mapping.smooth_name}, no activations "
                         "found to scale. This can occasionally occur in MoE models "
-                        "when certain experts are not activated by calibration samples."
+                        "when certain experts are not activated by calibration samples.",
                     )
                     del self._smooth_activation_scales[mapping.smooth_name]
                     continue
                 if not all(
                     [fp16_output.isfinite().all() for fp16_output in fp16_outputs]
                 ):
-                    logger.warning(
+                    _log_with_tqdm(
+                        "warning",
                         f"Skipping smooth_layer {mapping.smooth_name}, NaN or inf "
                         "outputs found during forward pass of the parent module "
                         f"{mapping.parent_name}. The model is either generating NaN "
                         "output with provided calibration data set, or the mappings "
                         "are incorrectly set and modifying the model in undesired "
                         "ways. If you encounter this consistently, raise an issue at "
-                        "https://github.com/vllm-project/llm-compressor/issues"
+                        "https://github.com/vllm-project/llm-compressor/issues",
                     )
                     del self._smooth_activation_scales[mapping.smooth_name]
                     continue
@@ -1214,10 +1245,11 @@ def _accumulate_max(
 
 def _minmax(
     inp: torch.Tensor,
-    prev_minmax_and_count: tuple[(torch.FloatTensor, torch.FloatTensor), int] | None,
-) -> tuple[(torch.FloatTensor, torch.FloatTensor), int]:
-    current_min = inp.to(torch.float32).amin(dim=0)
-    current_max = inp.to(torch.float32).amax(dim=0)
+    prev_minmax_and_count: tuple[tuple[torch.FloatTensor, torch.FloatTensor], int] | None,
+) -> tuple[tuple[torch.FloatTensor, torch.FloatTensor], int]:
+    inp_f32 = inp.to(torch.float32)
+    current_min = inp_f32.amin(dim=0)
+    current_max = inp_f32.amax(dim=0)
     num_added = inp.size(0)
     if prev_minmax_and_count is None:
         return (current_min, current_max), num_added
