@@ -13,7 +13,23 @@ from loguru import logger
 from safetensors.torch import save_file
 from transformers import AutoModelForCausalLM, PreTrainedModel
 
-# from transformers.modeling_utils import TORCH_INIT_FUNCTIONS
+try:
+    # Transformers < v5 support
+    import transformers.modeling_utils as _transformers_modeling_utils
+except ImportError:
+    try:
+        # Transformers v5 support
+        import transformers.initialization as _transformers_initialization
+    except ImportError:
+        _TORCH_INIT_FUNCTIONS = {}
+    else:
+        _TORCH_INIT_FUNCTIONS = getattr(
+            _transformers_initialization, "TORCH_INIT_FUNCTIONS", {}
+        )
+else:
+    _TORCH_INIT_FUNCTIONS = getattr(
+        _transformers_modeling_utils, "TORCH_INIT_FUNCTIONS", {}
+    )
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME, WEIGHTS_INDEX_NAME
 
 __all__ = [
@@ -26,6 +42,7 @@ __all__ = [
 from torch import nn
 
 TORCH_INIT_FUNCTIONS = {
+    **_TORCH_INIT_FUNCTIONS,
     "uniform_": nn.init.uniform_,
     "normal_": nn.init.normal_,
     "trunc_normal_": nn.init.trunc_normal_,
