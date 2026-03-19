@@ -31,6 +31,7 @@ class AWQMapping:
     smooth_layer: str
     balance_layers: list[str]
     activation_hook_target: str | None = None
+    norm_bias: float = 0.0
 
 
 _default_mappings = [
