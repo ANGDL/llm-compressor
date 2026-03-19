@@ -433,6 +433,8 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
                     )
                 smooth_layer = smooth_layers[0]
                 smooth_name = module_to_name.get(smooth_layer)
+                if 'norm' in smooth_name.lower():
+                    setattr(smooth_layer, "norm_bias", mapping.norm_bias)
 
                 # [[b00, b01, b02...], [b10, b11, b12,...], ...] ↓
                 #                             [b00, b01, b02, ..., b10, b11, b12, ...]
@@ -678,11 +680,12 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
                             module.weight.mul_(scales.view(1, -1)),
                         )
                     elif module == smooth_layer:
+                        norm_bias = getattr(module, "norm_bias", 0.0)
                         if module.weight.ndim == 1:
                             update_offload_parameter(
                                 module,
                                 "weight",
-                                module.weight.div_(scales),
+                                module.weight.add_(norm_bias).div_(scales).sub_(norm_bias),
                             )
                         else:
                             # NOTE: edge case when smooth layer number of out_features
@@ -692,7 +695,7 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
                             # because the desired smooth layer is v_proj
                             # https://github.com/casper-hansen/AutoAWQ/blob/main/awq/quantize/scale.py#L123
                             weight = module.weight
-                            weight[-scales.size(0) :].div_(scales.view(-1, 1))
+                            weight[-scales.size(0) :].add_(norm_bias).div_(scales.view(-1, 1)).sub_(norm_bias)
                             update_offload_parameter(module, "weight", weight)
                         if hasattr(module, "bias") and module.bias is not None:
                             update_offload_parameter(
