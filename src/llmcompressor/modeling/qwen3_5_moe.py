@@ -13,13 +13,13 @@ try:
 except ImportError:
     logger.warning(
         "Transformers does not have Qwen3_5MoeSparseMoeBlock. "
-        "CalibrateQwen3_5MoeTextSparseMoeBlock will not be registered."
+        "CalibrationQwen3_5MoeSparseMoeBlock will not be registered."
     )
-    class CalibrateQwen3_5MoeTextSparseMoeBlock:
+    class CalibrationQwen3_5MoeSparseMoeBlock:
         pass
 else:
     @MoECalibrationModule.register("Qwen3_5MoeSparseMoeBlock")
-    class CalibrateQwen3_5MoeTextSparseMoeBlock(MoECalibrationModule):
+    class CalibrationQwen3_5MoeSparseMoeBlock(MoECalibrationModule):
         """
         Calibration version of Qwen3_5MoeSparseMoeBlock that sends all tokens to all
         experts.
