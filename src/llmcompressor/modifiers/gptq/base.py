@@ -367,7 +367,7 @@ class GPTQModifier(Modifier, QuantizationMixin):
                             blocksize=self.block_size,
                             percdamp=self.dampening_frac,
                         )
-                        comp_logger.set_loss(loss)
+                        comp_logger.set_results(name="GPTQ", loss=loss)
 
                     if original_device != device:
                         module.to(device=original_device)
