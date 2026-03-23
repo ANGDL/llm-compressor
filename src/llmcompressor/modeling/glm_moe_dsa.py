@@ -50,6 +50,8 @@ class CalibrationGlmMoeDsaMoE(MoECalibrationModule):
         self.gate = original.gate
         self.shared_experts = original.shared_experts
         self.calibrate_all_experts = calibrate_all_experts
+        original.experts = None
+        del original.gate
 
     def route_tokens_to_experts(self, router_logits):
         router_logits = router_logits.sigmoid()
