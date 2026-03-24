@@ -809,6 +809,17 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
                 f"No AutoSmooth-targeted balance layers remain for {mapping.smooth_name}. "
                 "Please align AutoSmooth targets/ignore with mapping balance layers."
             )
+
+        # Track pre-existing attributes so cleanup only removes temporary ones.
+        preexisting_attrs: dict[Module, dict[str, bool]] = {}
+        for balance_layer, _, _ in balance_layers_to_patch:
+            preexisting_attrs[balance_layer] = {
+                "weight_scale": hasattr(balance_layer, "weight_scale"),
+                "weight_observer": hasattr(balance_layer, "weight_observer"),
+                "q_observer": hasattr(balance_layer, "q_observer"),
+                "k_observer": hasattr(balance_layer, "k_observer"),
+                "v_observer": hasattr(balance_layer, "v_observer"),
+            }
         
         if self.duo_scaling:
             w_scales = self._compute_layer_scales(
@@ -959,11 +970,17 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
         ), f"Nan found in scales: {best_scales}"
 
         for balance_layer, _, _ in balance_layers_to_patch:
-            if hasattr(balance_layer, "weight_scale"):
+            if (
+                not preexisting_attrs[balance_layer]["weight_scale"]
+                and hasattr(balance_layer, "weight_scale")
+            ):
                 delattr(balance_layer, "weight_scale")
             for name in ("weight", "q", "k", "v"):
                 obs_name = f"{name}_observer"
-                if hasattr(balance_layer, obs_name):
+                if (
+                    not preexisting_attrs[balance_layer].get(obs_name, False)
+                    and hasattr(balance_layer, obs_name)
+                ):
                     delattr(balance_layer, obs_name)
 
         return best_scales.detach().cpu()
