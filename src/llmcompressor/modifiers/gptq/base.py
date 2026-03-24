@@ -1,5 +1,7 @@
 import contextlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from queue import Empty, Queue
+from time import perf_counter
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
@@ -321,69 +323,222 @@ class GPTQModifier(Modifier, QuantizationMixin):
                 )
             )
 
-        modules_by_device: Dict[torch.device, List[Tuple[torch.nn.Module, torch.Tensor, torch.Tensor]]] = {
-            torch.device(f"cuda:{gpu_idx}"): [] for gpu_idx in range(n_gpus)
-        }
-        for i, payload in enumerate(module_payloads):
-            device = torch.device(f"cuda:{i % n_gpus}")
-            modules_by_device[device].append(payload)
+        # Prioritize larger modules to reduce straggler effects across workers.
+        module_payloads.sort(key=lambda payload: payload[1].shape[0], reverse=True)
 
-        active_devices = sum(1 for payloads in modules_by_device.values() if payloads)
-        if active_devices <= 1:
-            self.compress_module_list(module_list)
-            return
+        active_devices = min(n_gpus, len(module_payloads))
+        devices = [torch.device(f"cuda:{gpu_idx}") for gpu_idx in range(active_devices)]
 
         logger.info(
             "Running GPTQ compression in parallel across "
-            f"{active_devices} devices"
+            f"{active_devices} devices with async task consumption"
         )
 
-        def _compress_device_modules(
-            device: torch.device,
-            payloads: List[Tuple[torch.nn.Module, torch.Tensor, torch.Tensor]],
-        ):
+        # Per-device queues preserve affinity while still allowing work stealing.
+        per_device_queues: Dict[torch.device, Queue] = {
+            device: Queue() for device in devices
+        }
+        assigned_work: Dict[torch.device, int] = {device: 0 for device in devices}
+
+        for payload in module_payloads:
+            module, hessian, _ = payload
+            module_work = int(hessian.shape[0])
+            original_device = get_execution_device(module)
+            preferred_device: Optional[torch.device] = None
+
+            # Prefer the module's original CUDA device to minimize weight movement.
+            if (
+                isinstance(original_device, torch.device)
+                and original_device.type == "cuda"
+                and original_device.index is not None
+            ):
+                candidate_device = torch.device(f"cuda:{original_device.index}")
+                if candidate_device in per_device_queues:
+                    preferred_device = candidate_device
+
+            # Fallback to least-assigned worker by estimated hessian work.
+            if preferred_device is None:
+                preferred_device = min(devices, key=lambda device: assigned_work[device])
+
+            per_device_queues[preferred_device].put(payload)
+            assigned_work[preferred_device] += module_work
+
+        def _pop_next_payload(device: torch.device, allow_steal: bool = True):
+            try:
+                # Fast path: consume local queue first to keep affinity.
+                payload = per_device_queues[device].get_nowait()
+                return payload, per_device_queues[device]
+            except Empty:
+                pass
+
+            if not allow_steal:
+                return None, None
+
+            # Slow path: steal from peers to avoid idle workers.
+            for steal_device in devices:
+                if steal_device == device:
+                    continue
+                try:
+                    payload = per_device_queues[steal_device].get_nowait()
+                    return payload, per_device_queues[steal_device]
+                except Empty:
+                    continue
+
+            return None, None
+
+        def _schedule_payload_for_device(payload_and_queue, device, prefetch_stream):
+            payload, source_queue = payload_and_queue
+            module, hessian, num_samples = payload
+            module_work = int(hessian.shape[0])
+            original_device = get_execution_device(module)
+            ready_event = None
+
+            if device.type == "cuda" and prefetch_stream is not None:
+                # Prefetch tensors on a separate stream so copy can overlap compute.
+                with torch.cuda.stream(prefetch_stream):
+                    hessian = hessian.to(device=device, non_blocking=True)
+                    num_samples = num_samples.to(device=device, non_blocking=True)
+                    # Record readiness for this specific job.
+                    ready_event = torch.cuda.Event()
+                    ready_event.record(prefetch_stream)
+            else:
+                hessian = hessian.to(device=device)
+                num_samples = num_samples.to(device=device)
+
+            return {
+                "module": module,
+                "hessian": hessian,
+                "num_samples": num_samples,
+                "module_work": module_work,
+                "original_device": original_device,
+                "source_queue": source_queue,
+                "ready_event": ready_event,
+            }
+
+        def _compress_device_modules(device: torch.device):
             if device.type == "cuda":
                 torch.cuda.set_device(device)
 
-            for module, hessian, num_samples in payloads:
-                name = self._module_names[module]
-                quant_args = getattr_chain(module, "quantization_scheme.weights")
-                original_device = get_execution_device(module)
+            # Keep prefetch and compute streams separate for overlap.
+            prefetch_stream = (
+                torch.cuda.Stream(device=device) if device.type == "cuda" else None
+            )
+            compute_stream = (
+                torch.cuda.current_stream(device=device)
+                if device.type == "cuda"
+                else None
+            )
 
-                logger.info(f"Quantizing {name} on {device} using {num_samples} samples")
+            worker_start = perf_counter()
+            processed_modules = 0
+            processed_work = 0
 
-                with torch.no_grad():
-                    if original_device != device:
-                        module.to(device=device)
+            first_payload, first_queue = _pop_next_payload(device, allow_steal=True)
+            if first_payload is None:
+                elapsed = perf_counter() - worker_start
+                logger.info(
+                    f"[GPTQ multi-gpu] {device} processed {processed_modules} modules "
+                    f"(work={processed_work}) in {elapsed:.2f}s"
+                )
+                return processed_modules, processed_work, elapsed
 
-                    hessian = hessian.to(device=device)
-                    num_samples = num_samples.to(device=device)
+            # Prime the pipeline with the first prefetched job.
+            current_job = _schedule_payload_for_device(
+                (first_payload, first_queue), device, prefetch_stream
+            )
 
-                    with CompressionLogger(module) as comp_logger:
-                        loss, q_param_dict = quantize_weight(
-                            module=module,
-                            quant_args=quant_args,
-                            hessian=hessian / num_samples,
-                            blocksize=self.block_size,
-                            percdamp=self.dampening_frac,
+            while current_job is not None:
+                # Double-buffering prefetch only from local queue.
+                # This avoids early global reservation that can starve faster workers.
+                next_payload, next_queue = _pop_next_payload(device, allow_steal=False)
+                next_job = None
+                if next_payload is not None:
+                    next_job = _schedule_payload_for_device(
+                        (next_payload, next_queue), device, prefetch_stream
+                    )
+
+                try:
+                    module = current_job["module"]
+                    hessian = current_job["hessian"]
+                    num_samples = current_job["num_samples"]
+                    module_work = current_job["module_work"]
+                    original_device = current_job["original_device"]
+                    source_queue = current_job["source_queue"]
+                    ready_event = current_job["ready_event"]
+                    name = self._module_names[module]
+                    quant_args = getattr_chain(module, "quantization_scheme.weights")
+
+                    logger.info(
+                        f"Quantizing {name} on {device} using {num_samples} samples"
+                    )
+
+                    # Wait only for this job's copy, not the whole prefetch stream.
+                    if compute_stream is not None and ready_event is not None:
+                        compute_stream.wait_event(ready_event)
+
+                    with torch.no_grad():
+                        if original_device != device:
+                            module.to(device=device)
+
+                        with CompressionLogger(module) as comp_logger:
+                            loss, q_param_dict = quantize_weight(
+                                module=module,
+                                quant_args=quant_args,
+                                hessian=hessian / num_samples,
+                                blocksize=self.block_size,
+                                percdamp=self.dampening_frac,
+                            )
+                            comp_logger.set_results(name="GPTQ", loss=loss)
+
+                        if original_device != device:
+                            module.to(device=original_device)
+
+                    for attr, val in q_param_dict.items():
+                        update_offload_parameter(module, attr, val)
+                    processed_modules += 1
+                    processed_work += module_work
+                finally:
+                    # Mark completion on the queue this job originally came from.
+                    source_queue = current_job["source_queue"]
+                    if source_queue is not None:
+                        source_queue.task_done()
+
+                current_job = next_job
+
+                # If local pipeline is empty, attempt to steal now.
+                # Stealing at this point keeps overlap benefits without hoarding.
+                if current_job is None:
+                    stolen_payload, stolen_queue = _pop_next_payload(
+                        device, allow_steal=True
+                    )
+                    if stolen_payload is not None:
+                        current_job = _schedule_payload_for_device(
+                            (stolen_payload, stolen_queue), device, prefetch_stream
                         )
-                        comp_logger.set_results(name="GPTQ", loss=loss)
 
-                    if original_device != device:
-                        module.to(device=original_device)
+            elapsed = perf_counter() - worker_start
+            logger.info(
+                f"[GPTQ multi-gpu] {device} processed {processed_modules} modules "
+                f"(work={processed_work}) in {elapsed:.2f}s"
+            )
+            return processed_modules, processed_work, elapsed
 
-                for attr, val in q_param_dict.items():
-                    update_offload_parameter(module, attr, val)
+        start_time = perf_counter()
+        with ThreadPoolExecutor(max_workers=active_devices) as executor:
+            futures = [executor.submit(_compress_device_modules, device) for device in devices]
+            worker_stats = [future.result() for future in as_completed(futures)]
 
-        max_workers = min(active_devices, n_gpus)
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [
-                executor.submit(_compress_device_modules, device, payloads)
-                for device, payloads in modules_by_device.items()
-                if len(payloads) > 0
-            ]
-            for future in as_completed(futures):
-                future.result()
+        # Summarize per-worker stats into wall-time and aggregate work numbers.
+        total_elapsed = perf_counter() - start_time
+        total_modules = sum(stat[0] for stat in worker_stats)
+        total_work = sum(stat[1] for stat in worker_stats)
+        sum_worker_time = sum(stat[2] for stat in worker_stats)
+
+        logger.info(
+            "[GPTQ multi-gpu] finished "
+            f"modules={total_modules}, work={total_work}, wall={total_elapsed:.2f}s, "
+            f"accumulated_worker_time={sum_worker_time:.2f}s"
+        )
 
     def compress_module_list(self, module_list):
         for module in module_list:
