@@ -137,7 +137,3 @@ We can see the resulting scores look good!
 |gsm8k|      3|flexible-extract|     5|exact_match|↑  |0.728|±  |0.0282|
 |     |       |strict-match    |     5|exact_match|↑  |0.720|±  |0.0285|
 ```
-
-### Questions or Feature Request?
-
-Please open up an issue on `vllm-project/llm-compressor`
