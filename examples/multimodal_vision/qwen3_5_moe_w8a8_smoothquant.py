@@ -3,6 +3,8 @@ import argparse
 from io import BytesIO
 import os
 
+os.environ["DISABLE_OFFSET_NORM_CALIBRATION"] = "1"
+
 import torch
 from datasets import load_dataset
 from transformers import AutoProcessor, Qwen3_5MoeForConditionalGeneration
