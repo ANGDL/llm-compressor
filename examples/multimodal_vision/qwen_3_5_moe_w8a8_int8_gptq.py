@@ -93,7 +93,6 @@ recipe = [
         targets="Linear",
         scheme="W8A8",
         offload_hessians=True,
-        muti_gpu_compression=True,
         ignore=[
             "re:.*lm_head",
             "re:visual.*",

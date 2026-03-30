@@ -334,6 +334,8 @@ class GPTQModifier(Modifier, QuantizationMixin):
             f"{active_devices} devices with async task consumption"
         )
 
+        self._warmup_cholesky_on_devices(devices)
+
         # Per-device queues preserve affinity while still allowing work stealing.
         per_device_queues: Dict[torch.device, Queue] = {
             device: Queue() for device in devices
@@ -424,9 +426,7 @@ class GPTQModifier(Modifier, QuantizationMixin):
                 torch.cuda.Stream(device=device) if device.type == "cuda" else None
             )
             compute_stream = (
-                torch.cuda.current_stream(device=device)
-                if device.type == "cuda"
-                else None
+                torch.cuda.Stream(device=device) if device.type == "cuda" else None
             )
 
             worker_start = perf_counter()
@@ -476,22 +476,25 @@ class GPTQModifier(Modifier, QuantizationMixin):
                     if compute_stream is not None and ready_event is not None:
                         compute_stream.wait_event(ready_event)
 
-                    with torch.no_grad():
-                        if original_device != device:
-                            module.to(device=device)
+                    # Run compute in dedicated stream to avoid contention on default stream
+                    # in multi-threaded multi-GPU scenarios
+                    with torch.cuda.stream(compute_stream) if compute_stream else contextlib.nullcontext():
+                        with torch.no_grad():
+                            if original_device != device:
+                                module.to(device=device)
 
-                        with CompressionLogger(module) as comp_logger:
-                            loss, q_param_dict = quantize_weight(
-                                module=module,
-                                quant_args=quant_args,
-                                hessian=hessian / num_samples,
-                                blocksize=self.block_size,
-                                percdamp=self.dampening_frac,
-                            )
-                            comp_logger.set_results(name="GPTQ", loss=loss)
+                            with CompressionLogger(module) as comp_logger:
+                                loss, q_param_dict = quantize_weight(
+                                    module=module,
+                                    quant_args=quant_args,
+                                    hessian=hessian / num_samples,
+                                    blocksize=self.block_size,
+                                    percdamp=self.dampening_frac,
+                                )
+                                comp_logger.set_results(name="GPTQ", loss=loss)
 
-                        if original_device != device:
-                            module.to(device=original_device)
+                            if original_device != device:
+                                module.to(device=original_device)
 
                     for attr, val in q_param_dict.items():
                         update_offload_parameter(module, attr, val)
@@ -539,6 +542,24 @@ class GPTQModifier(Modifier, QuantizationMixin):
             f"modules={total_modules}, work={total_work}, wall={total_elapsed:.2f}s, "
             f"accumulated_worker_time={sum_worker_time:.2f}s"
         )
+
+    def _warmup_cholesky_on_devices(self, devices: List[torch.device]) -> None:
+        # Warm up CUDA linalg kernels per device before worker threads start.
+        # This avoids concurrent first-use lazy initialization in thread workers.
+        for device in devices:
+            if device.type != "cuda":
+                continue
+
+            try:
+                with torch.cuda.device(device), torch.no_grad():
+                    warmup_hessian = torch.eye(2, dtype=torch.float32, device=device)
+                    torch.linalg.cholesky(warmup_hessian)
+                torch.cuda.synchronize(device)
+            except RuntimeError as exc:
+                logger.warning(
+                    "[GPTQ multi-gpu] failed to warm up cholesky on "
+                    f"{device}: {exc}. Continuing without explicit warmup."
+                )
 
     def compress_module_list(self, module_list):
         for module in module_list:
