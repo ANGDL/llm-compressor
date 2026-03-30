@@ -18,6 +18,7 @@ from compressed_tensors.utils import (
     getattr_chain,
     match_modules_set,
     patch_attrs,
+    register_offload_parameter,
     update_offload_parameter,
 )
 from compressed_tensors.quantization.quant_config import (
@@ -815,6 +816,8 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
         for balance_layer, _, _ in balance_layers_to_patch:
             preexisting_attrs[balance_layer] = {
                 "weight_scale": hasattr(balance_layer, "weight_scale"),
+                "weight_zero_point": hasattr(balance_layer, "weight_zero_point"),
+                "weight_global_scale": hasattr(balance_layer, "weight_global_scale"),
                 "weight_observer": hasattr(balance_layer, "weight_observer"),
                 "q_observer": hasattr(balance_layer, "q_observer"),
                 "k_observer": hasattr(balance_layer, "k_observer"),
@@ -853,6 +856,36 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
                 for balance_layer, _, w_qscheme in balance_layers_to_patch
             ],
         ):
+            # Ensure required qparams exist before observer updates in grid search.
+            for balance_layer, _, w_qscheme in balance_layers_to_patch:
+                weight_observer: Observer = getattr(balance_layer, "weight_observer")
+                init_scale, init_zero_point = weight_observer(balance_layer.weight)
+
+                if not hasattr(balance_layer, "weight_scale"):
+                    register_offload_parameter(
+                        balance_layer,
+                        "weight_scale",
+                        torch.nn.Parameter(init_scale.detach(), requires_grad=False),
+                    )
+
+                if (not w_qscheme.symmetric) and (not hasattr(balance_layer, "weight_zero_point")):
+                    register_offload_parameter(
+                        balance_layer,
+                        "weight_zero_point",
+                        torch.nn.Parameter(init_zero_point.detach(), requires_grad=False),
+                    )
+
+                if (
+                    w_qscheme.strategy == QuantizationStrategy.TENSOR_GROUP
+                    and not hasattr(balance_layer, "weight_global_scale")
+                ):
+                    init_global_scale = weight_observer.get_global_scale(balance_layer.weight)
+                    register_offload_parameter(
+                        balance_layer,
+                        "weight_global_scale",
+                        torch.nn.Parameter(init_global_scale.detach(), requires_grad=False),
+                    )
+
             total_iterations = n_grid * len(duo_scalings)
             pbar = tqdm(
                 product(range(n_grid), duo_scalings),
@@ -975,6 +1008,16 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
                 and hasattr(balance_layer, "weight_scale")
             ):
                 delattr(balance_layer, "weight_scale")
+            if (
+                not preexisting_attrs[balance_layer]["weight_zero_point"]
+                and hasattr(balance_layer, "weight_zero_point")
+            ):
+                delattr(balance_layer, "weight_zero_point")
+            if (
+                not preexisting_attrs[balance_layer]["weight_global_scale"]
+                and hasattr(balance_layer, "weight_global_scale")
+            ):
+                delattr(balance_layer, "weight_global_scale")
             for name in ("weight", "q", "k", "v"):
                 obs_name = f"{name}_observer"
                 if (
