@@ -1,11 +1,38 @@
 import os
+import re
 import json
 import shutil
 from safetensors import safe_open
 from safetensors.torch import save_file
 
 
-def add_mpt_player(bf16_model_path, quant_model_path, mtp_layer_id):
+def _resolve_mtp_layer_name(mtp_layer_id=None, mtp_layer_name=None):
+    if mtp_layer_name is not None:
+        if not isinstance(mtp_layer_name, str) or not mtp_layer_name.strip():
+            raise ValueError("mtp_layer_name must be a non-empty string")
+        return mtp_layer_name.strip().rstrip(".")
+
+    if mtp_layer_id is None:
+        raise ValueError("Either mtp_layer_id or mtp_layer_name must be provided")
+
+    return f"model.layers.{mtp_layer_id}"
+
+
+def _build_ignore_patterns(layer_name):
+    escaped_layer_name = re.escape(layer_name)
+    literal_ignore = layer_name
+    regex_ignore = f"re:.*{escaped_layer_name}\\..*"
+    return literal_ignore, regex_ignore
+
+
+def add_mpt_player(
+    bf16_model_path,
+    quant_model_path,
+    mtp_layer_id=None,
+    mtp_layer_name=None,
+):
+    layer_name = _resolve_mtp_layer_name(mtp_layer_id, mtp_layer_name)
+
     # Read source BF16 index to locate layer tensors.
     bf16_index_file = os.path.join(bf16_model_path, "model.safetensors.index.json")
     with open(bf16_index_file, "r") as f:
@@ -28,14 +55,14 @@ def add_mpt_player(bf16_model_path, quant_model_path, mtp_layer_id):
     matched_tensor_count = 0
 
     for tensor_name, file_name in bf16_weight_map.items():
-        if f"model.layers.{mtp_layer_id}." not in tensor_name:
+        if not tensor_name.startswith(f"{layer_name}."):
             continue
         quant_weight_map[tensor_name] = mtp_output_file
         mtp_tensors_by_file.setdefault(file_name, []).append(tensor_name)
         matched_tensor_count += 1
 
     print(
-        f"Found {matched_tensor_count} tensors for model.layers.{mtp_layer_id}. "
+        f"Found {matched_tensor_count} tensors for {layer_name}. "
         f"Starting extraction..."
     )
 
@@ -57,7 +84,7 @@ def add_mpt_player(bf16_model_path, quant_model_path, mtp_layer_id):
 
     if not mtp_weight:
         raise ValueError(
-            f"No tensors found for layer {mtp_layer_id} in {bf16_index_file}"
+            f"No tensors found for layer {layer_name} in {bf16_index_file}"
         )
 
     save_file(mtp_weight, os.path.join(quant_model_path, mtp_output_file))
@@ -80,7 +107,9 @@ def add_mpt_player(bf16_model_path, quant_model_path, mtp_layer_id):
         f"Total size of added tensors: {mtp_size / (1024 * 1024):.2f} MB"
     )
 
-def update_config_ignores(quant_model_path, mtp_layer_id):
+
+def update_config_ignores(quant_model_path, mtp_layer_id=None, mtp_layer_name=None):
+    layer_name = _resolve_mtp_layer_name(mtp_layer_id, mtp_layer_name)
     config_file = os.path.join(quant_model_path, "config.json")
     if not os.path.exists(config_file):
         raise ValueError(f"Config file not found at {config_file}")
@@ -98,8 +127,7 @@ def update_config_ignores(quant_model_path, mtp_layer_id):
     elif not isinstance(ignores, list):
         raise ValueError("quantization_config.ignore must be a list or string")
 
-    literal_ignore = f"model.layers.{mtp_layer_id}"
-    regex_ignore = f"re:.*layers\\.{mtp_layer_id}\\..*"
+    literal_ignore, regex_ignore = _build_ignore_patterns(layer_name)
     updated = False
 
     if literal_ignore not in ignores:
@@ -119,11 +147,11 @@ def update_config_ignores(quant_model_path, mtp_layer_id):
 
     if updated:
         print(
-            f"Updated config.json to ignore model.layers.{mtp_layer_id} during quantization."
+            f"Updated config.json to ignore {layer_name} during quantization."
         )
     else:
         print(
-            f"model.layers.{mtp_layer_id} is already in the ignore list of config.json."
+            f"{layer_name} is already in the ignore list of config.json."
         )
 
     return config_data
@@ -131,6 +159,7 @@ def update_config_ignores(quant_model_path, mtp_layer_id):
 
 if __name__ == "__main__":
     import argparse
+
     parser = argparse.ArgumentParser(description="Add MPT player to quantized model")
     parser.add_argument(
         "--bf16_model_path",
@@ -146,12 +175,28 @@ if __name__ == "__main__":
         required=True,
         help="Path to the quantized model",
     )
-    parser.add_argument(
+
+    selector_group = parser.add_mutually_exclusive_group(required=True)
+    selector_group.add_argument(
         "--mtp_layer_id",
         type=int,
-        required=True,
         help="The layer id of the MPT player to be added",
     )
+    selector_group.add_argument(
+        "--mtp_layer_name",
+        type=str,
+        help="The full layer name of the MPT player to be added, e.g. mtp.layers.0",
+    )
+
     args = parser.parse_args()
-    add_mpt_player(args.bf16_model_path, args.quant_model_path, args.mtp_layer_id)
-    update_config_ignores(args.quant_model_path, args.mtp_layer_id)
+    add_mpt_player(
+        args.bf16_model_path,
+        args.quant_model_path,
+        mtp_layer_id=args.mtp_layer_id,
+        mtp_layer_name=args.mtp_layer_name,
+    )
+    update_config_ignores(
+        args.quant_model_path,
+        mtp_layer_id=args.mtp_layer_id,
+        mtp_layer_name=args.mtp_layer_name,
+    )
