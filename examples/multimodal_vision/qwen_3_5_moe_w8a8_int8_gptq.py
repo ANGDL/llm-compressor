@@ -11,6 +11,8 @@ from qwen_vl_utils import process_vision_info
 from llmcompressor import oneshot
 from llmcompressor.modifiers.quantization import GPTQModifier 
 from llmcompressor.utils import dispatch_for_generation
+from compressed_tensors.utils import save_mtp_tensors_to_checkpoint
+
 
 # Load model.
 model_id = "/data/models/Qwen3.5-122B-A10B"
@@ -100,7 +102,7 @@ recipe = [
             "re:.*mlp.gate$",
             "re:.*embed_tokens$",
             "re:.*shared_expert_gate$",
-            "re:.*linear_attn.*",
+            # "re:.*linear_attn.*",
         ],
     ),
 ]
@@ -127,3 +129,4 @@ SAVE_DIR = model_id.rstrip("/").split("/")[-1] + "-W8A8-gptq"
 SAVE_DIR = os.path.join("/data/models", SAVE_DIR)
 model.save_pretrained(SAVE_DIR, save_compressed=True)
 processor.save_pretrained(SAVE_DIR)
+save_mtp_tensors_to_checkpoint(source_model=model_id, dest_dir=SAVE_DIR)
