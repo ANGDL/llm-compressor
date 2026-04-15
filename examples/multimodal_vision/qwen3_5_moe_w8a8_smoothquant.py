@@ -252,7 +252,6 @@ oneshot(
     num_calibration_samples=NUM_CALIBRATION_SAMPLES,
     trust_remote_code_model=True,
     data_collator=data_collator,
-#    sequential_targets=["Qwen3_5MoeDecoderLayer"],
     output_dir=SAVE_DIR,
     moe_calibrate_all_experts=False,
 )

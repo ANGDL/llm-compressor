@@ -87,7 +87,6 @@ oneshot(
     max_seq_length=MAX_SEQUENCE_LENGTH,
     num_calibration_samples=NUM_CALIBRATION_SAMPLES,
     data_collator=data_collator,
-    sequential_targets=["Qwen3VLTextDecoderLayer"],
 )
 
 # Confirm generations of the quantized model look sane.

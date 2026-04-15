@@ -84,7 +84,6 @@ oneshot(
     recipe=recipe,
     max_seq_length=MAX_SEQUENCE_LENGTH,
     num_calibration_samples=NUM_CALIBRATION_SAMPLES,
-    sequential_targets=["Llama4TextMLP"],
     data_collator=data_collator,
 )
 

@@ -81,7 +81,6 @@ oneshot(
     max_seq_length=MAX_SEQUENCE_LENGTH,
     num_calibration_samples=NUM_CALIBRATION_SAMPLES,
     batch_size=1,
-    sequential_targets=['GlmMoeDsaDecoderLayer'],
 )
 
 # Save to disk compressed.
