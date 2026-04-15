@@ -1,3 +1,4 @@
+from copy import deepcopy
 from typing import Any, Dict, List, Optional, Set, Union
 
 import torch
@@ -5,6 +6,7 @@ from compressed_tensors.distributed import wait_for_comms
 from compressed_tensors.modeling import (
     IMPL_ATTR,
     KV_CACHE_ATTR,
+    initialize_hooked_kv_cache,
 )
 from compressed_tensors.offload.dist_utils import is_distributed
 from compressed_tensors.quantization import (
@@ -12,6 +14,7 @@ from compressed_tensors.quantization import (
     QuantizationArgs,
     QuantizationConfig,
     QuantizationScheme,
+    QuantizationStrategy,
     QuantizationStatus,
     apply_quantization_config,
     disable_quantization,
@@ -19,6 +22,14 @@ from compressed_tensors.quantization import (
     is_attention_module,
     is_preset_scheme,
     preset_name_to_scheme,
+)
+from compressed_tensors.quantization.lifecycle.initialize import (
+    QuantizationMetadata,
+    get_head_dim,
+    get_num_attn_heads,
+    get_num_kv_heads,
+    initialize_qparams,
+    initialize_module_for_quantization,
 )
 from compressed_tensors.quantization.utils import KV_CACHE_TARGETS
 from compressed_tensors.utils import match_named_modules, update_offload_parameter
@@ -224,13 +235,123 @@ class QuantizationMixin(HooksMixin):
         for _, module in match_named_modules(model, self.resolved_targets, self.ignore):
             reset_quantization_status(module)  # reset any previously applied qconfigs
 
-        apply_quantization_config(model, self.resolved_config)
+        config = self.resolved_config
+        if (
+            config.kv_cache_scheme is not None
+            and config.kv_cache_scheme.strategy == QuantizationStrategy.CHANNEL
+        ):
+            config = deepcopy(config)
+            self._apply_channel_kv_cache_scheme(
+                model,
+                config.kv_cache_scheme,
+                config.quantization_status,
+            )
+            # KV cache scheme has already been applied with channel strategy.
+            # Disable default path to avoid upstream validation error.
+            config.kv_cache_scheme = None
+
+        apply_quantization_config(model, config)
 
         if not self.bypass_divisibility_checks:
             validate_group_size_divisibility(model, self.resolved_targets, self.ignore)
 
         # disable quantization until calibration
         model.apply(disable_quantization)
+
+    def _apply_channel_kv_cache_scheme(
+        self,
+        model: torch.nn.Module,
+        kv_cache_scheme: QuantizationArgs,
+        status: QuantizationStatus,
+    ):
+        """
+        Apply CHANNEL kv-cache quantization for attention modules.
+
+        compressed_tensors currently validates kv_cache_scheme via
+        QuantizationScheme(input_activations=...), which rejects CHANNEL for
+        activations. KV cache quantization is attention-state quantization and
+        CHANNEL is supported by attention flattening logic, so we attach the
+        scheme directly and initialize attention modules in-place.
+        """
+        scheme = QuantizationScheme.model_construct(
+            targets=KV_CACHE_TARGETS.copy(),
+            input_activations=kv_cache_scheme,
+            output_activations=None,
+            weights=None,
+            format=None,
+        )
+
+        force_zero_point = status < QuantizationStatus.COMPRESSED
+        for module in model.modules():
+            if not is_attention_module(module):
+                continue
+
+            module.quantization_scheme = scheme
+            initialize_hooked_kv_cache(model, module)
+
+            if kv_cache_scheme.dynamic is False:
+                self._initialize_static_channel_attention_qparams(
+                    module,
+                    kv_cache_scheme,
+                    force_zero_point=force_zero_point,
+                )
+            else:
+                initialize_module_for_quantization(
+                    module,
+                    force_zero_point=force_zero_point,
+                )
+
+            module.quantization_status = status
+
+    def _initialize_static_channel_attention_qparams(
+        self,
+        module: torch.nn.Module,
+        kv_cache_scheme: QuantizationArgs,
+        force_zero_point: bool,
+    ):
+        """
+        Initialize static CHANNEL qparams for attention states.
+
+        Upstream initialization uses an observed shape that includes sequence length,
+        which is unknown at initialization time for KV cache and causes failures for
+        CHANNEL strategy. For attention state channel quantization, the number of
+        channels is known from head geometry: num_heads * head_dim.
+        """
+        QuantizationMetadata.clear_all_qparams(module)
+
+        kv_cache = getattr(module, KV_CACHE_ATTR, None)
+        if kv_cache is None:
+            raise ValueError(
+                "Attention module missing kv_cache after initialization; "
+                "cannot apply static channel kv-cache quantization"
+            )
+
+        config = kv_cache.config
+        num_attn_heads = get_num_attn_heads(config)
+        num_kv_heads = get_num_kv_heads(config)
+        head_dim = get_head_dim(config)
+        observed_dtype = next(module.parameters()).dtype
+
+        has_attention_impl = getattr(module, IMPL_ATTR, None) is not None
+        if has_attention_impl:
+            initialize_qparams(
+                module,
+                "q",
+                kv_cache_scheme,
+                observed_shape=(1, num_attn_heads, 1, head_dim),
+                observed_dtype=observed_dtype,
+                force_zero_point=force_zero_point,
+            )
+
+        for base_name in ("k", "v"):
+            initialize_qparams(
+                module,
+                base_name,
+                kv_cache_scheme,
+                observed_shape=(1, num_kv_heads, 1, head_dim),
+                observed_dtype=observed_dtype,
+                force_zero_point=force_zero_point,
+            )
 
     def start_calibration(self, model: torch.nn.Module):
         """

@@ -12,6 +12,7 @@ regex fails for models that name their attention differently (e.g. "attention",
 import torch.nn as nn
 from compressed_tensors.quantization import (
     QuantizationArgs,
+    QuantizationStrategy,
     QuantizationStatus,
     apply_quantization_config,
     is_attention_module,
@@ -124,3 +125,29 @@ def test_attention_module_not_named_self_attn_gets_calibrated():
         assert (
             m.quantization_status == QuantizationStatus.FROZEN
         ), f"Attention module '{name}' was not frozen after end_calibration"
+
+
+def test_kv_cache_channel_strategy_is_supported_for_attention_quantization():
+    """CHANNEL kv-cache strategy should initialize without upstream validation errors."""
+    model = _StubModel(dim=16)
+    modifier = QuantizationModifier(
+        targets=["Linear"],
+        kv_cache_scheme=QuantizationArgs(
+            num_bits=8,
+            type="int",
+            strategy="channel",
+            dynamic=False,
+            symmetric=True,
+        ),
+    )
+
+    modifier.initialize_quantization(model)
+
+    attn_modules = [m for _, m in model.named_modules() if is_attention_module(m)]
+    assert len(attn_modules) == 2
+
+    for module in attn_modules:
+        assert module.quantization_scheme.input_activations.strategy == (
+            QuantizationStrategy.CHANNEL
+        )
+        assert module.quantization_status == QuantizationStatus.INITIALIZED
