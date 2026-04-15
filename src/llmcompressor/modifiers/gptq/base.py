@@ -2,7 +2,7 @@ import contextlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from queue import Empty, Queue
 from time import perf_counter
-from typing import Dict, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 from compressed_tensors.distributed import greedy_bin_packing, wait_for_comms
