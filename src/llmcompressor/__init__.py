@@ -9,8 +9,8 @@ PyTorch and HuggingFace Transformers, allowing for quick experimentation.
 
 # ruff: noqa
 
+from ._version import __version__, version
 from .logger import LoggerConfig, configure_logger, logger
-from .version import __version__, version
 
 __all__ = [
     "__version__",
