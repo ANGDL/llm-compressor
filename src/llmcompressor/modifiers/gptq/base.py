@@ -2,9 +2,10 @@ import contextlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from queue import Empty, Queue
 from time import perf_counter
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, Optional, Tuple, Union
 
 import torch
+from compressed_tensors.distributed import greedy_bin_packing, wait_for_comms
 from compressed_tensors.offload.dist_utils import as_broadcastable, is_distributed
 from compressed_tensors.quantization import (
     QuantizationConfig,
@@ -34,7 +35,6 @@ from llmcompressor.modifiers.quantization.calibration import update_weight_globa
 from llmcompressor.modifiers.quantization.quantization import QuantizationMixin
 from llmcompressor.modifiers.utils import update_fused_layer_weight_global_scales
 from llmcompressor.sentinel import Sentinel
-from llmcompressor.utils import greedy_bin_packing, wait_for_comms
 from llmcompressor.utils.metric_logging import CompressionLogger
 
 __all__ = ["GPTQModifier"]
@@ -85,8 +85,6 @@ class GPTQModifier(Modifier, QuantizationMixin):
         - remove_hooks()
         - model.apply(freeze_module_quantization)
 
-    :param sequential_targets: list of layer names to compress during GPTQ, or
-        '__ALL__' to compress every layer in the model
     :param block_size: Used to determine number of columns to compress in one pass
     :param dampening_frac: Amount of dampening to apply to H, as a fraction of the
         diagonal norm
@@ -123,7 +121,6 @@ class GPTQModifier(Modifier, QuantizationMixin):
     """
 
     # gptq modifier arguments
-    sequential_targets: Union[str, List[str], None] = None
     block_size: int = 128
     dampening_frac: Optional[float] = 0.01
     # TODO: this does not serialize / will be incorrectly written

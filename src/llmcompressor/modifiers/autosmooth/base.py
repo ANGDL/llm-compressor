@@ -5,6 +5,7 @@ from copy import deepcopy
 from collections import OrderedDict
 
 import torch
+from compressed_tensors.modeling.kvcache import QuantizedKVCache
 from compressed_tensors.quantization import (
     QuantizationArgs,
     QuantizationStrategy,
@@ -41,10 +42,12 @@ from llmcompressor.modifiers import Modifier
 from llmcompressor.modifiers.awq.mappings import (
     AWQMapping,
     ResolvedMapping,
-    get_layer_mappings_from_architecture,
 )
+from llmcompressor.modifiers.awq.dynamic_mappings import get_layer_mappings_from_model
 from llmcompressor.modifiers.quantization.calibration import (
     call_observer,
+    update_weight_global_scale,
+    update_weight_zp_scale,
 )
 from llmcompressor.modifiers.quantization.quantization import QuantizationMixin
 from llmcompressor.modifiers.utils import update_fused_layer_weight_global_scales
@@ -122,8 +125,6 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
     - on_finalize
         - clear resolved mappings and captured activations
 
-    :param sequential_targets: list of module names to compress in
-        the same calibration pass
     :param mappings: list activation layers to smooth, and which layers to
         scale the output such that activations are smoothed.
         Each entry of the mapping list should be a list itself, in which the first
@@ -169,7 +170,6 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
     model_config: ConfigDict = ConfigDict(arbitrary_types_allowed=True)
 
     # User-provided vars (in addition to QuantizationMixin args)
-    sequential_targets: str | list[str] | None = None
     mappings: list[AWQMapping] | None = None
     offload_device: torch.device | None | Sentinel = Sentinel("not_provided")
     duo_scaling: bool | Literal["both"] = True
@@ -281,9 +281,7 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
 
         if self.mappings is None:
             logger.info("No AutoSmoothModifier.mappings provided, inferring from model...")
-            self.mappings = get_layer_mappings_from_architecture(
-                architecture=state.model.__class__.__name__
-            )
+            self.mappings = get_layer_mappings_from_model(state.model)
 
         # Set default offload_device
         if self.offload_device == Sentinel("not_provided"):
@@ -358,10 +356,12 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
 
         elif event.type_ == EventType.SEQUENTIAL_EPOCH_END:
             # Run smoothing in case of sequential pipeline
+            QuantizationMixin.sync_activation_observers(self, state.model)
             self._apply_smoothing(state.model)
 
         elif event.type_ == EventType.CALIBRATION_EPOCH_END:
             # Run smoothing in case of basic pipeline
+            QuantizationMixin.sync_activation_observers(self, state.model)
             self._apply_smoothing(state.model)
 
             if not self.ended_:
@@ -373,6 +373,25 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
         """
         self._assert_all_activations_consumed()
         self.ended_ = True
+
+        named_modules = list(
+            match_named_modules(state.model, self.resolved_targets, self.ignore)
+        )
+
+        # For TENSOR_GROUP (nvfp4), calculate global scales after smoothing.
+        for _, module in tqdm(named_modules, desc="Updating global scales"):
+            update_weight_global_scale(module)
+
+        # For TENSOR_GROUP (nvfp4), fuse global scales for attention and MLP layers.
+        for module in tqdm(state.model.modules(), desc="Fusing global scales"):
+            update_fused_layer_weight_global_scales(module)
+
+        # Calculate scales and zero points using the fused global scales.
+        for _, module in tqdm(named_modules, desc="Calibrating weights"):
+            update_weight_zp_scale(module)
+
+        QuantizationMixin.end_calibration(self, state.model)
+
         # remove activation hooks
         self.remove_hooks()
  
@@ -511,6 +530,12 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
             kwargs,
         ):
             values = inspect.signature(module.forward).bind(*args, **kwargs)
+
+            # Replace any quantized kv cache with None before replaying samples.
+            for k, v in values.arguments.items():
+                if isinstance(v, QuantizedKVCache):
+                    values.arguments[k] = None
+
             self._parent_args_cache[module].append(values.arguments)
 
         def create_cache_smooth_activations_hook_fn(smooth_name):
@@ -717,9 +742,15 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
         self._assert_all_activations_consumed()
 
     def _run_samples(self, module: Module) -> list[torch.Tensor]:
-        outputs = [
-            module(**batch_kwargs) for batch_kwargs in self._parent_args_cache[module]
-        ]
+        cache = self._parent_args_cache[module]
+        session = active_session()
+        use_prefetch = bool(
+            session
+            and session.state
+            and getattr(session.state, "sequential_prefetch", False)
+        )
+        batch_iter = cache.iter_prefetch() if use_prefetch else cache
+        outputs = [module(**batch_kwargs) for batch_kwargs in batch_iter]
         return [
             # If tuple, assume that first argument is the input
             output[0] if isinstance(output, tuple) else output
@@ -1034,20 +1065,35 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
         fp16_outputs: list[torch.Tensor],
         int_w_outputs: list[torch.Tensor],
     ) -> float:
-        loss = 0.0
-        num_elements = 0
+        session = active_session()
+        loss_masks = session.state.loss_masks if session and session.state else None
+
+        device = fp16_outputs[0].device
+        loss = torch.tensor(0.0, device=device)
+        num_elements = torch.tensor(0, device=device)
 
         # Compute the MSE loss for each batch
-        for fp16_batch, int_w_batch in zip(fp16_outputs, int_w_outputs):
-            loss += torch.nn.functional.mse_loss(
-                fp16_batch, int_w_batch.to(fp16_batch.device), reduction="sum"
-            ).item()
-            num_elements += fp16_batch.numel()
+        for batch_idx, (fp16_batch, int_w_batch) in enumerate(
+            zip(fp16_outputs, int_w_outputs)
+        ):
+            loss_mask = loss_masks[batch_idx] if loss_masks else None
+
+            if loss_mask is not None:
+                token_mask = loss_mask.to(fp16_batch.device) == 1  # (batch, seq)
+                fp16_masked = fp16_batch[token_mask]  # (num_masked_tokens, hidden)
+                int_w_masked = int_w_batch.to(fp16_batch.device)[token_mask]
+                loss += torch.nn.functional.mse_loss(
+                    fp16_masked, int_w_masked, reduction="sum"
+                )
+                num_elements += fp16_masked.numel()
+            else:
+                loss += torch.nn.functional.mse_loss(
+                    fp16_batch, int_w_batch.to(fp16_batch.device), reduction="sum"
+                )
+                num_elements += fp16_batch.numel()
 
         # Normalize the loss by the total number of elements
-        loss /= num_elements
-
-        return loss
+        return (loss / num_elements).item()
 
     def _log_error_metrics(self):
         """
