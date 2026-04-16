@@ -21,6 +21,7 @@ GPTQ_PRECISION = torch.float32
 __all__ = ["make_empty_hessian", "accumulate_hessian", "quantize_weight"]
 
 _USE_INPLACE_HESSIAN = os.getenv("LLM_COMPRESSOR_USE_INPLACE_HESSIAN", "0") in ["1", "true", "True"]
+_USE_INPLACE_DEAD_MASK = os.getenv("LLM_COMPRESSOR_USE_INPLACE_DEAD_MASK", "0") in ["1", "true", "True"]
 
 if _USE_INPLACE_HESSIAN:
     logger.info("Using inplace hessian accumulation for GPTQ. This may reduce memory usage but can lead to numerical instability. Use with caution.")
@@ -33,6 +34,25 @@ else:
         inp = math.sqrt(2) * inp
         H += inp.matmul(inp.t())
         return H
+
+
+def _mask_dead_hessian_compat(H: torch.Tensor, W: torch.Tensor) -> None:
+    dead = torch.diag(H) == 0
+    H[dead, dead] = 1
+    W[:, dead] = 0
+
+
+def _mask_dead_hessian_inplace(H: torch.Tensor, W: torch.Tensor) -> None:
+    diag = H.diagonal()
+    dead = diag.eq(0)
+    if dead.any():
+        diag.masked_fill_(dead, 1)
+        W[:, dead] = 0
+
+
+_mask_dead_hessian = (
+    _mask_dead_hessian_inplace if _USE_INPLACE_DEAD_MASK else _mask_dead_hessian_compat
+)
 
 
 def make_empty_hessian(
@@ -156,9 +176,7 @@ def quantize_weight(
     losses = torch.zeros(num_rows, device=module.weight.device)
 
     # mask dead hessian values
-    dead = torch.diag(H) == 0
-    H[dead, dead] = 1
-    W[:, dead] = 0
+    _mask_dead_hessian(H, W)
 
     # compute inverse hessian in place to save memory
     try:
