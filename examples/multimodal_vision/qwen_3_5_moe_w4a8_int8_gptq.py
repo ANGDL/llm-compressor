@@ -1,5 +1,4 @@
 import base64
-import argparse
 from io import BytesIO
 import os
 
