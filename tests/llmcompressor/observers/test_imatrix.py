@@ -3,6 +3,7 @@ import torch
 from compressed_tensors.quantization.quant_args import QuantizationArgs
 
 from llmcompressor.observers.base import Observer
+from llmcompressor.observers.imatrix import _get_oom_retry_chunk_size, _grid_search
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -263,6 +264,205 @@ class TestBasicFunctionality:
         assert torch.allclose(scale_i, scale_u)
         assert torch.equal(zp_i, zp_u)
 
+    def test_chunked_grid_search_matches_full_grid_search(self):
+        """Chunked error computation must match full-tensor computation."""
+        torch.manual_seed(7)
+        observed = torch.randn(1, 128, 1, 64)
+        importance = torch.rand_like(observed).abs_() + 1e-3
+        args = QuantizationArgs(
+            num_bits=4,
+            symmetric=True,
+            strategy="channel",
+            observer="imatrix_mse",
+        )
+
+        full_min, full_max = _grid_search(
+            observed=observed,
+            args=args,
+            maxshrink=0.95,
+            patience=5,
+            grid=20,
+            norm=2.4,
+            importance_weights=importance,
+            chunk_size=0,
+        )
+        chunked_min, chunked_max = _grid_search(
+            observed=observed,
+            args=args,
+            maxshrink=0.95,
+            patience=5,
+            grid=20,
+            norm=2.4,
+            importance_weights=importance,
+            chunk_size=17,
+        )
+
+        assert torch.allclose(chunked_min, full_min)
+        assert torch.allclose(chunked_max, full_max)
+
+
+@pytest.mark.parametrize(
+    "observed_shape,chunk_size,with_importance",
+    [
+        ((1, 64, 1, 32), 1, True),
+        ((1, 64, 1, 32), 7, True),
+        ((1, 64, 1, 32), 13, False),
+        ((2, 96, 1, 48), 1, True),
+        ((2, 96, 1, 48), 11, False),
+        ((1, 128, 1, 64), 3, True),
+        ((1, 128, 1, 64), 17, True),
+    ],
+)
+def test_chunked_grid_search_strong_equivalence(
+    observed_shape, chunk_size, with_importance
+):
+    """Chunked search must match full search over diverse shapes and chunk sizes."""
+    torch.manual_seed(2026)
+    observed = torch.randn(*observed_shape)
+    importance = (
+        torch.rand_like(observed).abs_() + 1e-3 if with_importance else None
+    )
+    args = QuantizationArgs(
+        num_bits=4,
+        symmetric=True,
+        strategy="channel",
+        observer="imatrix_mse",
+    )
+
+    full_min, full_max = _grid_search(
+        observed=observed,
+        args=args,
+        maxshrink=0.95,
+        patience=6,
+        grid=24,
+        norm=2.4,
+        importance_weights=importance,
+        chunk_size=10**9,
+    )
+    chunked_min, chunked_max = _grid_search(
+        observed=observed,
+        args=args,
+        maxshrink=0.95,
+        patience=6,
+        grid=24,
+        norm=2.4,
+        importance_weights=importance,
+        chunk_size=chunk_size,
+    )
+
+    assert torch.allclose(chunked_min, full_min, rtol=1e-6, atol=1e-7)
+    assert torch.allclose(chunked_max, full_max, rtol=1e-6, atol=1e-7)
+
+
+def test_chunked_grid_search_equivalence_with_global_scale():
+    """Chunked search must match full search when global_scale is provided."""
+    torch.manual_seed(2027)
+    observed = torch.randn(1, 80, 1, 32)
+    importance = torch.rand_like(observed).abs_() + 1e-3
+    args = QuantizationArgs(
+        num_bits=4,
+        symmetric=True,
+        strategy="tensor_group",
+        group_size=32,
+        observer="imatrix_mse",
+    )
+    global_scale = torch.tensor([0.83], dtype=torch.float32)
+
+    full_min, full_max = _grid_search(
+        observed=observed,
+        args=args,
+        maxshrink=0.90,
+        patience=5,
+        grid=20,
+        norm=2.2,
+        global_scale=global_scale,
+        optimize_global_scale=False,
+        importance_weights=importance,
+        chunk_size=10**9,
+    )
+    chunked_min, chunked_max = _grid_search(
+        observed=observed,
+        args=args,
+        maxshrink=0.90,
+        patience=5,
+        grid=20,
+        norm=2.2,
+        global_scale=global_scale,
+        optimize_global_scale=False,
+        importance_weights=importance,
+        chunk_size=5,
+    )
+
+    assert torch.allclose(chunked_min, full_min, rtol=1e-6, atol=1e-7)
+    assert torch.allclose(chunked_max, full_max, rtol=1e-6, atol=1e-7)
+
+
+def test_chunked_grid_search_randomized_stress_equivalence():
+    """Randomized stress test: chunked and full search must stay numerically equal."""
+    generator = torch.Generator().manual_seed(3407)
+    args = QuantizationArgs(
+        num_bits=4,
+        symmetric=True,
+        strategy="channel",
+        observer="imatrix_mse",
+    )
+    chunk_candidates = [1, 2, 3, 5, 7, 11, 16, 31]
+
+    for case_idx in range(20):
+        num_observations = int(torch.randint(1, 3, (1,), generator=generator).item())
+        qparam_count = int(torch.randint(24, 160, (1,), generator=generator).item())
+        group_size = int(torch.randint(16, 96, (1,), generator=generator).item())
+
+        observed = torch.randn(
+            num_observations,
+            qparam_count,
+            1,
+            group_size,
+            generator=generator,
+        )
+        with_importance = bool(torch.randint(0, 2, (1,), generator=generator).item())
+        importance = (
+            torch.rand(observed.shape, dtype=observed.dtype, generator=generator).abs_()
+            + 1e-3
+            if with_importance
+            else None
+        )
+        chunk_size = chunk_candidates[
+            int(torch.randint(0, len(chunk_candidates), (1,), generator=generator).item())
+        ]
+
+        full_min, full_max = _grid_search(
+            observed=observed,
+            args=args,
+            maxshrink=0.95,
+            patience=5,
+            grid=18,
+            norm=2.4,
+            importance_weights=importance,
+            chunk_size=10**9,
+        )
+        chunked_min, chunked_max = _grid_search(
+            observed=observed,
+            args=args,
+            maxshrink=0.95,
+            patience=5,
+            grid=18,
+            norm=2.4,
+            importance_weights=importance,
+            chunk_size=chunk_size,
+        )
+
+        assert torch.allclose(chunked_min, full_min, rtol=1e-6, atol=1e-7), (
+            "min mismatch for randomized case "
+            f"{case_idx}: shape={tuple(observed.shape)}, "
+            f"chunk_size={chunk_size}, with_importance={with_importance}"
+        )
+        assert torch.allclose(chunked_max, full_max, rtol=1e-6, atol=1e-7), (
+            "max mismatch for randomized case "
+            f"{case_idx}: shape={tuple(observed.shape)}, "
+            f"chunk_size={chunk_size}, with_importance={with_importance}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Validation edge cases
@@ -354,3 +554,16 @@ class TestValidation:
         )
         with pytest.raises(NotImplementedError, match="TENSOR strategy"):
             observer(module.weight)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_oom_retry_chunk_size_uses_free_memory(monkeypatch):
+    observed = torch.randn(1, 2048, 1, 1024, device="cuda")
+
+    # Pretend only 2GB are free to force a bounded retry chunk.
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: (2 * 1024**3, 0))
+
+    retry_chunk = _get_oom_retry_chunk_size(observed, requested_chunk_size=0)
+
+    assert retry_chunk is not None
+    assert 1 <= retry_chunk <= observed.shape[1] * observed.shape[2]

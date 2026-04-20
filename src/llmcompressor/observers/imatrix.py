@@ -36,11 +36,14 @@ class IMatrixMSEObserver(Observer):
         self.grid = kw.get("grid", 20)
         self.norm = kw.get("norm", 3.0)
         self.strict = kw.get("strict", False)
+        self.chunk_size = kw.get("chunk_size", 0)
 
         if self.grid <= 0:
             raise ValueError(f"grid must be > 0, got {self.grid}")
         if self.patience < 0:
             raise ValueError(f"patience must be >= 0, got {self.patience}")
+        if self.chunk_size < 0:
+            raise ValueError(f"chunk_size must be >= 0, got {self.chunk_size}")
         if not (0 <= self.maxshrink <= 1):
             raise ValueError(f"maxshrink must be in [0, 1], got {self.maxshrink}")
         if (
@@ -126,6 +129,7 @@ class IMatrixMSEObserver(Observer):
             self.norm,
             global_scale=self._get_module_param("global_scale"),
             importance_weights=self._prepare_importance(observed),
+            chunk_size=self.chunk_size,
         )
 
     def get_global_min_max(self, observed: torch.Tensor) -> MinMaxTuple:
@@ -141,6 +145,7 @@ class IMatrixMSEObserver(Observer):
             self.grid,
             self.norm,
             optimize_global_scale=True,
+            chunk_size=self.chunk_size,
         )
 
     # ------------------------------------------------------------------
@@ -304,8 +309,100 @@ def _grid_search(
     global_scale: Optional[torch.Tensor] = None,
     optimize_global_scale: bool = False,
     importance_weights: Optional[torch.Tensor] = None,
+    chunk_size: int = 0,
 ) -> MinMaxTuple:
     """Grid search for min/max minimizing (importance-weighted) quant error."""
+    try:
+        return _grid_search_impl(
+            observed=observed,
+            args=args,
+            maxshrink=maxshrink,
+            patience=patience,
+            grid=grid,
+            norm=norm,
+            global_scale=global_scale,
+            optimize_global_scale=optimize_global_scale,
+            importance_weights=importance_weights,
+            chunk_size=chunk_size,
+        )
+    except torch.OutOfMemoryError:
+        if observed.device.type != "cuda":
+            raise
+
+        with torch.cuda.device(observed.device):
+            torch.cuda.empty_cache()
+
+        retry_chunk_size = _get_oom_retry_chunk_size(
+            observed=observed,
+            requested_chunk_size=chunk_size,
+        )
+        if retry_chunk_size is not None:
+            logger.warning(
+                "imatrix_mse grid search hit CUDA OOM. Retrying on GPU with "
+                f"adaptive chunk_size={retry_chunk_size}.",
+                log_once=True,
+            )
+            try:
+                return _grid_search_impl(
+                    observed=observed,
+                    args=args,
+                    maxshrink=maxshrink,
+                    patience=patience,
+                    grid=grid,
+                    norm=norm,
+                    global_scale=global_scale,
+                    optimize_global_scale=optimize_global_scale,
+                    importance_weights=importance_weights,
+                    chunk_size=retry_chunk_size,
+                )
+            except torch.OutOfMemoryError:
+                with torch.cuda.device(observed.device):
+                    torch.cuda.empty_cache()
+
+        logger.warning(
+            "imatrix_mse grid search hit CUDA OOM. Falling back to CPU for this "
+            "module; this is slower but avoids calibration failure.",
+            log_once=True,
+        )
+
+        observed_cpu = observed.detach().to("cpu")
+        global_scale_cpu = (
+            global_scale.detach().to("cpu") if global_scale is not None else None
+        )
+        importance_cpu = (
+            importance_weights.detach().to("cpu")
+            if importance_weights is not None
+            else None
+        )
+
+        best_min, best_max = _grid_search_impl(
+            observed=observed_cpu,
+            args=args,
+            maxshrink=maxshrink,
+            patience=patience,
+            grid=grid,
+            norm=norm,
+            global_scale=global_scale_cpu,
+            optimize_global_scale=optimize_global_scale,
+            importance_weights=importance_cpu,
+            chunk_size=chunk_size,
+        )
+        return best_min.to(observed.device), best_max.to(observed.device)
+
+
+def _grid_search_impl(
+    observed: torch.Tensor,
+    args: QuantizationArgs,
+    maxshrink: float,
+    patience: int,
+    grid: int,
+    norm: float,
+    global_scale: Optional[torch.Tensor] = None,
+    optimize_global_scale: bool = False,
+    importance_weights: Optional[torch.Tensor] = None,
+    chunk_size: int = 0,
+) -> MinMaxTuple:
+    """Core grid search implementation used by both CUDA and CPU fallback paths."""
     min_val = torch.amin(observed, dim=(0, -1))
     max_val = torch.amax(observed, dim=(0, -1))
     best_error = torch.full(
@@ -318,7 +415,27 @@ def _grid_search(
     best_max = max_val.clone()
 
     no_improve = 0
-    observed_f = observed.float()
+    observed_f = observed if observed.dtype == torch.float32 else observed.float()
+    if importance_weights is not None:
+        importance_weights = importance_weights.to(observed_f.dtype)
+
+    qparam_count = min_val.numel()
+    num_observations = observed.shape[0]
+    group_size = observed.shape[-1]
+    effective_chunk_size = _get_effective_chunk_size(
+        requested_chunk_size=chunk_size,
+        qparam_count=qparam_count,
+        num_observations=num_observations,
+        group_size=group_size,
+    )
+
+    observed_flat = observed.reshape(num_observations, qparam_count, group_size)
+    observed_f_flat = observed_f.reshape(num_observations, qparam_count, group_size)
+    importance_flat = (
+        importance_weights.reshape(num_observations, qparam_count, group_size)
+        if importance_weights is not None
+        else None
+    )
 
     shrink_steps = max(1, int(maxshrink * grid))
     for i in range(shrink_steps + 1):
@@ -337,18 +454,20 @@ def _grid_search(
         )
 
         with patch_attr(args, "strategy", QuantizationStrategy.TOKEN):
-            q = fake_quantize(
-                observed,
-                scales.unsqueeze(-1),
-                zps.unsqueeze(-1),
-                args,
+            err = _compute_err(
+                observed=observed,
+                observed_f=observed_f,
+                observed_flat=observed_flat,
+                observed_f_flat=observed_f_flat,
+                scales=scales,
+                zps=zps,
+                args=args,
+                norm=norm,
                 global_scale=global_scale,
-            ).float()
-
-        q.sub_(observed_f).abs_().pow_(norm)
-        if importance_weights is not None:
-            q.mul_(importance_weights)
-        err = q.sum(dim=(0, -1))
+                importance_weights=importance_weights,
+                importance_flat=importance_flat,
+                effective_chunk_size=effective_chunk_size,
+            )
 
         improved = err < best_error
         if torch.any(improved):
@@ -362,3 +481,102 @@ def _grid_search(
                 break
 
     return best_min, best_max
+
+
+def _compute_err(
+    observed: torch.Tensor,
+    observed_f: torch.Tensor,
+    observed_flat: torch.Tensor,
+    observed_f_flat: torch.Tensor,
+    scales: torch.Tensor,
+    zps: torch.Tensor,
+    args: QuantizationArgs,
+    norm: float,
+    global_scale: Optional[torch.Tensor],
+    importance_weights: Optional[torch.Tensor],
+    importance_flat: Optional[torch.Tensor],
+    effective_chunk_size: int,
+) -> torch.Tensor:
+    if effective_chunk_size >= scales.numel():
+        q = fake_quantize(
+            observed,
+            scales.unsqueeze(-1),
+            zps.unsqueeze(-1),
+            args,
+            global_scale=global_scale,
+        ).to(observed_f.dtype)
+
+        q.sub_(observed_f).abs_().pow_(norm)
+        if importance_weights is not None:
+            q.mul_(importance_weights)
+        return q.sum(dim=(0, -1), dtype=torch.float32)
+
+    scales_flat = scales.reshape(-1)
+    zps_flat = zps.reshape(-1)
+    err_flat = torch.empty(
+        scales_flat.numel(), dtype=torch.float32, device=scales_flat.device
+    )
+
+    for start in range(0, scales_flat.numel(), effective_chunk_size):
+        end = min(start + effective_chunk_size, scales_flat.numel())
+
+        q_chunk = fake_quantize(
+            observed_flat[:, start:end, :],
+            scales_flat[start:end].unsqueeze(-1),
+            zps_flat[start:end].unsqueeze(-1),
+            args,
+            global_scale=global_scale,
+        ).to(observed_f.dtype)
+
+        q_chunk.sub_(observed_f_flat[:, start:end, :]).abs_().pow_(norm)
+        if importance_flat is not None:
+            q_chunk.mul_(importance_flat[:, start:end, :])
+
+        err_flat[start:end] = q_chunk.sum(dim=(0, -1), dtype=torch.float32)
+
+    return err_flat.reshape_as(scales)
+
+
+def _get_effective_chunk_size(
+    requested_chunk_size: int,
+    qparam_count: int,
+    num_observations: int,
+    group_size: int,
+) -> int:
+    if requested_chunk_size > 0:
+        return min(requested_chunk_size, qparam_count)
+
+    # Target <= 64MB temporary q tensor for error computation.
+    target_elements = 16 * 1024 * 1024
+    denom = max(1, num_observations * group_size)
+    auto_chunk = max(1, target_elements // denom)
+    return min(auto_chunk, qparam_count)
+
+
+def _get_oom_retry_chunk_size(
+    observed: torch.Tensor,
+    requested_chunk_size: int,
+) -> Optional[int]:
+    """Estimate a smaller GPU chunk size based on currently free CUDA memory."""
+    if observed.device.type != "cuda":
+        return None
+
+    qparam_count = observed.shape[1] * observed.shape[2]
+    if qparam_count <= 1:
+        return None
+
+    num_observations = observed.shape[0]
+    group_size = observed.shape[-1]
+
+    # q_chunk is promoted to float32 during error computation.
+    bytes_per_elem = torch.finfo(torch.float32).bits // 8
+    per_qparam_bytes = max(1, num_observations * group_size * bytes_per_elem)
+
+    free_bytes, _ = torch.cuda.mem_get_info(observed.device)
+    target_bytes = max(1, int(free_bytes * 0.35))
+    memory_based_chunk = max(1, target_bytes // per_qparam_bytes)
+
+    if requested_chunk_size > 0:
+        memory_based_chunk = min(memory_based_chunk, requested_chunk_size)
+
+    return min(memory_based_chunk, qparam_count)
