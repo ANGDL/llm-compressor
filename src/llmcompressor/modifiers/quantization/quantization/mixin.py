@@ -280,8 +280,12 @@ class QuantizationMixin(HooksMixin):
             weights=None,
             format=None,
         )
+        
+        # Symmetric quantization should not materialize explicit zero-point buffers.
+        force_zero_point = (
+            status < QuantizationStatus.COMPRESSED and not kv_cache_scheme.symmetric
+        )
 
-        force_zero_point = status < QuantizationStatus.COMPRESSED
         for module in model.modules():
             if not is_attention_module(module):
                 continue
