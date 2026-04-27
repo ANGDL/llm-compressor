@@ -1,5 +1,4 @@
 import inspect
-from itertools import product
 from typing import Iterator, Literal
 from copy import deepcopy
 from collections import OrderedDict
@@ -39,11 +38,13 @@ from tqdm import tqdm
 
 from llmcompressor.core import Event, EventType, State, active_session
 from llmcompressor.modifiers import Modifier
-from llmcompressor.modifiers.awq.mappings import (
+from llmcompressor.modifiers.transform.awq.mappings import (
     AWQMapping,
     ResolvedMapping,
 )
-from llmcompressor.modifiers.awq.dynamic_mappings import get_layer_mappings_from_model
+from llmcompressor.modifiers.transform.awq.dynamic_mappings import (
+    get_layer_mappings_from_model,
+)
 from llmcompressor.modifiers.quantization.calibration import (
     call_observer,
     update_weight_global_scale,
@@ -56,6 +57,7 @@ from llmcompressor.modifiers.utils.pytorch_helpers import is_moe_model
 from llmcompressor.observers.base import Observer
 from llmcompressor.pipelines.cache import IntermediatesCache
 from llmcompressor.sentinel import Sentinel
+from llmcompressor.utils.dev import get_high_precision
 from llmcompressor.utils.helpers import calibration_forward_context
 from llmcompressor.utils.pytorch.module import (
     get_module_to_name_dict,
@@ -862,16 +864,6 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
                 [w_qscheme for _, _, w_qscheme in balance_layers_to_patch],
             ).to(device)
 
-        match self.duo_scaling:
-            # if self.duo_scaling is "both", perform half the grid search with
-            # duo_scaling off and half with duo_scaling on
-            case "both":
-                n_grid = int(self.n_grid / 2)
-                duo_scalings = [False, True]
-            case _:
-                n_grid = self.n_grid
-                duo_scalings = [self.duo_scaling]
-
         # Where appropriate, replace observers with memoryless_minmax
         # for duration of grid search
         with patch_attrs(
@@ -917,17 +909,12 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
                         torch.nn.Parameter(init_global_scale.detach(), requires_grad=False),
                     )
 
-            total_iterations = n_grid * len(duo_scalings)
             pbar = tqdm(
-                product(range(n_grid), duo_scalings),
-                total=total_iterations,
+                self._get_grid_search_params(),
                 desc=f"Grid search for {mapping.smooth_name}",
                 leave=False,
             )
-            for grid_idx, use_duo_scaling in pbar:
-                # create new scales
-                ratio = grid_idx / n_grid
-
+            for ratio, use_duo_scaling in pbar:
                 # NOTE: s^-1 * x is fused here, according to paper
                 if use_duo_scaling:
                     scales = (x_scales.pow(ratio) / (w_scales.pow(1 - ratio) + 1e-4)).clamp(
@@ -1095,6 +1082,42 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
         # Normalize the loss by the total number of elements
         return (loss / num_elements).item()
 
+    @staticmethod
+    def _get_ratio_grid(num_points: int, single_point: float = 0.0) -> list[float]:
+        if num_points <= 0:
+            return []
+        if num_points == 1:
+            return [single_point]
+        return [grid_idx / (num_points - 1) for grid_idx in range(num_points)]
+
+    def _get_grid_search_params(self) -> list[tuple[float, bool]]:
+        """Get (ratio, duo_scaling) pairs used during best-scale grid search."""
+
+        match self.duo_scaling:
+            case "both":
+                n_grid = int(self.n_grid / 2)
+                return [
+                    (ratio, duo_scaling)
+                    for ratio in self._get_ratio_grid(n_grid)
+                    for duo_scaling in [False, True]
+                ]
+            case False:
+                return [
+                    (ratio, False) for ratio in self._get_ratio_grid(self.n_grid)
+                ]
+            case True:
+                return [(0.0, False)] + [
+                    (ratio, True)
+                    for ratio in self._get_ratio_grid(
+                        self.n_grid - 1,
+                        single_point=1.0,
+                    )
+                ]
+            case _:
+                raise ValueError(
+                    f"Found unexpected duo_scaling configuration {self.duo_scaling}"
+                )
+
     def _log_error_metrics(self):
         """
         Log the error metrics (initial error, best error, reduction).
@@ -1174,6 +1197,7 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
         # to calculate mean without having to carry full population
         weight_total_count = 0
         weight_total_sum = 0
+        accumulator_dtype = get_high_precision()
 
         for idx, layer in enumerate(layers):
             layer_name = (
@@ -1237,7 +1261,7 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
             weight = weight.reshape(orig_shape)
             # Gets the average rescaled magnitude for each output channel
             weight_total_count += weight.size(0)
-            weight_sum = weight.sum(0, dtype=torch.float64)
+            weight_sum = weight.sum(0, dtype=accumulator_dtype)
             weight_total_sum += weight_sum
 
         if weight_total_count == 0:
