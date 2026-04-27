@@ -8,7 +8,7 @@ from compressed_tensors.quantization import (
 
 import llmcompressor.modifiers.autosmooth.base as autosmooth_base
 from llmcompressor.modifiers.autosmooth import AutoSmoothModifier
-from llmcompressor.modifiers.awq.mappings import ResolvedMapping
+from llmcompressor.modifiers.transform.awq.mappings import ResolvedMapping
 from llmcompressor.pipelines.cache import IntermediatesCache
 
 
@@ -20,6 +20,53 @@ class _ToyParent(torch.nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.quantized_balance(x) + self.ignored_balance(x)
+
+
+class _FakeWeightObserver:
+    def __call__(self, weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        scale = torch.ones(weight.shape[0], device=weight.device, dtype=weight.dtype)
+        zero_point = torch.zeros_like(scale)
+        return scale, zero_point
+
+    def get_global_scale(self, weight: torch.Tensor) -> torch.Tensor:
+        return torch.ones(1, device=weight.device, dtype=weight.dtype)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "n_grid, duo_scaling, expected_len",
+    [
+        (20, True, 20),
+        (10, False, 10),
+        (30, "both", 30),
+        (2, True, 2),
+    ],
+)
+def test_get_grid_search_params(n_grid, duo_scaling, expected_len):
+    autosmooth = AutoSmoothModifier(n_grid=n_grid, duo_scaling=duo_scaling)
+
+    grid_search_params = autosmooth._get_grid_search_params()
+
+    assert (0.0, False) in grid_search_params
+    assert all(ratio >= 0.0 for ratio, _ in grid_search_params)
+    assert all(ratio <= 1.0 for ratio, _ in grid_search_params)
+    assert len(grid_search_params) == expected_len
+
+    n_false = len([
+        ratio for ratio, use_duo_scaling in grid_search_params if use_duo_scaling is False
+    ])
+    n_true = len([
+        ratio for ratio, use_duo_scaling in grid_search_params if use_duo_scaling is True
+    ])
+
+    if duo_scaling is False:
+        assert n_false == n_grid
+        assert n_true == 0
+    elif duo_scaling is True:
+        assert n_false == 1
+        assert n_true == expected_len - 1
+    else:
+        assert abs(n_false - n_true) <= 1
 
 
 @pytest.mark.unit
@@ -68,7 +115,7 @@ def test_compute_best_scale_uses_autosmooth_snapshot_qargs(monkeypatch):
         assert args is not None
         assert module is parent.quantized_balance
         captured.append((module, args))
-        return torch.nn.Identity()
+        return _FakeWeightObserver()
 
     monkeypatch.setattr(
         autosmooth_base.Observer,
@@ -139,7 +186,7 @@ def test_compute_best_scale_skips_non_targeted_balance_layers(monkeypatch):
         assert base_name == "weight"
         assert args is not None
         captured_modules.append(module)
-        return torch.nn.Identity()
+        return _FakeWeightObserver()
 
     monkeypatch.setattr(
         autosmooth_base.Observer,
@@ -242,7 +289,7 @@ def test_compute_best_scale_duo_scaling_uses_snapshot_qargs(monkeypatch):
     monkeypatch.setattr(
         autosmooth_base.Observer,
         "load_from_registry",
-        staticmethod(lambda *_args, **_kwargs: torch.nn.Identity()),
+        staticmethod(lambda *_args, **_kwargs: _FakeWeightObserver()),
     )
     monkeypatch.setattr(autosmooth_base, "call_observer", lambda *args, **kwargs: None)
     monkeypatch.setattr(
@@ -293,7 +340,7 @@ def test_compute_best_scale_preserves_existing_weight_scale(monkeypatch):
     monkeypatch.setattr(
         autosmooth_base.Observer,
         "load_from_registry",
-        staticmethod(lambda *_args, **_kwargs: torch.nn.Identity()),
+        staticmethod(lambda *_args, **_kwargs: _FakeWeightObserver()),
     )
     monkeypatch.setattr(autosmooth_base, "call_observer", lambda *args, **kwargs: None)
     monkeypatch.setattr(

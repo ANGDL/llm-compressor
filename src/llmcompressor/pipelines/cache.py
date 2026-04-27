@@ -269,12 +269,14 @@ class IntermediatesCache:
 
         match value:
             case torch.Tensor():
-                # use non_blocking when source is pinned and target is CUDA so the
-                # H2D DMA can overlap with GPU compute on a separate CUDA stream
+                # use non_blocking when source is pinned and target is an accelerator
+                # so the H2D DMA can overlap with compute on a separate stream
                 non_blocking = (
                     value.is_pinned()
                     and device is not None
-                    and torch.device(device).type == "cuda"
+                    and torch.accelerator.is_available()
+                    and torch.device(device).type
+                    == torch.accelerator.current_accelerator().type
                 )
                 return value.to(device=device, non_blocking=non_blocking)
             case list():
@@ -323,8 +325,9 @@ class IntermediatesCache:
                             # pin CPU tensors so onload can use non_blocking DMA
                             if (
                                 torch.device(offload_device).type == "cpu"
-                                and torch.cuda.is_available()
+                                and torch.accelerator.is_available()
                                 and not offloaded.is_pinned()
+                                and not torch.mps.is_available()  # pinning not supported on MPS
                             ):
                                 offloaded = offloaded.pin_memory()
                             cls.offload_values[value] = offloaded
