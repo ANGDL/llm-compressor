@@ -9,6 +9,10 @@ PyTorch and HuggingFace Transformers, allowing for quick experimentation.
 
 # ruff: noqa
 
+from llmcompressor._torch_accelerator_compat import ensure_torch_accelerator
+
+ensure_torch_accelerator()
+
 from ._version import __version__, version
 from .logger import LoggerConfig, configure_logger, logger
 

@@ -24,6 +24,10 @@ from compressed_tensors.utils import (
 from loguru import logger
 from pydantic import PrivateAttr
 
+from llmcompressor._torch_accelerator_compat import (
+    accelerator_is_available,
+    current_accelerator_type,
+)
 from llmcompressor.core import Event, EventType, State
 from llmcompressor.modifiers import Modifier
 from llmcompressor.modifiers.quantization.calibration import apply_calibration_status
@@ -352,8 +356,8 @@ class AutoRoundModifier(Modifier, QuantizationMixin):
         if torch.distributed.is_initialized():
             rank = torch.distributed.get_rank()
             ar_kwargs["device_map"] = (
-                f"{torch.accelerator.current_accelerator().type}:{rank}"
-                if torch.accelerator.is_available()
+                f"{current_accelerator_type()}:{rank}"
+                if accelerator_is_available()
                 else "cpu"
             )
 

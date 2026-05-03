@@ -12,6 +12,11 @@ import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 from tqdm import tqdm
 
+from llmcompressor._torch_accelerator_compat import (
+    accelerator_is_available,
+    current_accelerator_type,
+)
+
 
 @dataclass
 class IntermediateValue:
@@ -274,9 +279,9 @@ class IntermediatesCache:
                 non_blocking = (
                     value.is_pinned()
                     and device is not None
-                    and torch.accelerator.is_available()
+                    and accelerator_is_available()
                     and torch.device(device).type
-                    == torch.accelerator.current_accelerator().type
+                    == current_accelerator_type()
                 )
                 return value.to(device=device, non_blocking=non_blocking)
             case list():
@@ -325,7 +330,7 @@ class IntermediatesCache:
                             # pin CPU tensors so onload can use non_blocking DMA
                             if (
                                 torch.device(offload_device).type == "cpu"
-                                and torch.accelerator.is_available()
+                                and accelerator_is_available()
                                 and not offloaded.is_pinned()
                                 and not torch.mps.is_available()  # pinning not supported on MPS
                             ):
