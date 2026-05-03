@@ -76,6 +76,19 @@ Please refer to [compression_schemes.md](./docs/guides/compression_schemes.md) f
 pip install llmcompressor
 ```
 
+For environments that need `torch<2.10`, install the compatibility extra:
+
+```bash
+pip install ".[torch25-compat]"
+```
+
+This compatibility path targets `torch>=2.5.1,<2.10` and
+`compressed-tensors==0.15.1a20260409`.
+
+This extra is currently defined in the source tree. Until a release containing it is
+published, `pip install "llmcompressor[torch25-compat]"` will resolve against the
+latest PyPI metadata instead of your local checkout.
+
 ## Get Started
 
 ### End-to-End Examples

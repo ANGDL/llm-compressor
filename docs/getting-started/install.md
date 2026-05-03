@@ -26,6 +26,20 @@ pip install llmcompressor
 
 This will install the latest stable release of LLM Compressor.
 
+If you need compatibility with `torch<2.10`, install from a local clone with the
+compatibility extra to pin the matching `compressed-tensors` line:
+
+```bash
+pip install ".[torch25-compat]"
+```
+
+The `torch25-compat` extra targets `torch>=2.5.1,<2.10` together with
+`compressed-tensors==0.15.1a20260409`.
+
+Until a release containing this extra is published, installing by package name with
+`pip install "llmcompressor[torch25-compat]"` will use the published PyPI metadata
+instead of the local source tree.
+
 ### Install a Specific Version from PyPI
 
 If you need a specific version of LLM Compressor, you can specify the version number during installation:
@@ -54,10 +68,22 @@ If you have cloned the LLM Compressor repository locally and want to install it,
 pip install .
 ```
 
+For the low-version Torch compatibility path from a local clone, use:
+
+```bash
+pip install ".[torch25-compat]"
+```
+
 For development purposes, you can install it in editable mode with the `dev` extra:
 
 ```bash
 pip install -e .[dev]
+```
+
+To combine editable installs with the compatibility path, use:
+
+```bash
+pip install -e ".[dev,torch25-compat]"
 ```
 
 This allows you to make changes to the source code and have them reflected immediately without reinstalling.

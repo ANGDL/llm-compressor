@@ -4,6 +4,10 @@ from typing import Mapping, TypeVar
 
 import torch
 from compressed_tensors.utils.match import match_name
+from llmcompressor._torch_accelerator_compat import (
+    accelerator_is_available,
+    current_accelerator_type,
+)
 from loguru import logger
 
 __all__ = [
@@ -22,8 +26,8 @@ def gpu_if_available(device: torch.device | str | None) -> torch.device:
     if device is not None:
         return torch.device(device)
 
-    elif torch.accelerator.is_available():
-        accel_type = torch.accelerator.current_accelerator().type
+    elif accelerator_is_available():
+        accel_type = current_accelerator_type()
         return torch.device(accel_type, 0)
 
     else:

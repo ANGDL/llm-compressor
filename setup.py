@@ -13,6 +13,15 @@ if BUILD_TYPE not in VALID_BUILD_TYPES:
         f"Unsupported build type {BUILD_TYPE!r}, must be one of {VALID_BUILD_TYPES}"
     )
 
+TORCH_REQUIREMENT = (
+    "torch>=2.5.1,<=2.11.0" if BUILD_TYPE == "release" else "torch>=2.5.1"
+)
+COMPRESSED_TENSORS_REQUIREMENT = (
+    "compressed-tensors>=0.14.0,<=0.15.1a2"
+    if BUILD_TYPE == "release"
+    else "compressed-tensors>=0.14.0"
+)
+
 
 def version_func(version: ScmVersion) -> str:
     from setuptools_scm.version import guess_next_version
@@ -121,7 +130,7 @@ setup(
             else "requests>=2.32.2"
         ),
         ("tqdm>=4.66.3,<=4.67.3" if BUILD_TYPE == "release" else "tqdm>=4.66.3"),
-        ("torch>=2.10.0,<=2.11.0" if BUILD_TYPE == "release" else "torch>=2.10.0"),
+        TORCH_REQUIREMENT,
         (
             "transformers>=4.56.1,<=4.57.6"
             if BUILD_TYPE == "release"
@@ -144,11 +153,7 @@ setup(
             else "nvidia-ml-py>=12.560.30"
         ),
         ("pillow>=10.4.0,<=12.1.1" if BUILD_TYPE == "release" else "pillow>=10.4.0"),
-        (
-            "compressed-tensors==0.14.0"
-            if BUILD_TYPE == "release"
-            else "compressed-tensors>=0.15.1a2"
-        ),
+        COMPRESSED_TENSORS_REQUIREMENT,
     ],
     extras_require={
         "dev": [
@@ -179,6 +184,10 @@ setup(
         ],
         "qwen": [
             "qwen_vl_utils",
+        ],
+        "torch25-compat": [
+            "torch>=2.5.1,<2.10",
+            "compressed-tensors==0.15.1a20260409",
         ],
     },
     entry_points={

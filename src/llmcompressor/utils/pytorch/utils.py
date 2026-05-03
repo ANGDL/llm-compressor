@@ -1,7 +1,10 @@
 import gc
 
-import torch
 from compressed_tensors.utils import deprecated
+from llmcompressor._torch_accelerator_compat import (
+    accelerator_max_memory_allocated,
+    accelerator_reset_peak_memory_stats,
+)
 
 __all__ = ["measure_accelerator_memory", "measure_cuda_memory"]
 
@@ -11,17 +14,17 @@ class measure_accelerator_memory:
         self.device = device
 
     def reset_peak_memory_stats(self):
-        torch.accelerator.reset_peak_memory_stats(self.device)
+        accelerator_reset_peak_memory_stats(self.device)
 
     def current_memory_usage(self) -> float:
         # Return the memory usage in bytes.
         self.reset_peak_memory_stats()
-        mem = torch.accelerator.max_memory_allocated(self.device)
+        mem = accelerator_max_memory_allocated(self.device)
         return mem
 
     def peak_memory_usage(self) -> float:
         # Return the peak memory usage in bytes since the last reset
-        mem = torch.accelerator.max_memory_allocated(self.device)
+        mem = accelerator_max_memory_allocated(self.device)
         return mem
 
     def __enter__(self):

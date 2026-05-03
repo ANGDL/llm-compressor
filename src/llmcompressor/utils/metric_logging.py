@@ -10,6 +10,13 @@ from typing import Iterable, Optional
 
 import torch
 from compressed_tensors.offload import is_distributed
+from llmcompressor._torch_accelerator_compat import (
+    accelerator_device_count,
+    accelerator_get_memory_info,
+    accelerator_is_available,
+    accelerator_max_memory_allocated,
+    current_device_index,
+)
 from loguru import logger
 
 __all__ = ["CompressionLogger"]
@@ -48,12 +55,14 @@ class CompressionLogger:
         if self._loss is not None:
             patch.log("METRIC", f"error {self._loss:.2f}")
 
-        if not torch.accelerator.is_available() or torch.mps.is_available():
+        if not accelerator_is_available() or torch.mps.is_available():
             return
 
         for device_id in _get_visible_devices():
-            used_memory = torch.accelerator.max_memory_allocated(device_id) / 1e9
-            max_memory = torch.accelerator.get_memory_info(device_id)[1] / 1e9
+            used_memory = accelerator_max_memory_allocated(device_id) / 1e9
+            max_memory = accelerator_get_memory_info(device_id)[1] / 1e9
+            if max_memory == 0:
+                continue
             perc_used = 100 * used_memory / max_memory
             patch.log(
                 "METRIC",
@@ -66,7 +75,7 @@ class CompressionLogger:
 
 def _get_visible_devices() -> Iterable:
     if is_distributed():
-        return [torch.accelerator.current_device_index()]
+        return [current_device_index()]
 
     else:
-        return range(torch.accelerator.device_count())
+        return range(accelerator_device_count())

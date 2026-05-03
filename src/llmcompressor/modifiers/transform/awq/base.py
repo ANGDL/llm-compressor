@@ -25,6 +25,7 @@ from torch.nn import Module
 from torch.utils._pytree import tree_leaves
 from tqdm import tqdm
 
+from llmcompressor._torch_accelerator_compat import accelerator_device
 from llmcompressor.core import Event, EventType, State, active_session
 from llmcompressor.modifiers import Modifier
 from llmcompressor.modifiers.quantization.calibration import (
@@ -1064,10 +1065,7 @@ def get_lowest_common_ancestor_with_avoid(
 
 def _allreduce_data_sum(data: list[torch.Tensor]) -> list[torch.Tensor]:
     # needs to be on device to broadcast
-    device = torch.device(
-        torch.accelerator.current_accelerator().type,
-        torch.accelerator.current_device_index(),
-    )
+    device = accelerator_device()
     data = [datum.to(device) for datum in data]
 
     pending_comms = []

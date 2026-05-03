@@ -9,6 +9,10 @@ import torch
 from compressed_tensors.offload import dispatch_model
 from compressed_tensors.utils import deprecated, patch_attr
 from huggingface_hub import snapshot_download
+from llmcompressor._torch_accelerator_compat import (
+    accelerator_is_available,
+    current_accelerator_type,
+)
 from loguru import logger
 from safetensors.torch import save_file
 from transformers import AutoModelForCausalLM, PreTrainedModel
@@ -166,8 +170,8 @@ def get_main_device() -> torch.device:
             raise RuntimeError("Parallelism has not been supported for MPS")
         return torch.device("mps")
 
-    elif torch.accelerator.is_available():
-        accel_type = torch.accelerator.current_accelerator().type
+    elif accelerator_is_available():
+        accel_type = current_accelerator_type()
         return torch.device(accel_type, rank)
     else:
         logger.warning("No accelerator available! Compressing model on CPU instead")

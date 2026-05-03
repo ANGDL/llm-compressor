@@ -20,6 +20,7 @@ from torch.utils.data import DataLoader, RandomSampler, Sampler
 from transformers.data import DataCollatorWithPadding, default_data_collator
 
 from llmcompressor.args import DatasetArguments
+from llmcompressor._torch_accelerator_compat import accelerator_is_available
 from llmcompressor.transformers.data import TextGenerationDataset
 from llmcompressor.typing import Processor
 
@@ -138,7 +139,7 @@ def format_calibration_data(
     # Pin memory only when using workers (saves RAM for low-memory users when
     # num_workers=0; when num_workers>0, pin_memory speeds CPU->GPU transfer)
     num_workers = args.dataloader_num_workers
-    pin_memory = torch.accelerator.is_available() and num_workers > 0
+    pin_memory = accelerator_is_available() and num_workers > 0
     # persistent_workers avoids worker respawn between epochs (only when
     # num_workers > 0). prefetch_factor is left at DataLoader default (2).
     kwargs: dict[str, Any] = {}
