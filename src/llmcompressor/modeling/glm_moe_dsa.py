@@ -164,6 +164,6 @@ class SequentialGlmMoeDsaExperts(torch.nn.ModuleList):
 
                 gate_proj, up_proj = gate_up.chunk(2, dim=0)
 
-                self[i].gate_proj.weight.copy_(gate_proj.contiguous())
-                self[i].up_proj.weight.copy_(up_proj.contiguous())
-                self[i].down_proj.weight.copy_(down.contiguous())
+                self[i].gate_proj.weight.data = gate_proj.contiguous()
+                self[i].up_proj.weight.data = up_proj.contiguous()
+                self[i].down_proj.weight.data = down.contiguous()
