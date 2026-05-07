@@ -678,7 +678,7 @@ class Expert(nn.Module):
         )
 
 
-class MoE(nn.Module):
+class DeepseekV32MoE(nn.Module):
     """
     Mixture-of-Experts (MoE) module.
 
@@ -778,7 +778,7 @@ class Block(nn.Module):
         self.mlp = (
             MLP(args.dim, args.inter_dim)
             if layer_id < args.n_dense_layers
-            else MoE(args)
+            else DeepseekV32MoE(args)
         )
         self.input_layernorm = RMSNorm(args.dim)
         self.post_attention_layernorm = RMSNorm(args.dim)
