@@ -546,7 +546,7 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
                 args: tuple[torch.Tensor, ...],
                 _output: torch.Tensor,
             ):
-                activations = args[0].abs().detach()
+                activations = args[0].detach()
 
                 # Get loss mask for current batch from state
                 session = active_session()
@@ -571,21 +571,27 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
                         f"No activations cached for {smooth_name} in batch {batch_idx}."
                     )
                     return
+
+                stat_activations = (
+                    cached_activations
+                    if self.activation_scale_type == "minmax"
+                    else cached_activations.abs()
+                )
                 
                 match self.activation_scale_type:
                     case "max":
                         self._smooth_activation_scales[smooth_name] = _accumulate_max(
-                            cached_activations,
+                            stat_activations,
                             self._smooth_activation_scales.get(smooth_name, None),
                         )
                     case "minmax":
                         self._smooth_activation_scales[smooth_name] = _minmax(
-                            cached_activations,
+                            stat_activations,
                             self._smooth_activation_scales.get(smooth_name, None),
                         )
                     case _:
                         self._smooth_activation_scales[smooth_name] = _accumulate_mean(
-                            cached_activations,
+                            stat_activations,
                             self._smooth_activation_scales.get(smooth_name, None),
                         )
 
