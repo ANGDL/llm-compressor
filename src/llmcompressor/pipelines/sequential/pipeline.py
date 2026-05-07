@@ -1,8 +1,8 @@
 import contextlib
-from typing import TYPE_CHECKING, Iterator
+from typing import TYPE_CHECKING, Any, Iterator, Sequence, cast
 
 import torch
-from compressed_tensors.utils import disable_offloading
+from compressed_tensors.offload import disable_offloading, set_onload_device
 from torch.utils.data.dataloader import DataLoader
 from tqdm import tqdm
 
@@ -11,7 +11,6 @@ from llmcompressor.modifiers.utils.hooks import HooksMixin
 from llmcompressor.pipelines.cache import IntermediatesCache
 from llmcompressor.pipelines.registry import CalibrationPipeline
 from llmcompressor.pipelines.sequential.helpers import (
-    dispatch_for_sequential,
     handle_sequential_oom,
     trace_subgraphs,
 )
@@ -32,7 +31,7 @@ __all__ = ["SequentialPipeline"]
 def _get_batches(
     activations: IntermediatesCache,
     num_batches: int,
-    input_names: list[str],
+    input_names: Sequence[str],
     desc: str,
     sequential_prefetch: bool = False,
 ) -> Iterator[tuple[int, dict]]:
@@ -42,6 +41,7 @@ def _get_batches(
     main-thread forward pass. Delegates to
     :meth:`IntermediatesCache.iter_prefetch` when prefetching is enabled.
     """
+    input_names = list(input_names)
     batch_source = (
         activations.iter_prefetch(input_names)
         if sequential_prefetch
@@ -89,7 +89,7 @@ class SequentialPipeline(CalibrationPipeline):
         # prepare model for sequential onloading
         onload_device = get_main_device()
         offload_device = torch.device(dataset_args.sequential_offload_device)
-        dispatch_for_sequential(model, onload_device)
+        set_onload_device(model, onload_device)
 
         # prepare to trace subgraphs
         sequential_targets = infer_sequential_targets(
@@ -100,9 +100,9 @@ class SequentialPipeline(CalibrationPipeline):
         # trace subgraphs
         sample_input = next(iter(dataloader))
         subgraphs = trace_subgraphs(
-            model,
+            cast(Any, model),
             sample_input,
-            sequential_targets,
+            cast(list[str], sequential_targets),
             ignore,
             dataset_args.sequential_targets_per_subgraph,
         )
@@ -115,12 +115,12 @@ class SequentialPipeline(CalibrationPipeline):
         disable_qac = any(
             type(mod).__name__ in DISABLE_QAC_MODIFIERS
             for mod in session.lifecycle.recipe.modifiers
-        )
+        ) or not getattr(dataset_args, "quantization_aware_calibration", True)
 
         with contextlib.ExitStack() as stack:
             stack.enter_context(calibration_forward_context(model))
             # Optionally disable quantization
-            if not dataset_args.quantization_aware_calibration or disable_qac:
+            if disable_qac:
                 stack.enter_context(DisableQuantization(model))
 
             # prepare intermediates cache
@@ -131,10 +131,11 @@ class SequentialPipeline(CalibrationPipeline):
             # Populate loss_masks once from cached activations for AWQ masking support
             use_loss_mask = getattr(dataset_args, "use_loss_mask", False)
             if use_loss_mask:
-                session.state.loss_masks = [
+                loss_masks = [
                     activations.fetch(batch_idx, ["loss_mask"]).get("loss_mask")
                     for batch_idx in range(len(dataloader))
                 ]
+                session.state.loss_masks = cast(list[torch.Tensor], loss_masks)
             else:
                 session.state.loss_masks = None
 
@@ -156,6 +157,8 @@ class SequentialPipeline(CalibrationPipeline):
                 # prepare tqdm description texts
                 calib_desc = f"({subgraph_index + 1}/{num_subgraphs}): Calibrating"
                 prop_desc = f"({subgraph_index + 1}/{num_subgraphs}): Propagating"
+                input_names = list(subgraph.input_names)
+                consumed_names = list(subgraph.consumed_names)
 
                 # reduce memory movement by keeping modules onloaded
                 num_batches = len(dataloader)
@@ -164,31 +167,40 @@ class SequentialPipeline(CalibrationPipeline):
                     for batch_idx, inputs in _get_batches(
                         activations,
                         num_batches,
-                        subgraph.input_names,
+                        input_names,
                         calib_desc,
                         sequential_prefetch,
                     ):
-                        inputs = _materialize_meta_tensors(inputs)
+                        inputs = cast(dict[str, Any], _materialize_meta_tensors(inputs))
                         session.state.current_batch_idx = batch_idx
-                        subgraph.forward(model, **inputs)
+                        outputs = subgraph.forward(model, **inputs)
 
-                    LifecycleCallbacks.sequential_epoch_end(subgraph)
-
-                    # this pass does not trigger modifier hooks
-                    # and is only used for capturing outputs of newly compressed modules
-                    with HooksMixin.disable_hooks():
-                        for batch_idx, inputs in _get_batches(
-                            activations,
-                            num_batches,
-                            subgraph.input_names,
-                            prop_desc,
-                            sequential_prefetch,
-                        ):
-                            inputs = _materialize_meta_tensors(inputs)
-                            output = subgraph.forward(model, **inputs)
+                        if not dataset_args.propagate_error:
                             if subgraph_index < num_subgraphs - 1:
-                                activations.update(batch_idx, output)
-                                activations.delete(batch_idx, subgraph.consumed_names)
+                                activations.update(batch_idx, outputs)
+                                activations.delete(batch_idx, consumed_names)
+
+                    modules = list(subgraph.submodules(model))
+                    LifecycleCallbacks.sequential_epoch_end(modules)
+
+                    if dataset_args.propagate_error:
+                        # this pass does not trigger modifier hooks
+                        # and is only used for capturing outputs of compressed modules
+                        with HooksMixin.disable_hooks():
+                            for batch_idx, inputs in _get_batches(
+                                activations,
+                                num_batches,
+                                input_names,
+                                prop_desc,
+                                sequential_prefetch,
+                            ):
+                                inputs = cast(dict[str, Any], _materialize_meta_tensors(inputs))
+                                output = subgraph.forward(model, **inputs)
+                                if subgraph_index < num_subgraphs - 1:
+                                    activations.update(batch_idx, output)
+                                    activations.delete(
+                                        batch_idx, consumed_names
+                                    )
 
             # redundant, finish any remaining compression
             LifecycleCallbacks.calibration_epoch_end()
