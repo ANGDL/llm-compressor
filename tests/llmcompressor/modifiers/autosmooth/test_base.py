@@ -357,6 +357,35 @@ def test_compute_best_scale_preserves_existing_weight_scale(monkeypatch):
 
 
 @pytest.mark.unit
+def test_setup_activation_cache_hooks_uses_signed_values_for_minmax():
+    parent = torch.nn.Linear(2, 2, bias=False)
+    mapping = ResolvedMapping(
+        smooth_name="toy.smooth",
+        smooth_layer=torch.nn.LayerNorm(2),
+        balance_layers=[parent],
+        balance_names=["toy.balance"],
+        parent=parent,
+        parent_name="toy.parent",
+    )
+
+    modifier = AutoSmoothModifier(activation_scale_type="minmax")
+    modifier.offload_device = None
+    modifier._resolved_mappings = [mapping]
+
+    modifier._setup_activation_cache_hooks()
+    try:
+        parent(torch.tensor([[-3.0, 2.0], [1.0, -4.0]]))
+    finally:
+        modifier.remove_hooks()
+
+    (min_vals, max_vals), count = modifier._smooth_activation_scales[mapping.smooth_name]
+
+    assert count == 2
+    assert torch.equal(min_vals, torch.tensor([-3.0, -4.0]))
+    assert torch.equal(max_vals, torch.tensor([1.0, 2.0]))
+
+
+@pytest.mark.unit
 def test_log_error_metrics_handles_empty_metrics():
     modifier = AutoSmoothModifier()
     modifier._error_metrics = []
