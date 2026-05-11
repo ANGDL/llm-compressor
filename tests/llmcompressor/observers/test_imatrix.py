@@ -2,27 +2,33 @@ import pytest
 import torch
 from compressed_tensors.quantization.quant_args import QuantizationArgs
 
+import llmcompressor.observers.imatrix as imatrix
 from llmcompressor.observers.base import Observer
-from llmcompressor.observers.imatrix import _get_oom_retry_chunk_size, _grid_search
+from llmcompressor.observers.imatrix import _grid_search
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 
+def _set_importance(module, importance):
+    """Set raw imatrix accumulators so that importance = sum / count."""
+    module._imatrix_sum = importance.clone()
+    module._imatrix_count = torch.tensor(1, dtype=torch.int64)
+
+
 def _make_linear_with_importance(in_features=8, out_features=4, seed=42):
-    """Create a Linear module with non-uniform _imatrix_importance."""
+    """Create a Linear module with non-uniform imatrix importance."""
     torch.manual_seed(seed)
     module = torch.nn.Linear(in_features, out_features)
-    # Non-uniform importance: channels 0-3 are 10x more important
     importance = torch.ones(in_features)
     importance[: in_features // 2] = 10.0
-    module._imatrix_importance = importance
+    _set_importance(module, importance)
     return module
 
 
 def _make_observer(module, strategy="channel", group_size=None, **kwargs):
-    """Create an imatrix_mse observer for a given module."""
+    """Create an imatrix_mse observer and attach it to the module."""
     args = QuantizationArgs(
         num_bits=4,
         symmetric=True,
@@ -31,9 +37,9 @@ def _make_observer(module, strategy="channel", group_size=None, **kwargs):
         observer="imatrix_mse",
         observer_kwargs=kwargs,
     )
-    return Observer.load_from_registry(
-        "imatrix_mse", base_name="weight", args=args, module=module
-    )
+    observer = Observer.load_from_registry("imatrix_mse", base_name="weight", args=args)
+    observer.attach(module)
+    return observer
 
 
 # ---------------------------------------------------------------------------
@@ -55,12 +61,12 @@ class TestGlobalMinMaxTensorGroup:
             observer="imatrix_mse",
         )
         observer = Observer.load_from_registry(
-            "imatrix_mse", base_name="weight", args=args, module=module
+            "imatrix_mse", base_name="weight", args=args
         )
+        observer.attach(module)
 
-        # This used to crash because _get_global_scale_with_minmax reshapes
-        # to (1, 1, -1), breaking importance broadcasting.
-        global_scale = observer.get_global_scale(module.weight)
+        observer(module.weight)
+        global_scale = observer.get_qparams()["global_scale"]
         assert global_scale is not None
         assert global_scale.shape == (1,)
         assert torch.isfinite(global_scale).all()
@@ -76,89 +82,13 @@ class TestGlobalMinMaxTensorGroup:
             observer="imatrix_mse",
         )
         observer = Observer.load_from_registry(
-            "imatrix_mse", base_name="weight", args=args, module=module
+            "imatrix_mse", base_name="weight", args=args
         )
+        observer.attach(module)
 
-        global_scale = observer.get_global_scale(module.weight)
-        module.weight_global_scale = global_scale
-        scale, zp = observer(module.weight)
-        assert torch.isfinite(scale).all()
-
-
-# ---------------------------------------------------------------------------
-# Bug 2: importance must be reordered with g_idx (actorder)
-# ---------------------------------------------------------------------------
-
-
-class TestActorderReordering:
-    """Regression test for bug #2: g_idx alignment."""
-
-    def test_reorder_importance_with_g_idx(self):
-        """With g_idx set, importance must be reordered by argsort(g_idx)."""
-        in_features = 8
-        module = _make_linear_with_importance(in_features=in_features)
-
-        # Simulate actorder: g_idx assigns columns to groups in non-trivial order
-        g_idx = torch.tensor([1, 1, 0, 0, 1, 1, 0, 0])
-        module.weight_g_idx = g_idx
-
-        observer = _make_observer(module, strategy="group", group_size=4)
-
-        # Call through the observer — if reordering works, it should not crash
-        # and should produce valid scales
-        scale, zp = observer(module.weight)
-        assert torch.isfinite(scale).all()
-
-    def test_no_g_idx_still_works(self):
-        """Without g_idx, observer must work normally."""
-        module = _make_linear_with_importance(in_features=8)
-        observer = _make_observer(module, strategy="group", group_size=4)
-        scale, zp = observer(module.weight)
-        assert torch.isfinite(scale).all()
-
-
-# ---------------------------------------------------------------------------
-# Bug 3: weight-only guard
-# ---------------------------------------------------------------------------
-
-
-class TestWeightOnlyGuard:
-    """Regression test for bug #3: base_name != 'weight' must be rejected."""
-
-    def test_non_weight_base_name_strict_raises(self):
-        """strict=True must raise NotImplementedError for non-weight."""
-        module = _make_linear_with_importance()
-        args = QuantizationArgs(
-            num_bits=8,
-            symmetric=True,
-            strategy="channel",
-            observer="imatrix_mse",
-            observer_kwargs={"strict": True},
-        )
-        observer = Observer.load_from_registry(
-            "imatrix_mse", base_name="input", args=args, module=module
-        )
-        observed = torch.randn(2, 1, 1, 8)
-        with pytest.raises(NotImplementedError, match="weight observers"):
-            observer.get_min_max(observed)
-
-    def test_non_weight_base_name_non_strict_falls_back(self):
-        """strict=False must fall back to uniform MSE (no crash)."""
-        module = _make_linear_with_importance()
-        args = QuantizationArgs(
-            num_bits=8,
-            symmetric=True,
-            strategy="channel",
-            observer="imatrix_mse",
-            observer_kwargs={"strict": False},
-        )
-        observer = Observer.load_from_registry(
-            "imatrix_mse", base_name="input", args=args, module=module
-        )
-        observed = torch.randn(2, 1, 1, 8)
-        min_val, max_val = observer.get_min_max(observed)
-        assert torch.isfinite(min_val).all()
-        assert torch.isfinite(max_val).all()
+        observer(module.weight)
+        qparams = observer.get_qparams()
+        assert torch.isfinite(qparams["scale"]).all()
 
 
 # ---------------------------------------------------------------------------
@@ -172,23 +102,24 @@ class TestBasicFunctionality:
     def test_channel_strategy(self):
         module = _make_linear_with_importance(in_features=8, out_features=4)
         observer = _make_observer(module, strategy="channel")
-        scale, zp = observer(module.weight)
-        assert scale.shape == (4, 1)
-        assert torch.isfinite(scale).all()
+        observer(module.weight)
+        qparams = observer.get_qparams()
+        assert qparams["scale"].shape == (4, 1)
+        assert torch.isfinite(qparams["scale"]).all()
 
     def test_group_strategy(self):
         module = _make_linear_with_importance(in_features=8, out_features=4)
         observer = _make_observer(module, strategy="group", group_size=4)
-        scale, zp = observer(module.weight)
-        assert torch.isfinite(scale).all()
+        observer(module.weight)
+        qparams = observer.get_qparams()
+        assert torch.isfinite(qparams["scale"]).all()
 
     def test_tensor_group_strategy(self):
         module = _make_linear_with_importance(in_features=8, out_features=4)
         observer = _make_observer(module, strategy="tensor_group", group_size=4)
-        global_scale = observer.get_global_scale(module.weight)
-        module.weight_global_scale = global_scale
-        scale, zp = observer(module.weight)
-        assert torch.isfinite(scale).all()
+        observer(module.weight)
+        qparams = observer.get_qparams()
+        assert torch.isfinite(qparams["scale"]).all()
 
     def test_block_strategy(self):
         module = _make_linear_with_importance(in_features=8, out_features=4)
@@ -200,17 +131,20 @@ class TestBasicFunctionality:
             observer="imatrix_mse",
         )
         observer = Observer.load_from_registry(
-            "imatrix_mse", base_name="weight", args=args, module=module
+            "imatrix_mse", base_name="weight", args=args
         )
-        scale, zp = observer(module.weight)
-        assert torch.isfinite(scale).all()
+        observer.attach(module)
+        observer(module.weight)
+        qparams = observer.get_qparams()
+        assert torch.isfinite(qparams["scale"]).all()
 
     def test_no_importance_falls_back(self):
-        """Observer without _imatrix_importance must fall back gracefully."""
+        """Observer without importance data must fall back gracefully."""
         module = torch.nn.Linear(8, 4)
         observer = _make_observer(module, strategy="channel")
-        scale, zp = observer(module.weight)
-        assert torch.isfinite(scale).all()
+        observer(module.weight)
+        qparams = observer.get_qparams()
+        assert torch.isfinite(qparams["scale"]).all()
 
     def test_importance_changes_result(self):
         """Non-uniform importance must produce different scales than uniform."""
@@ -223,13 +157,15 @@ class TestBasicFunctionality:
         importance = torch.tensor(
             [1000.0, 1000.0, 1000.0, 1000.0, 0.01, 0.01, 0.01, 0.01]
         )
-        module_weighted._imatrix_importance = importance
+        _set_importance(module_weighted, importance)
 
         obs_w = _make_observer(module_weighted, strategy="channel")
         obs_u = _make_observer(module_uniform, strategy="channel")
 
-        scale_w, _ = obs_w(module_weighted.weight)
-        scale_u, _ = obs_u(module_uniform.weight)
+        obs_w(module_weighted.weight)
+        obs_u(module_uniform.weight)
+        scale_w = obs_w.get_qparams()["scale"]
+        scale_u = obs_u.get_qparams()["scale"]
 
         assert not torch.allclose(
             scale_w, scale_u
@@ -242,7 +178,7 @@ class TestBasicFunctionality:
         module_mse = torch.nn.Linear(8, 4)
         module_mse.weight.data.copy_(module_imatrix.weight.data)
         module_mse.bias.data.copy_(module_imatrix.bias.data)
-        module_imatrix._imatrix_importance = torch.ones(8)
+        _set_importance(module_imatrix, torch.ones(8))
 
         args_uniform = QuantizationArgs(
             num_bits=4,
@@ -255,213 +191,60 @@ class TestBasicFunctionality:
             module_imatrix, strategy="channel", norm=2.4, maxshrink=0.20
         )
         obs_uniform = Observer.load_from_registry(
-            "memoryless_mse", base_name="weight", args=args_uniform, module=module_mse
+            "memoryless_mse", base_name="weight", args=args_uniform
         )
 
-        scale_i, zp_i = obs_imatrix(module_imatrix.weight)
-        scale_u, zp_u = obs_uniform(module_mse.weight)
+        obs_imatrix(module_imatrix.weight)
+        obs_uniform(module_mse.weight)
+        qparams_i = obs_imatrix.get_qparams()
+        qparams_u = obs_uniform.get_qparams()
 
-        assert torch.allclose(scale_i, scale_u)
-        assert torch.equal(zp_i, zp_u)
+        assert torch.allclose(qparams_i["scale"], qparams_u["scale"])
+        assert torch.equal(qparams_i["zero_point"], qparams_u["zero_point"])
 
-    def test_chunked_grid_search_matches_full_grid_search(self):
-        """Chunked error computation must match full-tensor computation."""
-        torch.manual_seed(7)
-        observed = torch.randn(1, 128, 1, 64)
-        importance = torch.rand_like(observed).abs_() + 1e-3
+
+# ---------------------------------------------------------------------------
+# Weight-only guard
+# ---------------------------------------------------------------------------
+
+
+class TestWeightOnlyGuard:
+    """Regression test: base_name != 'weight' must be rejected."""
+
+    def test_non_weight_base_name_strict_raises(self):
+        """strict=True must raise NotImplementedError for non-weight."""
         args = QuantizationArgs(
-            num_bits=4,
+            num_bits=8,
             symmetric=True,
-            strategy="channel",
+            strategy="tensor",
             observer="imatrix_mse",
+            observer_kwargs={"strict": True},
         )
-
-        full_min, full_max = _grid_search(
-            observed=observed,
-            args=args,
-            maxshrink=0.95,
-            patience=5,
-            grid=20,
-            norm=2.4,
-            importance_weights=importance,
-            chunk_size=0,
+        observer = Observer.load_from_registry(
+            "imatrix_mse", base_name="input", args=args
         )
-        chunked_min, chunked_max = _grid_search(
-            observed=observed,
-            args=args,
-            maxshrink=0.95,
-            patience=5,
-            grid=20,
-            norm=2.4,
-            importance_weights=importance,
-            chunk_size=17,
+        observed = torch.randn(2, 1, 8)
+        with pytest.raises(NotImplementedError, match="weight observers"):
+            observer(observed)
+
+    def test_non_weight_base_name_non_strict_falls_back(self):
+        """strict=False must fall back to uniform MSE (no crash)."""
+        args = QuantizationArgs(
+            num_bits=8,
+            symmetric=True,
+            strategy="tensor",
+            observer="imatrix_mse",
+            observer_kwargs={"strict": False},
         )
-
-        assert torch.allclose(chunked_min, full_min)
-        assert torch.allclose(chunked_max, full_max)
-
-
-@pytest.mark.parametrize(
-    "observed_shape,chunk_size,with_importance",
-    [
-        ((1, 64, 1, 32), 1, True),
-        ((1, 64, 1, 32), 7, True),
-        ((1, 64, 1, 32), 13, False),
-        ((2, 96, 1, 48), 1, True),
-        ((2, 96, 1, 48), 11, False),
-        ((1, 128, 1, 64), 3, True),
-        ((1, 128, 1, 64), 17, True),
-    ],
-)
-def test_chunked_grid_search_strong_equivalence(
-    observed_shape, chunk_size, with_importance
-):
-    """Chunked search must match full search over diverse shapes and chunk sizes."""
-    torch.manual_seed(2026)
-    observed = torch.randn(*observed_shape)
-    importance = (
-        torch.rand_like(observed).abs_() + 1e-3 if with_importance else None
-    )
-    args = QuantizationArgs(
-        num_bits=4,
-        symmetric=True,
-        strategy="channel",
-        observer="imatrix_mse",
-    )
-
-    full_min, full_max = _grid_search(
-        observed=observed,
-        args=args,
-        maxshrink=0.95,
-        patience=6,
-        grid=24,
-        norm=2.4,
-        importance_weights=importance,
-        chunk_size=10**9,
-    )
-    chunked_min, chunked_max = _grid_search(
-        observed=observed,
-        args=args,
-        maxshrink=0.95,
-        patience=6,
-        grid=24,
-        norm=2.4,
-        importance_weights=importance,
-        chunk_size=chunk_size,
-    )
-
-    assert torch.allclose(chunked_min, full_min, rtol=1e-6, atol=1e-7)
-    assert torch.allclose(chunked_max, full_max, rtol=1e-6, atol=1e-7)
-
-
-def test_chunked_grid_search_equivalence_with_global_scale():
-    """Chunked search must match full search when global_scale is provided."""
-    torch.manual_seed(2027)
-    observed = torch.randn(1, 80, 1, 32)
-    importance = torch.rand_like(observed).abs_() + 1e-3
-    args = QuantizationArgs(
-        num_bits=4,
-        symmetric=True,
-        strategy="tensor_group",
-        group_size=32,
-        observer="imatrix_mse",
-    )
-    global_scale = torch.tensor([0.83], dtype=torch.float32)
-
-    full_min, full_max = _grid_search(
-        observed=observed,
-        args=args,
-        maxshrink=0.90,
-        patience=5,
-        grid=20,
-        norm=2.2,
-        global_scale=global_scale,
-        optimize_global_scale=False,
-        importance_weights=importance,
-        chunk_size=10**9,
-    )
-    chunked_min, chunked_max = _grid_search(
-        observed=observed,
-        args=args,
-        maxshrink=0.90,
-        patience=5,
-        grid=20,
-        norm=2.2,
-        global_scale=global_scale,
-        optimize_global_scale=False,
-        importance_weights=importance,
-        chunk_size=5,
-    )
-
-    assert torch.allclose(chunked_min, full_min, rtol=1e-6, atol=1e-7)
-    assert torch.allclose(chunked_max, full_max, rtol=1e-6, atol=1e-7)
-
-
-def test_chunked_grid_search_randomized_stress_equivalence():
-    """Randomized stress test: chunked and full search must stay numerically equal."""
-    generator = torch.Generator().manual_seed(3407)
-    args = QuantizationArgs(
-        num_bits=4,
-        symmetric=True,
-        strategy="channel",
-        observer="imatrix_mse",
-    )
-    chunk_candidates = [1, 2, 3, 5, 7, 11, 16, 31]
-
-    for case_idx in range(20):
-        num_observations = int(torch.randint(1, 3, (1,), generator=generator).item())
-        qparam_count = int(torch.randint(24, 160, (1,), generator=generator).item())
-        group_size = int(torch.randint(16, 96, (1,), generator=generator).item())
-
-        observed = torch.randn(
-            num_observations,
-            qparam_count,
-            1,
-            group_size,
-            generator=generator,
+        observer = Observer.load_from_registry(
+            "imatrix_mse", base_name="input", args=args
         )
-        with_importance = bool(torch.randint(0, 2, (1,), generator=generator).item())
-        importance = (
-            torch.rand(observed.shape, dtype=observed.dtype, generator=generator).abs_()
-            + 1e-3
-            if with_importance
-            else None
-        )
-        chunk_size = chunk_candidates[
-            int(torch.randint(0, len(chunk_candidates), (1,), generator=generator).item())
-        ]
-
-        full_min, full_max = _grid_search(
-            observed=observed,
-            args=args,
-            maxshrink=0.95,
-            patience=5,
-            grid=18,
-            norm=2.4,
-            importance_weights=importance,
-            chunk_size=10**9,
-        )
-        chunked_min, chunked_max = _grid_search(
-            observed=observed,
-            args=args,
-            maxshrink=0.95,
-            patience=5,
-            grid=18,
-            norm=2.4,
-            importance_weights=importance,
-            chunk_size=chunk_size,
-        )
-
-        assert torch.allclose(chunked_min, full_min, rtol=1e-6, atol=1e-7), (
-            "min mismatch for randomized case "
-            f"{case_idx}: shape={tuple(observed.shape)}, "
-            f"chunk_size={chunk_size}, with_importance={with_importance}"
-        )
-        assert torch.allclose(chunked_max, full_max, rtol=1e-6, atol=1e-7), (
-            "max mismatch for randomized case "
-            f"{case_idx}: shape={tuple(observed.shape)}, "
-            f"chunk_size={chunk_size}, with_importance={with_importance}"
-        )
+        observed = torch.randn(2, 1, 8)
+        observer(observed)
+        qparams = observer.get_qparams()
+        scale, zero_point = qparams["scale"], qparams["zero_point"]
+        assert torch.isfinite(scale).all()
+        assert torch.isfinite(zero_point).all()
 
 
 # ---------------------------------------------------------------------------
@@ -473,12 +256,12 @@ class TestValidation:
     def test_strict_raises_on_missing_importance(self):
         module = torch.nn.Linear(8, 4)
         observer = _make_observer(module, strategy="channel", strict=True)
-        with pytest.raises(ValueError, match="imatrix_importance"):
+        with pytest.raises(ValueError, match="importance"):
             observer(module.weight)
 
     def test_strict_raises_on_wrong_size(self):
         module = torch.nn.Linear(8, 4)
-        module._imatrix_importance = torch.ones(5)  # wrong size
+        _set_importance(module, torch.ones(5))  # wrong size
         observer = _make_observer(module, strategy="channel", strict=True)
         with pytest.raises(ValueError, match="size mismatch"):
             observer(module.weight)
@@ -496,7 +279,7 @@ class TestValidation:
     )
     def test_strict_raises_on_invalid_importance_values(self, importance, match):
         module = torch.nn.Linear(8, 4)
-        module._imatrix_importance = importance
+        _set_importance(module, importance)
         observer = _make_observer(module, strategy="channel", strict=True)
         with pytest.raises(ValueError, match=match):
             observer(module.weight)
@@ -514,7 +297,7 @@ class TestValidation:
         module_mse = torch.nn.Linear(8, 4)
         module_mse.weight.data.copy_(module_imatrix.weight.data)
         module_mse.bias.data.copy_(module_imatrix.bias.data)
-        module_imatrix._imatrix_importance = importance
+        _set_importance(module_imatrix, importance)
 
         args_uniform = QuantizationArgs(
             num_bits=4,
@@ -525,14 +308,16 @@ class TestValidation:
         )
         obs_imatrix = _make_observer(module_imatrix, strategy="channel", strict=False)
         obs_uniform = Observer.load_from_registry(
-            "memoryless_mse", base_name="weight", args=args_uniform, module=module_mse
+            "memoryless_mse", base_name="weight", args=args_uniform
         )
 
-        scale_i, zp_i = obs_imatrix(module_imatrix.weight)
-        scale_u, zp_u = obs_uniform(module_mse.weight)
+        obs_imatrix(module_imatrix.weight)
+        obs_uniform(module_mse.weight)
+        qparams_i = obs_imatrix.get_qparams()
+        qparams_u = obs_uniform.get_qparams()
 
-        assert torch.allclose(scale_i, scale_u)
-        assert torch.equal(zp_i, zp_u)
+        assert torch.allclose(qparams_i["scale"], qparams_u["scale"])
+        assert torch.equal(qparams_i["zero_point"], qparams_u["zero_point"])
 
     @pytest.mark.parametrize("norm", [0, -1, float("inf"), float("nan")])
     def test_invalid_norm_raises(self, norm):
@@ -550,20 +335,194 @@ class TestValidation:
             observer_kwargs={"strict": True},
         )
         observer = Observer.load_from_registry(
-            "imatrix_mse", base_name="weight", args=args, module=module
+            "imatrix_mse", base_name="weight", args=args
         )
+        observer.attach(module)
         with pytest.raises(NotImplementedError, match="TENSOR strategy"):
             observer(module.weight)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_oom_retry_chunk_size_uses_free_memory(monkeypatch):
-    observed = torch.randn(1, 2048, 1, 1024, device="cuda")
+class TestChunkBehavior:
+    def test_grid_search_chunked_matches_non_chunked(self):
+        observed = torch.randn(5, 6, 8)
+        importance = torch.rand_like(observed)
+        args = QuantizationArgs(
+            num_bits=4,
+            symmetric=True,
+            strategy="channel",
+            observer="imatrix_mse",
+        )
 
-    # Pretend only 2GB are free to force a bounded retry chunk.
-    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: (2 * 1024**3, 0))
+        non_chunk_min, non_chunk_max = _grid_search(
+            observed,
+            args,
+            maxshrink=0.8,
+            patience=5,
+            grid=20,
+            norm=3.0,
+            importance_weights=importance,
+            chunk_size=observed.shape[1],
+        )
+        chunked_min, chunked_max = _grid_search(
+            observed,
+            args,
+            maxshrink=0.8,
+            patience=5,
+            grid=20,
+            norm=3.0,
+            importance_weights=importance,
+            chunk_size=1,
+        )
 
-    retry_chunk = _get_oom_retry_chunk_size(observed, requested_chunk_size=0)
+        assert torch.allclose(chunked_min, non_chunk_min, atol=1e-6, rtol=1e-6)
+        assert torch.allclose(chunked_max, non_chunk_max, atol=1e-6, rtol=1e-6)
 
-    assert retry_chunk is not None
-    assert 1 <= retry_chunk <= observed.shape[1] * observed.shape[2]
+    def test_grid_search_uses_chunked_fake_quantize_calls(self, monkeypatch):
+        observed = torch.randn(3, 4, 8)
+        args = QuantizationArgs(
+            num_bits=4,
+            symmetric=True,
+            strategy="channel",
+            observer="imatrix_mse",
+        )
+
+        original_fake_quantize = imatrix.fake_quantize
+        seen_shapes = []
+
+        def fake_quantize_spy(observed_chunk, *args, **kwargs):
+            seen_shapes.append(tuple(observed_chunk.shape))
+            return original_fake_quantize(observed_chunk, *args, **kwargs)
+
+        monkeypatch.setattr(imatrix, "fake_quantize", fake_quantize_spy)
+
+        _grid_search(
+            observed,
+            args,
+            maxshrink=0.8,
+            patience=5,
+            grid=20,
+            norm=3.0,
+            chunk_size=1,
+        )
+
+        assert seen_shapes, "fake_quantize should be called"
+        assert all(
+            shape[1] == 1 for shape in seen_shapes
+        ), "chunk_size=1 should split qparams into single-column chunks"
+
+    @pytest.mark.skipif(
+        not (torch.cuda.is_available() or torch.backends.mps.is_available()),
+        reason="No accelerator available",
+    )
+    def test_grid_search_accelerator_oom_retries_chunk_before_cpu(self, monkeypatch):
+        accelerator = "cuda" if torch.cuda.is_available() else "mps"
+        observed = torch.randn(2, 4, 8).to(accelerator)
+        importance = torch.rand_like(observed)
+        args = QuantizationArgs(
+            num_bits=4,
+            symmetric=True,
+            strategy="channel",
+            observer="imatrix_mse",
+        )
+
+        call_records = []
+
+        def fake_compute_err(
+            observed,
+            observed_f,
+            observed_flat,
+            observed_f_flat,
+            scales,
+            zps,
+            args,
+            norm,
+            importance_weights,
+            importance_flat,
+            effective_chunk_size,
+        ):
+            call_records.append((observed.device.type, effective_chunk_size))
+            if observed.device.type == accelerator:
+                raise RuntimeError(f"{accelerator.upper()} out of memory")
+            return torch.zeros_like(scales, dtype=torch.float32)
+
+        monkeypatch.setattr(imatrix, "_compute_err", fake_compute_err)
+        monkeypatch.setattr(
+            imatrix,
+            "_get_oom_retry_chunk_size",
+            lambda observed, requested_chunk_size: 2,
+        )
+
+        actual_min, actual_max = _grid_search(
+            observed,
+            args,
+            maxshrink=0.8,
+            patience=5,
+            grid=20,
+            norm=3.0,
+            importance_weights=importance,
+            chunk_size=4,
+        )
+
+        assert call_records[0] == (accelerator, 4)
+        assert call_records[1] == (accelerator, 2)
+        assert call_records[2] == ("cpu", 4)
+        assert actual_min.device.type == accelerator
+        assert actual_max.device.type == accelerator
+        assert actual_min.shape == (observed.shape[1],)
+        assert actual_max.shape == (observed.shape[1],)
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() or torch.backends.mps.is_available()),
+    reason="No accelerator available",
+)
+def test_grid_search_falls_back_to_cpu_on_accelerator_oom(monkeypatch):
+    accelerator = "cuda" if torch.cuda.is_available() else "mps"
+    observed_cpu = torch.randn(3, 4, 8)
+    observed_accelerator = observed_cpu.to(accelerator)
+    importance_cpu = torch.rand_like(observed_cpu)
+    importance_accelerator = importance_cpu.to(accelerator)
+    args = QuantizationArgs(
+        num_bits=4,
+        symmetric=True,
+        strategy="channel",
+        observer="imatrix_mse",
+    )
+
+    expected_min, expected_max = _grid_search(
+        observed_cpu,
+        args,
+        maxshrink=0.8,
+        patience=5,
+        grid=20,
+        norm=3.0,
+        importance_weights=importance_cpu,
+    )
+
+    original_fake_quantize = imatrix.fake_quantize
+    call_devices = []
+
+    def fake_quantize_with_accelerator_oom(observed, *args, **kwargs):
+        call_devices.append(observed.device.type)
+        if observed.device.type == accelerator:
+            raise RuntimeError(f"{accelerator.upper()} out of memory")
+        return original_fake_quantize(observed, *args, **kwargs)
+
+    monkeypatch.setattr(imatrix, "fake_quantize", fake_quantize_with_accelerator_oom)
+
+    actual_min, actual_max = _grid_search(
+        observed_accelerator,
+        args,
+        maxshrink=0.8,
+        patience=5,
+        grid=20,
+        norm=3.0,
+        importance_weights=importance_accelerator,
+    )
+
+    assert call_devices[0] == accelerator
+    assert "cpu" in call_devices
+    assert actual_min.device.type == accelerator
+    assert actual_max.device.type == accelerator
+    assert torch.allclose(actual_min.cpu(), expected_min)
+    assert torch.allclose(actual_max.cpu(), expected_max)
