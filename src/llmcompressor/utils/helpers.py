@@ -23,7 +23,6 @@ __all__ = [
     "disable_hf_kernels",
     "calibration_forward_context",
     "disable_lm_head",
-    "DISABLE_QAC_MODIFIERS",
 ]
 
 
@@ -196,10 +195,4 @@ def disable_lm_head(model: torch.nn.Module):
             if hasattr(model, "_hf_hook"):
                 stack.enter_context(patch_attr(model._hf_hook, "io_same_device", False))
 
-            try:
-                yield
-            finally:
-                lm_head.apply(enable_quantization)
-
-
-DISABLE_QAC_MODIFIERS = ["GPTQModifier", "AWQModifier", "AutoRoundModifier", 'AutoSmoothModifier']
+            yield

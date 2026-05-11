@@ -4,6 +4,7 @@ from copy import deepcopy
 from collections import OrderedDict
 
 import torch
+from compressed_tensors.offload.dist_utils import is_source_process as is_src
 from compressed_tensors.modeling.kvcache import QuantizedKVCache
 from compressed_tensors.quantization import (
     QuantizationArgs,
@@ -46,15 +47,14 @@ from llmcompressor.modifiers.transform.awq.dynamic_mappings import (
     get_layer_mappings_from_model,
 )
 from llmcompressor.modifiers.quantization.calibration import (
-    call_observer,
-    update_weight_global_scale,
-    update_weight_zp_scale,
+    observe,
+    update_qparams,
 )
 from llmcompressor.modifiers.quantization.quantization import QuantizationMixin
-from llmcompressor.modifiers.utils import update_fused_layer_weight_global_scales
 from llmcompressor.modifiers.utils.hooks import HooksMixin
 from llmcompressor.modifiers.utils.pytorch_helpers import is_moe_model
 from llmcompressor.observers.base import Observer
+from llmcompressor.observers.helpers import fuse_weight_observers
 from llmcompressor.pipelines.cache import IntermediatesCache
 from llmcompressor.sentinel import Sentinel
 from llmcompressor.utils.dev import get_high_precision
@@ -82,6 +82,15 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
     in one-shot and not during training. Activation ranges are determined by running a
     small set of calibration data through the model.
 
+    AutoSmoothModifier follows the same core smoothing flow as AWQModifier: it
+    resolves mappings, caches activations, performs a grid search for per-channel
+    scales, and applies the resulting smoothing transform to the model weights.
+    Compared with AWQModifier, AutoSmooth adds support for multiple activation-scale
+    statistics (mean, max, minmax) and keeps its quantization target selection
+    independent from mapping resolution so layers can be excluded from quantization
+    via ``ignore`` without preventing required balance layers from participating in
+    smoothing statistics.
+
     example recipe:
     ```yaml
     AutoSmoothModifier:
@@ -107,22 +116,28 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
 
     Lifecycle:
 
+    The smoothing lifecycle matches AWQModifier at a high level, with additional
+    quantization setup/cleanup because AutoSmooth can own its quantization config.
+
     - on_initialize
+        - apply quantization config for AutoSmooth targets
         - resolve mappings
-        - capture kwargs needed for forward passes into modules
+        - snapshot target modules and weight qargs for later grid search
     - on_start
+        - attach quantization observers/calibration hooks
         - set up activation cache hooks to capture input activations
             to balance layers
     - on sequential epoch end
+        - sync observer activation statistics
+        - update activation qparams
         - apply smoothing to each smoothing layer
             - consume cached activations across all batches
                 - clear cached activations as they are used
             - find best smoothing scale for each smoothing layer
             - apply to model weights
-            - raise error if any unused activations remain
+        - observe smoothed weights and update weight qparams
     - on_end
-        - re-run logic of sequential epoch end (in case of basic pipeline)
-        - set scales and zero points
+        - remove quantization calibration hooks and observers
         - remove activation hooks
     - on_finalize
         - clear resolved mappings and captured activations
@@ -135,8 +150,10 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
         achieve the smoothing.
         If regex is used, it matches layers with the largest overlap in module name.
     :param ignore: list of layers to ignore during quantization (not smoothed).
-        It should match the name of layers whose outputs are scaled to achieve
-        smoothing (the second entry of the mappings list).
+        This ignore list only controls which layers AutoSmooth quantizes. Mapping
+        resolution still considers non-ignored balance layers so smoothing can use
+        the required activation statistics even when those layers should not receive
+        quantization config from AutoSmooth.
     :param scheme: a single quantization scheme to apply to the model. This is a
         dictionary that supports all keys from QuantizationScheme except targets, which
         will be set to the targets parameter set at the modifier level. Can also be set
@@ -324,7 +341,6 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
                 else:
                     qargs = deepcopy(qargs)
                 self._autosmooth_weight_qargs[module] = qargs
-                delattr(module, "quantization_scheme")
 
     def on_start(self, state: State, event: Event, **kwargs):
         self.started_ = True
@@ -357,40 +373,31 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
                 self.on_start(state, None)
 
         elif event.type_ == EventType.SEQUENTIAL_EPOCH_END:
-            # Run smoothing in case of sequential pipeline
-            QuantizationMixin.sync_activation_observers(self, state.model)
+            self.sync_obs_act_stats(state.model)
+            self.update_activation_qparams(state.model)
             self._apply_smoothing(state.model)
+
+            named_modules = list(
+                match_named_modules(state.model, self.resolved_targets, self.ignore)
+            )
+            observe([module for _, module in named_modules], "weight")
+            update_qparams(
+                [module for _, module in named_modules],
+                "weight",
+                only_update_onload=not is_src(),
+            )
 
         elif event.type_ == EventType.CALIBRATION_EPOCH_END:
-            # Run smoothing in case of basic pipeline
-            QuantizationMixin.sync_activation_observers(self, state.model)
-            self._apply_smoothing(state.model)
-
             if not self.ended_:
                 self.on_end(state, None)
 
     def on_end(self, state: State, event: Event, **kwargs):
         """
-        removing observers and calibration hooks
+        Finish calibration by removing quantization observers/hooks and
+        AutoSmooth activation hooks.
         """
         self._assert_all_activations_consumed()
         self.ended_ = True
-
-        named_modules = list(
-            match_named_modules(state.model, self.resolved_targets, self.ignore)
-        )
-
-        # For TENSOR_GROUP (nvfp4), calculate global scales after smoothing.
-        for _, module in tqdm(named_modules, desc="Updating global scales"):
-            update_weight_global_scale(module)
-
-        # For TENSOR_GROUP (nvfp4), fuse global scales for attention and MLP layers.
-        for module in tqdm(state.model.modules(), desc="Fusing global scales"):
-            update_fused_layer_weight_global_scales(module)
-
-        # Calculate scales and zero points using the fused global scales.
-        for _, module in tqdm(named_modules, desc="Calibrating weights"):
-            update_weight_zp_scale(module)
 
         QuantizationMixin.end_calibration(self, state.model)
 
@@ -880,15 +887,17 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
                     "memoryless_minmax",
                     base_name="weight",
                     args=w_qscheme,
-                    module=balance_layer,
                 )
                 for balance_layer, _, w_qscheme in balance_layers_to_patch
             ],
         ):
             # Ensure required qparams exist before observer updates in grid search.
             for balance_layer, _, w_qscheme in balance_layers_to_patch:
+                observe(balance_layer, "weight")
                 weight_observer: Observer = getattr(balance_layer, "weight_observer")
-                init_scale, init_zero_point = weight_observer(balance_layer.weight)
+                init_qparams = weight_observer.get_qparams()
+                init_scale = init_qparams["scale"]
+                init_zero_point = init_qparams["zero_point"]
 
                 if not hasattr(balance_layer, "weight_scale"):
                     register_offload_parameter(
@@ -908,12 +917,14 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
                     w_qscheme.strategy == QuantizationStrategy.TENSOR_GROUP
                     and not hasattr(balance_layer, "weight_global_scale")
                 ):
-                    init_global_scale = weight_observer.get_global_scale(balance_layer.weight)
+                    init_global_scale = init_qparams["global_scale"]
                     register_offload_parameter(
                         balance_layer,
                         "weight_global_scale",
                         torch.nn.Parameter(init_global_scale.detach(), requires_grad=False),
                     )
+
+            fuse_weight_observers(mapping.parent)
 
             pbar = tqdm(
                 self._get_grid_search_params(),
@@ -944,16 +955,11 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
                 # Q(W * s)
                 for balance_layer, _, w_qscheme in balance_layers_to_patch:
                     balance_layer.weight.mul_(_scalesview)
-                    # For TENSOR_GROUP (nvfp4), need to calculate global scale
-                    should_calculate_gparam = (
-                        w_qscheme.strategy == QuantizationStrategy.TENSOR_GROUP
-                    )
-                    call_observer(
-                        balance_layer,
-                        "weight",
-                        balance_layer.weight,
-                        should_calculate_gparam=should_calculate_gparam,
-                    )
+
+                    observe(balance_layer, "weight")
+
+                for balance_layer, _, w_qscheme in balance_layers_to_patch:
+                    update_qparams(balance_layer, "weight", only_update_onload=True)
                     update_offload_parameter(
                         balance_layer,
                         "weight",
@@ -965,14 +971,6 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
                         )
                         / _scalesview,
                     )
-
-                # Apply fused global scales for TENSOR_GROUP during grid search
-                # to match inference behavior
-                if balance_layers_to_patch and all(
-                    w_qscheme.strategy == QuantizationStrategy.TENSOR_GROUP
-                    for _, _, w_qscheme in balance_layers_to_patch
-                ):
-                    update_fused_layer_weight_global_scales(mapping.parent)
 
                 # W * X
                 int_w_outputs = self._run_samples(mapping.parent)

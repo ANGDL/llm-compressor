@@ -15,11 +15,7 @@ from llmcompressor.pipelines.sequential.helpers import (
     trace_subgraphs,
 )
 from llmcompressor.utils.dev import get_main_device
-from llmcompressor.utils.helpers import (
-    DISABLE_QAC_MODIFIERS,
-    DisableQuantization,
-    calibration_forward_context,
-)
+from llmcompressor.utils.helpers import DisableQuantization, calibration_forward_context
 from llmcompressor.utils.pytorch.module import infer_sequential_targets
 
 if TYPE_CHECKING:
@@ -110,19 +106,9 @@ class SequentialPipeline(CalibrationPipeline):
 
         LifecycleCallbacks.calibration_epoch_start()
 
-        # TODO: remove this to enable quantization aware calibration
-        # for GPTQ, AWQ and AutoRound.
-        disable_qac = any(
-            type(mod).__name__ in DISABLE_QAC_MODIFIERS
-            for mod in session.lifecycle.recipe.modifiers
-        ) or not getattr(dataset_args, "quantization_aware_calibration", True)
-
         with contextlib.ExitStack() as stack:
             stack.enter_context(calibration_forward_context(model))
-            # Optionally disable quantization
-            if disable_qac:
-                stack.enter_context(DisableQuantization(model))
-
+            stack.enter_context(DisableQuantization(model))
             # prepare intermediates cache
             activations = IntermediatesCache.from_dataloader(
                 dataloader, onload_device, offload_device

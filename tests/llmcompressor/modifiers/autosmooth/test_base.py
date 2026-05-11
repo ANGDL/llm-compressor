@@ -23,13 +23,28 @@ class _ToyParent(torch.nn.Module):
 
 
 class _FakeWeightObserver:
-    def __call__(self, weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        scale = torch.ones(weight.shape[0], device=weight.device, dtype=weight.dtype)
-        zero_point = torch.zeros_like(scale)
-        return scale, zero_point
+    def __init__(self):
+        self.args = type("Args", (), {"dynamic": False})()
+        self._scale = None
+        self._zero_point = None
+        self._global_scale = None
 
-    def get_global_scale(self, weight: torch.Tensor) -> torch.Tensor:
-        return torch.ones(1, device=weight.device, dtype=weight.dtype)
+    @property
+    def has_statistics(self) -> bool:
+        return self._scale is not None
+
+    def __call__(self, weight: torch.Tensor):
+        self._scale = torch.ones(weight.shape[0], device=weight.device, dtype=weight.dtype)
+        self._zero_point = torch.zeros_like(self._scale)
+        self._global_scale = torch.ones(1, device=weight.device, dtype=weight.dtype)
+        return self
+
+    def get_qparams(self):
+        return {
+            "scale": self._scale,
+            "zero_point": self._zero_point,
+            "global_scale": self._global_scale,
+        }
 
 
 @pytest.mark.unit
@@ -108,13 +123,12 @@ def test_compute_best_scale_uses_autosmooth_snapshot_qargs(monkeypatch):
     cache.append({"x": torch.randn(2, 4)})
     modifier._parent_args_cache[parent] = cache
 
-    captured = []
+    captured_qargs = []
 
-    def _fake_load_from_registry(_name, base_name, args, module):
+    def _fake_load_from_registry(_name, base_name, args):
         assert base_name == "weight"
         assert args is not None
-        assert module is parent.quantized_balance
-        captured.append((module, args))
+        captured_qargs.append(args)
         return _FakeWeightObserver()
 
     monkeypatch.setattr(
@@ -122,7 +136,8 @@ def test_compute_best_scale_uses_autosmooth_snapshot_qargs(monkeypatch):
         "load_from_registry",
         staticmethod(_fake_load_from_registry),
     )
-    monkeypatch.setattr(autosmooth_base, "call_observer", lambda *args, **kwargs: None)
+    monkeypatch.setattr(autosmooth_base, "fuse_weight_observers", lambda *args, **kwargs: None)
+    monkeypatch.setattr(autosmooth_base, "update_qparams", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         autosmooth_base,
         "forward_quantize",
@@ -132,9 +147,7 @@ def test_compute_best_scale_uses_autosmooth_snapshot_qargs(monkeypatch):
     fp16_outputs = modifier._run_samples(parent)
     best_scales = modifier._compute_best_scale(mapping, fp16_outputs)
 
-    assert len(captured) == 1
-    assert captured[0][0] is parent.quantized_balance
-    assert captured[0][1] is qargs
+    assert captured_qargs == [qargs]
     assert torch.isfinite(best_scales).all()
 
 
@@ -180,12 +193,12 @@ def test_compute_best_scale_skips_non_targeted_balance_layers(monkeypatch):
     cache.append({"x": torch.randn(2, 4)})
     modifier._parent_args_cache[parent] = cache
 
-    captured_modules = []
+    captured_qargs = []
 
-    def _fake_load_from_registry(_name, base_name, args, module):
+    def _fake_load_from_registry(_name, base_name, args):
         assert base_name == "weight"
         assert args is not None
-        captured_modules.append(module)
+        captured_qargs.append(args)
         return _FakeWeightObserver()
 
     monkeypatch.setattr(
@@ -193,7 +206,8 @@ def test_compute_best_scale_skips_non_targeted_balance_layers(monkeypatch):
         "load_from_registry",
         staticmethod(_fake_load_from_registry),
     )
-    monkeypatch.setattr(autosmooth_base, "call_observer", lambda *args, **kwargs: None)
+    monkeypatch.setattr(autosmooth_base, "fuse_weight_observers", lambda *args, **kwargs: None)
+    monkeypatch.setattr(autosmooth_base, "update_qparams", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         autosmooth_base,
         "forward_quantize",
@@ -203,7 +217,7 @@ def test_compute_best_scale_skips_non_targeted_balance_layers(monkeypatch):
     fp16_outputs = modifier._run_samples(parent)
     best_scales = modifier._compute_best_scale(mapping, fp16_outputs)
 
-    assert captured_modules == [parent.quantized_balance]
+    assert captured_qargs == [target_qargs]
     assert torch.isfinite(best_scales).all()
 
 
@@ -239,7 +253,8 @@ def test_compute_best_scale_errors_on_missing_qargs_for_targeted_layers(monkeypa
     cache.append({"x": torch.randn(2, 4)})
     modifier._parent_args_cache[parent] = cache
 
-    monkeypatch.setattr(autosmooth_base, "call_observer", lambda *args, **kwargs: None)
+    monkeypatch.setattr(autosmooth_base, "fuse_weight_observers", lambda *args, **kwargs: None)
+    monkeypatch.setattr(autosmooth_base, "update_qparams", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         autosmooth_base,
         "forward_quantize",
@@ -291,7 +306,8 @@ def test_compute_best_scale_duo_scaling_uses_snapshot_qargs(monkeypatch):
         "load_from_registry",
         staticmethod(lambda *_args, **_kwargs: _FakeWeightObserver()),
     )
-    monkeypatch.setattr(autosmooth_base, "call_observer", lambda *args, **kwargs: None)
+    monkeypatch.setattr(autosmooth_base, "fuse_weight_observers", lambda *args, **kwargs: None)
+    monkeypatch.setattr(autosmooth_base, "update_qparams", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         autosmooth_base,
         "forward_quantize",
@@ -342,7 +358,8 @@ def test_compute_best_scale_preserves_existing_weight_scale(monkeypatch):
         "load_from_registry",
         staticmethod(lambda *_args, **_kwargs: _FakeWeightObserver()),
     )
-    monkeypatch.setattr(autosmooth_base, "call_observer", lambda *args, **kwargs: None)
+    monkeypatch.setattr(autosmooth_base, "fuse_weight_observers", lambda *args, **kwargs: None)
+    monkeypatch.setattr(autosmooth_base, "update_qparams", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         autosmooth_base,
         "forward_quantize",
@@ -390,3 +407,27 @@ def test_log_error_metrics_handles_empty_metrics():
     modifier = AutoSmoothModifier()
     modifier._error_metrics = []
     modifier._log_error_metrics()
+
+
+@pytest.mark.unit
+def test_capture_quantization_state_preserves_live_qscheme_for_calibration():
+    model = torch.nn.Sequential(torch.nn.Linear(4, 4, bias=False))
+    layer = model[0]
+    layer.quantization_scheme = QuantizationScheme(
+        targets=["Linear"],
+        weights=QuantizationArgs(
+            strategy=QuantizationStrategy.CHANNEL,
+            num_bits=8,
+        ),
+    )
+
+    modifier = AutoSmoothModifier()
+
+    modifier._capture_autosmooth_quantization_state(model)
+
+    assert hasattr(layer, "quantization_scheme")
+
+    modifier.start_calibration(model)
+
+    assert hasattr(layer, "weight_observer")
+    assert hasattr(layer, "quantization_status")
