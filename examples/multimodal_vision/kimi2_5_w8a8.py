@@ -157,7 +157,7 @@ ignores = [
     r"re:mm_projector\.*",
     r"re:.*\.mlp\.gate$",
     r"re:.*\.embed_tokens$",
-    "lm_head",
+    r"re:.*lm_head$",
 ]
 
 # Configure the quantization algorithm to run.
@@ -210,5 +210,5 @@ SAVE_NAME = model_id.rstrip("/").split("/")[-1] + tail_name
 SAVE_DIR = os.path.join(args.save_dir, SAVE_NAME)
 
 with maybe_skip_from_accelerate(args.skip_restore_from_accelerate):
-    model.save_pretrained(SAVE_DIR, save_compressed=True)
+    model.save_pretrained(SAVE_DIR, save_compressed=True, max_shard_size="50GB")
 processor.save_pretrained(SAVE_DIR)
