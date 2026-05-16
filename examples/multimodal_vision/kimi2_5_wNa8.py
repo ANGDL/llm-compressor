@@ -25,7 +25,7 @@ from compressed_tensors.quantization import QuantizationScheme
 
 
 """
-python kimi2_5_wNa8.py --model_id /ssd3/models/Kimi-K2.6-bf16/ --dataset_id /home/llm-compressor/lmms-lab___flickr30k --modifier=RTN --observer imatrix_mse > k26.log 2>&1 &
+python kimi2_5_wNa8.py --model_id /ssd3/models/Kimi-K2.6-bf16/ --dataset_id /data/quant/lmms-lab___flickr30k --text_dataset_id /data/quant/ultrachat_200k --text_calibration_samples 256 --modifier=RTN --observer imatrix_mse > k26.log 2>&1 &
 python src/llmcompressor/utils/pack_int4_to_int8.py -i /ssd2/models/Kimi-K2.6-bf16-W4A8Experts-W8A8Other-IMatrix-RTN-unpacked/ -o /ssd3/models/Kimi-K2.6-w4a8-v2
 """
 
@@ -38,6 +38,22 @@ parser.add_argument("--observer", type=str, default=None, choices=[None, "imatri
 parser.add_argument("--modifier", type=str, default="RTN", choices=["GPTQ", "RTN"])
 parser.add_argument("--dataset_id", type=str, default="lmms-lab/flickr30k")
 parser.add_argument("--dataset_split", type=str, default="test")
+parser.add_argument(
+    "--text_dataset_id", type=str, default="HuggingFaceH4/ultrachat_200k"
+)
+parser.add_argument("--text_dataset_split", type=str, default="train_sft")
+parser.add_argument(
+    "--text_calibration_samples",
+    type=int,
+    default=128,
+    help="Number of Ultrachat text samples to append to calibration.",
+)
+parser.add_argument(
+    "--multimodal_max_sequence_length",
+    type=int,
+    default=8192,
+    help="Max sequence length for multimodal calibration samples.",
+)
 parser.add_argument(
     "--skip_restore_from_accelerate",
     action=argparse.BooleanOptionalAction,
@@ -103,24 +119,74 @@ print(f"Model was offloaded to the following devices: {devices}")
 # Select calibration dataset.
 DATASET_ID = args.dataset_id
 DATASET_SPLIT = args.dataset_split
+TEXT_DATASET_ID = args.text_dataset_id
+TEXT_DATASET_SPLIT = args.text_dataset_split
 
 # Increasing the number of samples can improve accuracy.
 NUM_CALIBRATION_SAMPLES = 128
-MAX_SEQUENCE_LENGTH = 8192
+NUM_TEXT_CALIBRATION_SAMPLES = args.text_calibration_samples
+MULTIMODAL_MAX_SEQUENCE_LENGTH = args.multimodal_max_sequence_length
 
 # Load dataset and preprocess.
-ds = load_dataset(DATASET_ID, split=f"{DATASET_SPLIT}[:{NUM_CALIBRATION_SAMPLES}]")
-ds = ds.shuffle(seed=42)
+multimodal_ds = load_dataset(
+    DATASET_ID,
+    split=f"{DATASET_SPLIT}[:{NUM_CALIBRATION_SAMPLES}]",
+)
+multimodal_ds = multimodal_ds.shuffle(seed=42)
 
-# Apply chat template and tokenize inputs.
-def preprocess_and_tokenize(example):
-    # preprocess
+text_ds = load_dataset(
+    TEXT_DATASET_ID,
+    split=f"{TEXT_DATASET_SPLIT}[:{NUM_TEXT_CALIBRATION_SAMPLES}]",
+) if NUM_TEXT_CALIBRATION_SAMPLES > 0 else None
+if text_ds is not None:
+    text_ds = text_ds.shuffle(seed=42)
+    text_examples = list(text_ds)
+else:
+    text_examples = []
+
+
+def tokenize_messages(messages, max_sequence_length):
+    return processor(
+        messages=messages,
+        padding=False,
+        max_length=max_sequence_length,
+        truncation=True,
+    )
+
+
+def _normalize_text_content(content):
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}]
+
+    normalized = []
+    for item in content:
+        if isinstance(item, str):
+            normalized.append({"type": "text", "text": item})
+        elif isinstance(item, dict):
+            if item.get("type") == "text":
+                normalized.append({"type": "text", "text": item.get("text", "")})
+            elif "text" in item:
+                normalized.append({"type": "text", "text": item["text"]})
+    return normalized
+
+
+def format_text_example(example):
+    return [
+        {
+            "role": message["role"],
+            "content": _normalize_text_content(message["content"]),
+        }
+        for message in example["messages"]
+    ]
+
+
+def build_multimodal_messages(example):
     buffered = BytesIO()
     example["image"].save(buffered, format="PNG")
     encoded_image = base64.b64encode(buffered.getvalue())
     encoded_image_text = encoded_image.decode("utf-8")
     base64_img = f"data:image;base64,{encoded_image_text}"
-    messages = [
+    return [
         {
             "role": "user",
             "content": [
@@ -139,16 +205,30 @@ def preprocess_and_tokenize(example):
         }
     ]
 
-    return processor(
-        messages=messages,
-        padding=False,
-        max_length=MAX_SEQUENCE_LENGTH,
-        truncation=True,
+
+def build_calibration_messages(multimodal_example, text_example=None):
+    messages = build_multimodal_messages(multimodal_example)
+    if text_example is not None:
+        messages.extend(format_text_example(text_example))
+    return messages
+
+
+def preprocess_and_tokenize(multimodal_example, idx):
+    text_example = None
+    if text_examples:
+        text_example = text_examples[idx % len(text_examples)]
+
+    return tokenize_messages(
+        build_calibration_messages(multimodal_example, text_example),
+        MULTIMODAL_MAX_SEQUENCE_LENGTH,
     )
 
 
-ds = ds.map(preprocess_and_tokenize, remove_columns=ds.column_names)
-
+multimodal_ds = multimodal_ds.map(
+    preprocess_and_tokenize,
+    with_indices=True,
+    remove_columns=multimodal_ds.column_names,
+)
 
 # Define a oneshot data collator for multimodal inputs.
 def data_collator(batch):
@@ -168,7 +248,7 @@ ignores = [
     r"re:mm_projector\.*",
     r"re:.*\.mlp\.gate$",
     r"re:.*\.embed_tokens$",
-    "lm_head",
+    r"re:.*lm_head$",
 ]
 
 
@@ -260,9 +340,9 @@ else:
 # Apply algorithms.
 oneshot(
     model=model,
-    dataset=ds,
+    dataset=multimodal_ds,
     recipe=recipes,
-    max_seq_length=MAX_SEQUENCE_LENGTH,
+    max_seq_length=MULTIMODAL_MAX_SEQUENCE_LENGTH,
     num_calibration_samples=NUM_CALIBRATION_SAMPLES,
     batch_size=1,
     data_collator=data_collator,
@@ -277,5 +357,5 @@ SAVE_NAME = model_id.rstrip("/").split("/")[-1] + tail_name + "-unpacked"
 SAVE_DIR = os.path.join(args.save_dir, SAVE_NAME)
 
 with maybe_skip_from_accelerate(args.skip_restore_from_accelerate):
-    model.save_pretrained(SAVE_DIR, save_compressed=True)
+    model.save_pretrained(SAVE_DIR, save_compressed=True, max_shard_size="50GB")
 processor.save_pretrained(SAVE_DIR)
