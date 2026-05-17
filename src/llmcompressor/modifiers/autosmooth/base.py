@@ -4,12 +4,12 @@ from copy import deepcopy
 from collections import OrderedDict
 
 import torch
-from compressed_tensors.offload.dist_utils import is_source_process as is_src
+from compressed_tensors.distributed import wait_for_comms
 from compressed_tensors.modeling.kvcache import QuantizedKVCache
+from compressed_tensors.offload.dist_utils import as_broadcastable, is_distributed
 from compressed_tensors.quantization import (
     QuantizationArgs,
     QuantizationStrategy,
-    disable_quantization,
     forward_quantize,
 )
 from compressed_tensors.utils import (
@@ -22,21 +22,16 @@ from compressed_tensors.utils import (
     register_offload_parameter,
     update_offload_parameter,
 )
-from compressed_tensors.quantization.quant_config import (
-    QuantizationConfig,
-    QuantizationStatus,
-)
 from compressed_tensors.utils.match import match_named_modules, match_targets
-from llmcompressor.modifiers.quantization.group_size_validation import (
-    validate_group_size_divisibility,
-)
 
 from loguru import logger
 from pydantic import ConfigDict, PrivateAttr, field_validator
+from torch import distributed as dist
 from torch.nn import Module
 from torch.utils._pytree import tree_leaves
 from tqdm import tqdm
 
+from llmcompressor._torch_accelerator_compat import accelerator_device
 from llmcompressor.core import Event, EventType, State, active_session
 from llmcompressor.modifiers import Modifier
 from llmcompressor.modifiers.transform.awq.mappings import (
@@ -116,28 +111,24 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
 
     Lifecycle:
 
-    The smoothing lifecycle matches AWQModifier at a high level, with additional
-    quantization setup/cleanup because AutoSmooth can own its quantization config.
+    AutoSmooth follows AWQModifier's transform-based lifecycle. It does not
+    initialize quantization, register calibration observers, or update activation
+    qparams. It only uses quantization args to evaluate smoothing scales.
 
     - on_initialize
-        - apply quantization config for AutoSmooth targets
+        - infer mappings when not provided
+        - snapshot AutoSmooth-targeted modules and weight qargs
         - resolve mappings
-        - snapshot target modules and weight qargs for later grid search
     - on_start
-        - attach quantization observers/calibration hooks
-        - set up activation cache hooks to capture input activations
-            to balance layers
+        - validate mapping constraints
+        - set up activation cache hooks to capture inputs to balance layers
     - on sequential epoch end
-        - sync observer activation statistics
-        - update activation qparams
         - apply smoothing to each smoothing layer
             - consume cached activations across all batches
                 - clear cached activations as they are used
             - find best smoothing scale for each smoothing layer
             - apply to model weights
-        - observe smoothed weights and update weight qparams
     - on_end
-        - remove quantization calibration hooks and observers
         - remove activation hooks
     - on_finalize
         - clear resolved mappings and captured activations
@@ -219,84 +210,14 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
     _error_metrics: list[dict] = PrivateAttr(default_factory=list)
 
 
-    def initialize_quantization(self, model: torch.nn.Module):
-        def _apply_quantization_config(model: Module, config: QuantizationConfig | None):
-            from compressed_tensors.quantization.lifecycle.apply import _scheme_from_targets, _apply_kv_cache_scheme
-            # copy form compressed_tensors/quantization/lifecycle/apply.py
-            config = deepcopy(config)
-            if config is None:
-                return dict()
-
-            # apply and initialize kv cache quantization
-            if config.kv_cache_scheme is not None:
-                _apply_kv_cache_scheme(
-                    model, config.kv_cache_scheme, config.quantization_status
-                )
-
-            # build mapping of targets to schemes for easier matching
-            # use ordered dict to preserve target ordering in config
-            target_to_scheme = OrderedDict()
-            for scheme in config.config_groups.values():
-                for target in scheme.targets:
-                    target_to_scheme[target] = scheme
-
-            # mark appropriate layers for quantization by setting their quantization schemes
-            for name, submodule in match_named_modules(
-                model, target_to_scheme, config.ignore, warn_on_fail=True
-            ):
-                # mark modules to be quantized by adding
-                # quant scheme to the matching layers
-                matched_targets = match_targets(name, submodule, target_to_scheme)
-                scheme = _scheme_from_targets(target_to_scheme, matched_targets, name)
-                # target matched - add layer and scheme to target list
-                submodule.quantization_scheme = scheme
-                submodule.quantization_status = config.quantization_status
-
-        # Clear status only on modules targeted by this modifier.
-        # Doing this inline avoids repeatedly traversing subtrees per target.
-        for _, module in match_named_modules(model, self.resolved_targets, self.ignore):
-            if hasattr(module, "quantization_status"):
-                delattr(module, "quantization_status")
-
-        _apply_quantization_config(model, self.resolved_config)
-
-        if not self.bypass_divisibility_checks:
-            validate_group_size_divisibility(model, self.resolved_targets, self.ignore)
-
-        model.apply(disable_quantization)
-
-
     def on_initialize(self, state: State, **kwargs) -> bool:
         """
         Initialize AWQ on the given state
-        Initialize quantization, resolve mappings, cache module kwargs
+        Resolve mappings and snapshot qargs used during grid search.
 
         :param state: state to run AWQ on
         :return: True on a successful run, False otherwise
         """
-
-        # apply config to model and prepare calibration hooks
-        if QuantizationMixin.has_config(self):
-            self.initialize_quantization(state.model)
-
-        # Validate that duo_scaling is only used with per-channel quantization
-        if self.duo_scaling is not False:
-            for _, module in match_named_modules(
-                state.model, self.resolved_targets, self.ignore
-            ):
-                if (
-                    hasattr(module, "quantization_scheme")
-                    and hasattr(module.quantization_scheme, "weights")
-                    and hasattr(module.quantization_scheme.weights, "strategy")
-                    and module.quantization_scheme.weights.strategy
-                    == QuantizationStrategy.TENSOR
-                ):
-                    raise ValueError(
-                        "duo_scaling is only supported with per-channel quantization "
-                        "strategies (group or channel), but found TENSOR strategy. "
-                        "Please set duo_scaling=False or use a per-channel "
-                        "quantization strategy."
-                    )
 
         if self.mappings is None:
             logger.info("No AutoSmoothModifier.mappings provided, inferring from model...")
@@ -318,9 +239,26 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
                 self.offload_device = None
 
         self._capture_autosmooth_quantization_state(state.model)
+        self._validate_duo_scaling_with_snapshot()
         self._set_resolved_mappings(state.model)
 
         return True
+
+    def _validate_duo_scaling_with_snapshot(self) -> None:
+        """Validate duo_scaling against the qargs snapshot captured by AutoSmooth."""
+        if self.duo_scaling is False:
+            return
+
+        if any(
+            qargs.strategy == QuantizationStrategy.TENSOR
+            for qargs in self._autosmooth_weight_qargs.values()
+        ):
+            raise ValueError(
+                "duo_scaling is only supported with per-channel quantization "
+                "strategies (group or channel), but found TENSOR strategy. "
+                "Please set duo_scaling=False or use a per-channel "
+                "quantization strategy."
+            )
 
     def _capture_autosmooth_quantization_state(self, model: Module) -> None:
         """
@@ -332,9 +270,26 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
         self._autosmooth_target_modules = set()
         self._autosmooth_weight_qargs = {}
 
-        for _, module in match_named_modules(model, self.resolved_targets, self.ignore):
+        target_to_scheme = OrderedDict()
+        for scheme in self.resolved_config.config_groups.values():
+            for target in scheme.targets:
+                target_to_scheme[target] = scheme
+
+        from compressed_tensors.quantization.lifecycle.apply import _scheme_from_targets
+
+        for name, module in match_named_modules(model, self.resolved_targets, self.ignore):
             self._autosmooth_target_modules.add(module)
+
+            # Prefer runtime qscheme if already attached, otherwise infer from
+            # AutoSmooth's own resolved config so later modifier mutations to
+            # quantization_scheme/ignore do not affect this snapshot.
             qargs = getattr_chain(module, "quantization_scheme.weights", None)
+            if qargs is None:
+                matched_targets = match_targets(name, module, target_to_scheme)
+                if matched_targets:
+                    scheme = _scheme_from_targets(target_to_scheme, matched_targets, name)
+                    qargs = getattr(scheme, "weights", None)
+
             if qargs is not None:
                 if hasattr(qargs, "model_copy"):
                     qargs = qargs.model_copy(deep=True)
@@ -356,15 +311,6 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
                 "for MoE layers from the AutoSmooth configuration."
             )
 
-        # register quantization calibration hooks
-        # assume quantization has been initialized by this modifier or one before it
-        QuantizationMixin.start_calibration(self, state.model)
-        # AWQ performs forward passes during _apply_smoothing
-        # before any scales or zero points are updated
-        # Quantization must be disabled, otherwise NaNs will
-        # appear in quantized forward method
-        state.model.apply(disable_quantization)
-
         self._setup_activation_cache_hooks()
 
     def on_event(self, state: State, event: Event, **kwargs):
@@ -373,19 +319,7 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
                 self.on_start(state, None)
 
         elif event.type_ == EventType.SEQUENTIAL_EPOCH_END:
-            self.sync_obs_act_stats(state.model)
-            self.update_activation_qparams(state.model)
             self._apply_smoothing(state.model)
-
-            named_modules = list(
-                match_named_modules(state.model, self.resolved_targets, self.ignore)
-            )
-            observe([module for _, module in named_modules], "weight")
-            update_qparams(
-                [module for _, module in named_modules],
-                "weight",
-                only_update_onload=not is_src(),
-            )
 
         elif event.type_ == EventType.CALIBRATION_EPOCH_END:
             if not self.ended_:
@@ -393,13 +327,10 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
 
     def on_end(self, state: State, event: Event, **kwargs):
         """
-        Finish calibration by removing quantization observers/hooks and
-        AutoSmooth activation hooks.
+        Finish by removing AutoSmooth activation hooks.
         """
         self._assert_all_activations_consumed()
         self.ended_ = True
-
-        QuantizationMixin.end_calibration(self, state.model)
 
         # remove activation hooks
         self.remove_hooks()
@@ -660,6 +591,12 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
             parent_module = mapping.parent
             num_samples = int(self._smooth_activation_scales[mapping.smooth_name][1])
 
+            if is_distributed():
+                [num_samples_tensor] = _allreduce_data_sum(
+                    [torch.tensor(float(num_samples))]
+                )
+                num_samples = int(num_samples_tensor.item())
+
             if num_samples == 0:
                 _log_with_tqdm(
                     "info",
@@ -772,6 +709,40 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
             for output in outputs
         ]
 
+    def _resolve_activation_scales(
+        self,
+        mapping: ResolvedMapping,
+        device: torch.device | str,
+    ) -> torch.Tensor:
+        """Resolve activation scales and synchronize across ranks when distributed."""
+        if not isinstance(device, torch.device):
+            device = accelerator_device()
+
+        activation_stats, count = self._smooth_activation_scales[mapping.smooth_name]
+
+        if self.activation_scale_type == "minmax":
+            min_vals, max_vals = activation_stats
+            min_vals = min_vals.to(device)
+            max_vals = max_vals.to(device)
+            if is_distributed():
+                min_vals = _allreduce_data_min([min_vals])[0]
+                max_vals = _allreduce_data_max([max_vals])[0]
+            return max_vals - min_vals
+
+        if self.activation_scale_type == "max":
+            x_scales = activation_stats.to(device)
+            if is_distributed():
+                x_scales = _allreduce_data_max([x_scales])[0]
+            return x_scales
+
+        x_mean = activation_stats.to(device)
+        count_tensor = torch.tensor(float(count), device=device)
+        x_sum = x_mean * count_tensor
+        if is_distributed():
+            x_sum, count_tensor = _allreduce_data_sum([x_sum, count_tensor])
+
+        return x_sum / count_tensor.clamp(min=1.0)
+
     def _compute_best_scale(
         self,
         mapping: ResolvedMapping,
@@ -806,12 +777,7 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
         }
 
         device = get_execution_device(mapping.parent)
-
-        if self.activation_scale_type == "minmax":
-            x_scales = self._smooth_activation_scales[mapping.smooth_name][0]
-            x_scales = x_scales[1].to(device) - x_scales[0].to(device)  # max - min
-        else:
-            x_scales = self._smooth_activation_scales[mapping.smooth_name][0].to(device)
+        x_scales = self._resolve_activation_scales(mapping, device)
 
         # Resolve quantization args with AutoSmooth's own snapshot first, so
         # different ignore/config from later modifiers won't break this stage.
@@ -956,10 +922,17 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
                 for balance_layer, _, w_qscheme in balance_layers_to_patch:
                     balance_layer.weight.mul_(_scalesview)
 
-                    observe(balance_layer, "weight")
+                observe(
+                    [balance_layer for balance_layer, _, _ in balance_layers_to_patch],
+                    "weight",
+                )
+                update_qparams(
+                    [balance_layer for balance_layer, _, _ in balance_layers_to_patch],
+                    "weight",
+                    only_update_onload=True,
+                )
 
                 for balance_layer, _, w_qscheme in balance_layers_to_patch:
-                    update_qparams(balance_layer, "weight", only_update_onload=True)
                     update_offload_parameter(
                         balance_layer,
                         "weight",
@@ -972,7 +945,7 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
                         / _scalesview,
                     )
 
-                # W * X
+                # W_q * X
                 int_w_outputs = self._run_samples(mapping.parent)
 
                 # compute mean squared error (L2 norm)
@@ -1082,6 +1055,9 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
                     fp16_batch, int_w_batch.to(fp16_batch.device), reduction="sum"
                 )
                 num_elements += fp16_batch.numel()
+
+        if is_distributed():
+            loss, num_elements = _allreduce_data_sum([loss, num_elements])
 
         # Normalize the loss by the total number of elements
         return (loss / num_elements).item()
@@ -1337,6 +1313,34 @@ def get_lowest_common_ancestor_with_avoid(
         if not isinstance(ancestor, avoid):
             return ancestor_name, ancestor
         ancestor_name = ".".join(ancestor_name.split(".")[:-1])
+
+
+def _allreduce_data(
+    data: list[torch.Tensor],
+    op,
+) -> list[torch.Tensor]:
+    device = accelerator_device()
+    data = [datum.to(device) for datum in data]
+
+    pending_comms = []
+    for datum in data:
+        pending_comms.append(
+            dist.all_reduce(as_broadcastable(datum), op=op, async_op=True)
+        )
+    wait_for_comms(pending_comms)
+    return data
+
+
+def _allreduce_data_sum(data: list[torch.Tensor]) -> list[torch.Tensor]:
+    return _allreduce_data(data, dist.ReduceOp.SUM)
+
+
+def _allreduce_data_max(data: list[torch.Tensor]) -> list[torch.Tensor]:
+    return _allreduce_data(data, dist.ReduceOp.MAX)
+
+
+def _allreduce_data_min(data: list[torch.Tensor]) -> list[torch.Tensor]:
+    return _allreduce_data(data, dist.ReduceOp.MIN)
 
 
 def _adaptive_norm(scales: torch.Tensor, alpha=6.0, beta=0.15) -> torch.Tensor:

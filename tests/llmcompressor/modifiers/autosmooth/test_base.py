@@ -137,7 +137,12 @@ def test_compute_best_scale_uses_autosmooth_snapshot_qargs(monkeypatch):
         staticmethod(_fake_load_from_registry),
     )
     monkeypatch.setattr(autosmooth_base, "fuse_weight_observers", lambda *args, **kwargs: None)
-    monkeypatch.setattr(autosmooth_base, "update_qparams", lambda *args, **kwargs: None)
+    captured_update_modules = []
+
+    def _fake_update_qparams(modules, *_args, **_kwargs):
+        captured_update_modules.append(modules)
+
+    monkeypatch.setattr(autosmooth_base, "update_qparams", _fake_update_qparams)
     monkeypatch.setattr(
         autosmooth_base,
         "forward_quantize",
@@ -148,6 +153,8 @@ def test_compute_best_scale_uses_autosmooth_snapshot_qargs(monkeypatch):
     best_scales = modifier._compute_best_scale(mapping, fp16_outputs)
 
     assert captured_qargs == [qargs]
+    assert captured_update_modules
+    assert all(isinstance(modules, list) for modules in captured_update_modules)
     assert torch.isfinite(best_scales).all()
 
 
@@ -410,7 +417,107 @@ def test_log_error_metrics_handles_empty_metrics():
 
 
 @pytest.mark.unit
-def test_capture_quantization_state_preserves_live_qscheme_for_calibration():
+def test_capture_quantization_state_infers_qargs_without_mutating_model():
+    model = torch.nn.Sequential(torch.nn.Linear(4, 4, bias=False))
+    layer = model[0]
+
+    modifier = AutoSmoothModifier(
+        config_groups={
+            "group_0": QuantizationScheme(
+                targets=["Linear"],
+                weights=QuantizationArgs(
+                    strategy=QuantizationStrategy.CHANNEL,
+                    num_bits=8,
+                ),
+            )
+        }
+    )
+
+    modifier._capture_autosmooth_quantization_state(model)
+
+    assert layer in modifier._autosmooth_target_modules
+    assert layer in modifier._autosmooth_weight_qargs
+    assert (
+        modifier._autosmooth_weight_qargs[layer].strategy
+        == QuantizationStrategy.CHANNEL
+    )
+
+    # Snapshot should not attach quantization artifacts to the live model.
+    assert not hasattr(layer, "quantization_scheme")
+
+
+@pytest.mark.unit
+def test_validate_duo_scaling_with_snapshot_rejects_tensor_strategy():
+    layer = torch.nn.Linear(4, 4, bias=False)
+    modifier = AutoSmoothModifier(duo_scaling=True)
+    modifier._autosmooth_weight_qargs = {
+        layer: QuantizationArgs(
+            strategy=QuantizationStrategy.TENSOR,
+            num_bits=8,
+        )
+    }
+
+    with pytest.raises(ValueError, match="duo_scaling is only supported"):
+        modifier._validate_duo_scaling_with_snapshot()
+
+
+@pytest.mark.unit
+def test_resolve_activation_scales_uses_allreduce_for_mean(monkeypatch):
+    parent = _ToyParent()
+    mapping = ResolvedMapping(
+        smooth_name="toy.smooth",
+        smooth_layer=torch.nn.LayerNorm(4),
+        balance_layers=[parent.quantized_balance],
+        balance_names=["toy.quantized_balance"],
+        parent=parent,
+        parent_name="toy",
+    )
+
+    modifier = AutoSmoothModifier(activation_scale_type="mean")
+    modifier._smooth_activation_scales[mapping.smooth_name] = (
+        torch.tensor([2.0, 4.0, 6.0, 8.0]),
+        2,
+    )
+
+    calls = []
+
+    def _fake_allreduce_sum(data):
+        calls.append(data)
+        return [datum * 2 for datum in data]
+
+    monkeypatch.setattr(autosmooth_base, "is_distributed", lambda: True)
+    monkeypatch.setattr(autosmooth_base, "_allreduce_data_sum", _fake_allreduce_sum)
+
+    x_scales = modifier._resolve_activation_scales(mapping, torch.device("cpu"))
+
+    assert calls
+    assert torch.allclose(x_scales, torch.tensor([2.0, 4.0, 6.0, 8.0]))
+
+
+@pytest.mark.unit
+def test_compute_loss_uses_allreduce_when_distributed(monkeypatch):
+    modifier = AutoSmoothModifier()
+    fp16_outputs = [torch.tensor([[1.0, -1.0]])]
+    int_w_outputs = [torch.tensor([[0.0, 0.0]])]
+
+    calls = []
+
+    def _fake_allreduce_sum(data):
+        calls.append(data)
+        return data
+
+    monkeypatch.setattr(autosmooth_base, "active_session", lambda: None)
+    monkeypatch.setattr(autosmooth_base, "is_distributed", lambda: True)
+    monkeypatch.setattr(autosmooth_base, "_allreduce_data_sum", _fake_allreduce_sum)
+
+    loss = modifier._compute_loss(fp16_outputs, int_w_outputs)
+
+    assert calls
+    assert loss == pytest.approx(1.0)
+
+
+@pytest.mark.unit
+def test_capture_quantization_state_preserves_live_qscheme_reference():
     model = torch.nn.Sequential(torch.nn.Linear(4, 4, bias=False))
     layer = model[0]
     layer.quantization_scheme = QuantizationScheme(
@@ -422,12 +529,7 @@ def test_capture_quantization_state_preserves_live_qscheme_for_calibration():
     )
 
     modifier = AutoSmoothModifier()
-
     modifier._capture_autosmooth_quantization_state(model)
 
     assert hasattr(layer, "quantization_scheme")
-
-    modifier.start_calibration(model)
-
-    assert hasattr(layer, "weight_observer")
-    assert hasattr(layer, "quantization_status")
+    assert layer in modifier._autosmooth_weight_qargs
