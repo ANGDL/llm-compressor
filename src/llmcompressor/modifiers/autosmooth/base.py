@@ -1,7 +1,7 @@
-import inspect
-from typing import Iterator, Literal
 from copy import deepcopy
-from collections import OrderedDict
+import inspect
+from contextlib import ExitStack, nullcontext
+from typing import Iterator, Literal
 
 import torch
 from compressed_tensors.distributed import wait_for_comms
@@ -19,10 +19,9 @@ from compressed_tensors.utils import (
     getattr_chain,
     match_modules_set,
     patch_attrs,
-    register_offload_parameter,
     update_offload_parameter,
 )
-from compressed_tensors.utils.match import match_named_modules, match_targets
+from compressed_tensors.utils.match import is_match
 
 from loguru import logger
 from pydantic import ConfigDict, PrivateAttr, field_validator
@@ -45,7 +44,6 @@ from llmcompressor.modifiers.quantization.calibration import (
     observe,
     update_qparams,
 )
-from llmcompressor.modifiers.quantization.quantization import QuantizationMixin
 from llmcompressor.modifiers.utils.hooks import HooksMixin
 from llmcompressor.modifiers.utils.pytorch_helpers import is_moe_model
 from llmcompressor.observers.base import Observer
@@ -60,7 +58,7 @@ from llmcompressor.utils.pytorch.module import (
 __all__ = ["AutoSmoothModifier"]
 
 
-class AutoSmoothModifier(Modifier, QuantizationMixin):
+class AutoSmoothModifier(Modifier):
     """
     Implements the AWQ (Activation-Weighted Quantization) algorithm,
     as described in https://arxiv.org/pdf/2306.00978. The algorithm
@@ -77,14 +75,15 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
     in one-shot and not during training. Activation ranges are determined by running a
     small set of calibration data through the model.
 
-    AutoSmoothModifier follows the same core smoothing flow as AWQModifier: it
-    resolves mappings, caches activations, performs a grid search for per-channel
-    scales, and applies the resulting smoothing transform to the model weights.
+    AutoSmoothModifier is a transform-based modifier, in that it does not perform
+    quantization or compression on its own. It scales activation channels according
+    to a quantization scheme set by a preceding modifier that inherits from
+    QuantizationMixin (e.g. QuantizationModifier or GPTQModifier).
+
     Compared with AWQModifier, AutoSmooth adds support for multiple activation-scale
-    statistics (mean, max, minmax) and keeps its quantization target selection
-    independent from mapping resolution so layers can be excluded from quantization
-    via ``ignore`` without preventing required balance layers from participating in
-    smoothing statistics.
+    statistics (mean, max, minmax) and keeps its smoothing target selection
+    independent from the quantization modifier's ignore list so layers can be
+    excluded from smoothing via ``ignore`` without affecting downstream quantization.
 
     example recipe:
     ```yaml
@@ -117,9 +116,9 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
 
     - on_initialize
         - infer mappings when not provided
-        - snapshot AutoSmooth-targeted modules and weight qargs
+    - on_start (after quantization config is applied by a preceding modifier)
+        - snapshot targeted modules and weight qargs
         - resolve mappings
-    - on_start
         - validate mapping constraints
         - set up activation cache hooks to capture inputs to balance layers
     - on sequential epoch end
@@ -140,16 +139,11 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
         to smoothed) and the second entry is the layer whose output is scaled to
         achieve the smoothing.
         If regex is used, it matches layers with the largest overlap in module name.
-    :param ignore: list of layers to ignore during quantization (not smoothed).
-        This ignore list only controls which layers AutoSmooth quantizes. Mapping
-        resolution still considers non-ignored balance layers so smoothing can use
-        the required activation statistics even when those layers should not receive
-        quantization config from AutoSmooth.
-    :param scheme: a single quantization scheme to apply to the model. This is a
-        dictionary that supports all keys from QuantizationScheme except targets, which
-        will be set to the targets parameter set at the modifier level. Can also be set
-        to a dictionary of the format `preset_scheme_name: targets` for example:
-        `W8A8: ['Linear']` for weight and activation 8-bit.
+    :param ignore: list of layers to ignore during smoothing. These modules will
+        not participate in the smoothing grid search even if they have quantization
+        config attached by a preceding modifier. Mapping resolution still considers
+        non-ignored balance layers so smoothing can use the required activation
+        statistics.
     :param offload_device: offload cached args to this device, which reduces memory
         requirements but requires more time to move data between cpu and execution
         device. Defaults to None, so cached args are not offloaded. Consider setting
@@ -160,6 +154,11 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
         If False, only activations are used.
         If "both", half the grid search is performed with duo_scaling=False and the
         other half is performed with duo_scaling=True.
+    :param include_nonq_wscale: whether balance layers with
+        ``quantization_scheme.weights is None`` should still participate in
+        duo-scaling weight-scale statistics by borrowing peer qargs from the same
+        smooth-balance group. Defaults to True. Set to False to compute weight
+        scales from quantized balance layers only.
     :param n_grid: when performing the best scales grid search for each mapping,
         this specifies how many grid points should be used. To decrease the runtime,
         at the possible cost of slightly worse scales, this can be decreased.
@@ -176,13 +175,16 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
 
     """
 
-    # Allow arbitrary types because AWQMapping has fields of type torch.nn.Module
-    model_config: ConfigDict = ConfigDict(arbitrary_types_allowed=True)
+    model_config: ConfigDict = ConfigDict(
+        arbitrary_types_allowed=True, extra="forbid"
+    )
 
-    # User-provided vars (in addition to QuantizationMixin args)
+    # User-provided vars
     mappings: list[AWQMapping] | None = None
+    ignore: list[str] = []
     offload_device: torch.device | None | Sentinel = Sentinel("not_provided")
     duo_scaling: bool | Literal["both"] = True
+    include_nonq_wscale: bool = True
     n_grid: int = 20
     norm_func: str = None
     norm_func_param: dict = {
@@ -200,10 +202,9 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
     _smooth_activation_scales: dict[str, tuple[torch.FloatTensor, int]] = PrivateAttr(
         default_factory=dict
     )
-    # Snapshot of AutoSmooth-targeted modules and their weight qargs at init time.
+    # Snapshot of weight qargs at init time, keyed by module.
     # This isolates grid search from later quantization modifier mutations.
-    _autosmooth_target_modules: set[Module] = PrivateAttr(default_factory=set)
-    _autosmooth_weight_qargs: dict[Module, QuantizationArgs] = PrivateAttr(
+    _autosmooth_weight_qargs: dict[Module, QuantizationArgs | None] = PrivateAttr(
         default_factory=dict
     )
     # List to store error metrics for each layer
@@ -212,10 +213,11 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
 
     def on_initialize(self, state: State, **kwargs) -> bool:
         """
-        Initialize AWQ on the given state
-        Resolve mappings and snapshot qargs used during grid search.
+        Initialize AutoSmooth. This runs before quantization config has been applied.
 
-        :param state: state to run AWQ on
+        - infer unresolved mappings based on model architecture, if not set manually
+
+        :param state: state to run AutoSmooth on
         :return: True on a successful run, False otherwise
         """
 
@@ -238,10 +240,6 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
                 # (no offloading by default)
                 self.offload_device = None
 
-        self._capture_autosmooth_quantization_state(state.model)
-        self._validate_duo_scaling_with_snapshot()
-        self._set_resolved_mappings(state.model)
-
         return True
 
     def _validate_duo_scaling_with_snapshot(self) -> None:
@@ -250,7 +248,8 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
             return
 
         if any(
-            qargs.strategy == QuantizationStrategy.TENSOR
+            qargs is not None
+            and qargs.strategy == QuantizationStrategy.TENSOR
             for qargs in self._autosmooth_weight_qargs.values()
         ):
             raise ValueError(
@@ -262,43 +261,60 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
 
     def _capture_autosmooth_quantization_state(self, model: Module) -> None:
         """
-        Capture AutoSmooth's own target modules and their weight qargs once.
+        Capture weight qargs from runtime quantization_scheme for balance layers
+        in resolved mappings.
 
-        This keeps AutoSmooth stable even if later modifiers overwrite
-        quantization configs or use different ignore lists.
+        Modules matching ``self.ignore`` are excluded, so AutoSmooth's smoothing
+        target selection stays independent from the quantization modifier's ignore.
+        Deep copies are taken so later modifier mutations cannot affect grid search.
+
+        For non-quantized balance layers (``quantization_scheme.weights is None``),
+        ``None`` is explicitly recorded in the snapshot so `_compute_best_scale`
+        can still include these layers with identity pseudo-quantization.
+
+        If mappings are not resolved yet, fall back to scanning all modules.
         """
-        self._autosmooth_target_modules = set()
         self._autosmooth_weight_qargs = {}
 
-        target_to_scheme = OrderedDict()
-        for scheme in self.resolved_config.config_groups.values():
-            for target in scheme.targets:
-                target_to_scheme[target] = scheme
+        modules_to_capture: list[tuple[str, Module]] = []
+        if self._resolved_mappings:
+            for mapping in self._resolved_mappings:
+                modules_to_capture.extend(
+                    zip(mapping.balance_names, mapping.balance_layers)
+                )
+        else:
+            modules_to_capture.extend(model.named_modules())
 
-        from compressed_tensors.quantization.lifecycle.apply import _scheme_from_targets
+        for name, module in modules_to_capture:
+            if self.ignore and is_match(name, module, self.ignore):
+                continue
 
-        for name, module in match_named_modules(model, self.resolved_targets, self.ignore):
-            self._autosmooth_target_modules.add(module)
+            if module in self._autosmooth_weight_qargs:
+                continue
 
-            # Prefer runtime qscheme if already attached, otherwise infer from
-            # AutoSmooth's own resolved config so later modifier mutations to
-            # quantization_scheme/ignore do not affect this snapshot.
             qargs = getattr_chain(module, "quantization_scheme.weights", None)
-            if qargs is None:
-                matched_targets = match_targets(name, module, target_to_scheme)
-                if matched_targets:
-                    scheme = _scheme_from_targets(target_to_scheme, matched_targets, name)
-                    qargs = getattr(scheme, "weights", None)
-
             if qargs is not None:
                 if hasattr(qargs, "model_copy"):
                     qargs = qargs.model_copy(deep=True)
                 else:
                     qargs = deepcopy(qargs)
-                self._autosmooth_weight_qargs[module] = qargs
+            self._autosmooth_weight_qargs[module] = qargs
 
     def on_start(self, state: State, event: Event, **kwargs):
+        """
+        Start AutoSmooth. This runs after quantization config has been applied
+        by a preceding modifier (i.e. after quantization_scheme is on modules).
+
+        - snapshot targeted modules and weight qargs
+        - resolve mappings
+        - validate mappings and quant scheme
+        - setup activation cache hooks
+        """
         self.started_ = True
+
+        self._set_resolved_mappings(state.model)
+        self._capture_autosmooth_quantization_state(state.model)
+        self._validate_duo_scaling_with_snapshot()
 
         # Check for unsupported token masking with MoE up_proj -> down_proj mappings
         if state.loss_masks is not None and self._has_moe_up_down_proj_mapping():
@@ -350,7 +366,6 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
         self._parent_args_cache.clear()
         self._smooth_activation_scales.clear()
         self._resolved_mappings.clear()
-        self._autosmooth_target_modules.clear()
         self._autosmooth_weight_qargs.clear()
 
         self._error_metrics.clear()
@@ -371,17 +386,19 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
         """
         resolved_mappings: list[ResolvedMapping] = []
         module_to_name = get_module_to_name_dict(model)
-        # Get names of modules targeted for quantization (excludes ignored)
-        targeted_names = set(
-            name
-            for name, _ in match_named_modules(
-                model, self.resolved_targets, self.ignore
+
+        ignored_names = set()
+        if self.ignore:
+            ignored_names = set(
+                name
+                for name, module in model.named_modules()
+                if is_match(name, module, self.ignore)
             )
-        )
+
         for mapping in self.mappings:
             # we deliberately don't use the ignore list when matching mappings,
             # so that we can handle layers that need smoothing but not quantization
-            # we only skip if no layers in mapping are targeted for quantization.
+            # we only skip if all layers in a mapping are ignored.
             for smooth_layers, *nested_balance_layers in match_modules_set(
                 model, (mapping.smooth_layer, *mapping.balance_layers)
             ):
@@ -404,9 +421,11 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
                     for balance_layer in balance_layers
                 ]
 
-                # Check if at least one layer is targeted for quantization
-                any_targeted = smooth_name in targeted_names or any(
-                    bn in targeted_names for bn in balance_names
+                # Keep mapping resolution independent from runtime qscheme.
+                # Align naming with AWQModifier: "targeted" means targeted for
+                # smoothing (i.e. not ignored by AutoSmooth.ignore).
+                any_targeted = smooth_name not in ignored_names or any(
+                    bn is None or bn not in ignored_names for bn in balance_names
                 )
 
                 all_compatible = _check_layers_are_compatible(
@@ -417,7 +436,7 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
                 if not all_compatible:
                     skip_message = " because found incompatible balance layers"
                 elif not any_targeted:
-                    skip_message = " because no layers are targeted for quantization"
+                    skip_message = " because all layers in the mapping are ignored"
                 elif len(balance_layers) == 0:
                     skip_message = " because no balance layers were found"
 
@@ -779,191 +798,212 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
         device = get_execution_device(mapping.parent)
         x_scales = self._resolve_activation_scales(mapping, device)
 
-        # Resolve quantization args with AutoSmooth's own snapshot first, so
-        # different ignore/config from later modifiers won't break this stage.
-        balance_layers_to_patch: list[tuple[Module, str, QuantizationArgs]] = []
-        skipped_non_targeted: list[str] = []
-        missing_qscheme: list[str] = []
+        # Resolve quantization args strictly from AutoSmooth's snapshot so
+        # later runtime quantization mutations cannot affect this stage.
+        # All balance layers participate in grid search uniformly. Layers with
+        # qargs are pseudo-quantized; layers without use identity (scale then
+        # unscale). Both are smoothed in _apply_smoothing.
+        balance_layer_info: list[tuple[Module, str, QuantizationArgs | None]] = []
 
         for balance_layer, balance_name in zip(mapping.balance_layers, mapping.balance_names):
-            if (
-                self._autosmooth_target_modules
-                and balance_layer not in self._autosmooth_target_modules
-            ):
-                skipped_non_targeted.append(balance_name)
-                continue
-
             w_qscheme = self._autosmooth_weight_qargs.get(balance_layer)
-            if w_qscheme is None:
-                w_qscheme = getattr_chain(balance_layer, "quantization_scheme.weights", None)
+            balance_layer_info.append((balance_layer, balance_name, w_qscheme))
 
-            if w_qscheme is None:
-                missing_qscheme.append(balance_name)
-                continue
+        quantized_layers = [
+            (bl, bn, qa) for bl, bn, qa in balance_layer_info if qa is not None
+        ]
+        has_quantized_layers = len(quantized_layers) > 0
 
-            balance_layers_to_patch.append((balance_layer, balance_name, w_qscheme))
-
-        if skipped_non_targeted:
-            logger.debug(
-                "Skipping non-targeted balance layers for AutoSmooth in "
-                f"{mapping.smooth_name}: {skipped_non_targeted}"
+        if not has_quantized_layers:
+            logger.warning(
+                "No quantized balance layers resolved for "
+                f"{mapping.smooth_name}; running identity pseudo-quantization "
+                "for all balance layers."
             )
 
-        if missing_qscheme:
-            raise ValueError(
-                "AutoSmooth could not resolve weight quantization args for targeted "
-                f"balance layers in {mapping.smooth_name}: {missing_qscheme}. "
-                "Please ensure AutoSmooth can access quantization config for these "
-                "layers."
+        if self.duo_scaling and has_quantized_layers:
+            weight_scale_layers = (
+                balance_layer_info
+                if self.include_nonq_wscale
+                else quantized_layers
             )
-
-        if len(balance_layers_to_patch) == 0:
-            raise ValueError(
-                f"No AutoSmooth-targeted balance layers remain for {mapping.smooth_name}. "
-                "Please align AutoSmooth targets/ignore with mapping balance layers."
-            )
-
-        # Track pre-existing attributes so cleanup only removes temporary ones.
-        preexisting_attrs: dict[Module, dict[str, bool]] = {}
-        for balance_layer, _, _ in balance_layers_to_patch:
-            preexisting_attrs[balance_layer] = {
-                "weight_scale": hasattr(balance_layer, "weight_scale"),
-                "weight_zero_point": hasattr(balance_layer, "weight_zero_point"),
-                "weight_global_scale": hasattr(balance_layer, "weight_global_scale"),
-                "weight_observer": hasattr(balance_layer, "weight_observer"),
-                "q_observer": hasattr(balance_layer, "q_observer"),
-                "k_observer": hasattr(balance_layer, "k_observer"),
-                "v_observer": hasattr(balance_layer, "v_observer"),
-            }
-        
-        if self.duo_scaling:
             w_scales = self._compute_layer_scales(
-                [balance_layer for balance_layer, _, _ in balance_layers_to_patch],
-                [balance_name for _, balance_name, _ in balance_layers_to_patch],
-                [w_qscheme for _, _, w_qscheme in balance_layers_to_patch],
+                [bl for bl, _, _ in weight_scale_layers],
+                [bn for _, bn, _ in weight_scale_layers],
+                [qa for _, _, qa in weight_scale_layers],
             ).to(device)
+
+        quantized_balance_layers = [bl for bl, _, _ in quantized_layers]
+        observer_patch_ctx = (
+            patch_attrs(
+                quantized_balance_layers,
+                "weight_observer",
+                [
+                    Observer.load_from_registry(
+                        "memoryless_minmax",
+                        base_name="weight",
+                        args=qa,
+                    )
+                    for _, _, qa in quantized_layers
+                ],
+            )
+            if has_quantized_layers
+            else nullcontext()
+        )
 
         # Where appropriate, replace observers with memoryless_minmax
         # for duration of grid search
-        with patch_attrs(
-            [balance_layer for balance_layer, _, _ in balance_layers_to_patch],
-            "weight_observer",
-            [
-                Observer.load_from_registry(
-                    "memoryless_minmax",
-                    base_name="weight",
-                    args=w_qscheme,
-                )
-                for balance_layer, _, w_qscheme in balance_layers_to_patch
-            ],
-        ):
+        with observer_patch_ctx:
+            scale_patch_layers: list[Module] = []
+            scale_patch_values: list[torch.nn.Parameter] = []
+            zero_point_patch_layers: list[Module] = []
+            zero_point_patch_values: list[torch.nn.Parameter] = []
+            global_scale_patch_layers: list[Module] = []
+            global_scale_patch_values: list[torch.nn.Parameter] = []
+
             # Ensure required qparams exist before observer updates in grid search.
-            for balance_layer, _, w_qscheme in balance_layers_to_patch:
-                observe(balance_layer, "weight")
-                weight_observer: Observer = getattr(balance_layer, "weight_observer")
-                init_qparams = weight_observer.get_qparams()
-                init_scale = init_qparams["scale"]
-                init_zero_point = init_qparams["zero_point"]
+            if has_quantized_layers:
+                for balance_layer, _, w_qscheme in quantized_layers:
+                    observe(balance_layer, "weight")
+                    weight_observer: Observer = getattr(balance_layer, "weight_observer")
+                    init_qparams = weight_observer.get_qparams()
 
-                if not hasattr(balance_layer, "weight_scale"):
-                    register_offload_parameter(
-                        balance_layer,
-                        "weight_scale",
-                        torch.nn.Parameter(init_scale.detach(), requires_grad=False),
-                    )
-
-                if (not w_qscheme.symmetric) and (not hasattr(balance_layer, "weight_zero_point")):
-                    register_offload_parameter(
-                        balance_layer,
-                        "weight_zero_point",
-                        torch.nn.Parameter(init_zero_point.detach(), requires_grad=False),
-                    )
-
-                if (
-                    w_qscheme.strategy == QuantizationStrategy.TENSOR_GROUP
-                    and not hasattr(balance_layer, "weight_global_scale")
-                ):
-                    init_global_scale = init_qparams["global_scale"]
-                    register_offload_parameter(
-                        balance_layer,
-                        "weight_global_scale",
-                        torch.nn.Parameter(init_global_scale.detach(), requires_grad=False),
-                    )
-
-            fuse_weight_observers(mapping.parent)
-
-            pbar = tqdm(
-                self._get_grid_search_params(),
-                desc=f"Grid search for {mapping.smooth_name}",
-                leave=False,
-            )
-            for ratio, use_duo_scaling in pbar:
-                # NOTE: s^-1 * x is fused here, according to paper
-                if use_duo_scaling:
-                    scales = (x_scales.pow(ratio) / (w_scales.pow(1 - ratio) + 1e-4)).clamp(
-                        min=1e-4
-                    )
-                else:
-                    scales = x_scales.pow(ratio).clamp(min=1e-4).view(-1)
-                
-                match self.norm_func:
-                    case "adaptive":
-                        scales = _adaptive_norm(scales, **self.norm_func_param["adaptive"])
-                    case "awq":
-                        scales = scales / (scales.max() * scales.min()).sqrt()
-                    
-                _scalesview = scales.view(1, -1).to(device)
-
-                # avoid scaling values that overflow
-                scales[torch.isinf(scales)] = 1
-                scales[torch.isnan(scales)] = 1
-
-                # Q(W * s)
-                for balance_layer, _, w_qscheme in balance_layers_to_patch:
-                    balance_layer.weight.mul_(_scalesview)
-
-                observe(
-                    [balance_layer for balance_layer, _, _ in balance_layers_to_patch],
-                    "weight",
-                )
-                update_qparams(
-                    [balance_layer for balance_layer, _, _ in balance_layers_to_patch],
-                    "weight",
-                    only_update_onload=True,
-                )
-
-                for balance_layer, _, w_qscheme in balance_layers_to_patch:
-                    update_offload_parameter(
-                        balance_layer,
-                        "weight",
-                        forward_quantize(
-                            balance_layer,
-                            balance_layer.weight.data,
-                            "weight",
-                            w_qscheme,
+                    if not hasattr(balance_layer, "weight_scale"):
+                        scale_patch_layers.append(balance_layer)
+                        scale_patch_values.append(
+                            torch.nn.Parameter(
+                                init_qparams["scale"].detach(),
+                                requires_grad=False,
+                            )
                         )
-                        / _scalesview,
+
+                    if (not w_qscheme.symmetric) and (not hasattr(balance_layer, "weight_zero_point")):
+                        zero_point_patch_layers.append(balance_layer)
+                        zero_point_patch_values.append(
+                            torch.nn.Parameter(
+                                init_qparams["zero_point"].detach(),
+                                requires_grad=False,
+                            )
+                        )
+
+                    if (
+                        w_qscheme.strategy == QuantizationStrategy.TENSOR_GROUP
+                        and not hasattr(balance_layer, "weight_global_scale")
+                    ):
+                        global_scale_patch_layers.append(balance_layer)
+                        global_scale_patch_values.append(
+                            torch.nn.Parameter(
+                                init_qparams["global_scale"].detach(),
+                                requires_grad=False,
+                            )
+                        )
+
+            with ExitStack() as qparam_patch_stack:
+                if scale_patch_layers:
+                    qparam_patch_stack.enter_context(
+                        patch_attrs(
+                            scale_patch_layers,
+                            "weight_scale",
+                            scale_patch_values,
+                        )
+                    )
+                if zero_point_patch_layers:
+                    qparam_patch_stack.enter_context(
+                        patch_attrs(
+                            zero_point_patch_layers,
+                            "weight_zero_point",
+                            zero_point_patch_values,
+                        )
+                    )
+                if global_scale_patch_layers:
+                    qparam_patch_stack.enter_context(
+                        patch_attrs(
+                            global_scale_patch_layers,
+                            "weight_global_scale",
+                            global_scale_patch_values,
+                        )
                     )
 
-                # W_q * X
-                int_w_outputs = self._run_samples(mapping.parent)
+                if has_quantized_layers:
+                    fuse_weight_observers(mapping.parent)
 
-                # compute mean squared error (L2 norm)
-                loss = self._compute_loss(fp16_outputs, int_w_outputs)
-
-                if initial_error is None:
-                    initial_error = loss
-
-                history.append(
-                    {"ratio": ratio, "duo_scaling": use_duo_scaling, "error": loss}
+                pbar = tqdm(
+                    self._get_grid_search_params(),
+                    desc=f"Grid search for {mapping.smooth_name}",
+                    leave=False,
                 )
-                if loss < best_error:
-                    best_error = loss
-                    best_ratio = ratio
-                    best_scales = scales.clone()
-                pbar.set_postfix({"best_error": f"{best_error:.3e}"})
+                for ratio, use_duo_scaling in pbar:
+                    # NOTE: s^-1 * x is fused here, according to paper
+                    if use_duo_scaling and has_quantized_layers:
+                        scales = (x_scales.pow(ratio) / (w_scales.pow(1 - ratio) + 1e-4)).clamp(
+                            min=1e-4
+                        )
+                    else:
+                        scales = x_scales.pow(ratio).clamp(min=1e-4).view(-1)
 
-                mapping.parent.load_state_dict(org_sd, strict=False)
+                    match self.norm_func:
+                        case "adaptive":
+                            scales = _adaptive_norm(scales, **self.norm_func_param["adaptive"])
+                        case "awq":
+                            scales = scales / (scales.max() * scales.min()).sqrt()
+
+                    # avoid scaling values that overflow
+                    scales[torch.isinf(scales)] = 1
+                    scales[torch.isnan(scales)] = 1
+
+                    _scalesview = scales.view(1, -1).to(device)
+
+                    # Scale ALL balance layers by s
+                    for balance_layer, _, _ in balance_layer_info:
+                        balance_layer.weight.mul_(_scalesview)
+
+                    # Observe and update qparams only for quantized layers
+                    if has_quantized_layers:
+                        observe(
+                            quantized_balance_layers,
+                            "weight",
+                        )
+                        update_qparams(
+                            quantized_balance_layers,
+                            "weight",
+                            only_update_onload=True,
+                        )
+
+                    # Q(W * s) / s for quantized; W * s / s for non-quantized
+                    for balance_layer, _, w_qscheme in balance_layer_info:
+                        if w_qscheme is not None:
+                            new_weight = (
+                                forward_quantize(
+                                    balance_layer,
+                                    balance_layer.weight.data,
+                                    "weight",
+                                    w_qscheme,
+                                )
+                                / _scalesview
+                            )
+                        else:
+                            new_weight = balance_layer.weight.data / _scalesview
+                        update_offload_parameter(balance_layer, "weight", new_weight)
+
+                    # W_q * X
+                    int_w_outputs = self._run_samples(mapping.parent)
+
+                    # compute mean squared error (L2 norm)
+                    loss = self._compute_loss(fp16_outputs, int_w_outputs)
+
+                    if initial_error is None:
+                        initial_error = loss
+
+                    history.append(
+                        {"ratio": ratio, "duo_scaling": use_duo_scaling, "error": loss}
+                    )
+                    if loss < best_error:
+                        best_error = loss
+                        best_ratio = ratio
+                        best_scales = scales.clone()
+                    pbar.set_postfix({"best_error": f"{best_error:.3e}"})
+
+                    mapping.parent.load_state_dict(org_sd, strict=False)
 
         if best_ratio == -1:
             logger.debug(history)
@@ -996,30 +1036,6 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
         assert (
             torch.isnan(best_scales).sum() == 0
         ), f"Nan found in scales: {best_scales}"
-
-        for balance_layer, _, _ in balance_layers_to_patch:
-            if (
-                not preexisting_attrs[balance_layer]["weight_scale"]
-                and hasattr(balance_layer, "weight_scale")
-            ):
-                delattr(balance_layer, "weight_scale")
-            if (
-                not preexisting_attrs[balance_layer]["weight_zero_point"]
-                and hasattr(balance_layer, "weight_zero_point")
-            ):
-                delattr(balance_layer, "weight_zero_point")
-            if (
-                not preexisting_attrs[balance_layer]["weight_global_scale"]
-                and hasattr(balance_layer, "weight_global_scale")
-            ):
-                delattr(balance_layer, "weight_global_scale")
-            for name in ("weight", "q", "k", "v"):
-                obs_name = f"{name}_observer"
-                if (
-                    not preexisting_attrs[balance_layer].get(obs_name, False)
-                    and hasattr(balance_layer, obs_name)
-                ):
-                    delattr(balance_layer, obs_name)
 
         return best_scales.detach().cpu()
 
@@ -1165,7 +1181,7 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
     def _compute_layer_scales(
         layers: list[Module],
         layer_names: list[str] | None = None,
-        layer_qargs: list[QuantizationArgs] | None = None,
+        layer_qargs: list[QuantizationArgs | None] | None = None,
     ) -> torch.Tensor:
         """
         Compute per-channel/group/block/tensor mean of normalised weights
@@ -1178,6 +1194,13 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
         weight_total_count = 0
         weight_total_sum = 0
         accumulator_dtype = get_high_precision()
+        # Allow non-quantized balance layers to still contribute to weight-scale
+        # statistics by borrowing qargs from peers in the same smooth-balance group.
+        peer_q_args = (
+            next((qarg for qarg in layer_qargs if qarg is not None), None)
+            if layer_qargs is not None
+            else None
+        )
 
         for idx, layer in enumerate(layers):
             layer_name = (
@@ -1201,8 +1224,12 @@ class AutoSmoothModifier(Modifier, QuantizationMixin):
             )
             if q_args is None:
                 q_args = getattr_chain(layer, "quantization_scheme.weights", None)
+            if q_args is None and peer_q_args is not None:
+                q_args = peer_q_args
+            elif q_args is not None and peer_q_args is None:
+                peer_q_args = q_args
 
-            if not q_args:
+            if q_args is None:
                 logger.warning(
                     "Unable to find quantization scheme for "
                     f"targeted layer {layer_name} ({type(layer)}), skipping"

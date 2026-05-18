@@ -8,7 +8,7 @@ from compressed_tensors.quantization import (
 
 import llmcompressor.modifiers.autosmooth.base as autosmooth_base
 from llmcompressor.modifiers.autosmooth import AutoSmoothModifier
-from llmcompressor.modifiers.transform.awq.mappings import ResolvedMapping
+from llmcompressor.modifiers.transform.awq.mappings import AWQMapping, ResolvedMapping
 from llmcompressor.pipelines.cache import IntermediatesCache
 
 
@@ -115,7 +115,8 @@ def test_compute_best_scale_uses_autosmooth_snapshot_qargs(monkeypatch):
     )
 
     modifier = AutoSmoothModifier(n_grid=2, duo_scaling=False)
-    modifier._autosmooth_target_modules = {parent.quantized_balance}
+    # Only quantized_balance has snapshot qargs; ignored_balance is non-quantized
+    # and participates in grid search with identity pseudo-quantization.
     modifier._autosmooth_weight_qargs = {parent.quantized_balance: qargs}
     modifier._smooth_activation_scales[mapping.smooth_name] = (torch.ones(4), 1)
 
@@ -160,7 +161,10 @@ def test_compute_best_scale_uses_autosmooth_snapshot_qargs(monkeypatch):
 
 @pytest.mark.unit
 @torch.no_grad()
-def test_compute_best_scale_skips_non_targeted_balance_layers(monkeypatch):
+def test_compute_best_scale_non_quantized_uses_identity(monkeypatch):
+    """Non-quantized balance layers participate in grid search with identity
+    pseudo-quantization (scale then unscale). Only quantized_balance has qargs,
+    so only its qargs should appear in observer construction."""
     parent = _ToyParent()
     smooth = torch.nn.LayerNorm(4)
 
@@ -168,20 +172,13 @@ def test_compute_best_scale_skips_non_targeted_balance_layers(monkeypatch):
         strategy=QuantizationStrategy.CHANNEL,
         num_bits=8,
     )
-    non_target_qargs = QuantizationArgs(
-        strategy=QuantizationStrategy.CHANNEL,
-        num_bits=4,
-    )
 
     parent.quantized_balance.quantization_scheme = QuantizationScheme(
         targets=["Linear"],
         weights=target_qargs,
     )
-    # Simulate another modifier attaching qscheme to a layer AutoSmooth ignores.
-    parent.ignored_balance.quantization_scheme = QuantizationScheme(
-        targets=["Linear"],
-        weights=non_target_qargs,
-    )
+    # ignored_balance has NO quantization_scheme — non-quantized layer
+    # that still participates in the mapping for smoothing.
 
     mapping = ResolvedMapping(
         smooth_name="toy.smooth",
@@ -193,7 +190,7 @@ def test_compute_best_scale_skips_non_targeted_balance_layers(monkeypatch):
     )
 
     modifier = AutoSmoothModifier(n_grid=2, duo_scaling=False)
-    modifier._autosmooth_target_modules = {parent.quantized_balance}
+    modifier._autosmooth_weight_qargs = {parent.quantized_balance: target_qargs}
     modifier._smooth_activation_scales[mapping.smooth_name] = (torch.ones(4), 1)
 
     cache = IntermediatesCache(offload_device=None)
@@ -230,18 +227,11 @@ def test_compute_best_scale_skips_non_targeted_balance_layers(monkeypatch):
 
 @pytest.mark.unit
 @torch.no_grad()
-def test_compute_best_scale_errors_on_missing_qargs_for_targeted_layers(monkeypatch):
+def test_compute_best_scale_all_non_quantized_balance_layers_use_identity(monkeypatch):
+    """When all balance layers are non-quantized, AutoSmooth still runs
+    grid search via identity pseudo-quantization."""
     parent = _ToyParent()
     smooth = torch.nn.LayerNorm(4)
-
-    parent.quantized_balance.quantization_scheme = QuantizationScheme(
-        targets=["Linear"],
-        weights=None,
-    )
-    parent.ignored_balance.quantization_scheme = QuantizationScheme(
-        targets=["Linear"],
-        weights=None,
-    )
 
     mapping = ResolvedMapping(
         smooth_name="toy.smooth",
@@ -253,24 +243,33 @@ def test_compute_best_scale_errors_on_missing_qargs_for_targeted_layers(monkeypa
     )
 
     modifier = AutoSmoothModifier(n_grid=2, duo_scaling=False)
-    modifier._autosmooth_target_modules = {parent.quantized_balance}
     modifier._smooth_activation_scales[mapping.smooth_name] = (torch.ones(4), 1)
 
     cache = IntermediatesCache(offload_device=None)
     cache.append({"x": torch.randn(2, 4)})
     modifier._parent_args_cache[parent] = cache
 
-    monkeypatch.setattr(autosmooth_base, "fuse_weight_observers", lambda *args, **kwargs: None)
-    monkeypatch.setattr(autosmooth_base, "update_qparams", lambda *args, **kwargs: None)
+    def _unexpected_observer(*_args, **_kwargs):
+        raise AssertionError(
+            "weight observer should not be created for non-quantized layers"
+        )
+
+    def _unexpected_update_qparams(*_args, **_kwargs):
+        raise AssertionError(
+            "update_qparams should not run for non-quantized layers"
+        )
+
     monkeypatch.setattr(
-        autosmooth_base,
-        "forward_quantize",
-        lambda _module, value, _base_name, _args: value,
+        autosmooth_base.Observer,
+        "load_from_registry",
+        staticmethod(_unexpected_observer),
     )
+    monkeypatch.setattr(autosmooth_base, "update_qparams", _unexpected_update_qparams)
 
     fp16_outputs = modifier._run_samples(parent)
-    with pytest.raises(ValueError, match="could not resolve weight quantization args"):
-        modifier._compute_best_scale(mapping, fp16_outputs)
+    best_scales = modifier._compute_best_scale(mapping, fp16_outputs)
+
+    assert torch.isfinite(best_scales).all()
 
 
 @pytest.mark.unit
@@ -300,7 +299,6 @@ def test_compute_best_scale_duo_scaling_uses_snapshot_qargs(monkeypatch):
     )
 
     modifier = AutoSmoothModifier(n_grid=2, duo_scaling=True)
-    modifier._autosmooth_target_modules = {parent.quantized_balance}
     modifier._autosmooth_weight_qargs = {parent.quantized_balance: qargs}
     modifier._smooth_activation_scales[mapping.smooth_name] = (torch.ones(4), 1)
 
@@ -319,6 +317,230 @@ def test_compute_best_scale_duo_scaling_uses_snapshot_qargs(monkeypatch):
         autosmooth_base,
         "forward_quantize",
         lambda _module, value, _base_name, _args: value,
+    )
+
+    fp16_outputs = modifier._run_samples(parent)
+    best_scales = modifier._compute_best_scale(mapping, fp16_outputs)
+
+    assert torch.isfinite(best_scales).all()
+
+
+@pytest.mark.unit
+@torch.no_grad()
+def test_compute_best_scale_duo_scaling_includes_non_quantized_in_weight_scales(monkeypatch):
+    parent = _ToyParent()
+    smooth = torch.nn.LayerNorm(4)
+
+    qargs = QuantizationArgs(
+        strategy=QuantizationStrategy.CHANNEL,
+        num_bits=8,
+    )
+    parent.quantized_balance.quantization_scheme = QuantizationScheme(
+        targets=["Linear"],
+        weights=None,
+    )
+
+    mapping = ResolvedMapping(
+        smooth_name="toy.smooth",
+        smooth_layer=smooth,
+        balance_layers=[parent.quantized_balance, parent.ignored_balance],
+        balance_names=["toy.quantized_balance", "toy.ignored_balance"],
+        parent=parent,
+        parent_name="toy",
+    )
+
+    modifier = AutoSmoothModifier(n_grid=2, duo_scaling=True)
+    modifier._autosmooth_weight_qargs = {parent.quantized_balance: qargs}
+    modifier._smooth_activation_scales[mapping.smooth_name] = (torch.ones(4), 1)
+
+    cache = IntermediatesCache(offload_device=None)
+    cache.append({"x": torch.randn(2, 4)})
+    modifier._parent_args_cache[parent] = cache
+
+    captured_call: dict[str, list] = {}
+
+    def _fake_compute_layer_scales(layers, layer_names=None, layer_qargs=None):
+        captured_call["layers"] = layers
+        captured_call["layer_names"] = layer_names
+        captured_call["layer_qargs"] = layer_qargs
+        return torch.ones(4)
+
+    monkeypatch.setattr(
+        autosmooth_base.AutoSmoothModifier,
+        "_compute_layer_scales",
+        staticmethod(_fake_compute_layer_scales),
+    )
+    monkeypatch.setattr(
+        autosmooth_base.Observer,
+        "load_from_registry",
+        staticmethod(lambda *_args, **_kwargs: _FakeWeightObserver()),
+    )
+    monkeypatch.setattr(autosmooth_base, "fuse_weight_observers", lambda *args, **kwargs: None)
+    monkeypatch.setattr(autosmooth_base, "update_qparams", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        autosmooth_base,
+        "forward_quantize",
+        lambda _module, value, _base_name, _args: value,
+    )
+
+    fp16_outputs = modifier._run_samples(parent)
+    best_scales = modifier._compute_best_scale(mapping, fp16_outputs)
+
+    assert torch.isfinite(best_scales).all()
+    assert len(captured_call["layers"]) == 2
+    assert captured_call["layer_names"] == [
+        "toy.quantized_balance",
+        "toy.ignored_balance",
+    ]
+    assert captured_call["layer_qargs"][0] is qargs
+    assert captured_call["layer_qargs"][1] is None
+
+
+@pytest.mark.unit
+@torch.no_grad()
+def test_compute_best_scale_duo_scaling_can_exclude_non_quantized_from_weight_scales(monkeypatch):
+    parent = _ToyParent()
+    smooth = torch.nn.LayerNorm(4)
+
+    qargs = QuantizationArgs(
+        strategy=QuantizationStrategy.CHANNEL,
+        num_bits=8,
+    )
+    parent.quantized_balance.quantization_scheme = QuantizationScheme(
+        targets=["Linear"],
+        weights=None,
+    )
+
+    mapping = ResolvedMapping(
+        smooth_name="toy.smooth",
+        smooth_layer=smooth,
+        balance_layers=[parent.quantized_balance, parent.ignored_balance],
+        balance_names=["toy.quantized_balance", "toy.ignored_balance"],
+        parent=parent,
+        parent_name="toy",
+    )
+
+    modifier = AutoSmoothModifier(
+        n_grid=2,
+        duo_scaling=True,
+        include_nonq_wscale=False,
+    )
+    modifier._autosmooth_weight_qargs = {parent.quantized_balance: qargs}
+    modifier._smooth_activation_scales[mapping.smooth_name] = (torch.ones(4), 1)
+
+    cache = IntermediatesCache(offload_device=None)
+    cache.append({"x": torch.randn(2, 4)})
+    modifier._parent_args_cache[parent] = cache
+
+    captured_call: dict[str, list] = {}
+
+    def _fake_compute_layer_scales(layers, layer_names=None, layer_qargs=None):
+        captured_call["layers"] = layers
+        captured_call["layer_names"] = layer_names
+        captured_call["layer_qargs"] = layer_qargs
+        return torch.ones(4)
+
+    monkeypatch.setattr(
+        autosmooth_base.AutoSmoothModifier,
+        "_compute_layer_scales",
+        staticmethod(_fake_compute_layer_scales),
+    )
+    monkeypatch.setattr(
+        autosmooth_base.Observer,
+        "load_from_registry",
+        staticmethod(lambda *_args, **_kwargs: _FakeWeightObserver()),
+    )
+    monkeypatch.setattr(autosmooth_base, "fuse_weight_observers", lambda *args, **kwargs: None)
+    monkeypatch.setattr(autosmooth_base, "update_qparams", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        autosmooth_base,
+        "forward_quantize",
+        lambda _module, value, _base_name, _args: value,
+    )
+
+    fp16_outputs = modifier._run_samples(parent)
+    best_scales = modifier._compute_best_scale(mapping, fp16_outputs)
+
+    assert torch.isfinite(best_scales).all()
+    assert len(captured_call["layers"]) == 1
+    assert captured_call["layer_names"] == ["toy.quantized_balance"]
+    assert captured_call["layer_qargs"] == [qargs]
+
+
+@pytest.mark.unit
+@torch.no_grad()
+def test_compute_best_scale_sanitizes_scales_before_scalesview(monkeypatch):
+    parent = _ToyParent()
+    smooth = torch.nn.LayerNorm(4)
+
+    qargs = QuantizationArgs(
+        strategy=QuantizationStrategy.CHANNEL,
+        num_bits=8,
+    )
+    parent.quantized_balance.quantization_scheme = QuantizationScheme(
+        targets=["Linear"],
+        weights=qargs,
+    )
+
+    mapping = ResolvedMapping(
+        smooth_name="toy.smooth",
+        smooth_layer=smooth,
+        balance_layers=[parent.quantized_balance],
+        balance_names=["toy.quantized_balance"],
+        parent=parent,
+        parent_name="toy",
+    )
+
+    modifier = AutoSmoothModifier(n_grid=2, duo_scaling=True)
+    modifier._autosmooth_weight_qargs = {parent.quantized_balance: qargs}
+    modifier._smooth_activation_scales[mapping.smooth_name] = (torch.ones(4), 1)
+
+    cache = IntermediatesCache(offload_device=None)
+    cache.append({"x": torch.randn(2, 4)})
+    modifier._parent_args_cache[parent] = cache
+
+    monkeypatch.setattr(
+        autosmooth_base.Observer,
+        "load_from_registry",
+        staticmethod(lambda *_args, **_kwargs: _FakeWeightObserver()),
+    )
+    monkeypatch.setattr(autosmooth_base, "fuse_weight_observers", lambda *args, **kwargs: None)
+    monkeypatch.setattr(autosmooth_base, "update_qparams", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        autosmooth_base,
+        "forward_quantize",
+        lambda _module, value, _base_name, _args: value,
+    )
+
+    # Force an inf entry in activation scales. The implementation must sanitize
+    # scales before constructing _scalesview to avoid propagating inf/nan into
+    # temporary weights and loss computation.
+    monkeypatch.setattr(
+        autosmooth_base.AutoSmoothModifier,
+        "_resolve_activation_scales",
+        lambda *_args, **_kwargs: torch.tensor([float("inf"), 1.0, 1.0, 1.0]),
+    )
+    monkeypatch.setattr(
+        autosmooth_base.AutoSmoothModifier,
+        "_compute_layer_scales",
+        staticmethod(lambda *_args, **_kwargs: torch.ones(4)),
+    )
+
+    original_compute_loss = autosmooth_base.AutoSmoothModifier._compute_loss
+
+    def _finite_loss(_self, fp16_outputs, int_w_outputs):
+        for out in int_w_outputs:
+            assert torch.isfinite(out).all(), "int_w_outputs should stay finite"
+        return original_compute_loss(
+            _self,
+            fp16_outputs,
+            int_w_outputs,
+        )
+
+    monkeypatch.setattr(
+        autosmooth_base.AutoSmoothModifier,
+        "_compute_loss",
+        _finite_loss,
     )
 
     fp16_outputs = modifier._run_samples(parent)
@@ -353,7 +575,6 @@ def test_compute_best_scale_preserves_existing_weight_scale(monkeypatch):
     )
 
     modifier = AutoSmoothModifier(n_grid=2, duo_scaling=False)
-    modifier._autosmooth_target_modules = {parent.quantized_balance}
     modifier._smooth_activation_scales[mapping.smooth_name] = (torch.ones(4), 1)
 
     cache = IntermediatesCache(offload_device=None)
@@ -378,6 +599,62 @@ def test_compute_best_scale_preserves_existing_weight_scale(monkeypatch):
 
     assert torch.isfinite(best_scales).all()
     assert hasattr(parent.quantized_balance, "weight_scale")
+
+
+@pytest.mark.unit
+@torch.no_grad()
+def test_compute_best_scale_does_not_leak_temporary_qparams(monkeypatch):
+    parent = _ToyParent()
+    smooth = torch.nn.LayerNorm(4)
+
+    qargs = QuantizationArgs(
+        strategy=QuantizationStrategy.TENSOR_GROUP,
+        group_size=2,
+        num_bits=8,
+        symmetric=False,
+    )
+    parent.quantized_balance.quantization_scheme = QuantizationScheme(
+        targets=["Linear"],
+        weights=qargs,
+    )
+
+    mapping = ResolvedMapping(
+        smooth_name="toy.smooth",
+        smooth_layer=smooth,
+        balance_layers=[parent.quantized_balance],
+        balance_names=["toy.quantized_balance"],
+        parent=parent,
+        parent_name="toy",
+    )
+
+    modifier = AutoSmoothModifier(n_grid=2, duo_scaling=False)
+    modifier._smooth_activation_scales[mapping.smooth_name] = (torch.ones(4), 1)
+
+    cache = IntermediatesCache(offload_device=None)
+    cache.append({"x": torch.randn(2, 4)})
+    modifier._parent_args_cache[parent] = cache
+
+    monkeypatch.setattr(
+        autosmooth_base.Observer,
+        "load_from_registry",
+        staticmethod(lambda *_args, **_kwargs: _FakeWeightObserver()),
+    )
+    monkeypatch.setattr(autosmooth_base, "fuse_weight_observers", lambda *args, **kwargs: None)
+    monkeypatch.setattr(autosmooth_base, "update_qparams", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        autosmooth_base,
+        "forward_quantize",
+        lambda _module, value, _base_name, _args: value,
+    )
+
+    fp16_outputs = modifier._run_samples(parent)
+    best_scales = modifier._compute_best_scale(mapping, fp16_outputs)
+
+    assert torch.isfinite(best_scales).all()
+    assert not hasattr(parent.quantized_balance, "weight_observer")
+    assert not hasattr(parent.quantized_balance, "weight_scale")
+    assert not hasattr(parent.quantized_balance, "weight_zero_point")
+    assert not hasattr(parent.quantized_balance, "weight_global_scale")
 
 
 @pytest.mark.unit
@@ -417,33 +694,74 @@ def test_log_error_metrics_handles_empty_metrics():
 
 
 @pytest.mark.unit
-def test_capture_quantization_state_infers_qargs_without_mutating_model():
+def test_set_resolved_mappings_keeps_non_quantized_balance_layers():
+    class _ToyMappingModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.smooth = torch.nn.LayerNorm(4)
+            self.balance = torch.nn.Linear(4, 4, bias=False)
+
+    model = _ToyMappingModel()
+    modifier = AutoSmoothModifier(
+        mappings=[AWQMapping(smooth_layer="smooth", balance_layers=["balance"])]
+    )
+
+    modifier._set_resolved_mappings(model)
+
+    assert len(modifier._resolved_mappings) == 1
+    resolved = modifier._resolved_mappings[0]
+    assert resolved.smooth_name == "smooth"
+    assert resolved.smooth_layer is model.smooth
+    assert resolved.balance_layers == [model.balance]
+
+
+@pytest.mark.unit
+def test_capture_quantization_state_tracks_non_quantized_balance_layers():
+    class _ToyMappingModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.smooth = torch.nn.LayerNorm(4)
+            self.balance = torch.nn.Linear(4, 4, bias=False)
+
+    model = _ToyMappingModel()
+    modifier = AutoSmoothModifier(
+        mappings=[AWQMapping(smooth_layer="smooth", balance_layers=["balance"])]
+    )
+
+    modifier._set_resolved_mappings(model)
+    modifier._capture_autosmooth_quantization_state(model)
+
+    assert model.balance in modifier._autosmooth_weight_qargs
+    assert modifier._autosmooth_weight_qargs[model.balance] is None
+
+
+@pytest.mark.unit
+def test_capture_quantization_state_reads_from_modules():
+    """Verify snapshot reads quantization_scheme from modules and deep copies qargs."""
     model = torch.nn.Sequential(torch.nn.Linear(4, 4, bias=False))
     layer = model[0]
 
-    modifier = AutoSmoothModifier(
-        config_groups={
-            "group_0": QuantizationScheme(
-                targets=["Linear"],
-                weights=QuantizationArgs(
-                    strategy=QuantizationStrategy.CHANNEL,
-                    num_bits=8,
-                ),
-            )
-        }
+    original_qargs = QuantizationArgs(
+        strategy=QuantizationStrategy.CHANNEL,
+        num_bits=8,
+    )
+    layer.quantization_scheme = QuantizationScheme(
+        targets=["Linear"],
+        weights=original_qargs,
     )
 
+    modifier = AutoSmoothModifier()
     modifier._capture_autosmooth_quantization_state(model)
 
-    assert layer in modifier._autosmooth_target_modules
     assert layer in modifier._autosmooth_weight_qargs
     assert (
         modifier._autosmooth_weight_qargs[layer].strategy
         == QuantizationStrategy.CHANNEL
     )
 
-    # Snapshot should not attach quantization artifacts to the live model.
-    assert not hasattr(layer, "quantization_scheme")
+    # Snapshot should be a deep copy — mutating the original must not affect it.
+    original_qargs.num_bits = 4
+    assert modifier._autosmooth_weight_qargs[layer].num_bits == 8
 
 
 @pytest.mark.unit
