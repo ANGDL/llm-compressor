@@ -214,17 +214,21 @@ class Recipe(BaseModel):
         if not model.modifiers:
             return model
 
+        from llmcompressor.modifiers.autosmooth import AutoSmoothModifier
         from llmcompressor.modifiers.quantization import QuantizationMixin
         from llmcompressor.modifiers.transform import AWQModifier
 
         for modifier_idx, modifier in enumerate(model.modifiers):
-            if isinstance(modifier, (AWQModifier)) and not any(
+            if isinstance(modifier, (AWQModifier, AutoSmoothModifier)) and not any(
                 isinstance(mod, QuantizationMixin)
                 for mod in model.modifiers[(modifier_idx + 1) :]
             ):
+                modifier_name = type(modifier).__name__
                 raise ValueError(
-                    f"Recipe includes AWQModifier with no subsequent quantization "
-                    f"modifer: {model.modifiers}. AWQ must be run with "
+                    f"Recipe includes {modifier_name} with no subsequent quantization "
+                    f"modifier: {model.modifiers}. {modifier_name} must be run with "
+                    f"a QuantizationMixin modifier (e.g. QuantizationModifier or "
+                    f"GPTQModifier) listed after it in the recipe."
                 )
 
         return model
