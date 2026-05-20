@@ -4,7 +4,7 @@ from collections import deque
 from dataclasses import dataclass
 from functools import wraps
 from types import FunctionType, MethodType
-from typing import TYPE_CHECKING, Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable
 
 import torch
 from compressed_tensors.offload import disable_onloading
@@ -45,7 +45,6 @@ class Subgraph:
     input_names: set[str]
     consumed_names: set[str]
     _code: PythonCode | None = None
-    _materialized: bool = False
 
     def forward(self, *args, **kwargs) -> dict[str, Any]:
         """
@@ -62,18 +61,7 @@ class Subgraph:
         forward_fn = self._code.globals.get("forward")
 
         with append_autowrap_source_on_fail():
-            try:
-                return forward_fn(*args, **kwargs)
-            except Exception as e:
-                logger.warning(
-                    f"Error caused by autowrap_forwards: {e},"
-                    f"trying to materialize model meta tensors."
-                )
-                if not self._materialized:
-                    self._materialize_model_meta_tensors(args[0] if args else None)
-                    self._materialized = True
-                outputs = forward_fn(*args, **kwargs)
-                return outputs
+            return forward_fn(*args, **kwargs)
 
     def submodules(self, model: Module, recurse: bool = False) -> set[Module]:
         nodes = self.graph.find_nodes(op="call_module")
@@ -82,42 +70,6 @@ class Subgraph:
             modules = set(m for module in modules for m in module.modules())
 
         return modules
-        
-    def _materialize_model_meta_tensors(self, model: Optional[Module]) -> None:
-        """Materialize meta tensors in model parameters and buffers"""
-        if model is None:
-            return
-
-        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-
-        for module in model.modules():
-            # Materialize parameters
-            for name, param in list(module.named_parameters(recurse=False)):
-                if param is not None and param.is_meta:
-                    try:
-                        # Create materialized tensor on target device
-                        materialized = torch.zeros_like(param, device=device)
-                        new_param = torch.nn.Parameter(
-                            materialized, requires_grad=param.requires_grad
-                        )
-                        module._parameters[name] = new_param
-                    except Exception as e:
-                        logger.warning(
-                            f"Failed to materialize parameter {name} in "
-                            f"{module.__class__.__name__}: {e}"
-                        )
-
-            # Materialize buffers
-            for name, buffer in list(module.named_buffers(recurse=False)):
-                if buffer is not None and buffer.is_meta:
-                    try:
-                        materialized = torch.zeros_like(buffer, device=device)
-                        module._buffers[name] = materialized
-                    except Exception as e:
-                        logger.warning(
-                            f"Failed to materialize buffer {name} in "
-                            f"{module.__class__.__name__}: {e}"
-                        )
 
 
 def trace_subgraphs(
