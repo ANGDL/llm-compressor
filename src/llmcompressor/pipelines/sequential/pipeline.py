@@ -1,5 +1,5 @@
 import contextlib
-from typing import TYPE_CHECKING, Any, Iterator, Sequence, cast
+from typing import TYPE_CHECKING, Iterator
 
 import torch
 from compressed_tensors.offload import disable_offloading, set_onload_device
@@ -27,7 +27,7 @@ __all__ = ["SequentialPipeline"]
 def _get_batches(
     activations: IntermediatesCache,
     num_batches: int,
-    input_names: Sequence[str],
+    input_names: list[str],
     desc: str,
     sequential_prefetch: bool = False,
 ) -> Iterator[tuple[int, dict]]:
@@ -37,7 +37,6 @@ def _get_batches(
     main-thread forward pass. Delegates to
     :meth:`IntermediatesCache.iter_prefetch` when prefetching is enabled.
     """
-    input_names = list(input_names)
     batch_source = (
         activations.iter_prefetch(input_names)
         if sequential_prefetch
@@ -96,9 +95,9 @@ class SequentialPipeline(CalibrationPipeline):
         # trace subgraphs
         sample_input = next(iter(dataloader))
         subgraphs = trace_subgraphs(
-            cast(Any, model),
+            model,
             sample_input,
-            cast(list[str], sequential_targets),
+            sequential_targets,
             ignore,
             dataset_args.sequential_targets_per_subgraph,
         )
@@ -117,34 +116,20 @@ class SequentialPipeline(CalibrationPipeline):
             # Populate loss_masks once from cached activations for AWQ masking support
             use_loss_mask = getattr(dataset_args, "use_loss_mask", False)
             if use_loss_mask:
-                loss_masks = [
+                session.state.loss_masks = [
                     activations.fetch(batch_idx, ["loss_mask"]).get("loss_mask")
                     for batch_idx in range(len(dataloader))
                 ]
-                session.state.loss_masks = cast(list[torch.Tensor], loss_masks)
             else:
                 session.state.loss_masks = None
 
             sequential_prefetch = getattr(dataset_args, "sequential_prefetch", False)
             session.state.sequential_prefetch = sequential_prefetch
 
-            # Define helper function to materialize meta tensors once
-            # Fixes "Tensor.item() on meta tensors" error when using device offloading
-            def _materialize_meta_tensors(obj):
-                if isinstance(obj, torch.Tensor) and obj.is_meta:
-                    return torch.zeros_like(obj, device=onload_device)
-                elif isinstance(obj, dict):
-                    return {k: _materialize_meta_tensors(v) for k, v in obj.items()}
-                elif isinstance(obj, (list, tuple)):
-                    return type(obj)([_materialize_meta_tensors(x) for x in obj])
-                return obj
-
             for subgraph_index, subgraph in enumerate(subgraphs):
                 # prepare tqdm description texts
                 calib_desc = f"({subgraph_index + 1}/{num_subgraphs}): Calibrating"
                 prop_desc = f"({subgraph_index + 1}/{num_subgraphs}): Propagating"
-                input_names = list(subgraph.input_names)
-                consumed_names = list(subgraph.consumed_names)
 
                 # reduce memory movement by keeping modules onloaded
                 num_batches = len(dataloader)
@@ -153,18 +138,17 @@ class SequentialPipeline(CalibrationPipeline):
                     for batch_idx, inputs in _get_batches(
                         activations,
                         num_batches,
-                        input_names,
+                        subgraph.input_names,
                         calib_desc,
                         sequential_prefetch,
                     ):
-                        inputs = cast(dict[str, Any], _materialize_meta_tensors(inputs))
                         session.state.current_batch_idx = batch_idx
                         outputs = subgraph.forward(model, **inputs)
 
                         if not dataset_args.propagate_error:
                             if subgraph_index < num_subgraphs - 1:
                                 activations.update(batch_idx, outputs)
-                                activations.delete(batch_idx, consumed_names)
+                                activations.delete(batch_idx, subgraph.consumed_names)
 
                     modules = list(subgraph.submodules(model))
                     LifecycleCallbacks.sequential_epoch_end(modules)
@@ -176,16 +160,15 @@ class SequentialPipeline(CalibrationPipeline):
                             for batch_idx, inputs in _get_batches(
                                 activations,
                                 num_batches,
-                                input_names,
+                                subgraph.input_names,
                                 prop_desc,
                                 sequential_prefetch,
                             ):
-                                inputs = cast(dict[str, Any], _materialize_meta_tensors(inputs))
                                 output = subgraph.forward(model, **inputs)
                                 if subgraph_index < num_subgraphs - 1:
                                     activations.update(batch_idx, output)
                                     activations.delete(
-                                        batch_idx, consumed_names
+                                        batch_idx, subgraph.consumed_names
                                     )
 
             # redundant, finish any remaining compression
