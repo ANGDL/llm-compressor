@@ -60,6 +60,17 @@ class IMatrixGatherer(Modifier):
     targets: str | list[str] = Field(default_factory=lambda: ["Linear"])
     ignore: list[str] = Field(default_factory=lambda: ["lm_head"])
     weight_observer: str = "imatrix_mse"
+    attach_by_initialize: bool = Field(
+        default=True,
+        description=(
+            "When True, observers attach (register hooks and create module buffers) "
+            "during on_initialize. When False, attachment is deferred — the downstream "
+            "QuantizationModifier/GPTQModifier creates the hooks and buffers, and "
+            "IMatrixGatherer syncs accumulated data to the observer during "
+            "SEQUENTIAL_EPOCH_END (after forward passes have run). Set to False when "
+            "using pipeline='sequential' to avoid double-attach conflicts."
+        ),
+    )
 
     # ------------------------------------------------------------------ #
     #  Lifecycle
@@ -86,7 +97,8 @@ class IMatrixGatherer(Modifier):
                 args=observer_args,
             )
             module.register_module("weight_observer", observer)
-            observer.attach(module)
+            if self.attach_by_initialize:
+                observer.attach(module)
 
         return True
 
@@ -97,6 +109,15 @@ class IMatrixGatherer(Modifier):
         if event.type_ == EventType.CALIBRATION_EPOCH_START:
             if not self.started_:
                 self.on_start(state, None)
+
+        if event.type_ == EventType.SEQUENTIAL_EPOCH_END and not self.attach_by_initialize:
+            parents = kwargs.get("modules", [])
+            modules = {m for parent in parents for m in parent.modules() if hasattr(m, "weight_observer")}
+            for module in modules:
+                observer = getattr(module, "weight_observer", None)
+                if observer is not None:
+                    observer._imatrix_sum = module._imatrix_sum
+                    observer._imatrix_count = module._imatrix_count
 
         if event.type_ == EventType.CALIBRATION_EPOCH_END:
             if not self.ended_:
