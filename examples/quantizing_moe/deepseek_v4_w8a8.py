@@ -291,6 +291,12 @@ class SafetensorsReader:
         elif dtype_str in ("I8", "U8"):
             arr = np.frombuffer(raw, dtype=np.int8 if dtype_str == "I8" else np.uint8)
             return torch.from_numpy(arr.reshape(shape).copy())
+        elif dtype_str == "I64":
+            arr = np.frombuffer(raw, dtype=np.int64).reshape(shape).copy()
+            return torch.from_numpy(arr)
+        elif dtype_str == "I32":
+            arr = np.frombuffer(raw, dtype=np.int32).reshape(shape).copy()
+            return torch.from_numpy(arr)
         else:
             raise ValueError(f"Unsupported dtype: {dtype_str} for key {key}")
 
