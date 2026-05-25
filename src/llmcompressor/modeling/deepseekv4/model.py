@@ -781,9 +781,33 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
     def __init__(self, config: ModelConfig):
         super().__init__(config)
         self.register_load_state_dict_pre_hook(self._remap_checkpoint_keys_for_loading)
+        self._register_state_dict_hook(self._remap_state_dict_for_saving)
+        self.save_raw_format = False
         self.model = Transformer(config)
         self.vocab_size = config.vocab_size
         self.post_init()
+
+    @staticmethod
+    def _remap_state_dict_for_saving(module, state_dict, prefix, local_metadata):
+        if not getattr(module, "save_raw_format", False):
+            return
+        remapped = {}
+        for key, value in list(state_dict.items()):
+            new_key = key
+            if new_key.startswith("model."):
+                new_key = new_key[len("model."):]
+            new_key = new_key.replace(".weight_scale", ".scale")
+            remapped[new_key] = value
+        state_dict.clear()
+        state_dict.update(remapped)
+        # Update tied weights keys to match the new format
+        if hasattr(module, "_tied_weights_keys") and module._tied_weights_keys:
+            new_tied = {}
+            for k, v in module._tied_weights_keys.items():
+                nk = k.removeprefix("model.")
+                nv = v.removeprefix("model.")
+                new_tied[nk] = nv
+            module._tied_weights_keys = new_tied
 
     def get_input_embeddings(self):
         return self.model.embed

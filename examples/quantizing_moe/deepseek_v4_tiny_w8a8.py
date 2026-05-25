@@ -150,6 +150,7 @@ def main():
 
     save_dir = Path("./DeepSeek-V4-Tiny-W8A8")
 
+    model.save_raw_format = True
     import llmcompressor.transformers.compression.compressed_tensors_utils as ct_utils
     original_from_accelerate = ct_utils.from_accelerate
     ct_utils.from_accelerate = lambda model: ({}, None)

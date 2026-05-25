@@ -115,6 +115,16 @@ parser.add_argument(
     default=4,
     help="Number of parallel workers for BF16 conversion.",
 )
+parser.add_argument(
+    "--save-raw-checkpoint-format",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help=(
+        "Save weights in raw DeepSeek checkpoint format (no 'model.' prefix, "
+        "'.weight_scale' → '.scale') for compatibility with sglang/vLLM. "
+        "Disable to keep HuggingFace format."
+    ),
+)
 args = parser.parse_args()
 
 
@@ -160,6 +170,7 @@ def maybe_skip_from_accelerate(skip_restore: bool):
         yield
     finally:
         ct_utils.from_accelerate = original_from_accelerate
+
 
 
 # ===========================================================================
@@ -611,6 +622,9 @@ else:
 # Save to disk compressed.
 SAVE_NAME = args.model_id.rstrip("/").split("/")[-1] + tail_name
 SAVE_DIR = os.path.join(args.save_dir, SAVE_NAME)
+
+if args.save_raw_checkpoint_format:
+    model.save_raw_format = True
 
 with maybe_skip_from_accelerate(args.skip_restore_from_accelerate):
     model.save_pretrained(SAVE_DIR, save_compressed=True)
