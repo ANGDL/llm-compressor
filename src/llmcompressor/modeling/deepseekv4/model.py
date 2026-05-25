@@ -186,9 +186,25 @@ class Compressor(nn.Module):
         self.rope_head_dim = args.rope_head_dim
         self.kv_cache: Optional[torch.Tensor] = None
         self.freqs_cis: Optional[torch.Tensor] = None
-        self._overlap_factor = overlap_factor
-        self._kv_state: Optional[torch.Tensor] = None
-        self._score_state: Optional[torch.Tensor] = None
+        self.register_buffer(
+            "kv_state",
+            torch.zeros(
+                args.max_batch_size,
+                overlap_factor * compress_ratio,
+                overlap_factor * self.head_dim,
+                dtype=torch.float32,
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "score_state",
+            torch.full(
+                (args.max_batch_size, overlap_factor * compress_ratio, overlap_factor * self.head_dim),
+                float("-inf"),
+                dtype=torch.float32,
+            ),
+            persistent=False,
+        )
 
     def overlap_transform(self, tensor: torch.Tensor, value: float = 0.0) -> torch.Tensor:
         bsz, seqlen, _, _ = tensor.size()
@@ -208,19 +224,8 @@ class Compressor(nn.Module):
         ratio = self.compress_ratio
         overlap = self.overlap
         dim = self.head_dim
-        overlap_factor = self._overlap_factor
-        # Lazy allocate state buffers
-        if self._kv_state is None or self._kv_state.size(0) < bsz:
-            self._kv_state = torch.zeros(
-                bsz, overlap_factor * ratio, overlap_factor * dim,
-                dtype=torch.float32, device=x.device,
-            )
-            self._score_state = torch.full(
-                (bsz, overlap_factor * ratio, overlap_factor * dim),
-                float("-inf"), dtype=torch.float32, device=x.device,
-            )
-        kv_state = self._kv_state
-        score_state = self._score_state
+        kv_state = cast(torch.Tensor, self.kv_state)
+        score_state = cast(torch.Tensor, self.score_state)
         kv = self.wkv(x).float()
         score = self.wgate(x).float()
         if start_pos == 0:
@@ -293,7 +298,11 @@ class Indexer(nn.Module):
         self.softmax_scale = self.head_dim**-0.5
         self.compress_ratio = compress_ratio
         self.compressor = Compressor(args, compress_ratio, self.head_dim, True)
-        self._kv_cache: Optional[torch.Tensor] = None
+        self.register_buffer(
+            "kv_cache",
+            torch.zeros(args.max_batch_size, args.max_seq_len // compress_ratio, self.head_dim, dtype=torch.float32),
+            persistent=False,
+        )
         self.freqs_cis: Optional[torch.Tensor] = None
 
     def forward(self, x: torch.Tensor, qr: torch.Tensor, start_pos: int, offset: int):
@@ -302,17 +311,12 @@ class Indexer(nn.Module):
         freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
         ratio = self.compress_ratio
         end_pos = start_pos + seqlen
-        # Lazy allocate kv_cache
-        max_compressed = end_pos // ratio
-        if self._kv_cache is None or self._kv_cache.size(1) < max_compressed:
-            new_size = max(max_compressed, (self._kv_cache.size(1) * 2) if self._kv_cache is not None else max_compressed)
-            self._kv_cache = torch.zeros(bsz, new_size, self.head_dim, dtype=torch.float32, device=x.device)
         q = self.wq_b(qr).view(bsz, seqlen, self.n_local_heads, self.head_dim)
         if self.rope_head_dim > 0:
             apply_rotary_emb(q[..., -self.rope_head_dim :], freqs_cis)
             q = rotate_activation(q)
         if self.compressor.kv_cache is None:
-            self.compressor.kv_cache = self._kv_cache
+            self.compressor.kv_cache = cast(torch.Tensor, self.kv_cache)
             self.compressor.freqs_cis = self.freqs_cis
         _ = self.compressor(x, start_pos)
         compressed_len = end_pos // ratio
@@ -322,7 +326,7 @@ class Indexer(nn.Module):
         score = torch.einsum(
             "bshd,btd->bsht",
             q.float(),
-            self._kv_cache[:bsz, :compressed_len].float(),
+            cast(torch.Tensor, self.kv_cache)[:bsz, :compressed_len].float(),
         )
         score = (score.relu() * weights.unsqueeze(-1)).sum(dim=2)
         if start_pos == 0:
