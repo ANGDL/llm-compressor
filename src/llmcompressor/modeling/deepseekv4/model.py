@@ -180,8 +180,8 @@ class Compressor(nn.Module):
         self.rotate = rotate
         overlap_factor = 1 + self.overlap
         self.ape = nn.Parameter(torch.empty(compress_ratio, overlap_factor * self.head_dim, dtype=torch.float32))
-        self.wkv = Linear(self.dim, overlap_factor * self.head_dim, bias=False, dtype=torch.float32)
-        self.wgate = Linear(self.dim, overlap_factor * self.head_dim, bias=False, dtype=torch.float32)
+        self.wkv = Linear(self.dim, overlap_factor * self.head_dim, bias=False)
+        self.wgate = Linear(self.dim, overlap_factor * self.head_dim, bias=False)
         self.norm = RMSNorm(self.head_dim, args.norm_eps)
         self.rope_head_dim = args.rope_head_dim
         self.kv_cache: Optional[torch.Tensor] = None
@@ -289,7 +289,7 @@ class Indexer(nn.Module):
         self.index_topk = args.index_topk
         self.q_lora_rank = args.q_lora_rank
         self.wq_b = Linear(self.q_lora_rank, self.n_heads * self.head_dim, bias=False)
-        self.weights_proj = Linear(args.dim, self.n_heads, bias=False, dtype=torch.float32)
+        self.weights_proj = Linear(args.dim, self.n_heads, bias=False)
         self.softmax_scale = self.head_dim**-0.5
         self.compress_ratio = compress_ratio
         self.compressor = Compressor(args, compress_ratio, self.head_dim, True)
@@ -367,7 +367,6 @@ class Attention(nn.Module):
             self.n_heads * self.head_dim // self.n_groups,
             self.n_groups * args.o_lora_rank,
             bias=False,
-            dtype=torch.float32,
         )
         self.wo_b = Linear(self.n_groups * args.o_lora_rank, self.dim, bias=False)
         self.softmax_scale = self.head_dim**-0.5
@@ -467,9 +466,18 @@ class Attention(nn.Module):
         if self.rope_head_dim > 0:
             apply_rotary_emb(output[..., -self.rope_head_dim :], freqs_cis, inverse=True)
         output = output.view(bsz, seqlen, self.n_local_groups, -1)
-        wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1).float()
-        output = torch.einsum("bsgd,grd->bsgr", output.float(), wo_a).to(x.dtype)
-        return self.wo_b(output.flatten(2))
+        # Call wo_a through forward() so quantization hooks can observe activations.
+        # wo_a is a block-diagonal grouped projection: each group's input (per_group_dim)
+        # maps to its own o_lora_rank outputs via the corresponding weight rows.
+        per_group_dim = output.size(-1)
+        all_inputs = output.reshape(-1, per_group_dim)
+        all_outputs = self.wo_a(all_inputs)
+        all_outputs = all_outputs.view(bsz * seqlen, self.n_local_groups, -1)
+        output = torch.stack([
+            all_outputs[:, g, g * self.o_lora_rank : (g + 1) * self.o_lora_rank]
+            for g in range(self.n_local_groups)
+        ], dim=1).view(bsz, seqlen, self.n_local_groups, self.o_lora_rank)
+        return self.wo_b(output.flatten(2).to(x.dtype))
 
 
 class Gate(nn.Module):
