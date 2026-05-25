@@ -16,6 +16,12 @@ from llmcompressor.pipelines.data_free import pipeline as data_free_pipeline
 from compressed_tensors.offload.dispatch import dispatch_model as _dispatch_model
 from compressed_tensors.quantization import preset_name_to_scheme
 
+"""
+Usage example for quantizing GLM-5.1 with MoE layers to W8A8 using LLM Compressor.
+python glm5_w8a8.py --model_id /ssd3/models/GLM-5.1/ --save_dir /ssd2/models/ --transform "" --modifier RTN  --observer imatrix_mse  \
+    --num_calibration_samples 512 --max_sequence_length 2048 --dataset_id ./ultrachat_200k --dataset_split train_sft  \
+    --indexer-ignore-mode indexer_all --dispatch_extra_memory_gb 10 --pipeline sequential
+"""
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--model_id", type=str, default="/ssd4/models/GLM-5")
