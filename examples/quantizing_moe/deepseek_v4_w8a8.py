@@ -550,6 +550,7 @@ ignores = [
     "lm_head",
     "re:.*embed$",
     "re:.*ffn\\.gate$",
+    "re:.*attn\\.wo_a$",
     "re:.*attn\\.compressor\\.wgate$",
     "re:.*attn\\.compressor\\.wkv$",
     "re:.*attn\\.indexer\\.compressor\\.wgate$",
