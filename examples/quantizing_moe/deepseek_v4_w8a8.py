@@ -462,13 +462,24 @@ ds = ds.shuffle(seed=42)
 # This bypasses the transformers library's native DeepSeek V4 support which has
 # known issues with quantization workflows.
 model_id = BFLOAT16_SAVE_DIR
-model = DeepseekV4ForCausalLM.from_pretrained(
-    model_id,
-    torch_dtype=torch.bfloat16,
-    device_map="auto",
-    offload_folder=args.offload_folder,
-    max_memory={"cpu": int(args.max_memory_cpu_gb * 1e9)},
-)
+
+# Override cache-related config to avoid allocating hundreds of GB of KV cache
+# buffers that are not needed for quantization. The model registers large
+# persistent=False buffers sized by max_batch_size × max_seq_len per layer.
+from llmcompressor.modeling.deepseekv4.config import ModelConfig
+config = ModelConfig.from_pretrained(model_id)
+config.max_batch_size = 1
+config.max_seq_len = MAX_SEQUENCE_LENGTH
+
+with load_offloaded_model():
+    model = DeepseekV4ForCausalLM.from_pretrained(
+        model_id,
+        config=config,
+        dtype="auto",
+        device_map="auto_offload",
+        offload_folder=args.offload_folder,
+        max_memory={"cpu": int(args.max_memory_cpu_gb * 1e9)},
+    )
 tokenizer = AutoTokenizer.from_pretrained(model_id)
 
 # The custom model implementation has MTP built-in (model.model.mtp), so no
@@ -584,6 +595,7 @@ oneshot_kwargs = dict(
     model=model,
     dataset=ds,
     recipe=recipes,
+    tokenizer=tokenizer,
     max_seq_length=MAX_SEQUENCE_LENGTH,
     num_calibration_samples=NUM_CALIBRATION_SAMPLES,
     batch_size=1,
