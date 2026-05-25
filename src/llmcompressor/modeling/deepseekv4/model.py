@@ -654,8 +654,8 @@ class ParallelHead(nn.Module):
 class MTPBlock(Block):
     def __init__(self, layer_id: int, args: ModelConfig):
         super().__init__(layer_id, args)
-        self.e_proj = Linear(args.dim, args.dim)
-        self.h_proj = Linear(args.dim, args.dim)
+        self.e_proj = Linear(args.dim, args.dim, bias=False)
+        self.h_proj = Linear(args.dim, args.dim, bias=False)
         self.enorm = RMSNorm(args.dim, args.norm_eps)
         self.hnorm = RMSNorm(args.dim, args.norm_eps)
         self.norm = RMSNorm(args.dim, args.norm_eps)
@@ -797,15 +797,15 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
             if new_key.startswith("model."):
                 new_key = new_key[len("model."):]
             new_key = new_key.replace(".weight_scale", ".scale")
+            new_key = new_key.replace("lm_head.", "head.")
             remapped[new_key] = value
         state_dict.clear()
         state_dict.update(remapped)
-        # Update tied weights keys to match the new format
         if hasattr(module, "_tied_weights_keys") and module._tied_weights_keys:
             new_tied = {}
             for k, v in module._tied_weights_keys.items():
-                nk = k.removeprefix("model.")
-                nv = v.removeprefix("model.")
+                nk = k.removeprefix("model.").replace("lm_head.", "head.")
+                nv = v.removeprefix("model.").replace("lm_head.", "head.")
                 new_tied[nk] = nv
             module._tied_weights_keys = new_tied
 
