@@ -10,18 +10,18 @@ import torch
 from datasets import load_dataset
 from loguru import logger
 from safetensors.torch import save_file
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoTokenizer
 
 from llmcompressor import oneshot
 from llmcompressor.modeling.deepseek_v4 import CalibrationDeepseekV4MoE  # noqa: F401
-from llmcompressor.modeling.deepseek_v4_mtp import attach_mtp_layer
+from llmcompressor.modeling.deepseekv4.model import DeepseekV4ForCausalLM
 from llmcompressor.modifiers.gptq import GPTQModifier
 from llmcompressor.modifiers.quantization import QuantizationModifier
 from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
 from llmcompressor.pipelines.basic import pipeline as basic_pipeline
 from llmcompressor.pipelines.data_free import pipeline as data_free_pipeline
 from llmcompressor.utils import ImatrixFallbackStats
-from compressed_tensors.offload import get_device_map, load_offloaded_model
+from compressed_tensors.offload import get_device_map
 from compressed_tensors.offload.dispatch import dispatch_model as _dispatch_model
 from compressed_tensors.quantization import preset_name_to_scheme
 from llmcompressor.logger import LoggerConfig, configure_logger
@@ -458,28 +458,32 @@ MAX_SEQUENCE_LENGTH = args.max_sequence_length
 ds = load_dataset(DATASET_ID, split=f"{DATASET_SPLIT}[:{NUM_CALIBRATION_SAMPLES}]")
 ds = ds.shuffle(seed=42)
 
-# Load the BF16 model
+# Load the BF16 model using our custom DeepseekV4ForCausalLM implementation.
+# This bypasses the transformers library's native DeepSeek V4 support which has
+# known issues with quantization workflows.
 model_id = BFLOAT16_SAVE_DIR
-with load_offloaded_model():
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        dtype="auto",
-        device_map="auto_offload",
-        offload_folder=args.offload_folder,
-        max_memory={"cpu": int(args.max_memory_cpu_gb * 1e9)},
-    )
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
+model = DeepseekV4ForCausalLM.from_pretrained(
+    model_id,
+    torch_dtype=torch.bfloat16,
+    device_map="auto",
+    offload_folder=args.offload_folder,
+    max_memory={"cpu": int(args.max_memory_cpu_gb * 1e9)},
+)
+tokenizer = AutoTokenizer.from_pretrained(model_id)
 
-# Attach the MTP layer so it participates in the calibration forward pass and
-# gets quantized end-to-end along with the main model.
-attach_mtp_layer(model, model_id)
+# The custom model implementation has MTP built-in (model.model.mtp), so no
+# attach_mtp_layer call is needed. The MTP layers are part of the Transformer
+# architecture and participate in calibration automatically.
+
+# GPTQ's lm_head disabling utility assumes a single-input output head.
+# DeepSeekV4 head has extra arguments, so skip output embedding wrapping.
+model.get_output_embeddings = lambda: None
 
 
 def preprocess(example):
     """Format calibration data using DeepSeek V4 chat encoding."""
     if "messages" in example:
         messages = example["messages"]
-        # DeepSeek V4 uses custom encoding: BOS + system + <|User|>msg<|Assistant|></think>response<|EOS|>
         bos = "<｜begin▁of▁sentence｜>"
         eos = "<｜end▁of▁sentence｜>"
         user_token = "<｜User｜>"
@@ -515,26 +519,21 @@ def tokenize(sample):
 
 ds = ds.map(tokenize, remove_columns=ds.column_names)
 
-# Ignore list: match the original model's non-quantized layers.
-# Original quantized layers (have .scale in checkpoint):
-#   - Attention: wq_a, wq_b, wkv, wo_a, wo_b (→ q_a_proj, q_b_proj, kv_proj, o_a_proj, o_b_proj)
-#   - Indexer: wq_b (→ indexer.wq_b or indexer.q_b_proj)
-#   - Experts: w1, w2, w3 (→ gate_proj, up_proj, down_proj or gate_up_proj, down_proj)
-#   - Shared experts: w1, w2, w3 (→ gate_proj, up_proj, down_proj)
-#   - MTP: e_proj, h_proj (quantized in original)
-#
-# Non-quantized layers (no .scale):
-#   - embed_tokens, lm_head/head
-#   - mlp.gate (router)
-#   - compressor.wgate, compressor.wkv (attention compressor)
-#   - indexer.weights_proj
-#   - All norm layers, attn_sink, ape (non-Linear)
+# Ignore list: layers that should NOT be quantized.
+# In the custom model, naming follows the raw checkpoint format:
+#   - attn.compressor.wgate, attn.compressor.wkv: attention compressor projections
+#   - attn.indexer.weights_proj: indexer weight projection
+#   - ffn.gate: MoE router
+#   - lm_head: output head
 ignores = [
     "lm_head",
-    "re:.*embed_tokens$",
-    "re:.*mlp\\.gate$",
-    "re:.*self_attn\\.compressor.*",
-    "re:.*self_attn\\.indexer\\.weights_proj$",
+    "re:.*embed$",
+    "re:.*ffn\\.gate$",
+    "re:.*attn\\.compressor\\.wgate$",
+    "re:.*attn\\.compressor\\.wkv$",
+    "re:.*attn\\.indexer\\.compressor\\.wgate$",
+    "re:.*attn\\.indexer\\.compressor\\.wkv$",
+    "re:.*attn\\.indexer\\.weights_proj$",
 ]
 
 # Configure the quantization algorithm to run.
