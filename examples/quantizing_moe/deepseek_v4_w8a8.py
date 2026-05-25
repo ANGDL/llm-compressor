@@ -471,15 +471,14 @@ config = ModelConfig.from_pretrained(model_id)
 config.max_batch_size = 1
 config.max_seq_len = MAX_SEQUENCE_LENGTH
 
-with load_offloaded_model():
-    model = DeepseekV4ForCausalLM.from_pretrained(
-        model_id,
-        config=config,
-        dtype="auto",
-        device_map="auto_offload",
-        offload_folder=args.offload_folder,
-        max_memory={"cpu": int(args.max_memory_cpu_gb * 1e9)},
-    )
+model = DeepseekV4ForCausalLM.from_pretrained(
+    model_id,
+    config=config,
+    dtype="auto",
+    device_map=None,
+    offload_folder=args.offload_folder,
+    max_memory={"cpu": int(args.max_memory_cpu_gb * 1e9)},
+)
 tokenizer = AutoTokenizer.from_pretrained(model_id)
 
 # The custom model implementation has MTP built-in (model.model.mtp), so no
