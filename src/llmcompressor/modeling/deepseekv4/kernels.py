@@ -118,7 +118,7 @@ def hc_split(
     )
     pre = torch.softmax(pre_logits * hc_scale[0], dim=-1) + hc_eps
     post = torch.softmax(post_logits * hc_scale[1], dim=-1) + hc_eps
-    comb = comb_logits.view(*comb_logits.shape[:-1], hc_mult, hc_mult)
+    comb = comb_logits.unflatten(-1, (hc_mult, hc_mult))
     comb = torch.softmax(comb * hc_scale[2], dim=-2)
     return pre, post, comb
 
