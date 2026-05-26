@@ -704,7 +704,10 @@ class Transformer(nn.Module):
         hidden_states = hidden_states.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
         for layer in self.layers:
             hidden_states = layer(hidden_states, start_pos, input_ids)
-        return self.lm_head(hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base, self.norm)
+        logits = self.lm_head(hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base, self.norm)
+        for mtp_block in self.mtp:
+            mtp_block(hidden_states, start_pos, input_ids)
+        return logits
 
 
 class DeepseekV4PreTrainedModel(PreTrainedModel):
