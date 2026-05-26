@@ -369,19 +369,31 @@ def convert_to_bf16(model_path: str, save_dir: str, max_workers: int = 4):
                     logger.error(f"Failed to convert {sp}: {e}")
                     raise
 
-    # Update the index file to remove .scale entries
+    # Update the index file: remove .scale entries and remap keys to HF format
     index_path = os.path.join(save_dir, "model.safetensors.index.json")
     if os.path.exists(index_path):
         with open(index_path) as f:
             index = json.load(f)
         index["weight_map"] = {
-            k: v for k, v in index["weight_map"].items()
+            _raw_key_to_hf_key(k): v for k, v in index["weight_map"].items()
             if not k.endswith(".scale")
         }
         with open(index_path, "w") as f:
             json.dump(index, f, indent=2)
 
     logger.info(f"BF16 conversion complete: {save_dir}")
+
+
+def _raw_key_to_hf_key(key: str) -> str:
+    """Convert raw checkpoint key to HuggingFace model format.
+
+    Transforms: head.* -> model.lm_head.*, other -> model.*
+    This ensures from_pretrained can load without relying on state_dict hooks
+    (which are bypassed by accelerate's low-memory loading path).
+    """
+    if key.startswith("head."):
+        return "model.lm_head." + key[len("head."):]
+    return "model." + key
 
 
 def _convert_shard(shard_path: str, save_dir: str):
@@ -422,13 +434,13 @@ def _convert_shard(shard_path: str, save_dir: str):
                     raise ValueError(
                         f"Unexpected quantized dtype {dtype_str} for {key}"
                     )
-                output_tensors[key] = tensor
+                output_tensors[_raw_key_to_hf_key(key)] = tensor
             elif key.endswith(".scale"):
                 # Skip standalone scale keys (already handled above)
                 continue
             else:
                 # Non-quantized tensor: read as-is
-                output_tensors[key] = reader.get_tensor(key)
+                output_tensors[_raw_key_to_hf_key(key)] = reader.get_tensor(key)
 
     save_file(output_tensors, out_path)
     logger.info(f"Saved: {shard_name} ({len(output_tensors)} tensors)")

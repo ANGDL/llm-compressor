@@ -711,7 +711,7 @@ class DeepseekV4PreTrainedModel(PreTrainedModel):
     config_class = ModelConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
-    _no_split_modules = ["Block", "MTPBlock"]
+    _no_split_modules = ["Expert", "Attention"]
     _skip_keys_device_placement = ["past_key_values"]
     _keys_to_ignore_on_load_unexpected = [r".*zero_point$", r".*\.scale$"]
 
