@@ -3,6 +3,8 @@ import os
 from contextlib import contextmanager
 
 from datasets import load_dataset
+from loguru import logger
+from torch.utils._pytree import tree_leaves
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from llmcompressor import oneshot
@@ -10,11 +12,22 @@ from llmcompressor.modeling.glm_moe_dsa import CalibrationGlmMoeDsaMoE  # noqa: 
 from llmcompressor.modeling.glm_moe_dsa_mtp import attach_mtp_layer
 from llmcompressor.modifiers.gptq import GPTQModifier
 from llmcompressor.modifiers.quantization import QuantizationModifier
+from llmcompressor.modifiers.autosmooth import AutoSmoothModifier
+from llmcompressor.modifiers.transform.awq.mappings import AWQMapping
+from llmcompressor.modifiers.transform.smoothquant import SmoothQuantModifier
 from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
 from llmcompressor.pipelines.basic import pipeline as basic_pipeline
 from llmcompressor.pipelines.data_free import pipeline as data_free_pipeline
+from llmcompressor.utils.pytorch.module import get_module_to_name_dict
+from llmcompressor.utils import ImatrixFallbackStats
+from compressed_tensors.offload import get_device_map, load_offloaded_model
 from compressed_tensors.offload.dispatch import dispatch_model as _dispatch_model
 from compressed_tensors.quantization import preset_name_to_scheme
+from compressed_tensors.utils import match_modules_set
+from llmcompressor.logger import LoggerConfig, configure_logger
+
+configure_logger(LoggerConfig(console_log_level="DEBUG"))
+
 
 """
 Usage example for quantizing GLM-5.1 with MoE layers to W8A8 using LLM Compressor.
@@ -23,13 +36,45 @@ python glm5_w8a8.py --model_id /ssd3/models/GLM-5.1/ --save_dir /ssd2/models/ --
     --indexer-ignore-mode indexer_all --dispatch_extra_memory_gb 10 --pipeline sequential
 """
 
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be a positive integer")
+    return parsed
+
+
 parser = argparse.ArgumentParser()
 parser.add_argument("--model_id", type=str, default="/ssd4/models/GLM-5")
 parser.add_argument("--save_dir", type=str, default="/ssd3/models")
-parser.add_argument("--observer", type=str, default=None, choices=[None, "imatrix_mse"])
+parser.add_argument(
+    "--observer",
+    type=str,
+    default="",
+    choices=["", "mse", "imatrix_mse"],
+    help="Observer for weights quantization: empty(default), mse, or imatrix_mse.",
+)
 parser.add_argument("--modifier", type=str, default="GPTQ", choices=["GPTQ", "RTN"])
+parser.add_argument(
+    "--transform",
+    type=str,
+    default="",
+    choices=["", "AutoSmooth", "SmoothQuant"],
+    help="Optional transform: empty(default), AutoSmooth, or SmoothQuant.",
+)
 parser.add_argument("--dataset_id", type=str, default="HuggingFaceH4/ultrachat_200k")
 parser.add_argument("--dataset_split", type=str, default="train_sft")
+parser.add_argument(
+    "--num_calibration_samples",
+    type=positive_int,
+    default=32,
+    help="Number of calibration samples to load from the dataset.",
+)
+parser.add_argument(
+    "--max_sequence_length",
+    type=positive_int,
+    default=8192,
+    help="Maximum sequence length used for tokenization and calibration.",
+)
 parser.add_argument(
     "--skip_restore_from_accelerate",
     action=argparse.BooleanOptionalAction,
@@ -45,13 +90,69 @@ parser.add_argument(
     default=20.0,
     help="Reserved memory per GPU for dispatch_model. Lower this if dispatch fails.",
 )
+parser.add_argument(
+    "--offload_folder",
+    type=str,
+    default="./offload_folder",
+    help="Directory used for disk offloading when loading very large models.",
+)
+parser.add_argument(
+    "--print_autosmooth_matches",
+    action=argparse.BooleanOptionalAction,
+    default=False,
+    help="Print resolved AutoSmooth mappings before compression for debugging.",
+)
+parser.add_argument(
+    "--indexer-ignore-mode",
+    type=str,
+    default="indexer_all",
+    choices=["weights_proj", "indexer_all"],
+    help=(
+        "Control indexer ignore scope: 'weights_proj' only ignores "
+        "self_attn.indexer.weights_proj; 'indexer_all' ignores all self_attn.indexer*"
+    ),
+)
+parser.add_argument(
+    "--moe-calibrate-all-experts",
+    action=argparse.BooleanOptionalAction,
+    default=False,
+    help="Whether to calibrate all MoE experts (not just the top-k).",
+)
+parser.add_argument(
+    "--pipeline",
+    type=str,
+    default="independent",
+    choices=["independent", "sequential", "basic", "data_free"],
+    help="Pipeline to use for oneshot compression.",
+)
+parser.add_argument(
+    "--max-memory-cpu-gb",
+    type=float,
+    default=1500.0,
+    help="Max CPU memory in GB for model loading (passed as max_memory={'cpu': <value>e9}).",
+)
 args = parser.parse_args()
 
 
 def patch_pipeline_dispatch(extra_memory_gb: float):
     extra_memory_bytes = int(extra_memory_gb * 1024**3)
 
+    def _has_disk_offload(model) -> bool:
+        try:
+            device_map = get_device_map(model)
+        except Exception:
+            return False
+
+        return any(offload == "disk" for _onload, offload in device_map.values())
+
     def _dispatch_with_cap(model):
+        if _has_disk_offload(model):
+            logger.info(
+                "Preserving existing disk offload map for basic/datafree pipeline "
+                "instead of redispatching with CPU-only fallback"
+            )
+            return model
+
         return _dispatch_model(model, extra_memory=extra_memory_bytes)
 
     basic_pipeline.dispatch_model = _dispatch_with_cap
@@ -77,10 +178,28 @@ def maybe_skip_from_accelerate(skip_restore: bool):
         ct_utils.from_accelerate = original_from_accelerate
 
 
+# Select calibration dataset.
+DATASET_ID = args.dataset_id
+DATASET_SPLIT = args.dataset_split
+NUM_CALIBRATION_SAMPLES = args.num_calibration_samples
+MAX_SEQUENCE_LENGTH = args.max_sequence_length
+
+
+# Load dataset and preprocess.
+ds = load_dataset(DATASET_ID, split=f"{DATASET_SPLIT}[:{NUM_CALIBRATION_SAMPLES}]")
+ds = ds.shuffle(seed=42)
+
 # Load the model
 model_id = args.model_id
-model = AutoModelForCausalLM.from_pretrained(model_id, dtype="auto", device_map=None)
-tokenizer = AutoTokenizer.from_pretrained(model_id)
+with load_offloaded_model():
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id,
+        dtype="auto",
+        device_map="auto_offload",
+        offload_folder=args.offload_folder,
+        max_memory={"cpu": int(args.max_memory_cpu_gb * 1e9)},
+    )
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
 # MoE calibration is now handled automatically by the pipeline.
 # The `CalibrationGlmMoeDsaMoE` modules (from `llmcompressor.modeling.glm_moe_dsa`)
 # will be applied during calibration to enable proper expert calibration.
@@ -91,30 +210,21 @@ tokenizer = AutoTokenizer.from_pretrained(model_id)
 # gets quantized end-to-end along with the main model.
 attach_mtp_layer(model, model_id)
 
-# Select calibration dataset.
-DATASET_ID = args.dataset_id
-DATASET_SPLIT = args.dataset_split
-
-# Select number of samples. 512 samples is a good place to start.
-# Increasing the number of samples can improve accuracy.
-NUM_CALIBRATION_SAMPLES = 32
-MAX_SEQUENCE_LENGTH = 8192
-
-# Load dataset and preprocess.
-ds = load_dataset(DATASET_ID, split=f"{DATASET_SPLIT}[:{NUM_CALIBRATION_SAMPLES}]")
-ds = ds.shuffle(seed=42)
-
 
 def preprocess(example):
-    return {
-        "text": tokenizer.apply_chat_template(
-            example["messages"],
-            tokenize=False,
-        )
-    }
+    if "messages" in example:
+        return {
+            "text": tokenizer.apply_chat_template(
+                example["messages"],
+                tokenize=False,
+            )
+        }
+    elif "text" in example:
+        return {"text": example["text"]}
 
 
 ds = ds.map(preprocess)
+print(ds[0])
 
 
 # Tokenize inputs.
@@ -130,26 +240,134 @@ def tokenize(sample):
 
 ds = ds.map(tokenize, remove_columns=ds.column_names)
 
+if args.indexer_ignore_mode == "weights_proj":
+    INDEXER_WEIGHTS_PROJ_PATTERN = r"re:.*self_attn\.indexer\.weights_proj$"
+elif args.indexer_ignore_mode == "indexer_all":
+    INDEXER_WEIGHTS_PROJ_PATTERN = r"re:.*self_attn\.indexer*"
+else:
+    raise ValueError(f"Invalid indexer ignore mode: {args.indexer_ignore_mode}")
+
 ignores = [
     # Keep the MTP projection in BF16 for downstream NextN loaders.
     "re:^mtp\\.eh_proj$",
     "re:.*eh_proj$",
-    # Ignore the output head
     "re:.*mlp.gate$",
     "re:.*embed_tokens$",
-    "re:.*indexer.*",
+    INDEXER_WEIGHTS_PROJ_PATTERN,
     "lm_head",
 ]
+
+autosmooth_ignores = [
+    pattern for pattern in ignores if pattern != INDEXER_WEIGHTS_PROJ_PATTERN
+]
+
+autosmooth_mappings: list[AWQMapping] = [
+    AWQMapping(
+        smooth_layer=r"re:.*input_layernorm$",
+        balance_layers=[
+            r"re:.*q(_a)?_proj$",
+            r"re:.*kv_a_proj_with_mqa$",
+            r"re:.*indexer\.wk$",
+            # `weights_proj` consumes the same input_layernorm output as wk/q_a/kv_a.
+            # Balance it here to keep the indexer scoring path consistent after smoothing.
+            r"re:.*indexer\.weights_proj$",
+        ],
+    ),
+    AWQMapping(
+        smooth_layer=r"re:.*q_a_layernorm$",
+        balance_layers=[r"re:.*q_b_proj$", r"re:.*indexer\.wq_b$"],
+    ),
+    AWQMapping(
+        smooth_layer=r"re:.*kv_a_layernorm$",
+        balance_layers=[r"re:.*kv_b_proj$"],
+    ),
+    AWQMapping(
+        smooth_layer=r"re:.*up_proj$",
+        balance_layers=[r"re:.*down_proj$"],
+    ),
+]
+
+smoothquant_mappings: list[tuple | list] = [
+    [mapping.balance_layers, mapping.smooth_layer] for mapping in autosmooth_mappings
+]
+
+
+def print_autosmooth_matches(model, mappings: list[AWQMapping]):
+    module_to_name = get_module_to_name_dict(model)
+    matched_weights_proj = False
+
+    print("[AutoSmooth] Resolved mappings:")
+    resolved_count = 0
+    for mapping in mappings:
+        for smooth_layers, *nested_balance_layers in match_modules_set(
+            model, (mapping.smooth_layer, *mapping.balance_layers)
+        ):
+            if len(smooth_layers) != 1:
+                continue
+
+            resolved_count += 1
+            smooth_name = module_to_name.get(smooth_layers[0], "<unnamed>")
+            balance_layers = tree_leaves(nested_balance_layers)
+            balance_names = [
+                module_to_name.get(layer, "<unnamed>") for layer in balance_layers
+            ]
+
+            if any(name.endswith("self_attn.indexer.weights_proj") for name in balance_names):
+                matched_weights_proj = True
+
+            print(f"  [{resolved_count}] smooth: {smooth_name}")
+            for name in balance_names:
+                print(f"       -> {name}")
+
+    print(f"[AutoSmooth] total resolved mappings: {resolved_count}")
+    print(f"[AutoSmooth] indexer.weights_proj matched: {matched_weights_proj}")
+
+
+if args.print_autosmooth_matches:
+    print_autosmooth_matches(model, autosmooth_mappings)
 
 # Configure the quantization algorithm to run.
 scheme = preset_name_to_scheme("W8A8", ["Linear"])
 
 tail_name = "-W8A8"
 recipes = []
+
+if args.transform == "AutoSmooth":
+    recipes.append(
+        AutoSmoothModifier(
+            ignore=autosmooth_ignores,
+            activation_scale_type="minmax",
+            # norm_func="awq",
+            mappings=autosmooth_mappings,
+        ),
+    )
+    tail_name += "-AutoSmooth"
+elif args.transform == "SmoothQuant":
+    recipes.append(
+        SmoothQuantModifier(
+            mappings=smoothquant_mappings,
+            ignore=autosmooth_ignores,
+            smoothing_strength=0.75,
+        ),
+    )
+    tail_name += "-SmoothQuant"
+
 if args.observer == "imatrix_mse":
+    if scheme.weights is None:
+        raise RuntimeError("W8A8 preset missing weights quantization args")
     scheme.weights.observer = "imatrix_mse"
-    recipes.append(IMatrixGatherer(ignore=ignores))
+    imatrix_fallback_stats = ImatrixFallbackStats()
+    imatrix_fallback_stats.install_hooks()
+    imatrix_kwargs = dict(ignore=ignores)
+    if args.pipeline == "sequential":
+        imatrix_kwargs["attach_by_initialize"] = False
+    recipes.append(IMatrixGatherer(**imatrix_kwargs))
     tail_name += "-IMatrix"
+elif args.observer == "mse":
+    if scheme.weights is None:
+        raise RuntimeError("W8A8 preset missing weights quantization args")
+    scheme.weights.observer = "mse"
+    tail_name += "-MSE"
 
 if args.modifier == "GPTQ":
     recipes.append(
@@ -172,14 +390,22 @@ else:
     raise ValueError(f"Invalid modifier selected: {args.modifier}")
 
 # Apply algorithms.
-oneshot(
+oneshot_kwargs = dict(
     model=model,
     dataset=ds,
     recipe=recipes,
     max_seq_length=MAX_SEQUENCE_LENGTH,
     num_calibration_samples=NUM_CALIBRATION_SAMPLES,
     batch_size=1,
+    moe_calibrate_all_experts=args.moe_calibrate_all_experts,
+    pipeline=args.pipeline,
 )
+
+if args.observer == "imatrix_mse":
+    with imatrix_fallback_stats:
+        oneshot(**oneshot_kwargs)
+else:
+    oneshot(**oneshot_kwargs)
 
 # Save to disk compressed.
 SAVE_NAME = model_id.rstrip("/").split("/")[-1] + tail_name
