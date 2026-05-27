@@ -23,7 +23,12 @@ from llmcompressor.pipelines.data_free import pipeline as data_free_pipeline
 from llmcompressor.utils import ImatrixFallbackStats
 from compressed_tensors.offload import get_device_map
 from compressed_tensors.offload.dispatch import dispatch_model as _dispatch_model
-from compressed_tensors.quantization import preset_name_to_scheme
+from compressed_tensors.quantization import preset_name_to_scheme, QuantizationScheme
+from compressed_tensors.quantization.quant_args import (
+    QuantizationArgs,
+    QuantizationStrategy,
+    QuantizationType,
+)
 from llmcompressor.logger import LoggerConfig, configure_logger
 
 configure_logger(LoggerConfig(console_log_level="DEBUG"))
@@ -55,6 +60,17 @@ parser.add_argument(
     help="Observer for weights quantization: empty(default), mse, or imatrix_mse.",
 )
 parser.add_argument("--modifier", type=str, default="GPTQ", choices=["GPTQ", "RTN"])
+parser.add_argument(
+    "--quant_mode",
+    type=str,
+    default="w8a8",
+    choices=["w8a8", "wNa8"],
+    help=(
+        "Quantization mode: 'w8a8' (uniform INT8 for all linear layers), "
+        "'wNa8' (mixed precision: routed experts INT4, attention/shared_experts/MTP INT8). "
+        "The mixed mode follows the original checkpoint precision: FP4→INT4, FP8→INT8."
+    ),
+)
 parser.add_argument("--dataset_id", type=str, default="HuggingFaceH4/ultrachat_200k")
 parser.add_argument("--dataset_split", type=str, default="train_sft")
 parser.add_argument(
@@ -571,15 +587,75 @@ ignores = [
 ]
 
 # Configure the quantization algorithm to run.
-scheme = preset_name_to_scheme("W8A8", ["Linear"])
+if args.quant_mode == "w8a8":
+    # Uniform W8A8: all linear layers use INT8 weights + INT8 activations.
+    scheme = preset_name_to_scheme("W8A8", ["Linear"])
+    config_groups = {"group_0": scheme}
+    tail_name = "-W8A8"
 
-tail_name = "-W8A8"
+elif args.quant_mode == "wNa8":
+    # Mixed precision following the original checkpoint format:
+    #   FP4 (routed experts) → INT4 weights
+    #   FP8 (attention, shared experts, MTP projections) → INT8 weights
+    weights_args_4 = QuantizationArgs(
+        num_bits=4,
+        type=QuantizationType.INT,
+        strategy=QuantizationStrategy.CHANNEL,
+        symmetric=True,
+        dynamic=False,
+    )
+    weights_args_8 = QuantizationArgs(
+        num_bits=8,
+        type=QuantizationType.INT,
+        strategy=QuantizationStrategy.CHANNEL,
+        symmetric=True,
+        dynamic=False,
+    )
+    activations_args = QuantizationArgs(
+        num_bits=8,
+        type=QuantizationType.INT,
+        strategy=QuantizationStrategy.TOKEN,
+        symmetric=False,
+        dynamic=True,
+        observer=None,
+    )
+
+    # INT4: routed experts (originally FP4 in checkpoint)
+    experts_w4_scheme = QuantizationScheme(
+        targets=[
+            r"re:.*ffn\.experts\.\d+\.(w1|w2|w3)$",
+        ],
+        weights=weights_args_4,
+        input_activations=activations_args,
+    )
+
+    # INT8: attention projections, shared experts, MTP e_proj/h_proj (originally FP8)
+    other_w8_scheme = QuantizationScheme(
+        targets=[
+            r"re:.*attn\.(wq_a|wq_b|wkv|wo_b)$",
+            r"re:.*ffn\.shared_experts\.(w1|w2|w3)$",
+            r"re:.*mtp\.\d+\.(e_proj|h_proj)$",
+        ],
+        weights=weights_args_8,
+        input_activations=activations_args,
+    )
+
+    config_groups = {
+        "experts_w4a8": experts_w4_scheme,
+        "other_w8a8": other_w8_scheme,
+    }
+    tail_name = "-WNA8"
+
 recipes = []
 
 if args.observer == "imatrix_mse":
-    if scheme.weights is None:
-        raise RuntimeError("W8A8 preset missing weights quantization args")
-    scheme.weights.observer = "imatrix_mse"
+    if args.quant_mode == "w8a8":
+        if scheme.weights is None:
+            raise RuntimeError("W8A8 preset missing weights quantization args")
+        scheme.weights.observer = "imatrix_mse"
+    else:
+        weights_args_4.observer = "imatrix_mse"
+        weights_args_8.observer = "imatrix_mse"
     imatrix_fallback_stats = ImatrixFallbackStats()
     imatrix_fallback_stats.install_hooks()
     imatrix_kwargs = dict(ignore=ignores)
@@ -588,15 +664,19 @@ if args.observer == "imatrix_mse":
     recipes.append(IMatrixGatherer(**imatrix_kwargs))
     tail_name += "-IMatrix"
 elif args.observer == "mse":
-    if scheme.weights is None:
-        raise RuntimeError("W8A8 preset missing weights quantization args")
-    scheme.weights.observer = "mse"
+    if args.quant_mode == "w8a8":
+        if scheme.weights is None:
+            raise RuntimeError("W8A8 preset missing weights quantization args")
+        scheme.weights.observer = "mse"
+    else:
+        weights_args_4.observer = "mse"
+        weights_args_8.observer = "mse"
     tail_name += "-MSE"
 
 if args.modifier == "GPTQ":
     recipes.append(
         GPTQModifier(
-            config_groups={"group_0": scheme},
+            config_groups=config_groups,
             ignore=ignores,
             offload_hessians=True,
         )
@@ -605,7 +685,7 @@ if args.modifier == "GPTQ":
 elif args.modifier == "RTN":
     recipes.append(
         QuantizationModifier(
-            config_groups={"group_0": scheme},
+            config_groups=config_groups,
             ignore=ignores,
         )
     )
