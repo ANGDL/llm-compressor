@@ -71,7 +71,8 @@ parser.add_argument(
         "The mixed mode follows the original checkpoint precision: FP4→INT4, FP8→INT8."
     ),
 )
-parser.add_argument("--dataset_id", type=str, default="HuggingFaceH4/ultrachat_200k")
+parser.add_argument("--dataset_id", type=str, default="HuggingFaceH4/ultrachat_200k",
+                    help="HuggingFace dataset ID or path to a local JSON/JSONL file.")
 parser.add_argument("--dataset_split", type=str, default="train_sft")
 parser.add_argument(
     "--num_calibration_samples",
@@ -494,7 +495,18 @@ NUM_CALIBRATION_SAMPLES = args.num_calibration_samples
 MAX_SEQUENCE_LENGTH = args.max_sequence_length
 
 # Load dataset and preprocess.
-ds = load_dataset(DATASET_ID, split=f"{DATASET_SPLIT}[:{NUM_CALIBRATION_SAMPLES}]")
+# Support both HuggingFace Hub datasets and local JSON/JSONL files.
+if os.path.isfile(DATASET_ID) or DATASET_ID.endswith((".json", ".jsonl")):
+    # Local JSON/JSONL file
+    logger.info(f"Loading calibration data from local file: {DATASET_ID}")
+    ds = load_dataset(
+        "json",
+        data_files=DATASET_ID,
+        split=f"train[:{NUM_CALIBRATION_SAMPLES}]",
+    )
+else:
+    # HuggingFace Hub dataset
+    ds = load_dataset(DATASET_ID, split=f"{DATASET_SPLIT}[:{NUM_CALIBRATION_SAMPLES}]")
 ds = ds.shuffle(seed=42)
 
 # Load the BF16 model using our custom DeepseekV4ForCausalLM implementation.
