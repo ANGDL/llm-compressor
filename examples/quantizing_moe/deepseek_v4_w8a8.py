@@ -531,24 +531,14 @@ model.get_output_embeddings = lambda: None
 
 def preprocess(example):
     """Format calibration data using DeepSeek V4 chat encoding."""
-    if "messages" in example:
-        messages = example["messages"]
-        bos = "<｜begin▁of▁sentence｜>"
-        eos = "<｜end▁of▁sentence｜>"
-        user_token = "<｜User｜>"
-        assistant_token = "<｜Assistant｜>"
+    from llmcompressor.modeling.deepseekv4.encoding.encoding_dsv4 import encode_messages
 
-        parts = [bos]
-        for msg in messages:
-            role = msg["role"]
-            content = msg["content"]
-            if role == "system":
-                parts.append(content)
-            elif role == "user":
-                parts.append(f"{user_token}{content}")
-            elif role == "assistant":
-                parts.append(f"{assistant_token}</think>{content}{eos}")
-        return {"text": "".join(parts)}
+    if "messages" in example:
+        text = encode_messages(
+            example["messages"],
+            thinking_mode="thinking",
+        )
+        return {"text": text}
     elif "text" in example:
         return {"text": example["text"]}
 
@@ -713,6 +703,9 @@ else:
     oneshot(**oneshot_kwargs)
 
 # Save to disk compressed.
+if 'WNA8' in tail_name:
+    tail_name += 'unpacked' 
+
 SAVE_NAME = args.model_id.rstrip("/").split("/")[-1] + tail_name
 SAVE_DIR = os.path.join(args.save_dir, SAVE_NAME)
 
