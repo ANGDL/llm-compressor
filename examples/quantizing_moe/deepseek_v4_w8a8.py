@@ -517,12 +517,29 @@ for i, dataset_id in enumerate(DATASET_IDS):
         part = load_dataset(dataset_id, split=f"{DATASET_SPLIT}[:{n_samples}]")
     all_datasets.append(part.shuffle(seed=42))
 
+
+def preprocess(example):
+    """Format calibration data using DeepSeek V4 chat encoding."""
+    from llmcompressor.modeling.deepseekv4.encoding.encoding_dsv4 import encode_messages
+
+    if "messages" in example:
+        text = encode_messages(
+            example["messages"],
+            thinking_mode="thinking",
+        )
+        return {"text": text}
+    elif "text" in example:
+        return {"text": example["text"]}
+
+
+# Preprocess each source to unified {"text": ...} schema before concatenation,
+# since different sources may have different column schemas.
+all_datasets = [part.map(preprocess, remove_columns=part.column_names) for part in all_datasets]
+
 if len(all_datasets) == 1:
     ds = all_datasets[0]
 else:
     ds = concatenate_datasets(all_datasets)
-
-ds = ds.shuffle(seed=42)
 
 # Load the BF16 model using our custom DeepseekV4ForCausalLM implementation.
 # This bypasses the transformers library's native DeepSeek V4 support which has
@@ -554,23 +571,6 @@ tokenizer = AutoTokenizer.from_pretrained(model_id)
 # GPTQ's lm_head disabling utility assumes a single-input output head.
 # DeepSeekV4 head has extra arguments, so skip output embedding wrapping.
 model.get_output_embeddings = lambda: None
-
-
-def preprocess(example):
-    """Format calibration data using DeepSeek V4 chat encoding."""
-    from llmcompressor.modeling.deepseekv4.encoding.encoding_dsv4 import encode_messages
-
-    if "messages" in example:
-        text = encode_messages(
-            example["messages"],
-            thinking_mode="thinking",
-        )
-        return {"text": text}
-    elif "text" in example:
-        return {"text": example["text"]}
-
-
-ds = ds.map(preprocess)
 
 
 def tokenize(sample):
