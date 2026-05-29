@@ -19,25 +19,36 @@ def reset_kernel_backend_cache():
 
 
 def _reference_backend_requested() -> bool:
-    return os.environ.get(REFERENCE_KERNEL_BACKEND_ENV, "").strip().lower() == "reference"
+    backend = os.environ.get(REFERENCE_KERNEL_BACKEND_ENV, "").strip().lower()
+    print(f"[kernels] {REFERENCE_KERNEL_BACKEND_ENV} = '{backend}'")
+    return backend == "reference"
 
 
 def _candidate_reference_kernel_path() -> Optional[str]:
     explicit_path = os.environ.get(REFERENCE_KERNEL_PATH_ENV)
+    print(f"[kernels] {REFERENCE_KERNEL_PATH_ENV} = '{explicit_path}'")
     if explicit_path:
         return explicit_path
 
     model_path = os.environ.get(REFERENCE_MODEL_ENV)
+    print(f"[kernels] {REFERENCE_MODEL_ENV} = '{model_path}'")
     if not model_path:
         return None
 
-    return str(Path(model_path).with_name("kernel.py"))
+    result = str(Path(model_path).with_name("kernel.py"))
+    print(f"[kernels] derived kernel path = '{result}'")
+    return result
 
 
 def get_reference_kernel_path() -> Optional[str]:
     path = _candidate_reference_kernel_path()
-    if path and os.path.exists(path):
-        return path
+    if path:
+        exists = os.path.exists(path)
+        print(f"[kernels] kernel path '{path}' exists={exists}")
+        if exists:
+            return path
+    else:
+        print("[kernels] no kernel path candidate")
     return None
 
 
@@ -48,10 +59,18 @@ def reference_kernel_available() -> bool:
 @lru_cache(1)
 def _load_reference_kernel_module() -> Optional[ModuleType]:
     if not _reference_backend_requested():
+        print("[kernels] backend not set to 'reference', skipping reference kernel module")
         return None
 
     path = get_reference_kernel_path()
     if path is None:
+        print("[kernels] reference kernel path not found, skipping")
+        return None
+
+    print(f"[kernels] loading reference kernel module from '{path}'")
+    spec = importlib.util.spec_from_file_location("deepseek_v4_reference_kernel_backend", path)
+    if spec is None or spec.loader is None:
+        print(f"[kernels] failed to create spec for '{path}'")
         return None
 
     spec = importlib.util.spec_from_file_location("deepseek_v4_reference_kernel_backend", path)
@@ -61,8 +80,10 @@ def _load_reference_kernel_module() -> Optional[ModuleType]:
     module = importlib.util.module_from_spec(spec)
     try:
         spec.loader.exec_module(module)
-    except Exception:
+    except Exception as e:
+        print(f"[kernels] failed to load reference kernel module: {e}")
         return None
+    print(f"[kernels] reference kernel module loaded successfully")
     return module
 
 
