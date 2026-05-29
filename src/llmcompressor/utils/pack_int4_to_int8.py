@@ -48,7 +48,7 @@ def _process_tensor_file(args):
                 continue
 
             if quant_config_parser.is_int4_layer(key):
-                print(f"Packing {key} from {tensor_name} with shape {tensor.shape} and dtype {tensor.dtype}")
+                # print(f"Packing {key} from {tensor_name} with shape {tensor.shape} and dtype {tensor.dtype}")
                 packed_tensor = _pack_int4_to_int8(tensor)
                 if rename:
                     new_key = f"{key[:-len('weight')]}weight_packed"
