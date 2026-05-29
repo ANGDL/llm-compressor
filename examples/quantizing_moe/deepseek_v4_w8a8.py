@@ -71,8 +71,10 @@ parser.add_argument(
         "The mixed mode follows the original checkpoint precision: FP4→INT4, FP8→INT8."
     ),
 )
-parser.add_argument("--dataset_id", type=str, default="HuggingFaceH4/ultrachat_200k",
-                    help="HuggingFace dataset ID or path to a local JSON/JSONL file.")
+parser.add_argument("--dataset_id", type=str, nargs="+",
+                    default=["HuggingFaceH4/ultrachat_200k"],
+                    help="HuggingFace dataset ID(s) or path(s) to local JSON/JSONL files. "
+                         "Multiple sources can be specified and will be concatenated.")
 parser.add_argument("--dataset_split", type=str, default="train_sft")
 parser.add_argument(
     "--num_calibration_samples",
@@ -489,24 +491,37 @@ if args.step == "bf16":
 # --- Step 2: Load BF16 model and quantize to INT8 ---
 
 # Select calibration dataset.
-DATASET_ID = args.dataset_id
+DATASET_IDS = args.dataset_id
 DATASET_SPLIT = args.dataset_split
 NUM_CALIBRATION_SAMPLES = args.num_calibration_samples
 MAX_SEQUENCE_LENGTH = args.max_sequence_length
 
 # Load dataset and preprocess.
-# Support both HuggingFace Hub datasets and local JSON/JSONL files.
-if os.path.isfile(DATASET_ID) or DATASET_ID.endswith((".json", ".jsonl")):
-    # Local JSON/JSONL file
-    logger.info(f"Loading calibration data from local file: {DATASET_ID}")
-    ds = load_dataset(
-        "json",
-        data_files=DATASET_ID,
-        split=f"train[:{NUM_CALIBRATION_SAMPLES}]",
-    )
+# Support multiple sources (HuggingFace Hub and/or local JSON/JSONL files).
+from datasets import concatenate_datasets
+
+per_source_samples = NUM_CALIBRATION_SAMPLES // len(DATASET_IDS)
+remainder = NUM_CALIBRATION_SAMPLES % len(DATASET_IDS)
+
+all_datasets = []
+for i, dataset_id in enumerate(DATASET_IDS):
+    n_samples = per_source_samples + (1 if i < remainder else 0)
+    if os.path.isfile(dataset_id) or dataset_id.endswith((".json", ".jsonl")):
+        logger.info(f"Loading calibration data from local file: {dataset_id}")
+        part = load_dataset(
+            "json",
+            data_files=dataset_id,
+            split=f"train[:{n_samples}]",
+        )
+    else:
+        part = load_dataset(dataset_id, split=f"{DATASET_SPLIT}[:{n_samples}]")
+    all_datasets.append(part.shuffle(seed=42))
+
+if len(all_datasets) == 1:
+    ds = all_datasets[0]
 else:
-    # HuggingFace Hub dataset
-    ds = load_dataset(DATASET_ID, split=f"{DATASET_SPLIT}[:{NUM_CALIBRATION_SAMPLES}]")
+    ds = concatenate_datasets(all_datasets)
+
 ds = ds.shuffle(seed=42)
 
 # Load the BF16 model using our custom DeepseekV4ForCausalLM implementation.
@@ -580,13 +595,16 @@ ignores = [
     "lm_head",
     "re:.*embed$",
     "re:.*ffn\\.gate$",
-    "re:.*attn\\.wo_a$",
     "re:.*attn\\.compressor\\.wgate$",
     "re:.*attn\\.compressor\\.wkv$",
     "re:.*attn\\.indexer\\.compressor\\.wgate$",
     "re:.*attn\\.indexer\\.compressor\\.wkv$",
     "re:.*attn\\.indexer\\.weights_proj$",
 ]
+if args.quant_mode == "w8a8":
+    # W8A8 uniform mode: wo_a is a grouped linear (block-diagonal), skip it
+    # to avoid issues with the uniform quantization scheme.
+    ignores.append("re:.*attn\\.wo_a$")
 
 # Configure the quantization algorithm to run.
 if args.quant_mode == "w8a8":
@@ -634,7 +652,8 @@ elif args.quant_mode == "wNa8":
     # INT8: attention projections, shared experts, MTP e_proj/h_proj (originally FP8)
     other_w8_scheme = QuantizationScheme(
         targets=[
-            r"re:.*attn\.(wq_a|wq_b|wkv|wo_b)$",
+            r"re:.*attn\.(wq_a|wq_b|wkv|wo_a|wo_b)$",
+            r"re:.*attn\.indexer\.wq_b$",
             r"re:.*ffn\.shared_experts\.(w1|w2|w3)$",
             r"re:.*mtp\.\d+\.(e_proj|h_proj)$",
         ],
