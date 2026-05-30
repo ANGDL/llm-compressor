@@ -744,5 +744,5 @@ if args.save_raw_checkpoint_format:
     model.save_raw_format = True
 
 with maybe_skip_from_accelerate(args.skip_restore_from_accelerate):
-    model.save_pretrained(SAVE_DIR, save_compressed=True)
+    model.save_pretrained(SAVE_DIR, save_compressed=True, max_shard_size='50GB')
 tokenizer.save_pretrained(SAVE_DIR)
