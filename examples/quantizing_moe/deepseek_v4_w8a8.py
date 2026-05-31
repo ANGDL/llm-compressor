@@ -7,7 +7,7 @@ from glob import glob
 
 import numpy as np
 import torch
-from datasets import load_dataset
+from datasets import concatenate_datasets, load_dataset
 from loguru import logger
 from safetensors.torch import save_file
 from transformers import AutoTokenizer
@@ -64,11 +64,12 @@ parser.add_argument(
     "--quant_mode",
     type=str,
     default="w8a8",
-    choices=["w8a8", "wNa8"],
+    choices=["w8a8", "wNa8", "w4a8"],
     help=(
         "Quantization mode: 'w8a8' (uniform INT8 for all linear layers), "
-        "'wNa8' (mixed precision: routed experts INT4, attention/shared_experts/MTP INT8). "
-        "The mixed mode follows the original checkpoint precision: FP4→INT4, FP8→INT8."
+        "'wNa8' (mixed precision: routed experts INT4, attention/shared_experts/MTP INT8), "
+        "'w4a8' (uniform INT4 weights + INT8 activations). "
+        "The wNa8 mode follows the original checkpoint precision: FP4→INT4, FP8→INT8."
     ),
 )
 parser.add_argument("--dataset_id", type=str, nargs="+",
@@ -109,12 +110,7 @@ parser.add_argument(
     default="./offload_folder",
     help="Directory used for disk offloading when loading very large models.",
 )
-parser.add_argument(
-    "--moe-calibrate-all-experts",
-    action=argparse.BooleanOptionalAction,
-    default=False,
-    help="Whether to calibrate all MoE experts (not just the top-k).",
-)
+
 parser.add_argument(
     "--pipeline",
     type=str,
@@ -172,7 +168,7 @@ def patch_pipeline_dispatch(extra_memory_gb: float):
     data_free_pipeline.dispatch_model = _dispatch_with_cap
 
 
-patch_pipeline_dispatch(args.dispatch_extra_memory_gb)
+# patch_pipeline_dispatch(args.dispatch_extra_memory_gb)
 
 
 @contextmanager
@@ -498,7 +494,11 @@ MAX_SEQUENCE_LENGTH = args.max_sequence_length
 
 # Load dataset and preprocess.
 # Support multiple sources (HuggingFace Hub and/or local JSON/JSONL files).
-from datasets import concatenate_datasets
+if NUM_CALIBRATION_SAMPLES < len(DATASET_IDS):
+    raise ValueError(
+        f"num_calibration_samples ({NUM_CALIBRATION_SAMPLES}) must be >= "
+        f"number of dataset sources ({len(DATASET_IDS)}): {DATASET_IDS}"
+    )
 
 per_source_samples = NUM_CALIBRATION_SAMPLES // len(DATASET_IDS)
 remainder = NUM_CALIBRATION_SAMPLES % len(DATASET_IDS)
@@ -544,25 +544,25 @@ else:
 # Load the BF16 model using our custom DeepseekV4ForCausalLM implementation.
 # This bypasses the transformers library's native DeepSeek V4 support which has
 # known issues with quantization workflows.
-model_id = BFLOAT16_SAVE_DIR
+bf16_model_id = BFLOAT16_SAVE_DIR
 
 # Override cache-related config to avoid allocating hundreds of GB of KV cache
 # buffers that are not needed for quantization. The model registers large
 # persistent=False buffers sized by max_batch_size × max_seq_len per layer.
 from llmcompressor.modeling.deepseekv4.config import ModelConfig
-config = ModelConfig.from_pretrained(model_id)
+config = ModelConfig.from_pretrained(bf16_model_id)
 config.max_batch_size = 1
 config.max_seq_len = MAX_SEQUENCE_LENGTH
 
 model = DeepseekV4ForCausalLM.from_pretrained(
-    model_id,
+    bf16_model_id,
     config=config,
     dtype="auto",
     device_map=None,
     offload_folder=args.offload_folder,
     max_memory={"cpu": int(args.max_memory_cpu_gb * 1e9)},
 )
-tokenizer = AutoTokenizer.from_pretrained(model_id)
+tokenizer = AutoTokenizer.from_pretrained(bf16_model_id)
 
 # The custom model implementation has MTP built-in (model.model.mtp), so no
 # attach_mtp_layer call is needed. The MTP layers are part of the Transformer
@@ -607,9 +607,17 @@ if args.quant_mode == "w8a8":
     ignores.append("re:.*attn\\.wo_a$")
 
 # Configure the quantization algorithm to run.
+# Each quant_mode branch builds config_groups, applies observer settings,
+# and assembles the recipe list – keeping all mode-specific logic together.
+recipes = []
+
 if args.quant_mode == "w8a8":
     # Uniform W8A8: all linear layers use INT8 weights + INT8 activations.
     scheme = preset_name_to_scheme("W8A8", ["Linear"])
+    if scheme.weights is None:
+        raise RuntimeError("W8A8 preset missing weights quantization args")
+    if args.observer in ("imatrix_mse", "mse"):
+        scheme.weights.observer = args.observer
     config_groups = {"group_0": scheme}
     tail_name = "-W8A8"
 
@@ -639,6 +647,9 @@ elif args.quant_mode == "wNa8":
         dynamic=True,
         observer=None,
     )
+    if args.observer in ("imatrix_mse", "mse"):
+        weights_args_4.observer = args.observer
+        weights_args_8.observer = args.observer
 
     # INT4: routed experts (originally FP4 in checkpoint)
     experts_w4_scheme = QuantizationScheme(
@@ -667,33 +678,48 @@ elif args.quant_mode == "wNa8":
     }
     tail_name = "-WNA8"
 
-recipes = []
+elif args.quant_mode == "w4a8":
+    weights_args_4 = QuantizationArgs(
+        num_bits=4,
+        type=QuantizationType.INT,
+        strategy=QuantizationStrategy.CHANNEL,
+        symmetric=True,
+        dynamic=False,
+    )
+    activations_args = QuantizationArgs(
+        num_bits=8,
+        type=QuantizationType.INT,
+        strategy=QuantizationStrategy.TOKEN,
+        symmetric=False,
+        dynamic=True,
+        observer=None,
+    )
+    if args.observer in ("imatrix_mse", "mse"):
+        weights_args_4.observer = args.observer
+    scheme = QuantizationScheme(
+        targets=["Linear"],
+        weights=weights_args_4,
+        input_activations=activations_args,
+    )
+    config_groups = {"group_0": scheme}
+    tail_name = "-W4A8"
+
+else:
+    raise ValueError(f"Unknown quant_mode: {args.quant_mode}")
+
+# Observer-specific recipe additions.
+if args.observer in ("imatrix_mse", "mse"):
+    tail_name += "-IMatrix" if args.observer == "imatrix_mse" else "-MSE"
 
 if args.observer == "imatrix_mse":
-    if args.quant_mode == "w8a8":
-        if scheme.weights is None:
-            raise RuntimeError("W8A8 preset missing weights quantization args")
-        scheme.weights.observer = "imatrix_mse"
-    else:
-        weights_args_4.observer = "imatrix_mse"
-        weights_args_8.observer = "imatrix_mse"
     imatrix_fallback_stats = ImatrixFallbackStats()
     imatrix_fallback_stats.install_hooks()
     imatrix_kwargs = dict(ignore=ignores)
     if args.pipeline == "sequential":
         imatrix_kwargs["attach_by_initialize"] = False
     recipes.append(IMatrixGatherer(**imatrix_kwargs))
-    tail_name += "-IMatrix"
-elif args.observer == "mse":
-    if args.quant_mode == "w8a8":
-        if scheme.weights is None:
-            raise RuntimeError("W8A8 preset missing weights quantization args")
-        scheme.weights.observer = "mse"
-    else:
-        weights_args_4.observer = "mse"
-        weights_args_8.observer = "mse"
-    tail_name += "-MSE"
 
+# Quantization modifier (GPTQ or RTN).
 if args.modifier == "GPTQ":
     recipes.append(
         GPTQModifier(
@@ -723,7 +749,6 @@ oneshot_kwargs = dict(
     max_seq_length=MAX_SEQUENCE_LENGTH,
     num_calibration_samples=NUM_CALIBRATION_SAMPLES,
     batch_size=1,
-    moe_calibrate_all_experts=args.moe_calibrate_all_experts,
     pipeline=args.pipeline,
 )
 
@@ -734,8 +759,10 @@ else:
     oneshot(**oneshot_kwargs)
 
 # Save to disk compressed.
-if 'WNA8' in tail_name:
-    tail_name += 'unpacked' 
+# wNa8 mode uses per-expert quantization targets; mark as unpacked in the
+# output directory name so downstream tooling can distinguish formats.
+if args.quant_mode == "wNa8" or args.quant_mode == "w4a8":
+    tail_name += '-unpacked' 
 
 SAVE_NAME = args.model_id.rstrip("/").split("/")[-1] + tail_name
 SAVE_DIR = os.path.join(args.save_dir, SAVE_NAME)
