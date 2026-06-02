@@ -34,6 +34,32 @@ from llmcompressor.logger import LoggerConfig, configure_logger
 configure_logger(LoggerConfig(console_log_level="DEBUG"))
 
 
+"""
+Note:
+    为了获得良好的量化体验，请保证你的内存+交换内存>=3T
+    为了保证精度，请设置环境变量：
+        export DEEPSEEK_V4_KERNEL_BACKEND=reference
+        export DEEPSEEK_V4_REFERENCE_KERNEL_PATH=/ssd4/models/DeepSeek-V4-Pro/inference/kernel.py
+
+Usage:
+1. Convert to BF16 (optional, can skip if already have a BF16 checkpoint):
+    python examples/quantizing_moe/deepseek_v4_w8a8.py --step bf16 \
+         --model_id /ssd4/models/DeepSeek-V4-Pro \
+         --bf16_save_dir /ssd2/models/DeepSeek-V4-Pro-BF16
+2. Quantize to W8A8:
+    /data/llm-compressor/examples/quantizing_moe/deepseek_v4_w8a8.py \
+        --model_id /ssd4/models/DeepSeek-V4-Pro/ --bf16_save_dir /ssd2/models/ \
+        --step int8 --observer "imatrix_mse" --modifier RTN --quant_mode wNa8 \
+        --dataset_id ./ultrachat_200k ./calibration_data_dsv4_pro.jsonl \
+        --num_calibration_samples 512 --max_sequence_length 8192 --pipeline sequential  \
+        --save_dir /ssd3/models
+3. Packed
+    python src/llmcompressor/utils/pack_int4_to_int8.py \
+        -i /ssd3/models/DeepSeek-V4-Pro-WNA8-IMatrix-RTNunpacked/ \
+        -o /ssd3/models/DeepSeek-V4-Pro-WNA8
+"""
+
+
 def positive_int(value: str) -> int:
     parsed = int(value)
     if parsed <= 0:
@@ -110,7 +136,12 @@ parser.add_argument(
     default="./offload_folder",
     help="Directory used for disk offloading when loading very large models.",
 )
-
+parser.add_argument(
+    "--moe-calibrate-all-experts",
+    action=argparse.BooleanOptionalAction,
+    default=False,
+    help="Whether to calibrate all MoE experts (not just the top-k).",
+)
 parser.add_argument(
     "--pipeline",
     type=str,
@@ -749,6 +780,7 @@ oneshot_kwargs = dict(
     max_seq_length=MAX_SEQUENCE_LENGTH,
     num_calibration_samples=NUM_CALIBRATION_SAMPLES,
     batch_size=1,
+    moe_calibrate_all_experts=args.moe_calibrate_all_experts,
     pipeline=args.pipeline,
 )
 
