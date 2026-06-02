@@ -115,7 +115,7 @@ class IMatrixGatherer(Modifier):
             modules = {m for parent in parents for m in parent.modules() if hasattr(m, "weight_observer")}
             for module in modules:
                 observer = getattr(module, "weight_observer", None)
-                if observer is not None:
+                if observer is not None and hasattr(module, "_imatrix_sum"):
                     observer._imatrix_sum = module._imatrix_sum
                     observer._imatrix_count = module._imatrix_count
 
