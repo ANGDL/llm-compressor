@@ -2,6 +2,7 @@ import argparse
 import base64
 from io import BytesIO
 import os
+import shutil
 
 import torch
 from datasets import load_dataset
@@ -62,6 +63,26 @@ parser.add_argument(
 args = parser.parse_args()
 
 use_autosmooth = not args.disable_autosmooth
+
+
+MODEL_ARTIFACT_FILES = {
+    "config.json",
+    "model.safetensors.index.json",
+    "pytorch_model.bin.index.json",
+}
+MODEL_ARTIFACT_SUFFIXES = (".safetensors", ".bin")
+
+
+def copy_original_non_model_files(source_dir, save_dir):
+    for filename in os.listdir(source_dir):
+        source_path = os.path.join(source_dir, filename)
+        if (
+            filename in MODEL_ARTIFACT_FILES
+            or filename.endswith(MODEL_ARTIFACT_SUFFIXES)
+            or not os.path.isfile(source_path)
+        ):
+            continue
+        shutil.copy2(source_path, os.path.join(save_dir, filename))
 
 # Load model.
 model_id = args.model_id
@@ -264,4 +285,4 @@ print("==========================================")
 SAVE_NAME = model_id.rstrip("/").split("/")[-1] + tail_name
 SAVE_DIR = os.path.join(args.save_dir, SAVE_NAME)
 model.save_pretrained(SAVE_DIR, save_compressed=True)
-processor.save_pretrained(SAVE_DIR)
+copy_original_non_model_files(model_id, SAVE_DIR)

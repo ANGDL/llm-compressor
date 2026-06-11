@@ -8,8 +8,29 @@ from llmcompressor.modifiers.quantization import GPTQModifier
 from llmcompressor.modifiers.autosmooth import AutoSmoothModifier
 from llmcompressor.modifiers.awq import AWQMapping
 import os
+import shutil
 
 # select a Mixture of Experts model for quantization
+
+MODEL_ARTIFACT_FILES = {
+    "config.json",
+    "model.safetensors.index.json",
+    "pytorch_model.bin.index.json",
+}
+MODEL_ARTIFACT_SUFFIXES = (".safetensors", ".bin")
+
+
+def copy_original_non_model_files(source_dir, save_dir):
+    for filename in os.listdir(source_dir):
+        source_path = os.path.join(source_dir, filename)
+        if (
+            filename in MODEL_ARTIFACT_FILES
+            or filename.endswith(MODEL_ARTIFACT_SUFFIXES)
+            or not os.path.isfile(source_path)
+        ):
+            continue
+        shutil.copy2(source_path, os.path.join(save_dir, filename))
+
 MODEL_ID = "/ssd1/models/Qwen3-235B-A22B-Instruct-2507/"
 
 model = AutoModelForCausalLM.from_pretrained(
@@ -112,4 +133,4 @@ except Exception as e:
 SAVE_DIR = MODEL_ID.rstrip("/").split("/")[-1] + "-smooth-w8a8"
 SAVE_DIR = os.path.join("/ssd1/models", SAVE_DIR)
 model.save_pretrained(SAVE_DIR, save_compressed=True)
-tokenizer.save_pretrained(SAVE_DIR)
+copy_original_non_model_files(MODEL_ID, SAVE_DIR)
