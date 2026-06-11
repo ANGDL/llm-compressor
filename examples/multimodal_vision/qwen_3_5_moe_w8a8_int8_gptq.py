@@ -2,6 +2,7 @@ import base64
 import argparse
 from io import BytesIO
 import os
+import shutil
 
 import torch
 from datasets import load_dataset
@@ -127,5 +128,22 @@ oneshot(
 SAVE_DIR = model_id.rstrip("/").split("/")[-1] + "-W8A8-gptq"
 SAVE_DIR = os.path.join("/data/models", SAVE_DIR)
 model.save_pretrained(SAVE_DIR, save_compressed=True)
-processor.save_pretrained(SAVE_DIR)
+
+MODEL_ARTIFACT_FILES = {
+    "config.json",
+    "model.safetensors.index.json",
+    "pytorch_model.bin.index.json",
+}
+MODEL_ARTIFACT_SUFFIXES = (".safetensors", ".bin")
+
+for filename in os.listdir(model_id):
+    source_path = os.path.join(model_id, filename)
+    if (
+        filename in MODEL_ARTIFACT_FILES
+        or filename.endswith(MODEL_ARTIFACT_SUFFIXES)
+        or not os.path.isfile(source_path)
+    ):
+        continue
+    shutil.copy2(source_path, os.path.join(SAVE_DIR, filename))
+
 save_mtp_tensors_to_checkpoint(source_model=model_id, dest_dir=SAVE_DIR)
