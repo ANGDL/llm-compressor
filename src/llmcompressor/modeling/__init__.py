@@ -24,6 +24,7 @@ from .qwen3_vl_moe import CalibrateQwen3VLMoeTextSparseMoeBlock  # noqa: F401
 from .qwen3_next_moe import CalibrationQwen3NextSparseMoeBlock  # noqa: F401
 from .offset_norm import CalibrationOffsetNorm  # noqa: F401
 from .gemma4 import SequentialGemma4TextExperts  # noqa: F401
+from .step3p5 import CalibrationStep3p5MoEMLP  # noqa: F401
 # TODO: add granite4
 
 from .fuse import *

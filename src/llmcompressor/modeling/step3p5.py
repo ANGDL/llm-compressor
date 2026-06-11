@@ -14,11 +14,9 @@ individual ``Step3p5ExpertMLP`` modules with three ``nn.Linear`` projections.
 After replacement the unpacked form is permanent (``is_permanent = True``) so
 the saved checkpoint is compatible with downstream runtimes.
 
-Routing replicates the original three branches exactly:
-
-* ``use_moe_router_bias=True``  -> ``router_bias_func``
-* ``moe_router_activation == "sigmoid"`` -> ``sigmoid_routing_function``
-* otherwise                     -> standard ``softmax + topk``
+Routing delegates to the original ``Step3p5MoEMLP.custom_routing_function``
+whenever available, and only falls back to the original softmax + top-k branch
+when no custom router is configured.
 
 ``need_fp32_gate`` and ``moe_router_scaling_factor`` are honoured.
 """
@@ -147,9 +145,8 @@ class CalibrationStep3p5MoEMLP(MoECalibrationModule):
         self.hidden_size = config.hidden_size
         self.moe_intermediate_size = config.moe_intermediate_size
 
-        self.use_moe_router_bias = config.use_moe_router_bias
-        self.moe_router_activation = getattr(
-            config, "moe_router_activation", "softmax"
+        original_custom_routing_function = getattr(
+            original, "custom_routing_function", None
         )
         self.need_fp32_gate = getattr(config, "need_fp32_gate", False)
         self.routed_scaling_factor = getattr(config, "moe_router_scaling_factor", 1.0)
@@ -158,13 +155,16 @@ class CalibrationStep3p5MoEMLP(MoECalibrationModule):
         # via the standard `re:.*moe.gate$` ignore pattern).
         self.gate = original.gate
 
-        # Optional learnable router bias used by ``router_bias_func``.
-        if self.use_moe_router_bias:
-            # Register as a Parameter so device-placement / offload
-            # bookkeeping treats it like the original module.
+        # Preserve optional router bias and rebind bound custom routers to this
+        # module so device placement follows the calibration replacement.
+        if hasattr(original, "router_bias"):
             self.router_bias = original.router_bias
+        if getattr(original_custom_routing_function, "__self__", None) is original:
+            self.custom_routing_function = original_custom_routing_function.__func__.__get__(
+                self, type(self)
+            )
         else:
-            self.register_parameter("router_bias", None)
+            self.custom_routing_function = original_custom_routing_function
 
         # Unpack the packed 3-D experts into individual ``nn.Linear`` modules.
         swiglu_limit: float | None = original.limit  # type: ignore[assignment]
@@ -184,10 +184,6 @@ class CalibrationStep3p5MoEMLP(MoECalibrationModule):
         original.gate_proj = None
         original.down_proj = None
 
-    # ------------------------------------------------------------------
-    # Routing — replicates the three branches of the original module.
-    # ``renormalize=True`` matches ``Step3p5MoEMLP.forward`` (always passed).
-    # ------------------------------------------------------------------
     def _route(self, hidden_states: torch.Tensor):
         if self.need_fp32_gate:
             router_logits = torch.matmul(
@@ -197,27 +193,14 @@ class CalibrationStep3p5MoEMLP(MoECalibrationModule):
         else:
             router_logits = self.gate(hidden_states)
 
-        if self.use_moe_router_bias:
-            # router_bias_func: bias is added to the *score* used for top-k
-            # selection only; weights returned to the caller use the unbiased
-            # sigmoid probabilities.
-            gate_prob = torch.sigmoid(router_logits.float())
-            scored = gate_prob + self.router_bias.unsqueeze(0)
-            _, indices = torch.topk(scored, k=self.top_k, dim=1)
-            topk_prob = torch.gather(gate_prob, 1, indices)
-            denom = torch.sum(topk_prob, dim=-1, keepdim=True) + 1e-20
-            routing_weights = topk_prob / denom
-        elif self.moe_router_activation == "sigmoid":
-            gate_prob = torch.sigmoid(router_logits.float())
-            gate_prob = gate_prob / gate_prob.sum(dim=-1, keepdim=True)
-            topk_prob, indices = torch.topk(gate_prob, k=self.top_k, dim=1)
-            routing_weights = topk_prob / torch.sum(
-                topk_prob, dim=-1, keepdim=True
+        if self.custom_routing_function:
+            routing_weights, indices = self.custom_routing_function(
+                router_logits, self.top_k, renormalize=True
             )
         else:
-            gate_prob = F.softmax(router_logits, dim=1, dtype=torch.float)
+            routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
             routing_weights, indices = torch.topk(
-                gate_prob, self.top_k, dim=-1
+                routing_weights, self.top_k, dim=-1
             )
 
         routing_weights = routing_weights * self.routed_scaling_factor
