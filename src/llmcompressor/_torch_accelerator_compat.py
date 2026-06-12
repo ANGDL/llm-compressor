@@ -91,8 +91,21 @@ class _AcceleratorCompat:
 
 
 def ensure_torch_accelerator():
+    compat = _AcceleratorCompat()
     if not hasattr(torch, "accelerator"):
-        torch.accelerator = _AcceleratorCompat()
+        torch.accelerator = compat
+    else:
+        for name in (
+            "is_available",
+            "current_accelerator",
+            "current_device_index",
+            "device_count",
+            "reset_peak_memory_stats",
+            "max_memory_allocated",
+            "get_memory_info",
+        ):
+            if not hasattr(torch.accelerator, name):
+                setattr(torch.accelerator, name, getattr(compat, name))
     return torch.accelerator
 
 
