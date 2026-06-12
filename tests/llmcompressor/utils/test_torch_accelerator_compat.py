@@ -1,6 +1,7 @@
 import importlib.util
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 
@@ -49,6 +50,21 @@ def test_ensure_torch_accelerator_preserves_existing_namespace():
     accelerator = compat.ensure_torch_accelerator()
 
     assert accelerator is torch.accelerator
+
+
+def test_ensure_torch_accelerator_backfills_missing_methods(monkeypatch):
+    compat = _load_compat_module()
+    existing_accelerator = SimpleNamespace(is_available=lambda: True)
+    monkeypatch.setattr(torch, "accelerator", existing_accelerator, raising=False)
+
+    accelerator = compat.ensure_torch_accelerator()
+
+    assert accelerator is existing_accelerator
+    assert hasattr(accelerator, "is_available")
+    assert hasattr(accelerator, "get_memory_info")
+    memory_info = compat.accelerator_get_memory_info()
+    assert isinstance(memory_info, tuple)
+    assert len(memory_info) == 2
 
 
 def test_import_llmcompressor_backfills_torch_accelerator(monkeypatch):
