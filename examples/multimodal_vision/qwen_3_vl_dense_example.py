@@ -1,188 +1,62 @@
-import argparse
 import base64
+import argparse
 from io import BytesIO
 import os
-import shutil
 
 import torch
 from datasets import load_dataset
-from qwen_vl_utils import process_vision_info
 from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
+from qwen_vl_utils import process_vision_info
 
 from llmcompressor import oneshot
-from llmcompressor.modifiers.quantization import GPTQModifier, QuantizationModifier
+from llmcompressor.modifiers.quantization import GPTQModifier 
+from llmcompressor.modifiers.awq import AWQModifier
 from llmcompressor.utils import dispatch_for_generation
 from llmcompressor.modifiers.autosmooth import AutoSmoothModifier
 from llmcompressor.modifiers.awq import AWQMapping
 
-
-parser = argparse.ArgumentParser()
-parser.add_argument("--model_id", type=str, default="/data/models/Qwen3-VL-8B-Instruct")
-parser.add_argument("--save_dir", type=str, default="/data/models/")
-parser.add_argument("--num_calibration_samples", type=int, default=128)
-parser.add_argument("--max_sequence_length", type=int, default=2048)
-parser.add_argument("--dataset_id", type=str, default="lmms-lab/flickr30k")
-parser.add_argument("--dataset_split", type=str, default="test")
-parser.add_argument(
-    "--text_dataset_id", type=str, default="HuggingFaceH4/ultrachat_200k"
-)
-parser.add_argument("--text_dataset_split", type=str, default="train_sft")
-parser.add_argument(
-    "--text_calibration_samples",
-    type=int,
-    default=128,
-    help="Number of text samples to append to calibration. Set 0 to disable.",
-)
-parser.add_argument(
-    "--quantizer",
-    type=str,
-    default="GPTQ",
-    choices=["GPTQ", "RTN", "none"],
-    help="Quantization modifier: GPTQ, RTN, or none (skip quantization).",
-)
-parser.add_argument(
-    "--disable_autosmooth",
-    action="store_true",
-    default=False,
-    help="Disable AutoSmoothModifier.",
-)
-parser.add_argument(
-    "--activation_scale_type",
-    type=str,
-    default="mean",
-    choices=["mean", "max", "min"],
-    help="Activation scale type for AutoSmoothModifier.",
-)
-parser.add_argument(
-    "--norm_func",
-    type=str,
-    default="adaptive",
-    choices=["adaptive", "l1", "l2", "linf"],
-    help="Norm function for AutoSmoothModifier.",
-)
-args = parser.parse_args()
-
-use_autosmooth = not args.disable_autosmooth
-
-
-MODEL_ARTIFACT_FILES = {
-    "config.json",
-    "model.safetensors.index.json",
-    "pytorch_model.bin.index.json",
-}
-MODEL_ARTIFACT_SUFFIXES = (".safetensors", ".bin")
-
-
-def copy_original_non_model_files(source_dir, save_dir):
-    for filename in os.listdir(source_dir):
-        source_path = os.path.join(source_dir, filename)
-        if (
-            filename in MODEL_ARTIFACT_FILES
-            or filename.endswith(MODEL_ARTIFACT_SUFFIXES)
-            or not os.path.isfile(source_path)
-        ):
-            continue
-        shutil.copy2(source_path, os.path.join(save_dir, filename))
-
 # Load model.
-model_id = args.model_id
-model = Qwen3VLForConditionalGeneration.from_pretrained(model_id, dtype="auto")
+model_id = "/ssd1/models/Qwen3-VL-8B-Instruct"
+model = Qwen3VLForConditionalGeneration.from_pretrained(model_id, device_map=None, dtype="auto",local_files_only=True)
 processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+# for name, module in model.named_modules():
+#     print(name, ":", module)
 
 # Oneshot arguments
-NUM_CALIBRATION_SAMPLES = args.num_calibration_samples
-MAX_SEQUENCE_LENGTH = args.max_sequence_length
-NUM_TEXT_CALIBRATION_SAMPLES = args.text_calibration_samples
+NUM_CALIBRATION_SAMPLES = 256
+MAX_SEQUENCE_LENGTH = 4096
 
-DATASET_ID = args.dataset_id
-DATASET_SPLIT = args.dataset_split
+DATASET_ID = "lmms-lab/flickr30k"
+DATASET_SPLIT = f"test[:{NUM_CALIBRATION_SAMPLES}]"
 
-# Load multimodal dataset.
-multimodal_ds = load_dataset(
-    DATASET_ID, split=f"{DATASET_SPLIT}[:{NUM_CALIBRATION_SAMPLES}]"
-)
-multimodal_ds = multimodal_ds.shuffle(seed=42)
-
-# Load text dataset.
-text_ds = (
-    load_dataset(
-        args.text_dataset_id,
-        split=f"{args.text_dataset_split}[:{NUM_TEXT_CALIBRATION_SAMPLES}]",
-    )
-    if NUM_TEXT_CALIBRATION_SAMPLES > 0
-    else None
-)
-if text_ds is not None:
-    text_ds = text_ds.shuffle(seed=42)
-    text_examples = list(text_ds)
-else:
-    text_examples = []
+# Load dataset and preprocess.
+ds = load_dataset(DATASET_ID, split=DATASET_SPLIT)
+ds = ds.shuffle(seed=42)
 
 
-def _normalize_text_content(content):
-    if isinstance(content, str):
-        return [{"type": "text", "text": content}]
-
-    normalized = []
-    for item in content:
-        if isinstance(item, str):
-            normalized.append({"type": "text", "text": item})
-        elif isinstance(item, dict):
-            if item.get("type") == "text":
-                normalized.append({"type": "text", "text": item.get("text", "")})
-            elif "text" in item:
-                normalized.append({"type": "text", "text": item["text"]})
-    return normalized
-
-
-def format_text_example(example):
-    return [
-        {
-            "role": message["role"],
-            "content": _normalize_text_content(message["content"]),
-        }
-        for message in example["messages"]
-    ]
-
-
-def build_multimodal_messages(example):
+# Apply chat template and tokenize inputs.
+def preprocess_and_tokenize(example):
+    # preprocess
     buffered = BytesIO()
     example["image"].save(buffered, format="PNG")
     encoded_image = base64.b64encode(buffered.getvalue())
     encoded_image_text = encoded_image.decode("utf-8")
     base64_qwen = f"data:image;base64,{encoded_image_text}"
-    return [
+    messages = [
         {
             "role": "user",
             "content": [
                 {"type": "image", "image": base64_qwen},
                 {"type": "text", "text": "What does the image show?"},
             ],
-        },
-        {
-            "role": "assistant",
-            "content": [
-                {
-                    "text": f"{example['caption'][0]}",
-                    "type": "text",
-                }
-            ],
-        },
+        }
     ]
-
-
-def preprocess_and_tokenize(example, idx):
-    messages = build_multimodal_messages(example)
-
-    if text_examples:
-        text_example = text_examples[idx % len(text_examples)]
-        messages.extend(format_text_example(text_example))
-
     text = processor.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
     )
     image_inputs, video_inputs = process_vision_info(messages)
 
+    # tokenize
     return processor(
         text=[text],
         images=image_inputs,
@@ -193,11 +67,7 @@ def preprocess_and_tokenize(example, idx):
     )
 
 
-multimodal_ds = multimodal_ds.map(
-    preprocess_and_tokenize,
-    with_indices=True,
-    remove_columns=multimodal_ds.column_names,
-)
+ds = ds.map(preprocess_and_tokenize, remove_columns=ds.column_names)
 
 
 # Define a oneshot data collator for multimodal inputs.
@@ -205,49 +75,55 @@ def data_collator(batch):
     assert len(batch) == 1
     return {key: torch.tensor(value) for key, value in batch[0].items()}
 
-# Build recipe based on flags
-recipe = []
-tail_name = ""
 
-if use_autosmooth:
-    recipe.append(
-        AutoSmoothModifier(
-            activation_scale_type=args.activation_scale_type,
-            norm_func=args.norm_func,
-        )
-    )
-    tail_name += f"-AutoSmooth-{args.norm_func}"
+parser = argparse.ArgumentParser(description="vision block range")
+parser.add_argument('--max_id', type=int, default=-1, help='block id')
+args = parser.parse_args()
 
-if args.quantizer == "GPTQ":
-    recipe.append(
-        GPTQModifier(
-            targets="Linear",
-            scheme="W8A8",
-            ignore=["lm_head", "re:visual.*", "re:model.visual.*"],
-            offload_hessians=True,
-        ),
-    )
-    tail_name += "-W8A8-GPTQ"
-elif args.quantizer == "RTN":
-    recipe.append(
-        QuantizationModifier(
-            targets="Linear",
-            scheme="W8A8",
-            ignore=["lm_head", "re:visual.*", "re:model.visual.*"],
-        ),
-    )
-    tail_name += "-W8A8-RTN"
+vit_ignore = list()
+for i in range(args.max_id):
+    vit_ignore.append('"re:model.visual.blocks.{}.attn.*"'.format(i))
+    vit_ignore.append('"re:model.visual.blocks.{}.mlp.*"'.format(i))
+vit_ignore_str = ",".join(vit_ignore)
+
+mapping = [
+    AWQMapping(
+        "re:.*input_layernorm$",
+        ["re:.*q_proj$", "re:.*k_proj$", "re:.*v_proj$"],
+    ),
+    AWQMapping("re:.*v_proj$", ["re:.*o_proj$"]),
+    AWQMapping(
+        "re:.*post_attention_layernorm$",
+        ["re:.*mlp.experts.*.gate_proj$", "re:.*mlp.experts.*.up_proj$"],
+    ),
+    AWQMapping(
+        "re:.*up_proj$",
+        ["re:.*down_proj$"],
+    ),
+]
+
+recipe = [
+    #AutoSmoothModifier(activation_scale_type="minmax", norm_func='awq', mappings=mapping),
+    GPTQModifier(
+        targets="Linear",
+        scheme="W8A8",
+        offload_hessians=True,
+        ignore=["lm_head", "re:visual.*", "re:model.visual.*"],
+    ),
+]
+
 
 # Perform oneshot
 oneshot(
     model=model,
     tokenizer=model_id,
-    dataset=multimodal_ds,
+    dataset=ds,
     recipe=recipe,
     max_seq_length=MAX_SEQUENCE_LENGTH,
     num_calibration_samples=NUM_CALIBRATION_SAMPLES,
     trust_remote_code_model=True,
     data_collator=data_collator,
+    sequential_targets=["Qwen3VLTextDecoderLayer"],
 )
 
 # Confirm generations of the quantized model look sane.
@@ -282,7 +158,7 @@ print("==========================================")
 
 
 # Save to disk compressed.
-SAVE_NAME = model_id.rstrip("/").split("/")[-1] + tail_name
-SAVE_DIR = os.path.join(args.save_dir, SAVE_NAME)
+SAVE_DIR = model_id.rstrip("/").split("/")[-1] + "-W8A8_LLM"
+SAVE_DIR = os.path.join("/ssd3/models", SAVE_DIR)
 model.save_pretrained(SAVE_DIR, save_compressed=True)
-copy_original_non_model_files(model_id, SAVE_DIR)
+processor.save_pretrained(SAVE_DIR)
