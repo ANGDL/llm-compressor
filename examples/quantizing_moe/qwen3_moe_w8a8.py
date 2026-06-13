@@ -39,7 +39,7 @@ model = AutoModelForCausalLM.from_pretrained(
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
 
 # Select calibration dataset.
-DATASET_ID = "../minmax/ultrachat_200k"
+DATASET_ID = "HuggingFaceH4/ultrachat_200k"
 DATASET_SPLIT = "train_sft"
 NUM_CALIBRATION_SAMPLES = 256
 MAX_SEQUENCE_LENGTH = 3072
@@ -116,21 +116,28 @@ oneshot(
     num_calibration_samples=NUM_CALIBRATION_SAMPLES,
     trust_remote_code_model=True,
     batch_size=64,
+    concatenate_data=True,
+    moe_calibrate_all_experts=False,
 )
 
-print("========== SAMPLE GENERATION ==============")
-try:
-    dispatch_for_generation(model)
-    sample = tokenizer("Hello my name is", return_tensors="pt")
-    sample = {key: value.to(model.device) for key, value in sample.items()}
-    output = model.generate(**sample, max_new_tokens=100)
-    print(tokenizer.decode(output[0]))
-    print("==========================================")
-except Exception as e:
-    print(f"Failed to generate sample: {e}")
+# print("========== SAMPLE GENERATION ==============")
+# try:
+#     dispatch_for_generation(model)
+#     sample = tokenizer("Hello my name is", return_tensors="pt")
+#     sample = {key: value.to(model.device) for key, value in sample.items()}
+#     output = model.generate(**sample, max_new_tokens=100)
+#     print(tokenizer.decode(output[0]))
+#     print("==========================================")
+# except Exception as e:
+#     print(f"Failed to generate sample: {e}")
 
 # Save to disk in compressed-tensors format.
 SAVE_DIR = MODEL_ID.rstrip("/").split("/")[-1] + "-smooth-w8a8"
 SAVE_DIR = os.path.join("/ssd1/models", SAVE_DIR)
-model.save_pretrained(SAVE_DIR, save_compressed=True)
+
+try:
+    model.save_pretrained(SAVE_DIR, save_compressed=True)
+except torch.OutOfMemoryError as e:
+    print(f"This error is just for accelerator dispatch, and can be ignored if it happens during saving: {e}")
+
 copy_original_non_model_files(MODEL_ID, SAVE_DIR)
