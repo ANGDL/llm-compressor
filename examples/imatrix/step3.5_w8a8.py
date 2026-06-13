@@ -136,7 +136,7 @@ tokenizer.save_pretrained(SAVE_DIR)
 try:
     model.save_pretrained(SAVE_DIR, save_compressed=True, max_shard_size='10GB')
 except torch.OutOfMemoryError as e:
-    print(f"This error is only for P800, and can be ignored if it happens during saving: {e}")
+    print(f"This error is just for accelerator dispatch, and can be ignored if it happens during saving: {e}")
 
 for i, mtp_id in enumerate(["45", "46", "47"]):
     mtp_prefix = f"model.layers.{mtp_id}"

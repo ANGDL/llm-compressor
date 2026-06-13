@@ -5,8 +5,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from llmcompressor import oneshot
 from llmcompressor.utils import dispatch_for_generation
 from llmcompressor.modifiers.quantization import GPTQModifier
-from llmcompressor.modifiers.autosmooth import AutoSmoothModifier
-from llmcompressor.modifiers.awq import AWQMapping
+
 import os
 import shutil
 
@@ -31,7 +30,7 @@ def copy_original_non_model_files(source_dir, save_dir):
             continue
         shutil.copy2(source_path, os.path.join(save_dir, filename))
 
-MODEL_ID = "/ssd1/models/Qwen3-235B-A22B-Instruct-2507/"
+MODEL_ID = "/ssd2/models/Qwen3-32B"
 
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_ID, dtype="auto", trust_remote_code=True, device_map=None
@@ -42,7 +41,7 @@ tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
 DATASET_ID = "HuggingFaceH4/ultrachat_200k"
 DATASET_SPLIT = "train_sft"
 NUM_CALIBRATION_SAMPLES = 256
-MAX_SEQUENCE_LENGTH = 3072
+MAX_SEQUENCE_LENGTH = 2048
 
 
 # Load dataset and preprocess.
@@ -75,35 +74,12 @@ def tokenize(sample):
 
 ds = ds.map(tokenize, remove_columns=ds.column_names)
 
-# Configure the quantization algorithm to run.
-# since the MoE gate layers are sensitive to quantization, we add them to the ignore
-# list so they remain at full precision
-mapping = [
-    AWQMapping(
-        "re:.*input_layernorm$",
-        ["re:.*q_proj$", "re:.*k_proj$", "re:.*v_proj$"],
-    ),
-    AWQMapping("re:.*v_proj$", ["re:.*o_proj$"]),
-    AWQMapping(
-        "re:.*post_attention_layernorm$",
-        [
-            "re:.*mlp.experts.*.gate_proj$", 
-            "re:.*mlp.experts.*.up_proj$",
-        ],
-    ),
-    AWQMapping(
-        "re:.*up_proj$",
-        ["re:.*down_proj$"],
-    ),
-]
-
 # Recipe
 recipe = [
-    AutoSmoothModifier(activation_scale_type="max", norm_func='adaptive', mappings=mapping),
     GPTQModifier(
         targets="Linear",
         scheme="W8A8",
-        ignore=["lm_head", "re:.*mlp.gate$"],
+        ignore=["lm_head"],
         offload_hessians=True,
     ),
 ]
@@ -117,7 +93,6 @@ oneshot(
     trust_remote_code_model=True,
     batch_size=64,
     concatenate_data=True,
-    moe_calibrate_all_experts=False,
 )
 
 # print("========== SAMPLE GENERATION ==============")
@@ -132,12 +107,8 @@ oneshot(
 #     print(f"Failed to generate sample: {e}")
 
 # Save to disk in compressed-tensors format.
-SAVE_DIR = MODEL_ID.rstrip("/").split("/")[-1] + "-smooth-w8a8"
+SAVE_DIR = MODEL_ID.rstrip("/").split("/")[-1] + "-w8a8"
 SAVE_DIR = os.path.join("/ssd1/models", SAVE_DIR)
 
-try:
-    model.save_pretrained(SAVE_DIR, save_compressed=True)
-except torch.OutOfMemoryError as e:
-    print(f"This error is just for accelerator dispatch, and can be ignored if it happens during saving: {e}")
-
+model.save_pretrained(SAVE_DIR, save_compressed=True)
 copy_original_non_model_files(MODEL_ID, SAVE_DIR)
