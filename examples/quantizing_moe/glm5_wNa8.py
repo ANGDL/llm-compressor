@@ -10,13 +10,13 @@ from llmcompressor.modeling.glm_moe_dsa import CalibrationGlmMoeDsaMoE  # noqa: 
 from llmcompressor.modeling.glm_moe_dsa_mtp import attach_mtp_layer
 from llmcompressor.modifiers.gptq import GPTQModifier
 from llmcompressor.modifiers.quantization import QuantizationModifier
-from llmcompressor.modifiers.autosmooth import AutoSmoothModifier
-from llmcompressor.modifiers.smooth_gptq import SmoothGPTQModifier
-from llmcompressor.modifiers.awq import AWQMapping
 from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
 from llmcompressor.pipelines.basic import pipeline as basic_pipeline
 from llmcompressor.pipelines.data_free import pipeline as data_free_pipeline
+from llmcompressor.utils import ImatrixFallbackStats
+from llmcompressor.logger import LoggerConfig, configure_logger
 
+from compressed_tensors.offload import load_offloaded_model
 from compressed_tensors.offload.dispatch import dispatch_model as _dispatch_model
 from compressed_tensors.quantization import QuantizationScheme
 from compressed_tensors.quantization.quant_args import (
@@ -24,16 +24,56 @@ from compressed_tensors.quantization.quant_args import (
     QuantizationStrategy,
     QuantizationType,
 )
-import torch
+
+configure_logger(LoggerConfig(console_log_level="DEBUG"))
+
+
+"""
+Usage example for quantizing GLM-5.1 with MoE layers to mixed W4/W8 + A8 using LLM Compressor.
+1. 更改权重文件中的generation_config.json, 添加："do_sample": true
+2. 量化
+python glm5_wNa8.py --model_id /ssd3/models/GLM-5.1/ --save_dir /ssd2/models/ --modifier RTN --observer imatrix_mse \
+    --num_calibration_samples 512 --max_sequence_length 4096 --dataset_id ./ultrachat_200k --dataset_split train_sft \
+    --indexer-ignore-mode indexer_all --dispatch_extra_memory_gb 10 --pipeline sequential
+3. 打包，确保输入路径正确
+python src/llmcompressor/utils/pack_int4_to_int8.py \
+    -i /ssd2/models/GLM-5.1-WNA8-IMatrix-RTN-unpacked/ \
+    -o /ssd2/models/GLM-5.1-W4A8-v2
+"""
+
+
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be a positive integer")
+    return parsed
 
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--model_id", type=str, default="/ssd4/models/GLM-5")
 parser.add_argument("--save_dir", type=str, default="/ssd3/models")
-parser.add_argument("--observer", type=str, default=None, choices=[None, "imatrix_mse"])
+parser.add_argument(
+    "--observer",
+    type=str,
+    default="",
+    choices=["", "mse", "imatrix_mse"],
+    help="Observer for weights quantization: empty(default), mse, or imatrix_mse.",
+)
 parser.add_argument("--modifier", type=str, default="GPTQ", choices=["GPTQ", "RTN"])
 parser.add_argument("--dataset_id", type=str, default="HuggingFaceH4/ultrachat_200k")
 parser.add_argument("--dataset_split", type=str, default="train_sft")
+parser.add_argument(
+    "--num_calibration_samples",
+    type=positive_int,
+    default=32,
+    help="Number of calibration samples to load from the dataset.",
+)
+parser.add_argument(
+    "--max_sequence_length",
+    type=positive_int,
+    default=8192,
+    help="Maximum sequence length used for tokenization and calibration.",
+)
 parser.add_argument(
     "--skip_restore_from_accelerate",
     action=argparse.BooleanOptionalAction,
@@ -44,10 +84,45 @@ parser.add_argument(
     default=True,
 )
 parser.add_argument(
+    "--offload_folder",
+    type=str,
+    default="./offload_folder",
+    help="Directory used for disk offloading when loading very large models.",
+)
+parser.add_argument(
     "--dispatch_extra_memory_gb",
     type=float,
     default=20.0,
     help="Reserved memory per GPU for dispatch_model. Lower this if dispatch fails.",
+)
+parser.add_argument(
+    "--indexer-ignore-mode",
+    type=str,
+    default="indexer_all",
+    choices=["weights_proj", "indexer_all"],
+    help=(
+        "Control indexer ignore scope: 'weights_proj' only ignores "
+        "self_attn.indexer.weights_proj; 'indexer_all' ignores all self_attn.indexer*"
+    ),
+)
+parser.add_argument(
+    "--moe-calibrate-all-experts",
+    action=argparse.BooleanOptionalAction,
+    default=False,
+    help="Whether to calibrate all MoE experts (not just the top-k).",
+)
+parser.add_argument(
+    "--pipeline",
+    type=str,
+    default="independent",
+    choices=["independent", "sequential", "basic", "data_free"],
+    help="Pipeline to use for oneshot compression.",
+)
+parser.add_argument(
+    "--max-memory-cpu-gb",
+    type=float,
+    default=1500.0,
+    help="Max CPU memory in GB for model loading (passed as max_memory={'cpu': <value>e9}).",
 )
 args = parser.parse_args()
 
@@ -80,10 +155,28 @@ def maybe_skip_from_accelerate(skip_restore: bool):
     finally:
         ct_utils.from_accelerate = original_from_accelerate
 
+# Select calibration dataset.
+DATASET_ID = args.dataset_id
+DATASET_SPLIT = args.dataset_split
+NUM_CALIBRATION_SAMPLES = args.num_calibration_samples
+MAX_SEQUENCE_LENGTH = args.max_sequence_length
+
+
+# Load dataset and preprocess.
+ds = load_dataset(DATASET_ID, split=f"{DATASET_SPLIT}[:{NUM_CALIBRATION_SAMPLES}]")
+ds = ds.shuffle(seed=42)
+
 # Load the model
 model_id = args.model_id
-model = AutoModelForCausalLM.from_pretrained(model_id, dtype="auto", device_map=None)
-tokenizer = AutoTokenizer.from_pretrained(model_id)
+with load_offloaded_model():
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id,
+        dtype="auto",
+        device_map="auto_offload",
+        offload_folder=args.offload_folder,
+        max_memory={"cpu": int(args.max_memory_cpu_gb * 1e9)},
+    )
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
 # MoE calibration is now handled automatically by the pipeline.
 # The `CalibrationGlmMoeDsaMoE` modules (from `llmcompressor.modeling.glm_moe_dsa`)
 # will be applied during calibration to enable proper expert calibration.
@@ -94,27 +187,17 @@ tokenizer = AutoTokenizer.from_pretrained(model_id)
 # gets quantized end-to-end along with the main model.
 attach_mtp_layer(model, model_id)
 
-# Select calibration dataset.
-DATASET_ID = args.dataset_id
-DATASET_SPLIT = args.dataset_split
-
-# Select number of samples. 512 samples is a good place to start.
-# Increasing the number of samples can improve accuracy.
-NUM_CALIBRATION_SAMPLES = 32
-MAX_SEQUENCE_LENGTH = 8192
-
-# Load dataset and preprocess.
-ds = load_dataset(DATASET_ID, split=f"{DATASET_SPLIT}[:{NUM_CALIBRATION_SAMPLES}]")
-ds = ds.shuffle(seed=42)
-
 
 def preprocess(example):
-    return {
-        "text": tokenizer.apply_chat_template(
-            example["messages"],
-            tokenize=False,
-        )
-    }
+    if "messages" in example:
+        return {
+            "text": tokenizer.apply_chat_template(
+                example["messages"],
+                tokenize=False,
+            )
+        }
+    elif "text" in example:
+        return {"text": example["text"]}
 
 
 ds = ds.map(preprocess)
@@ -133,14 +216,20 @@ def tokenize(sample):
 
 ds = ds.map(tokenize, remove_columns=ds.column_names)
 
+if args.indexer_ignore_mode == "weights_proj":
+    INDEXER_WEIGHTS_PROJ_PATTERN = r"re:.*self_attn\.indexer\.weights_proj$"
+elif args.indexer_ignore_mode == "indexer_all":
+    INDEXER_WEIGHTS_PROJ_PATTERN = r"re:.*self_attn\.indexer*"
+else:
+    raise ValueError(f"Invalid indexer ignore mode: {args.indexer_ignore_mode}")
+
 ignores = [
     # Keep the MTP projection in BF16 for downstream NextN loaders.
     "re:^mtp\\.eh_proj$",
     "re:.*eh_proj$",
-    # Ignore the output head
-    "re:.*mlp\\.gate$",
+    "re:.*mlp.gate$",
     "re:.*embed_tokens$",
-    "re:.*indexer.*",
+    INDEXER_WEIGHTS_PROJ_PATTERN,
     "lm_head",
 ]
 
@@ -193,64 +282,6 @@ other_linear_w8_scheme = QuantizationScheme(
     input_activations=activations_args,
 )
 
-def build_int4_mappings(config) -> list[AWQMapping]:
-    """Build int4-only AWQ mappings with one smooth layer per mapping."""
-    num_layers = int(getattr(config, "num_hidden_layers"))
-    num_experts = int(
-        getattr(
-            config,
-            "num_local_experts",
-            getattr(config, "n_routed_experts", 0),
-        )
-    )
-
-    mappings: list[AWQMapping] = []
-    for layer_idx in range(num_layers):
-        layer_prefix = rf"re:.*layers\.{layer_idx}\."
-
-        # LayerNorm -> expert gate/up projections (all int4 MLP entry projections).
-        balance_layers = [
-            rf"{layer_prefix}mlp\.shared_experts\.gate_proj$",
-            rf"{layer_prefix}mlp\.shared_experts\.up_proj$",
-        ]
-        for expert_idx in range(num_experts):
-            balance_layers.append(
-                rf"{layer_prefix}mlp\.experts\.{expert_idx}\.gate_proj$"
-            )
-            balance_layers.append(
-                rf"{layer_prefix}mlp\.experts\.{expert_idx}\.up_proj$"
-            )
-
-        mappings.append(
-            AWQMapping(
-                rf"{layer_prefix}post_attention_layernorm$",
-                balance_layers,
-            )
-        )
-
-        # shared_experts up -> down
-        mappings.append(
-            AWQMapping(
-                rf"{layer_prefix}mlp\.shared_experts\.up_proj$",
-                [rf"{layer_prefix}mlp\.shared_experts\.down_proj$"],
-            )
-        )
-
-        # experts.<idx> up -> down (must be per-expert to keep smooth_layer unique)
-        for expert_idx in range(num_experts):
-            mappings.append(
-                AWQMapping(
-                    rf"{layer_prefix}mlp\.experts\.{expert_idx}\.up_proj$",
-                    [rf"{layer_prefix}mlp\.experts\.{expert_idx}\.down_proj$"],
-                )
-            )
-
-    return mappings
-
-
-# AutoSmooth/SmoothGPTQ mappings restricted to int4 layers only.
-int4_mapping = build_int4_mappings(model.config)
-
 
 # Configure the quantization algorithm to run.
 #   * quantize experts/shared_experts to int4 and other selected linear layers to int8
@@ -264,37 +295,23 @@ recipes = []
 if args.observer == "imatrix_mse":
     weights_args_4.observer = "imatrix_mse"
     weights_args_8.observer = "imatrix_mse"
-    recipes.append(IMatrixGatherer(ignore=ignores))
+    imatrix_fallback_stats = ImatrixFallbackStats()
+    imatrix_fallback_stats.install_hooks()
+    imatrix_kwargs = dict(ignore=ignores)
+    if args.pipeline == "sequential":
+        imatrix_kwargs["attach_by_initialize"] = False
+    recipes.append(IMatrixGatherer(**imatrix_kwargs))
     tail_name += "-IMatrix"
-
-# Keep these reference configs nearby for future experiments.
-# recipe = [
-    # SmoothGPTQModifier(
-    #     activation_scale_type="max", 
-    #     norm_func='awq',
-    #     mappings=int4_mapping,
-    #     config_groups=config_groups,
-    #     offload_device=torch.device("cuda:1") if torch.cuda.device_count() > 1 else torch.device("cpu"),
-    #     ignore=ignores,
-    #     muti_gpu_compression=True,
-    #     offload_hessians=True,
-    # )
-
-    # AutoSmoothModifier(
-    #     activation_scale_type="max", 
-    #     norm_func='awq',
-    #     mappings=int4_mapping,
-    #     config_groups={"experts_w4a8": experts_w4_scheme},
-    #     offload_device=torch.device("cuda:1") if torch.cuda.device_count() > 1 else torch.device("cpu"),
-    #     ignore=ignores,
-    # ),
+elif args.observer == "mse":
+    weights_args_4.observer = "mse"
+    weights_args_8.observer = "mse"
+    tail_name += "-MSE"
 
 if args.modifier == "GPTQ":
     recipes.append(
         GPTQModifier(
             config_groups=config_groups,
             ignore=ignores,
-            # muti_gpu_compression=True,
             offload_hessians=True,
         )
     )
@@ -311,14 +328,22 @@ else:
     raise ValueError(f"Invalid modifier selected: {args.modifier}")
 
 # Apply algorithms.
-oneshot(
+oneshot_kwargs = dict(
     model=model,
     dataset=ds,
     recipe=recipes,
     max_seq_length=MAX_SEQUENCE_LENGTH,
     num_calibration_samples=NUM_CALIBRATION_SAMPLES,
     batch_size=1,
+    moe_calibrate_all_experts=args.moe_calibrate_all_experts,
+    pipeline=args.pipeline,
 )
+
+if args.observer == "imatrix_mse":
+    with imatrix_fallback_stats:
+        oneshot(**oneshot_kwargs)
+else:
+    oneshot(**oneshot_kwargs)
 
 # Save to disk compressed.
 SAVE_NAME = model_id.rstrip("/").split("/")[-1] + tail_name + "-unpacked"
