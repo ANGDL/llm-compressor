@@ -129,7 +129,7 @@ recipe = [
         targets="Linear",
         scheme="W8A8",
         offload_hessians=True,
-        ignore=["lm_head", "re:visual.*", "re:model.visual.*"],
+        ignore=["lm_head", "re:visual.*", "re:model.visual.*", 're:.*mlp.gate$'],
     ),
 ]
 
@@ -146,39 +146,39 @@ oneshot(
     data_collator=data_collator,
 )
 
-# Confirm generations of the quantized model look sane.
-print("========== SAMPLE GENERATION ==============")
-dispatch_for_generation(model)
-messages = [
-    {
-        "role": "user",
-        "content": [
-            {
-                "type": "image",
-                "image": "http://images.cocodataset.org/train2017/000000231895.jpg",
-            },
-            {"type": "text", "text": "Please describe the animal in this image\n"},
-        ],
-    }
-]
-prompt = processor.apply_chat_template(messages, add_generation_prompt=True)
-image_inputs, video_inputs = process_vision_info(messages)
-inputs = processor(
-    text=[prompt],
-    images=image_inputs,
-    videos=video_inputs,
-    padding=False,
-    max_length=MAX_SEQUENCE_LENGTH,
-    truncation=True,
-    return_tensors="pt",
-).to(model.device)
-output = model.generate(**inputs, max_new_tokens=100)
-print(processor.decode(output[0], skip_special_tokens=True))
-print("==========================================")
+# # Confirm generations of the quantized model look sane.
+# print("========== SAMPLE GENERATION ==============")
+# dispatch_for_generation(model)
+# messages = [
+#     {
+#         "role": "user",
+#         "content": [
+#             {
+#                 "type": "image",
+#                 "image": "http://images.cocodataset.org/train2017/000000231895.jpg",
+#             },
+#             {"type": "text", "text": "Please describe the animal in this image\n"},
+#         ],
+#     }
+# ]
+# prompt = processor.apply_chat_template(messages, add_generation_prompt=True)
+# image_inputs, video_inputs = process_vision_info(messages)
+# inputs = processor(
+#     text=[prompt],
+#     images=image_inputs,
+#     videos=video_inputs,
+#     padding=False,
+#     max_length=MAX_SEQUENCE_LENGTH,
+#     truncation=True,
+#     return_tensors="pt",
+# ).to(model.device)
+# output = model.generate(**inputs, max_new_tokens=100)
+# print(processor.decode(output[0], skip_special_tokens=True))
+# print("==========================================")
 
 
 # Save to disk compressed.
-SAVE_DIR = model_id.rstrip("/").split("/")[-1] + "-W8A8_LLM"
+SAVE_DIR = model_id.rstrip("/").split("/")[-1] + "-W8A8-gptq"
 SAVE_DIR = os.path.join("/ssd3/models", SAVE_DIR)
 model.save_pretrained(SAVE_DIR, save_compressed=True)
 copy_original_non_model_files(model_id, SAVE_DIR)
