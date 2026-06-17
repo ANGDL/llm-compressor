@@ -112,6 +112,17 @@ parser.add_argument(
     help="Whether to calibrate all MoE experts (not just the top-k).",
 )
 parser.add_argument(
+    "--shared-experts-bits",
+    type=int,
+    default=8,
+    choices=[4, 8],
+    help=(
+        "Quantization bits for mlp.shared_experts.* projections. "
+        "Default 4 keeps shared experts in the W4 group (with routed experts); "
+        "use 8 to move them into the W8 group together with attention/MLP linears."
+    ),
+)
+parser.add_argument(
     "--pipeline",
     type=str,
     default="independent",
@@ -262,22 +273,31 @@ activations_args = QuantizationArgs(
     observer=None,
 )
 
-# Experts and shared experts use int4 weights.
+# Routed experts always use int4 weights; shared experts follow --shared-experts-bits.
+shared_experts_pattern = (
+    "re:.*mlp\\.shared_experts(?:\\..+)?\\.(gate_proj|up_proj|down_proj)$"
+)
+experts_w4_targets = [
+    "re:.*mlp\\.experts\\..*\\.(gate_proj|up_proj|down_proj)$",
+]
+other_linear_w8_targets = [
+    "re:.*self_attn\\.(q_a_proj|q_b_proj|kv_a_proj_with_mqa|kv_b_proj|o_proj)$",
+    "re:.*mlp\\.(gate_proj|up_proj|down_proj)$",
+]
+if args.shared_experts_bits == 4:
+    experts_w4_targets.append(shared_experts_pattern)
+else:
+    other_linear_w8_targets.append(shared_experts_pattern)
+
 experts_w4_scheme = QuantizationScheme(
-    targets=[
-        "re:.*mlp\\.experts\\..*\\.(gate_proj|up_proj|down_proj)$",
-        "re:.*mlp\\.shared_experts(?:\\..+)?\\.(gate_proj|up_proj|down_proj)$",
-    ],
+    targets=experts_w4_targets,
     weights=weights_args_4,
     input_activations=activations_args,
 )
 
 # Other linear projections use int8 weights.
 other_linear_w8_scheme = QuantizationScheme(
-    targets=[
-        "re:.*self_attn\\.(q_a_proj|q_b_proj|kv_a_proj_with_mqa|kv_b_proj|o_proj)$",
-        "re:.*mlp\\.(gate_proj|up_proj|down_proj)$",
-    ],
+    targets=other_linear_w8_targets,
     weights=weights_args_8,
     input_activations=activations_args,
 )
