@@ -31,6 +31,8 @@ configure_logger(LoggerConfig(console_log_level="DEBUG"))
 
 """
 Usage example for quantizing GLM-5.1 with MoE layers to W8A8 using LLM Compressor.
+1. 更改权重文件中的generation_config.json, 添加："do_sample": true
+2. 量化
 python glm5_w8a8.py --model_id /ssd3/models/GLM-5.1/ --save_dir /ssd2/models/ --transform "" --modifier RTN  --observer imatrix_mse  \
     --num_calibration_samples 512 --max_sequence_length 2048 --dataset_id ./ultrachat_200k --dataset_split train_sft  \
     --indexer-ignore-mode indexer_all --dispatch_extra_memory_gb 10 --pipeline sequential
