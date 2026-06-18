@@ -218,9 +218,22 @@ class GlmMoeDsaMTPLayer(nn.Module):
                     + ["sparse"] * (mtp_layer_idx - len(config.mlp_layer_types) + 1)
                 )
             if hasattr(config, "indexer_types") and len(config.indexer_types) <= mtp_layer_idx:
-                # Layer 78 has the same self_attn structure (including indexer.*)
-                # as layer 77, so reuse the last entry rather than guessing.
-                fill = config.indexer_types[-1] if config.indexer_types else "sparse"
+                # GLM-5.2 introduced cross-layer top-k sharing where some layers run a
+                # `"full"` indexer and others are `"shared"` (reuse the previous full
+                # layer's top-k). The MTP layer's indexer mode is NOT inferable from the
+                # last main layer:
+                #   - GLM-5.1: indexer_types absent in config → defaults to all `"full"`,
+                #     and MTP layer also has its own indexer.
+                #   - GLM-5.2: indexer_types has `"shared"` entries, and the last main
+                #     layer (77) happens to be `"shared"`. But the MTP layer (78) ships
+                #     with full `self_attn.indexer.*` weights in the checkpoint, so it
+                #     must be configured as `"full"`.
+                # Detect from the raw tensors whether the MTP layer carries its own
+                # indexer weights, and set the slot accordingly.
+                mtp_has_indexer = any(
+                    name.startswith("self_attn.indexer.") for name in raw_tensors
+                )
+                fill = "full" if mtp_has_indexer else "shared"
                 extended.indexer_types = (
                     list(config.indexer_types)
                     + [fill] * (mtp_layer_idx - len(config.indexer_types) + 1)
