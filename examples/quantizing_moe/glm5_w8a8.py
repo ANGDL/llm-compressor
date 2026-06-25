@@ -133,6 +133,37 @@ parser.add_argument(
     default=1500.0,
     help="Max CPU memory in GB for model loading (passed as max_memory={'cpu': <value>e9}).",
 )
+parser.add_argument(
+    "--autosmooth-activation-scale-type",
+    type=str,
+    default="minmax",
+    choices=["mean", "max", "minmax"],
+    help=(
+        "AutoSmooth activation scale aggregation method: mean / max / minmax. "
+        "Forwarded to AutoSmoothModifier.activation_scale_type."
+    ),
+)
+parser.add_argument(
+    "--autosmooth-norm-func",
+    type=str,
+    default="",
+    choices=["", "awq", "adaptive"],
+    help=(
+        "Normalization function applied to scales during AutoSmooth grid search. "
+        "'awq' use the modifier default (standard AWQ normalization, "
+        "norm_func=None). 'adaptive' enables adaptive normalization with "
+        "alpha/beta from --autosmooth-norm-func-param."
+    ),
+)
+parser.add_argument(
+    "--autosmooth-norm-func-param",
+    type=str,
+    default="6.0,0.15",
+    help=(
+        "Only used when --autosmooth-norm-func=adaptive. Format 'alpha,beta', "
+        "default 6.0,0.15. Ignored otherwise."
+    ),
+)
 args = parser.parse_args()
 
 
@@ -263,31 +294,102 @@ autosmooth_ignores = [
     pattern for pattern in ignores if pattern != INDEXER_WEIGHTS_PROJ_PATTERN
 ]
 
+# --------------------------------------------------------------------------
+# AutoSmooth / SmoothQuant 映射
+#
+# GLM-5.2 引入了「跨层 top-k 共享」：config.indexer_types 中标记为 "shared"
+# 的层不构造自己的 self_attn.indexer.* 子模块，而是复用前一个 "full" 层的 top-k。
+# 因此一条混合写法（``re:.*input_layernorm$`` 配 ``re:.*indexer\.wk$``）在
+# 5.2 上会让 ``match_modules_set`` 在 shared 层一直找不齐 indexer 子模块，
+# 把多层的 input_layernorm 累积进同一个 group，最终触发
+# ``Smooth needs to match a single smoothlayer ...`` 错误。
+#
+# 按 ``indexer_types`` 把映射拆成 full / shared 两组——full 层
+# （以及 MTP 解码器，attach_mtp_layer 已根据 checkpoint 把它配为 "full"）继续
+# 把 indexer.{wk,weights_proj,wq_b} 加进 balance_layers，shared 层只 balance 主
+# 注意力分支。GLM-5.1 的 indexer_types 全是 "full"，shared 组为空，行为退化为原始
+# 4 条映射，与原 5.1 行为完全一致。
+# --------------------------------------------------------------------------
+_indexer_types: list[str] = (
+    list(model.config.indexer_types)
+    if getattr(model.config, "indexer_types", None) is not None
+    else ["full"] * model.config.num_hidden_layers
+)
+_full_layer_idx = [i for i, t in enumerate(_indexer_types) if t == "full"]
+_shared_layer_idx = [i for i, t in enumerate(_indexer_types) if t == "shared"]
+
+
+def _alt(idxs: list[int]) -> str:
+    """把层号列表拼成 ``(?:0|1|2|6)`` 形式的正则非捕获组。"""
+    return "(?:" + "|".join(str(i) for i in idxs) + ")"
+
+
+# full 前缀：匹配主模型里所有 "full" 层 + 通过 attach_mtp_layer 挂上的 mtp.decoder.*
+# （MTP 解码器自带完整的 indexer 权重，被强制配为 "full"）。
+_full_prefix = (
+    rf"(?:^model\.layers\.{_alt(_full_layer_idx)}\.|^mtp\.decoder\.)"
+    if _full_layer_idx
+    else r"^mtp\.decoder\."
+)
+# shared 前缀：仅在 GLM-5.2 上非空。
+_shared_prefix = (
+    rf"^model\.layers\.{_alt(_shared_layer_idx)}\."
+    if _shared_layer_idx
+    else None
+)
+
 autosmooth_mappings: list[AWQMapping] = [
+    # ---- full 层 + MTP：input_layernorm → q_a_proj / kv_a_proj_with_mqa / indexer.wk / indexer.weights_proj
     AWQMapping(
-        smooth_layer=r"re:.*input_layernorm$",
+        smooth_layer=rf"re:{_full_prefix}input_layernorm$",
         balance_layers=[
-            r"re:.*q(_a)?_proj$",
-            r"re:.*kv_a_proj_with_mqa$",
-            r"re:.*indexer\.wk$",
-            # `weights_proj` consumes the same input_layernorm output as wk/q_a/kv_a.
-            # Balance it here to keep the indexer scoring path consistent after smoothing.
-            r"re:.*indexer\.weights_proj$",
+            rf"re:{_full_prefix}self_attn\.q_a_proj$",
+            rf"re:{_full_prefix}self_attn\.kv_a_proj_with_mqa$",
+            rf"re:{_full_prefix}self_attn\.indexer\.wk$",
+            # weights_proj 与 wk/q_a/kv_a 共用同一份 input_layernorm 输出，
+            # 在这里一并 balance，保证 smoothing 后 indexer 打分路径一致。
+            rf"re:{_full_prefix}self_attn\.indexer\.weights_proj$",
         ],
     ),
+    # ---- full 层 + MTP：q_a_layernorm → q_b_proj / indexer.wq_b
     AWQMapping(
-        smooth_layer=r"re:.*q_a_layernorm$",
-        balance_layers=[r"re:.*q_b_proj$", r"re:.*indexer\.wq_b$"],
+        smooth_layer=rf"re:{_full_prefix}self_attn\.q_a_layernorm$",
+        balance_layers=[
+            rf"re:{_full_prefix}self_attn\.q_b_proj$",
+            rf"re:{_full_prefix}self_attn\.indexer\.wq_b$",
+        ],
     ),
+    # ---- 通用：kv_a_layernorm → kv_b_proj（full / shared 层结构相同）
     AWQMapping(
         smooth_layer=r"re:.*kv_a_layernorm$",
         balance_layers=[r"re:.*kv_b_proj$"],
     ),
+    # ---- 通用：up_proj → down_proj（dense MLP / shared_experts / 每个 routed expert 都覆盖）
     AWQMapping(
         smooth_layer=r"re:.*up_proj$",
         balance_layers=[r"re:.*down_proj$"],
     ),
 ]
+
+# GLM-5.2 才会进这两条；5.1 上 _shared_prefix 为 None，跳过即可。
+if _shared_prefix is not None:
+    autosmooth_mappings.insert(
+        1,
+        AWQMapping(
+            smooth_layer=rf"re:{_shared_prefix}input_layernorm$",
+            balance_layers=[
+                rf"re:{_shared_prefix}self_attn\.q_a_proj$",
+                rf"re:{_shared_prefix}self_attn\.kv_a_proj_with_mqa$",
+            ],
+        ),
+    )
+    autosmooth_mappings.insert(
+        3,
+        AWQMapping(
+            smooth_layer=rf"re:{_shared_prefix}self_attn\.q_a_layernorm$",
+            balance_layers=[rf"re:{_shared_prefix}self_attn\.q_b_proj$"],
+        ),
+    )
 
 smoothquant_mappings: list[tuple | list] = [
     [mapping.balance_layers, mapping.smooth_layer] for mapping in autosmooth_mappings
@@ -335,14 +437,26 @@ tail_name = "-W8A8"
 recipes = []
 
 if args.transform == "AutoSmooth":
-    recipes.append(
-        AutoSmoothModifier(
-            ignore=autosmooth_ignores,
-            activation_scale_type="minmax",
-            # norm_func="awq",
-            mappings=autosmooth_mappings,
-        ),
+    autosmooth_kwargs = dict(
+        ignore=autosmooth_ignores,
+        activation_scale_type=args.autosmooth_activation_scale_type,
+        mappings=autosmooth_mappings,
     )
+    if args.autosmooth_norm_func == "adaptive":
+        try:
+            alpha_s, beta_s = args.autosmooth_norm_func_param.split(",")
+            alpha, beta = float(alpha_s), float(beta_s)
+        except ValueError as e:
+            raise ValueError(
+                f"--autosmooth-norm-func-param 应为 'alpha,beta'，"
+                f"收到: {args.autosmooth_norm_func_param!r}"
+            ) from e
+        autosmooth_kwargs["norm_func"] = "adaptive"
+        autosmooth_kwargs["norm_func_param"] = {
+            "adaptive": {"alpha": alpha, "beta": beta}
+        }
+    # "awq" / "" 走默认（norm_func=None）
+    recipes.append(AutoSmoothModifier(**autosmooth_kwargs))
     tail_name += "-AutoSmooth"
 elif args.transform == "SmoothQuant":
     recipes.append(
