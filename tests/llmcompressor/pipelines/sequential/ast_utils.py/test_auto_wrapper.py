@@ -66,7 +66,7 @@ def test_static_if_global_vars():
 
 
 def test_dynamic_if():
-    """Checks that non-resolvable if statements are ignored"""
+    """Checks that non-resolvable if statements are wrapped"""
 
     source = """
     def forward():
@@ -233,5 +233,26 @@ def test_ignore_discard_underscore_name():
     def forward(hidden_states):
         (hidden_states,) = wrapped_0(hidden_states)  # skip: some envs use "(hidden_states,)" -> "hidden_states,"
         return hidden_states
+    """
+    check_wrapping(source, output)
+
+
+def test_dynamic_ifexp():
+    """Checks that non-resolvable if expressions are wrapped"""
+
+    source = """
+    def forward():
+        test = ...
+        out = 1 if test else 2
+    """
+    output = """
+    @torch.fx.wrap
+    def wrapped_0(test):
+        return 1 if test else 2
+        return ()
+
+    def forward():
+        test = ...
+        out = wrapped_0(test)
     """
     check_wrapping(source, output)

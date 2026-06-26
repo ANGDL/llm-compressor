@@ -6,7 +6,7 @@ from functools import wraps
 from typing import Type
 
 import torch
-from compressed_tensors.offload import dispatch_model
+from compressed_tensors.offload import dispatch_model, load_offloaded_model
 from compressed_tensors.utils import deprecated, patch_attr
 from huggingface_hub import snapshot_download
 from llmcompressor._torch_accelerator_compat import (
@@ -42,6 +42,7 @@ __all__ = [
     "get_main_device",
     "get_high_precision",
     "dispatch_for_generation",
+    "load_context",
 ]
 
 from torch import nn
@@ -63,6 +64,26 @@ TORCH_INIT_FUNCTIONS = {
     "kaiming_uniform": nn.init.kaiming_uniform,
     "kaiming_normal": nn.init.kaiming_normal,
 }
+
+
+@contextlib.contextmanager
+def load_context(model_cls: Type[PreTrainedModel] = AutoModelForCausalLM):
+    """
+    Context manager for loading HuggingFace models with both offloading and
+    MoE linearization support.
+
+    This context manager combines `load_offloaded_model` and `load_quantizable_moe`
+    contexts to provide a unified interface for loading models that may require
+    either or both capabilities.
+
+    :param model_cls: The model class to patch, defaults to AutoModelForCausalLM
+    """
+    from llmcompressor.modeling.moe.linearize import load_quantizable_moe
+
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(load_offloaded_model(model_cls))
+        stack.enter_context(load_quantizable_moe(model_cls))
+        yield
 
 
 @contextlib.contextmanager
@@ -156,8 +177,10 @@ def patch_transformers_logger_level(level: int = logging.ERROR):
     restore_log_level = transformers_logger.getEffectiveLevel()
 
     transformers_logger.setLevel(level=level)
-    yield
-    transformers_logger.setLevel(level=restore_log_level)
+    try:
+        yield
+    finally:
+        transformers_logger.setLevel(level=restore_log_level)
 
 
 def get_main_device() -> torch.device:

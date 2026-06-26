@@ -3,6 +3,7 @@ import torch
 from compressed_tensors.quantization.quant_args import QuantizationArgs
 
 import llmcompressor.observers.imatrix as imatrix
+from llmcompressor.modifiers.utils.hooks import HooksMixin
 from llmcompressor.observers.base import Observer
 from llmcompressor.observers.imatrix import _grid_search
 
@@ -339,7 +340,7 @@ class TestValidation:
         )
         observer.attach(module)
         with pytest.raises(NotImplementedError, match="TENSOR strategy"):
-            observer(module.weight)
+            observer(module.weight).get_qparams()
 
 
 class TestChunkBehavior:
@@ -526,3 +527,39 @@ def test_grid_search_falls_back_to_cpu_on_accelerator_oom(monkeypatch):
     assert actual_max.device.type == accelerator
     assert torch.allclose(actual_min.cpu(), expected_min)
     assert torch.allclose(actual_max.cpu(), expected_max)
+
+
+# ---------------------------------------------------------------------------
+# Hook disabled during HooksMixin.disable_hooks()
+# ---------------------------------------------------------------------------
+
+
+class TestHookDisabling:
+    """
+    The iMatrix hook must not accumulate when HooksMixin.disable_hooks() is active.
+    """
+
+    def test_hook_skipped_under_disable_hooks(self):
+        module = torch.nn.Linear(8, 4)
+        _make_observer(module, strategy="channel")
+
+        x = torch.randn(2, 8)
+        module(x)
+        assert module._imatrix_count.item() > 0
+        count_before = module._imatrix_count.item()
+
+        with HooksMixin.disable_hooks():
+            module(torch.randn(2, 8))
+
+        assert module._imatrix_count.item() == count_before
+
+    def test_hook_resumes_after_disable_hooks(self):
+        module = torch.nn.Linear(8, 4)
+        _make_observer(module, strategy="channel")
+
+        with HooksMixin.disable_hooks():
+            module(torch.randn(2, 8))
+        assert module._imatrix_count.item() == 0
+
+        module(torch.randn(2, 8))
+        assert module._imatrix_count.item() > 0
