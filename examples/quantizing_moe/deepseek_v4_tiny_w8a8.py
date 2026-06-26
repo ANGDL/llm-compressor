@@ -9,7 +9,7 @@ from torch.utils.data import DataLoader
 
 from llmcompressor import oneshot
 from llmcompressor.modeling.deepseekv4.config import ModelConfig
-from llmcompressor.modeling.deepseekv4.model import DeepseekV4ForCausalLM
+from llmcompressor.modeling.deepseekv4.model import DeepseekV4NativeForCausalLM
 from llmcompressor.modifiers.gptq import GPTQModifier
 from llmcompressor.modifiers.autosmooth import AutoSmoothModifier
 from llmcompressor.modifiers.quantization import QuantizationModifier
@@ -47,7 +47,7 @@ def build_tiny_config() -> ModelConfig:
 def main():
     torch.manual_seed(0)
     with torch.no_grad():
-        model = DeepseekV4ForCausalLM(build_tiny_config())
+        model = DeepseekV4NativeForCausalLM(build_tiny_config())
         model = model.to(torch.bfloat16)
     # GPTQ's lm_head disabling utility assumes a single-input output head.
     # DeepSeekV4 head has extra arguments, so skip output embedding wrapping.
@@ -160,7 +160,7 @@ def main():
         ct_utils.from_accelerate = original_from_accelerate
 
     with torch.no_grad():
-           reloaded = DeepseekV4ForCausalLM.from_pretrained(sym_save_dir, dtype=torch.bfloat16)
+           reloaded = DeepseekV4NativeForCausalLM.from_pretrained(sym_save_dir, dtype=torch.bfloat16)
            reloaded = reloaded.to(torch.bfloat16)
     print("post-reload logits:", reloaded(input_ids=sample).logits.shape)
     print(f"saved to: {save_dir}")
