@@ -392,6 +392,14 @@ class Attention(nn.Module):
             torch.zeros(args.max_batch_size, kv_cache_size, self.head_dim, dtype=torch.float32),
             persistent=False,
         )
+        # `precompute_freqs_cis` is `@lru_cache`-d, so layers with matching
+        # hyperparameters would otherwise share a single storage. When transformers
+        # 5.x instantiates the model under `torch.device("meta")` and then moves
+        # non-persistent buffers off meta via `named_non_persistent_buffers`
+        # (default `remove_duplicate=True`), only the first alias is moved and the
+        # rest stay on meta — which later crashes `set_onload_device` /
+        # `offload_module` with "Cannot copy out of meta tensor". Clone here to
+        # give every Attention its own storage.
         self.register_buffer(
             "freqs_cis",
             precompute_freqs_cis(
@@ -402,7 +410,7 @@ class Attention(nn.Module):
                 args.rope_factor,
                 args.beta_fast,
                 args.beta_slow,
-            ),
+            ).clone(),
             persistent=False,
         )
 
