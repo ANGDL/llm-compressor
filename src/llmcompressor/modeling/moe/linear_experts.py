@@ -54,6 +54,12 @@ class ExpertMLPWithGate(ExpertMLP):
 
     def copy_from_experts_module(self, experts: FusedExpertsProtocol, index: int):
         # load weights
+        # NOTE: assign to ``weight.data`` instead of ``weight.copy_(...)`` to
+        # avoid holding the skip-init placeholder buffer alongside the fused
+        # source tensor while the slice is copied. For large MoE models
+        # (e.g. GLM-5) the extra placeholder caused noticeable peak-memory
+        # doubling. ``contiguous()`` materializes a fresh storage so the
+        # original fused weight can be freed once the caller drops it.
         if not experts.is_transposed:
             gate_weight = experts.gate_up_proj[index, : self.intermediate_size]
             up_weight = experts.gate_up_proj[index, self.intermediate_size :]
@@ -64,9 +70,9 @@ class ExpertMLPWithGate(ExpertMLP):
             up_weight = experts.gate_up_proj[index, :, self.intermediate_size :].T
             down_weight = experts.down_proj[index].T
 
-        self.gate_proj.weight.copy_(gate_weight)
-        self.up_proj.weight.copy_(up_weight)
-        self.down_proj.weight.copy_(down_weight)
+        self.gate_proj.weight.data = gate_weight.contiguous()
+        self.up_proj.weight.data = up_weight.contiguous()
+        self.down_proj.weight.data = down_weight.contiguous()
 
         # load biases
         if experts.has_bias:
@@ -74,9 +80,9 @@ class ExpertMLPWithGate(ExpertMLP):
             up_bias = experts.gate_up_proj_bias[index, self.intermediate_size :]
             down_bias = experts.down_proj_bias[index]
 
-            self.gate_proj.bias.copy_(gate_bias)
-            self.up_proj.bias.copy_(up_bias)
-            self.down_proj.bias.copy_(down_bias)
+            self.gate_proj.bias.data = gate_bias.contiguous()
+            self.up_proj.bias.data = up_bias.contiguous()
+            self.down_proj.bias.data = down_bias.contiguous()
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.down_proj(
@@ -113,6 +119,8 @@ class ExpertMLPWithoutGate(ExpertMLP):
 
     def copy_from_experts_module(self, experts: FusedExpertsProtocol, index: int):
         # load weights
+        # NOTE: assign to ``weight.data`` instead of ``weight.copy_(...)``;
+        # see ExpertMLPWithGate.copy_from_experts_module above for details.
         if not experts.is_transposed:
             up_weight = experts.up_proj[index]
             down_weight = experts.down_proj[index]
@@ -121,16 +129,16 @@ class ExpertMLPWithoutGate(ExpertMLP):
             up_weight = experts.up_proj[index].T
             down_weight = experts.down_proj[index].T
 
-        self.up_proj.weight.copy_(up_weight)
-        self.down_proj.weight.copy_(down_weight)
+        self.up_proj.weight.data = up_weight.contiguous()
+        self.down_proj.weight.data = down_weight.contiguous()
 
         # load biases
         if experts.has_bias:
             up_bias = experts.up_proj_bias[index]
             down_bias = experts.down_proj_bias[index]
 
-            self.up_proj.bias.copy_(up_bias)
-            self.down_proj.bias.copy_(down_bias)
+            self.up_proj.bias.data = up_bias.contiguous()
+            self.down_proj.bias.data = down_bias.contiguous()
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.down_proj(self.act_fn(self.up_proj(hidden_states)))
