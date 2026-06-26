@@ -330,14 +330,14 @@ class AutoSmoothModifier(Modifier):
         self._setup_activation_cache_hooks()
 
     def on_event(self, state: State, event: Event, **kwargs):
-        if event.type_ == EventType.CALIBRATION_EPOCH_START:
+        if event.type_ == EventType.CALIBRATION_START:
             if not self.started_:
                 self.on_start(state, None)
 
         elif event.type_ == EventType.SEQUENTIAL_EPOCH_END:
             self._apply_smoothing(state.model)
 
-        elif event.type_ == EventType.CALIBRATION_EPOCH_END:
+        elif event.type_ == EventType.CALIBRATION_END:
             if not self.ended_:
                 self.on_end(state, None)
 
