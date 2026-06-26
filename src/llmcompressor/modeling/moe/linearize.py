@@ -118,11 +118,23 @@ def linearize_moe(model: PreTrainedModel):
         "https://docs.vllm.ai/projects/llm-compressor/en/latest/developer-tutorials/add-moe-support"  # noqa: E501
     )
 
-    for name, module in tqdm.tqdm(non_linearized_moes, desc="Linearizing experts"):
+    # Iterate by popping from the front so the list itself doesn't keep
+    # references to original packed expert modules. ``set_submodule`` only
+    # removes the parent's reference; without also dropping the entry held
+    # by ``non_linearized_moes``, every original packed expert block stays
+    # alive for the entire loop (peak memory ≈ all-original-experts +
+    # new-unpacked-experts), which doubles RSS on large MoE models such as
+    # GLM-5.
+    progress = tqdm.tqdm(total=len(non_linearized_moes), desc="Linearizing experts")
+    while non_linearized_moes:
+        name, module = non_linearized_moes.pop(0)
         config = getattr(module, "config", model.config)
         linear_experts_cls = LinearExperts2D.get_linear_experts_cls(module.__class__)
         linear_moe = linear_experts_cls.from_experts_module(module, config)
         model.set_submodule(name, linear_moe)
+        del module, linear_moe
+        progress.update(1)
+    progress.close()
 
 
 def get_non_linearized_moes(
