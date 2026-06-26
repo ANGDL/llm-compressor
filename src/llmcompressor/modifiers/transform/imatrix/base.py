@@ -2,7 +2,7 @@ from compressed_tensors.quantization import QuantizationArgs
 from compressed_tensors.utils import match_named_modules
 from pydantic import Field
 
-from llmcompressor.core import Event, EventType, State
+from llmcompressor.core import Event, State
 from llmcompressor.modifiers import Modifier
 from llmcompressor.observers.base import Observer
 
@@ -102,29 +102,23 @@ class IMatrixGatherer(Modifier):
 
         return True
 
-    def on_start(self, state: State, event: Event, **kwargs):
-        self.started_ = True
+    def on_sequential_epoch_end(self, state: State, event: Event, **kwargs):
+        if self.attach_by_initialize:
+            return
+        parents = kwargs.get("modules", [])
+        modules = {
+            m
+            for parent in parents
+            for m in parent.modules()
+            if hasattr(m, "weight_observer")
+        }
+        for module in modules:
+            observer = getattr(module, "weight_observer", None)
+            if observer is not None and hasattr(module, "_imatrix_sum"):
+                observer._imatrix_sum = module._imatrix_sum
+                observer._imatrix_count = module._imatrix_count
 
-    def on_event(self, state: State, event: Event, **kwargs):
-        if event.type_ == EventType.CALIBRATION_EPOCH_START:
-            if not self.started_:
-                self.on_start(state, None)
-
-        if event.type_ == EventType.SEQUENTIAL_EPOCH_END and not self.attach_by_initialize:
-            parents = kwargs.get("modules", [])
-            modules = {m for parent in parents for m in parent.modules() if hasattr(m, "weight_observer")}
-            for module in modules:
-                observer = getattr(module, "weight_observer", None)
-                if observer is not None and hasattr(module, "_imatrix_sum"):
-                    observer._imatrix_sum = module._imatrix_sum
-                    observer._imatrix_count = module._imatrix_count
-
-        if event.type_ == EventType.CALIBRATION_EPOCH_END:
-            if not self.ended_:
-                self.on_end(state, None)
-
-    def on_end(self, state: State, event: Event, **kwargs):
-        self.ended_ = True
+    def on_calibration_end(self, state: State, event: Event, **kwargs):
         for _, module in match_named_modules(
             state.model, self._resolved_targets, self.ignore
         ):
@@ -137,9 +131,6 @@ class IMatrixGatherer(Modifier):
         """
         Clean up any remaining accumulators so they don't end up in the checkpoint
         """
-        if not self.ended_:
-            self.on_end(state, None)
-
         for _, module in match_named_modules(
             state.model, self._resolved_targets, self.ignore
         ):
