@@ -87,6 +87,16 @@ class _AcceleratorCompat:
             return torch.cuda.mem_get_info(index)
         if backend == "xpu" and hasattr(torch.xpu, "mem_get_info"):
             return torch.xpu.mem_get_info(index)
+        if backend == "mps":
+            # torch 2.12's torch.accelerator.get_memory_info raises on MPS
+            # (the C++ allocator does not implement _accelerator_getMemoryInfo).
+            # Substitute the runtime's recommended max memory; compressed_tensors
+            # dispatch only consumes the `total` slot of the tuple.
+            try:
+                total = int(torch.mps.recommended_max_memory())
+            except Exception:
+                total = 0
+            return (total, total)
         return (0, 0)
 
 
@@ -106,6 +116,18 @@ def ensure_torch_accelerator():
         ):
             if not hasattr(torch.accelerator, name):
                 setattr(torch.accelerator, name, getattr(compat, name))
+
+        # torch 2.12 ships torch.accelerator.get_memory_info but it raises on
+        # MPS (`device_allocator INTERNAL ASSERT FAILED`). Detect that backend
+        # at patch-time and unconditionally route MPS through the compat impl,
+        # which falls back to torch.mps.recommended_max_memory().
+        if hasattr(torch, "mps") and torch.mps.is_available():
+            try:
+                accel_type = torch.accelerator.current_accelerator().type
+            except Exception:
+                accel_type = "mps"
+            if accel_type == "mps":
+                torch.accelerator.get_memory_info = compat.get_memory_info
     return torch.accelerator
 
 
