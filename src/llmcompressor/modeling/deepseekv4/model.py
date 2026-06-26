@@ -710,7 +710,7 @@ class Transformer(nn.Module):
         return logits
 
 
-class DeepseekV4PreTrainedModel(PreTrainedModel):
+class DeepseekV4NativePreTrainedModel(PreTrainedModel):
     config_class = ModelConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
@@ -774,7 +774,7 @@ class DeepseekV4PreTrainedModel(PreTrainedModel):
                         pass
 
 
-class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
+class DeepseekV4NativeForCausalLM(DeepseekV4NativePreTrainedModel, GenerationMixin):
     config: ModelConfig
     _tied_weights_keys = {
         "model.mtp.0.embed.weight": "model.embed.weight",

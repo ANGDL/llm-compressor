@@ -14,7 +14,7 @@ from transformers import AutoTokenizer
 
 from llmcompressor import oneshot
 from llmcompressor.modeling.deepseek_v4 import CalibrationDeepseekV4MoE  # noqa: F401
-from llmcompressor.modeling.deepseekv4.model import DeepseekV4ForCausalLM
+from llmcompressor.modeling.deepseekv4.model import DeepseekV4NativeForCausalLM
 from llmcompressor.modifiers.gptq import GPTQModifier
 from llmcompressor.modifiers.quantization import QuantizationModifier
 from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
@@ -572,7 +572,7 @@ if len(all_datasets) == 1:
 else:
     ds = concatenate_datasets(all_datasets)
 
-# Load the BF16 model using our custom DeepseekV4ForCausalLM implementation.
+# Load the BF16 model using our custom DeepseekV4NativeForCausalLM implementation.
 # This bypasses the transformers library's native DeepSeek V4 support which has
 # known issues with quantization workflows.
 bf16_model_id = BFLOAT16_SAVE_DIR
@@ -585,7 +585,7 @@ config = ModelConfig.from_pretrained(bf16_model_id)
 config.max_batch_size = 1
 config.max_seq_len = MAX_SEQUENCE_LENGTH
 
-model = DeepseekV4ForCausalLM.from_pretrained(
+model = DeepseekV4NativeForCausalLM.from_pretrained(
     bf16_model_id,
     config=config,
     dtype="auto",

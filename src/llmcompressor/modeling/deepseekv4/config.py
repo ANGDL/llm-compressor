@@ -3,8 +3,27 @@ from typing import Literal, Optional
 from transformers.configuration_utils import PretrainedConfig
 
 
+# NOTE: We intentionally use a distinct model_type from upstream HF transformers
+# (which ships its own `deepseek_v4` implementation starting in v5.12). This
+# implementation targets the original DeepSeek-V4 reference checkpoint layout
+# (with MTP / Indexer / hc_split kernels), and must coexist with HF's. Both
+# implementations therefore live under different model_type strings so that
+# AutoConfig / AutoModelForCausalLM dispatch is unambiguous.
 class ModelConfig(PretrainedConfig):
-    model_type = "deepseek_v4"
+    model_type = "deepseek_v4_native"
+
+    @classmethod
+    def from_dict(cls, config_dict, **kwargs):
+        # Tolerate raw upstream checkpoints whose config.json carries
+        # `model_type: "deepseek_v4"`. When they are loaded explicitly through
+        # this class (the LC native impl) we silently treat them as our own
+        # model_type. This does not affect HF's dispatch path: that path uses
+        # AutoConfig, which keeps returning HF's DeepseekV4Config for
+        # "deepseek_v4".
+        if isinstance(config_dict, dict) and config_dict.get("model_type") == "deepseek_v4":
+            config_dict = dict(config_dict)
+            config_dict["model_type"] = cls.model_type
+        return super().from_dict(config_dict, **kwargs)
 
     def __init__(
         self,
