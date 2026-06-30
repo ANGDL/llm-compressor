@@ -25,6 +25,9 @@ from llmcompressor.datasets import get_calibration_dataloader
 from llmcompressor.entrypoints.utils import post_process, pre_process
 from llmcompressor.modeling.moe.context import moe_calibration_context
 from llmcompressor.modeling.moe.linearize import get_non_linearized_moes, linearize_moe
+from llmcompressor.modeling.moe_context import (
+    moe_calibration_context as moe_module_replacement_context,
+)
 from llmcompressor.modeling.offset_norm import norm_calibration_context
 from llmcompressor.pipelines import CalibrationPipeline
 
@@ -235,6 +238,12 @@ class Oneshot:
             stack.enter_context(norm_calibration_context(self.model))
             if self.dataset_args.moe_calibrate_all_experts:
                 stack.enter_context(moe_calibration_context())
+            stack.enter_context(
+                moe_module_replacement_context(
+                    self.model,
+                    calibrate_all_experts=self.dataset_args.moe_calibrate_all_experts,
+                )
+            )
 
             session.initialize(
                 model=self.model,

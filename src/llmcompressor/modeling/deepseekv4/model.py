@@ -781,6 +781,85 @@ class DeepseekV4NativePreTrainedModel(PreTrainedModel):
                     except Exception:
                         pass
 
+    def _move_missing_keys_from_meta_to_device(
+        self, missing_keys, device_map, device_mesh, hf_quantizer
+    ):
+        # Under meta-device init (e.g. from_pretrained with ``max_memory=`` set,
+        # which engages accelerate low-mem loading), transformers materializes
+        # non-persistent buffers with ``torch.empty_like`` — i.e. *uninitialized*
+        # memory — discarding the values computed in ``__init__``. In particular
+        # ``freqs_cis`` (computed via ``precompute_freqs_cis``) becomes NaN/garbage
+        # and is read by ``apply_rotary_emb`` before being overwritten, which
+        # corrupts every activation and makes imatrix importance non-finite
+        # (every module then falls back to uniform MSE). Restore the computed /
+        # constant-init buffers here on their materialized device.
+        super()._move_missing_keys_from_meta_to_device(
+            missing_keys, device_map, device_mesh, hf_quantizer
+        )
+        self._reinitialize_non_persistent_buffers()
+
+    def _reinitialize_non_persistent_buffers(self):
+        """Recompute ``freqs_cis`` and re-zero kv cache/state buffers in place.
+
+        Idempotent and safe to call on a normally-initialized model (values are
+        just overwritten with the same content). Must run after the buffers have
+        been moved off meta by the parent loader.
+        """
+        # ``precompute_freqs_cis`` is ``@lru_cache``-d and may still hold the
+        # meta tensors produced during ``__init__``; clear so recomputation
+        # happens on a real device.
+        precompute_freqs_cis.cache_clear()
+        args = self.config
+        for module in self.modules():
+            if isinstance(module, Attention):
+                compress_ratio = module.compress_ratio
+                original_seq_len = args.original_seq_len if compress_ratio else 0
+                rope_theta = args.compress_rope_theta if compress_ratio else args.rope_theta
+                freqs_cis = precompute_freqs_cis(
+                    module.rope_head_dim,
+                    args.max_seq_len,
+                    original_seq_len,
+                    rope_theta,
+                    args.rope_factor,
+                    args.beta_fast,
+                    args.beta_slow,
+                )
+                module._buffers["freqs_cis"] = freqs_cis.clone().to(module.freqs_cis.device)
+                kv_cache_size = module.window_size + (
+                    args.max_seq_len // compress_ratio if compress_ratio else 0
+                )
+                module._buffers["kv_cache"] = torch.zeros(
+                    args.max_batch_size,
+                    kv_cache_size,
+                    module.head_dim,
+                    dtype=torch.float32,
+                    device=module.kv_cache.device,
+                )
+            elif isinstance(module, Compressor):
+                overlap_factor = 1 + int(module.overlap)
+                shape = (
+                    args.max_batch_size,
+                    overlap_factor * module.compress_ratio,
+                    overlap_factor * module.head_dim,
+                )
+                module._buffers["kv_state"] = torch.zeros(
+                    *shape, dtype=torch.float32, device=module.kv_state.device
+                )
+                module._buffers["score_state"] = torch.full(
+                    shape,
+                    float("-inf"),
+                    dtype=torch.float32,
+                    device=module.score_state.device,
+                )
+            elif isinstance(module, Indexer):
+                module._buffers["kv_cache"] = torch.zeros(
+                    args.max_batch_size,
+                    args.max_seq_len // module.compress_ratio,
+                    module.head_dim,
+                    dtype=torch.float32,
+                    device=module.kv_cache.device,
+                )
+
 
 class DeepseekV4NativeForCausalLM(DeepseekV4NativePreTrainedModel, GenerationMixin):
     config: ModelConfig
@@ -797,6 +876,15 @@ class DeepseekV4NativeForCausalLM(DeepseekV4NativePreTrainedModel, GenerationMix
         self.model = Transformer(config)
         self.vocab_size = config.vocab_size
         self.post_init()
+
+    def get_expanded_tied_weights_keys(self, all_submodels: bool = False) -> dict:
+        # MTP embed/lm_head are tied to main embed/lm_head regardless of
+        # tie_word_embeddings (which only controls the main lm_head<->embed tie).
+        tied = {}
+        for i in range(getattr(self.config, "n_mtp_layers", 1)):
+            tied[f"model.mtp.{i}.embed.weight"] = "model.embed.weight"
+            tied[f"model.mtp.{i}.lm_head.weight"] = "model.lm_head.weight"
+        return tied
 
     @staticmethod
     def _remap_state_dict_for_saving(module, state_dict, prefix, local_metadata):
