@@ -107,11 +107,23 @@ def sparse_attention(
     kv_expanded = kv.unsqueeze(1).expand(-1, seqlen, -1, -1)
     gather_indices = topk_idxs.clamp(min=0).long().unsqueeze(-1).expand(-1, -1, -1, head_dim)
     gathered_kv = torch.gather(kv_expanded, 2, gather_indices)
+    # scores: [bsz, seqlen, n_heads, topk]
     scores = torch.einsum("bshd,bskd->bshk", q.float(), gathered_kv.float()) * softmax_scale
-    scores = scores.masked_fill(topk_idxs.unsqueeze(2) < 0, float("-inf"))
-    sink_scores = attn_sink.view(1, 1, n_heads, 1).expand(bsz, seqlen, -1, -1)
-    probs = torch.softmax(torch.cat([sink_scores, scores], dim=-1), dim=-1)[..., 1:]
-    return torch.einsum("bshk,bskd->bshd", probs, gathered_kv.float()).to(output_dtype)
+    mask = topk_idxs.unsqueeze(2) < 0  # [bsz, seqlen, 1, topk]
+    scores = scores.masked_fill(mask, float("-inf"))
+    # Match tilelang online softmax: max over real scores only (not including sink)
+    scores_max = scores.amax(dim=-1, keepdim=True)  # [bsz, seqlen, n_heads, 1]
+    scores_max = scores_max.clamp(min=-1e30)  # avoid -inf max when all masked
+    exp_scores = torch.exp(scores - scores_max)  # unnormalized exp
+    exp_scores = exp_scores.masked_fill(mask, 0.0)
+    # Cast to BF16 before value matmul (matches kernel acc_s_cast)
+    exp_scores_bf16 = exp_scores.bfloat16()
+    # Weighted sum: BF16 weights × BF16 values → FP32 accumulator
+    acc_o = torch.einsum("bshk,bskd->bshd", exp_scores_bf16.float(), gathered_kv.float())
+    # Total sum includes sink contribution
+    sink_expanded = attn_sink.view(1, 1, n_heads, 1)  # [1, 1, n_heads, 1]
+    sum_exp = exp_scores.sum(dim=-1, keepdim=True) + torch.exp(sink_expanded - scores_max)
+    return (acc_o / sum_exp).to(output_dtype)
 
 
 def hc_split(
@@ -133,14 +145,24 @@ def hc_split(
             hc_eps,
         )
 
-    adjusted = mixes + hc_base
-    pre_logits, post_logits, comb_logits = torch.split(
-        adjusted, [hc_mult, hc_mult, hc_mult * hc_mult], dim=-1
+    pre_raw = mixes[..., :hc_mult]
+    post_raw = mixes[..., hc_mult : 2 * hc_mult]
+    comb_raw = mixes[..., 2 * hc_mult :]
+
+    # pre: sigmoid(mixes * scale + base) + eps
+    pre = torch.sigmoid(pre_raw * hc_scale[0] + hc_base[:hc_mult]) + hc_eps
+    # post: 2 * sigmoid(mixes * scale + base)
+    post = 2 * torch.sigmoid(post_raw * hc_scale[1] + hc_base[hc_mult : 2 * hc_mult])
+    # comb: affine → row-wise softmax + eps → sinkhorn normalization
+    comb = (comb_raw * hc_scale[2] + hc_base[2 * hc_mult :]).unflatten(
+        -1, (hc_mult, hc_mult)
     )
-    pre = torch.softmax(pre_logits * hc_scale[0], dim=-1) + hc_eps
-    post = torch.softmax(post_logits * hc_scale[1], dim=-1) + hc_eps
-    comb = comb_logits.unflatten(-1, (hc_mult, hc_mult))
-    comb = torch.softmax(comb * hc_scale[2], dim=-2)
+    comb = torch.softmax(comb, dim=-1) + hc_eps
+    comb = comb / (comb.sum(dim=-2, keepdim=True) + hc_eps)
+    for _ in range(hc_sinkhorn_iters - 1):
+        comb = comb / (comb.sum(dim=-1, keepdim=True) + hc_eps)
+        comb = comb / (comb.sum(dim=-2, keepdim=True) + hc_eps)
+
     return pre, post, comb
 
 
