@@ -224,7 +224,8 @@ class Oneshot:
         session = active_session()
         session.reset()
 
-        if len(get_non_linearized_moes(self.model)) > 0:
+        model_was_linearized = len(get_non_linearized_moes(self.model)) > 0
+        if model_was_linearized:
             logger.warning(
                 "Detected an MoE model which has not been linearized. First load "
                 "model `with llmcompressor.modeling.moe.linearize.load_quantizable_moe`"
@@ -238,12 +239,22 @@ class Oneshot:
             stack.enter_context(norm_calibration_context(self.model))
             if self.dataset_args.moe_calibrate_all_experts:
                 stack.enter_context(moe_calibration_context())
-            stack.enter_context(
-                moe_module_replacement_context(
-                    self.model,
-                    calibrate_all_experts=self.dataset_args.moe_calibrate_all_experts,
+
+            # Only apply MoE module replacement for models that were NOT
+            # linearized. After linearize_moe, experts are LinearExperts2D which
+            # already supports calibrate_all_experts via the global flag; applying
+            # moe_module_replacement_context on top would conflict because the
+            # CalibrationXxx classes expect the original fused (3D) expert layout.
+            # Models like DeepseekV4 that use a custom loader (experts already in
+            # 2D ModuleList, never detected by get_non_linearized_moes) still need
+            # moe_module_replacement for proper routing during calibration.
+            if not model_was_linearized:
+                stack.enter_context(
+                    moe_module_replacement_context(
+                        self.model,
+                        calibrate_all_experts=self.dataset_args.moe_calibrate_all_experts,
+                    )
                 )
-            )
 
             session.initialize(
                 model=self.model,
