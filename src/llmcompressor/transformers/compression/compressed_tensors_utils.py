@@ -8,6 +8,7 @@ from compressed_tensors import ModelCompressor, SparsityCompressionConfig
 from compressed_tensors.config import CompressionFormat
 from compressed_tensors.distributed import is_source_process
 from compressed_tensors.offload import from_accelerate, to_accelerate
+from compressed_tensors.quantization.utils import is_module_quantized
 from compressed_tensors.utils import deprecated
 from loguru import logger
 from transformers import PreTrainedModel
@@ -18,6 +19,50 @@ from llmcompressor.transformers.utils import RECIPE_FILE_NAME
 from llmcompressor.transformers.utils.helpers import infer_recipe_from_model_path
 
 __all__ = ["modify_save_pretrained"]
+
+
+def _filter_container_modules_from_ignore(
+    model: torch.nn.Module,
+    ignore: list[str],
+) -> list[str]:
+    """Remove container modules from the ignore list if any of their children are
+    quantized.
+
+    ``QuantizationConfig.from_pretrained`` reconstructs the ignore list by walking
+    ``model.named_modules()`` and collecting every non-quantized module whose type
+    also appears among quantized modules. This is a heuristic that breaks when a
+    container module's class name triggers the ``get_vllm_module_type`` Router/Gate
+    remapping (e.g. ``ExpertMLPWithGate`` → ``"Linear"``), causing the container
+    to be confused with a leaf Linear layer and incorrectly added to the ignore list.
+
+    This function filters out any ignore entry whose corresponding module has at
+    least one quantized direct child, since that means the module is a *container*
+    of quantized sub-layers rather than an unquantized leaf.
+    """
+    if not ignore:
+        return ignore
+
+    # Build a set for O(1) lookup
+    ignore_set = set(ignore)
+    to_remove: set[str] = set()
+
+    for name, module in model.named_modules():
+        if name not in ignore_set:
+            continue
+        # Check if any direct child is quantized
+        for _child_name, child in module.named_children():
+            if is_module_quantized(child):
+                to_remove.add(name)
+                break
+
+    if to_remove:
+        logger.debug(
+            f"Filtered {len(to_remove)} container module(s) from quantization "
+            "ignore list (their children are quantized)"
+        )
+        return [name for name in ignore if name not in to_remove]
+
+    return ignore
 
 
 def modify_save_pretrained(model: PreTrainedModel):
@@ -68,6 +113,21 @@ def modify_save_pretrained(model: PreTrainedModel):
             compressor = ModelCompressor.from_pretrained_model(
                 model, quantization_format=quantization_format
             )
+
+            # Fix: filter out container modules whose children are quantized.
+            # compressed_tensors' get_vllm_module_type remaps class names containing
+            # "Gate" to "Linear", causing ExpertMLPWithGate containers to be
+            # incorrectly added to the ignore list alongside actual unquantized
+            # Linear modules (e.g. router gates, indexer projections).
+            if (
+                compressor.quantization_config is not None
+                and compressor.quantization_config.ignore
+            ):
+                compressor.quantization_config.ignore = (
+                    _filter_container_modules_from_ignore(
+                        model, compressor.quantization_config.ignore
+                    )
+                )
             if save_compressed:
                 compressor.compress_model(model)
 
