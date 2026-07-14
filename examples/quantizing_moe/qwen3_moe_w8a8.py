@@ -132,7 +132,7 @@ oneshot(
 #     print(f"Failed to generate sample: {e}")
 
 # Save to disk in compressed-tensors format.
-SAVE_DIR = MODEL_ID.rstrip("/").split("/")[-1] + "-smooth-w8a8"
+SAVE_DIR = MODEL_ID.rstrip("/").split("/")[-1] + "-w8a8-smooth-gptq"
 SAVE_DIR = os.path.join("/ssd1/models", SAVE_DIR)
 
 try:
