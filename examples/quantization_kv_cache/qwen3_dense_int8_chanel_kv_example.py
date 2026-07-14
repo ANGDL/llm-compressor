@@ -36,6 +36,11 @@ from llmcompressor.modifiers.autosmooth import AutoSmoothModifier
 from llmcompressor.modifiers.gptq import GPTQModifier
 from llmcompressor.modifiers.quantization import QuantizationModifier
 from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
+from llmcompressor.utils import ImatrixFallbackStats
+
+from llmcompressor.logger import LoggerConfig, configure_logger
+
+configure_logger(LoggerConfig(console_log_level="DEBUG"))
 
 
 def positive_int(value: str) -> int:
@@ -258,6 +263,8 @@ if args.transform == "AutoSmooth":
     tail_name += "-AutoSmooth"
 
 if args.observer == "imatrix_mse":
+    imatrix_fallback_stats = ImatrixFallbackStats()
+    imatrix_fallback_stats.install_hooks()
     recipe.append(IMatrixGatherer(ignore=ignores))
     tail_name += "-IMatrix"
 elif args.observer == "mse":
@@ -287,13 +294,23 @@ if args.kv_cache:
 
 
 # ---- Run oneshot --------------------------------------------------------
-oneshot(
-    model=model,
-    dataset=ds,
-    recipe=recipe,
-    max_seq_length=MAX_SEQUENCE_LENGTH,
-    num_calibration_samples=NUM_CALIBRATION_SAMPLES,
-)
+if args.observer == "imatrix_mse":
+    with imatrix_fallback_stats:
+        oneshot(
+            model=model,
+            dataset=ds,
+            recipe=recipe,
+            max_seq_length=MAX_SEQUENCE_LENGTH,
+            num_calibration_samples=NUM_CALIBRATION_SAMPLES,
+        )
+else:
+    oneshot(
+        model=model,
+        dataset=ds,
+        recipe=recipe,
+        max_seq_length=MAX_SEQUENCE_LENGTH,
+        num_calibration_samples=NUM_CALIBRATION_SAMPLES,
+    )
 
 # Save to disk compressed before dispatching for generation.
 SAVE_NAME = model_id.rstrip("/").split("/")[-1] + tail_name
