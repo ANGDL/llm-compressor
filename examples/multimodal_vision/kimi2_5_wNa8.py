@@ -6,9 +6,10 @@ from contextlib import contextmanager
 
 from datasets import load_dataset
 import torch
-from transformers import AutoModelForCausalLM, AutoProcessor
+from transformers import AutoProcessor
 
 from llmcompressor import oneshot
+from llmcompressor.modeling import load_kimi_k25_model
 from llmcompressor.pipelines.basic import pipeline as basic_pipeline
 from llmcompressor.pipelines.data_free import pipeline as data_free_pipeline
 from llmcompressor.modifiers.quantization import QuantizationModifier
@@ -102,15 +103,14 @@ patch_pipeline_dispatch(args.dispatch_extra_memory_gb)
 
 
 model_id = args.model_id
-model = AutoModelForCausalLM.from_pretrained(
+model = load_kimi_k25_model(
     model_id,
     dtype="auto",
     device_map=None,
     offload_folder=args.offload_folder,
-    trust_remote_code=True,
 )
 
-processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=False)
 # Confirm that model is dispatched correctly
 devices = {offloaded for _onloaded, offloaded in get_device_map(model).values()}
 print(f"Model was offloaded to the following devices: {devices}")
@@ -146,11 +146,15 @@ else:
 
 
 def tokenize_messages(messages, max_sequence_length):
-    return processor(
-        messages=messages,
-        padding=False,
-        max_length=max_sequence_length,
-        truncation=True,
+    return processor.apply_chat_template(
+        messages,
+        tokenize=True,
+        return_dict=True,
+        processor_kwargs={
+            "padding": False,
+            "max_length": max_sequence_length,
+            "truncation": True,
+        },
     )
 
 
@@ -190,7 +194,7 @@ def build_multimodal_messages(example):
         {
             "role": "user",
             "content": [
-                {"type": "image", "image_url": base64_img},
+                {"type": "image_url", "image_url": {"url": base64_img}},
                 {"type": "text", "text": "What does the image show?"},
             ],
         },
