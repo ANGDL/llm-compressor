@@ -4,6 +4,11 @@ from pathlib import Path
 import torch
 from llmcompressor import model_free_ptq
 
+"""
+Usage:
+    python /data/llm-compressor/examples/model_free_ptq/hy3_int8.py \
+    --model-id /ssd4/models/Hy3 --save-dir /ssd4/models/Hy3-w8a8-rtn --strict-symmetric --scale-dtype float32
+"""
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Quantize the Hy3 model with W8A8")
