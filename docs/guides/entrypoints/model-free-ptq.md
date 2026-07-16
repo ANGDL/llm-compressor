@@ -51,6 +51,12 @@ Multiple files can be processed in parallel using the `max_workers` argument.
 | `max_workers` | `int` | `1` | Number of parallel worker threads for processing safetensors files |
 | `device` | `str \| torch.device \| None` | `None` | Device to use for quantization. Defaults to GPU if available, otherwise CPU |
 | `converter` | `Converter \| None` | `None` | Optional `compressed-tensors` converter to apply before quantization, e.g. to convert modelopt-format checkpoints to compressed-tensors format |
+| `strict_symmetric` | `bool` | `False` | Use the strict symmetric integer weight range `[-127, 127]` instead of the default `[-128, 127]` |
+
+For integer weight quantization, set `strict_symmetric=True` to calculate scales
+with `absmax / (2^(num_bits - 1) - 1)`. For example, strict symmetric INT8
+weight quantization uses `absmax / 127` while the default `W8A8` preset uses
+`absmax / 127.5`.
 
 ## Standard Flow (Non-Microscale Schemes)
 
