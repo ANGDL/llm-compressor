@@ -1,7 +1,15 @@
 import torch
 from compressed_tensors.offload import get_cache_init_kwargs, offload_module
 from transformers.models.granitemoe.configuration_granitemoe import GraniteMoeConfig
-from transformers.models.granitemoe.modeling_granitemoe import GraniteMoeParallelExperts
+
+try:
+    # Transformers v5 renamed this implementation to ``GraniteMoeExperts``.
+    # The legacy adapter below only applies to the old ModuleList-based class.
+    from transformers.models.granitemoe.modeling_granitemoe import (
+        GraniteMoeParallelExperts,
+    )
+except ImportError:  # pragma: no cover - depends on the installed Transformers version
+    GraniteMoeParallelExperts = None
 
 from llmcompressor.modeling.moe.context import get_calibrate_all_experts_flag
 from llmcompressor.modeling.moe.linear_experts import LinearExperts2D
@@ -80,5 +88,7 @@ class GraniteMoeLinearExperts(LinearExperts2D):
         return torch.cat(output_list, dim=0)
 
 
-# register in registry
-LinearExperts2D._registry[GraniteMoeParallelExperts] = GraniteMoeLinearExperts
+# Register only when the legacy class exists.  Newer Transformers versions expose
+# ``GraniteMoeExperts`` with a different (fused tensor) contract handled elsewhere.
+if GraniteMoeParallelExperts is not None:
+    LinearExperts2D._registry[GraniteMoeParallelExperts] = GraniteMoeLinearExperts

@@ -10,6 +10,7 @@ from llmcompressor.modeling.kimi_k25 import (
     _patch_transformers_v5_for_checkpoint_code,
     load_kimi_k25_model,
 )
+from llmcompressor.modeling.moe.linearize import get_non_linearized_moes
 
 
 def test_loader_forces_checkpoint_implementation():
@@ -93,6 +94,12 @@ def test_checkpoint_tie_weights_accepts_transformers_v5_argument():
     model = CheckpointModel()
     model.tie_weights(missing_keys={"lm_head.weight"}, recompute_mapping=False)
     assert model.called
+
+
+def test_moe_scan_does_not_require_legacy_granitemoe_class():
+    model = torch.nn.Sequential(torch.nn.Linear(4, 4))
+
+    assert get_non_linearized_moes(model) == []
 
 
 class _Gate(torch.nn.Module):
