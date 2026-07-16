@@ -52,11 +52,28 @@ Multiple files can be processed in parallel using the `max_workers` argument.
 | `device` | `str \| torch.device \| None` | `None` | Device to use for quantization. Defaults to GPU if available, otherwise CPU |
 | `converter` | `Converter \| None` | `None` | Optional `compressed-tensors` converter to apply before quantization, e.g. to convert modelopt-format checkpoints to compressed-tensors format |
 | `strict_symmetric` | `bool` | `False` | Use the strict symmetric integer weight range `[-127, 127]` instead of the default `[-128, 127]` |
+| `scale_dtype` | `torch.dtype \| None` | `None` | Optional dtype used to save weight scales. If omitted, preserves the scheme/model dtype behavior |
 
 For integer weight quantization, set `strict_symmetric=True` to calculate scales
 with `absmax / (2^(num_bits - 1) - 1)`. For example, strict symmetric INT8
 weight quantization uses `absmax / 127` while the default `W8A8` preset uses
 `absmax / 127.5`.
+
+`strict_symmetric` and `scale_dtype` are independent options. To match a
+conversion flow that uses strict `/127` scaling and stores scales in FP32, pass
+both options explicitly:
+
+```python
+import torch
+
+model_free_ptq(
+    model_stub="Tencent-Hunyuan/Hy3",
+    save_directory="Hy3-W8A8-INT8",
+    scheme="W8A8",
+    strict_symmetric=True,
+    scale_dtype=torch.float32,
+)
+```
 
 ## Standard Flow (Non-Microscale Schemes)
 

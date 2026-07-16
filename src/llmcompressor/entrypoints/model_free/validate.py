@@ -1,5 +1,6 @@
 import json
 
+import torch
 from compressed_tensors.quantization import (
     QuantizationScheme,
     preset_name_to_scheme,
@@ -19,6 +20,7 @@ __all__ = ["validate_scheme", "validate_safetensors_index"]
 def validate_scheme(
     scheme: QuantizationScheme,
     strict_symmetric: bool = False,
+    scale_dtype: torch.dtype | None = None,
 ) -> tuple[str, QuantizationScheme]:
     # treat strings as preset schemes
     if isinstance(scheme, str):
@@ -38,6 +40,9 @@ def validate_scheme(
                 "strict_symmetric requires symmetric integer weight quantization"
             )
         scheme.weights.observer = "strict_symmetric_minmax"
+
+    if scale_dtype is not None:
+        scheme.weights.scale_dtype = scale_dtype
 
     # activation quantization must be dynamic
     input_dynamic = getattr_chain(scheme, "input_activations.dynamic", True)

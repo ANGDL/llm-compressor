@@ -45,6 +45,10 @@ def initialize_quantized_linear(
     module.weight.data.copy_(weight)
     initialize_module_for_quantization(module, scheme, force_zero_point=False)
 
+    scale_dtype = scheme.weights.scale_dtype
+    if scale_dtype is not None and hasattr(module, "weight_scale"):
+        module.weight_scale.data = module.weight_scale.data.to(scale_dtype)
+
     return module
 
 
