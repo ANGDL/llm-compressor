@@ -86,6 +86,22 @@ def _patch_checkpoint_tie_weights(model_class: type) -> None:
     model_class.tie_weights = tie_weights
 
 
+def _normalize_checkpoint_tied_weight_keys(model: torch.nn.Module) -> None:
+    """Convert legacy tied-weight metadata to the Transformers v5 format.
+
+    Checkpoint code may define ``_tied_weights_keys`` as a list of target-key
+    patterns. Transformers v5 expects a target-to-source mapping, but its save path
+    only consumes the mapping keys. Mapping each legacy pattern to itself preserves
+    the old save semantics without re-tying or otherwise touching model parameters.
+    """
+    for module in model.modules():
+        tied_weight_keys = getattr(module, "_tied_weights_keys", None)
+        if isinstance(tied_weight_keys, (list, set, tuple)):
+            module._tied_weights_keys = {
+                pattern: pattern for pattern in tied_weight_keys
+            }
+
+
 def _prepare_checkpoint_model_class(
     pretrained_model_name_or_path: str | PathLike[str],
     kwargs: dict[str, Any],
@@ -192,15 +208,18 @@ def load_kimi_k25_model(
     kwargs.pop("trust_remote_code", None)
     model_class = _prepare_checkpoint_model_class(pretrained_model_name_or_path, kwargs)
     if model_class is not None:
-        return model_class.from_pretrained(
+        model = model_class.from_pretrained(
             pretrained_model_name_or_path,
             **kwargs,
         )
-    return AutoModelForCausalLM.from_pretrained(
-        pretrained_model_name_or_path,
-        trust_remote_code=True,
-        **kwargs,
-    )
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            pretrained_model_name_or_path,
+            trust_remote_code=True,
+            **kwargs,
+        )
+    _normalize_checkpoint_tied_weight_keys(model)
+    return model
 
 
 __all__ = [
