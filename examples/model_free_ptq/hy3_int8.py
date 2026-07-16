@@ -72,6 +72,7 @@ def main() -> None:
             "re:.*mlp.shared_expert_gate.*",
             "re:.*norm.*",
             "re:.*embed_tokens.*",
+            "model.embed_tokens",
         ],
         max_workers=args.max_workers,
         device=args.device,
