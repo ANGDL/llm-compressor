@@ -12,6 +12,37 @@ from transformers.utils import import_utils
 from llmcompressor.modeling.moe_context import MoECalibrationModule
 
 
+def _patch_flash_attn_varlen_func() -> None:
+    """Adapt checkpoint FA2 calls to flash-attn versions without ``deterministic``.
+
+    The checkpoint imports ``flash_attn_varlen_func`` directly while its attention
+    wrapper always passes ``deterministic``. Older flash-attn releases reject that
+    keyword, so patch the module export before dynamic checkpoint code is imported.
+    """
+    try:
+        import flash_attn
+    except ImportError:
+        return
+
+    function = getattr(flash_attn, "flash_attn_varlen_func", None)
+    if function is None or getattr(function, "_kimi_k25_compat_patched", False):
+        return
+    try:
+        supports_deterministic = "deterministic" in inspect.signature(function).parameters
+    except (TypeError, ValueError):
+        supports_deterministic = False
+    if supports_deterministic:
+        return
+
+    def compatible_flash_attn_varlen_func(*args, **kwargs):
+        kwargs.pop("deterministic", None)
+        return function(*args, **kwargs)
+
+    compatible_flash_attn_varlen_func._kimi_k25_compat_patched = True
+    compatible_flash_attn_varlen_func.__wrapped__ = function
+    flash_attn.flash_attn_varlen_func = compatible_flash_attn_varlen_func
+
+
 def _patch_transformers_v5_for_checkpoint_code() -> None:
     # Older DeepSeek remote code imports this helper, which was removed in v5.
     if not hasattr(import_utils, "is_torch_fx_available"):
@@ -157,6 +188,7 @@ def load_kimi_k25_model(
     and memory intensive for the 1.9 TB Kimi K2.6 checkpoint.
     """
     _patch_transformers_v5_for_checkpoint_code()
+    _patch_flash_attn_varlen_func()
     kwargs.pop("trust_remote_code", None)
     model_class = _prepare_checkpoint_model_class(pretrained_model_name_or_path, kwargs)
     if model_class is not None:
