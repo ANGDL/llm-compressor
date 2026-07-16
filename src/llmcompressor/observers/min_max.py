@@ -1,10 +1,16 @@
 import torch
+from compressed_tensors.quantization.quant_args import round_to_quantized_type_dtype
 from torch import distributed as dist
 
 from llmcompressor.observers.base import MinMaxTuple, Observer
 from llmcompressor.observers.helpers import lerp
 
-__all__ = ["MemorylessMinMaxObserver", "StaticMinMaxObserver", "MinMaxObserver"]
+__all__ = [
+    "MemorylessMinMaxObserver",
+    "StrictSymmetricMinMaxObserver",
+    "StaticMinMaxObserver",
+    "MinMaxObserver",
+]
 
 
 @Observer.register("memoryless_minmax")
@@ -17,6 +23,35 @@ class MemorylessMinMaxObserver(Observer):
 
     def update_statistics_from_observed(self, observed: torch.Tensor) -> None:
         self.min_vals, self.max_vals = _get_min_max(observed)
+
+
+@Observer.register("strict_symmetric_minmax")
+class StrictSymmetricMinMaxObserver(MemorylessMinMaxObserver):
+    """Min/max observer using the symmetric integer range [-127, 127]."""
+
+    @torch.no_grad()
+    def get_qparams(self):
+        qparams = super().get_qparams()
+        if self.args.type != "int" or not self.args.symmetric:
+            raise ValueError(
+                "strict_symmetric_minmax requires symmetric integer quantization"
+            )
+
+        max_val_pos = torch.max(
+            torch.abs(self.min_vals), torch.abs(self.max_vals)
+        )
+        qmax = 2.0 ** (self.args.num_bits - 1) - 1
+        scales = max_val_pos / qmax
+
+        if self.args.scale_dtype is not None:
+            scales = round_to_quantized_type_dtype(
+                scales, dtype=self.args.scale_dtype
+            )
+
+        # Keep the same nonzero safeguard as the standard qparam path.
+        scales = torch.where(scales == 0, qparams["scale"], scales)
+        qparams["scale"] = scales
+        return qparams
 
 
 @Observer.register("static_minmax")

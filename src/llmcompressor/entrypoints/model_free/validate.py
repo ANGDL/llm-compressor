@@ -16,7 +16,10 @@ from .microscale import get_fused_names, is_microscale_scheme
 __all__ = ["validate_scheme", "validate_safetensors_index"]
 
 
-def validate_scheme(scheme: QuantizationScheme) -> tuple[str, QuantizationScheme]:
+def validate_scheme(
+    scheme: QuantizationScheme,
+    strict_symmetric: bool = False,
+) -> tuple[str, QuantizationScheme]:
     # treat strings as preset schemes
     if isinstance(scheme, str):
         scheme_name, scheme = scheme, preset_name_to_scheme(scheme, [])
@@ -28,6 +31,13 @@ def validate_scheme(scheme: QuantizationScheme) -> tuple[str, QuantizationScheme
         raise ValueError(
             "Must provide a weights quantization scheme to perform weights-only PTQ"
         )
+
+    if strict_symmetric:
+        if scheme.weights.type != "int" or not scheme.weights.symmetric:
+            raise ValueError(
+                "strict_symmetric requires symmetric integer weight quantization"
+            )
+        scheme.weights.observer = "strict_symmetric_minmax"
 
     # activation quantization must be dynamic
     input_dynamic = getattr_chain(scheme, "input_activations.dynamic", True)
