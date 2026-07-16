@@ -1,3 +1,4 @@
+from types import ModuleType
 from unittest.mock import patch
 
 import torch
@@ -7,6 +8,7 @@ from transformers.utils import import_utils
 from llmcompressor.modeling.kimi_k25 import (
     CalibrationKimiK25DeepseekV3MoE,
     _patch_checkpoint_tie_weights,
+    _patch_flash_attn_varlen_func,
     _patch_transformers_v5_for_checkpoint_code,
     load_kimi_k25_model,
 )
@@ -83,6 +85,22 @@ def test_checkpoint_transformers_v5_compatibility_patch():
         PreTrainedModel._flash_attn_can_dispatch(model, 2, True)
         dispatch.assert_called_once_with(model, 2, True)
     assert model._supports_flash_attn is False
+
+
+def test_flash_attn_compatibility_drops_unsupported_deterministic_keyword():
+    calls = []
+
+    def old_flash_attn(*args, **kwargs):
+        calls.append((args, kwargs))
+        return "output"
+
+    module = ModuleType("flash_attn")
+    module.flash_attn_varlen_func = old_flash_attn
+    with patch.dict("sys.modules", {"flash_attn": module}):
+        _patch_flash_attn_varlen_func()
+        assert module.flash_attn_varlen_func(1, deterministic=True) == "output"
+
+    assert calls == [((1,), {})]
 
 
 def test_checkpoint_tie_weights_accepts_transformers_v5_argument():
