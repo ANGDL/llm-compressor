@@ -31,27 +31,28 @@ class StrictSymmetricMinMaxObserver(MemorylessMinMaxObserver):
 
     @torch.no_grad()
     def get_qparams(self):
-        qparams = super().get_qparams()
         if self.args.type != "int" or not self.args.symmetric:
             raise ValueError(
                 "strict_symmetric_minmax requires symmetric integer quantization"
             )
 
         max_val_pos = torch.max(
-            torch.abs(self.min_vals), torch.abs(self.max_vals)
+            torch.abs(self.min_vals.to(torch.float32)),
+            torch.abs(self.max_vals.to(torch.float32)),
         )
         qmax = 2.0 ** (self.args.num_bits - 1) - 1
-        scales = max_val_pos / qmax
+        scales = torch.clamp(max_val_pos / qmax, min=1e-8)
 
         if self.args.scale_dtype is not None:
             scales = round_to_quantized_type_dtype(
                 scales, dtype=self.args.scale_dtype
             )
 
-        # Keep the same nonzero safeguard as the standard qparam path.
-        scales = torch.where(scales == 0, qparams["scale"], scales)
-        qparams["scale"] = scales
-        return qparams
+        return {
+            "scale": scales,
+            "zero_point": torch.zeros_like(scales, dtype=self.args.zp_dtype),
+            "global_scale": None,
+        }
 
 
 @Observer.register("static_minmax")
