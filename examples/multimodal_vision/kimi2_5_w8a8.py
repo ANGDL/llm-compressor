@@ -202,7 +202,7 @@ oneshot(
     processor=processor,
     preprocessing_num_workers=2,
     dataloader_num_workers=2,
-    sequential_prefetch=True,
+    sequential_prefetch=False,
 )
 
 # Save to disk compressed.

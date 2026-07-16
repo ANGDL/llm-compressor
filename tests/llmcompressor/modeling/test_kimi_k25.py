@@ -3,6 +3,7 @@ from unittest.mock import patch
 
 import torch
 from transformers import PreTrainedModel
+from transformers.modeling_utils import _get_tied_weight_keys
 from transformers.utils import import_utils
 
 from llmcompressor.modeling.kimi_k25 import (
@@ -10,13 +11,14 @@ from llmcompressor.modeling.kimi_k25 import (
     _patch_checkpoint_tie_weights,
     _patch_flash_attn_varlen_func,
     _patch_transformers_v5_for_checkpoint_code,
+    _normalize_checkpoint_tied_weight_keys,
     load_kimi_k25_model,
 )
 from llmcompressor.modeling.moe.linearize import get_non_linearized_moes
 
 
 def test_loader_forces_checkpoint_implementation():
-    sentinel = object()
+    sentinel = torch.nn.Module()
     config = type(
         "Config",
         (),
@@ -112,6 +114,22 @@ def test_checkpoint_tie_weights_accepts_transformers_v5_argument():
     model = CheckpointModel()
     model.tie_weights(missing_keys={"lm_head.weight"}, recompute_mapping=False)
     assert model.called
+
+
+def test_checkpoint_tied_weight_keys_use_transformers_v5_format():
+    model = torch.nn.Sequential(torch.nn.Linear(2, 2))
+    model._tied_weights_keys = ["output.weight"]
+    model[0]._tied_weights_keys = ["weight", "bias"]
+
+    _normalize_checkpoint_tied_weight_keys(model)
+
+    assert model._tied_weights_keys == {"output.weight": "output.weight"}
+    assert model[0]._tied_weights_keys == {"weight": "weight", "bias": "bias"}
+    assert set(_get_tied_weight_keys(model)) == {
+        "output.weight",
+        "0.weight",
+        "0.bias",
+    }
 
 
 def test_moe_scan_does_not_require_legacy_granitemoe_class():
