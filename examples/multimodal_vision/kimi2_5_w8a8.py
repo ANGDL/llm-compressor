@@ -83,7 +83,7 @@ model = load_kimi_k25_model(
     offload_folder=args.offload_folder,
 )
 
-processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=False)
+processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
 # Confirm that model is dispatched correctly
 devices = {offloaded for _onloaded, offloaded in get_device_map(model).values()}
 print(f"Model was offloaded to the following devices: {devices}")
@@ -113,7 +113,7 @@ def preprocess_and_tokenize(example):
         {
             "role": "user",
             "content": [
-                {"type": "image_url", "image_url": {"url": base64_img}},
+                {"type": "image", "image_url": base64_img},
                 {"type": "text", "text": "What does the image show?"},
             ],
         },
@@ -128,15 +128,11 @@ def preprocess_and_tokenize(example):
         }
     ]
 
-    return processor.apply_chat_template(
-        messages,
-        tokenize=True,
-        return_dict=True,
-        processor_kwargs={
-            "padding": False,
-            "max_length": MAX_SEQUENCE_LENGTH,
-            "truncation": True,
-        },
+    return processor(
+        messages=messages,
+        padding=False,
+        max_length=MAX_SEQUENCE_LENGTH,
+        truncation=True,
     )
 
 
