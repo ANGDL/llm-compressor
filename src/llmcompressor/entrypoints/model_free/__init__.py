@@ -47,6 +47,7 @@ def model_free_ptq(
     device: Optional[str | torch.device | list[str | torch.device]] = None,
     converter: Converter | None = None,
     strict_symmetric: bool = False,
+    scale_dtype: Optional[torch.dtype] = None,
 ):
     """
     Quantize a model without the need for a model definition. This function
@@ -71,11 +72,17 @@ def model_free_ptq(
     :param strict_symmetric: use the symmetric integer range [-127, 127] for
         weight quantization instead of the default compressed-tensors range
         [-128, 127].
+    :param scale_dtype: optional dtype used to store weight scales. If omitted,
+        the existing scheme/model dtype behavior is preserved.
     """
     # validate arguments
     model_files = get_checkpoint_files(model_stub)
 
-    scheme_name, scheme = validate_scheme(scheme, strict_symmetric=strict_symmetric)
+    scheme_name, scheme = validate_scheme(
+        scheme,
+        strict_symmetric=strict_symmetric,
+        scale_dtype=scale_dtype,
+    )
     resolved_devices = _resolve_devices(device)
     validate_safetensors_index(model_files, scheme)
 

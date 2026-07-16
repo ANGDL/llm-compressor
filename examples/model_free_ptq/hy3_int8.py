@@ -1,6 +1,7 @@
 import argparse
 from pathlib import Path
 
+import torch
 from llmcompressor import model_free_ptq
 
 
@@ -32,6 +33,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Use the strict symmetric INT8 range [-127, 127] for weights",
     )
+    parser.add_argument(
+        "--scale-dtype",
+        choices=("auto", "float32", "bfloat16"),
+        default="auto",
+        help="Dtype used to save weight scales (default: model dtype)",
+    )
     return parser.parse_args()
 
 
@@ -39,6 +46,11 @@ def main() -> None:
     args = parse_args()
     model_id = args.model_id
     save_dir = args.save_dir or f"{Path(model_id.rstrip('/')).name}-W8A8-INT8"
+    scale_dtype = {
+        "auto": None,
+        "float32": torch.float32,
+        "bfloat16": torch.bfloat16,
+    }[args.scale_dtype]
 
     # Apply W8A8 to the model
     # Once quantized, the model is saved
@@ -59,6 +71,7 @@ def main() -> None:
         max_workers=args.max_workers,
         device=args.device,
         strict_symmetric=args.strict_symmetric,
+        scale_dtype=scale_dtype,
     )
 
 
