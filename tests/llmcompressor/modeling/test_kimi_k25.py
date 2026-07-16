@@ -118,18 +118,16 @@ def test_checkpoint_tie_weights_accepts_transformers_v5_argument():
 
 def test_checkpoint_tied_weight_keys_use_transformers_v5_format():
     model = torch.nn.Sequential(torch.nn.Linear(2, 2))
+    model.config = type("Config", (), {"tie_word_embeddings": True})()
     model._tied_weights_keys = ["output.weight"]
+    model[0].config = type("Config", (), {"tie_word_embeddings": False})()
     model[0]._tied_weights_keys = ["weight", "bias"]
 
     _normalize_checkpoint_tied_weight_keys(model)
 
     assert model._tied_weights_keys == {"output.weight": "output.weight"}
-    assert model[0]._tied_weights_keys == {"weight": "weight", "bias": "bias"}
-    assert set(_get_tied_weight_keys(model)) == {
-        "output.weight",
-        "0.weight",
-        "0.bias",
-    }
+    assert model[0]._tied_weights_keys == {}
+    assert _get_tied_weight_keys(model) == ["output.weight"]
 
 
 def test_moe_scan_does_not_require_legacy_granitemoe_class():

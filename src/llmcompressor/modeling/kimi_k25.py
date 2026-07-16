@@ -90,16 +90,22 @@ def _normalize_checkpoint_tied_weight_keys(model: torch.nn.Module) -> None:
     """Convert legacy tied-weight metadata to the Transformers v5 format.
 
     Checkpoint code may define ``_tied_weights_keys`` as a list of target-key
-    patterns. Transformers v5 expects a target-to-source mapping, but its save path
-    only consumes the mapping keys. Mapping each legacy pattern to itself preserves
-    the old save semantics without re-tying or otherwise touching model parameters.
+    patterns. Transformers v5 expects a target-to-source mapping. Ignore stale
+    legacy metadata when the module config explicitly disables weight tying; for
+    tied models, preserve the legacy target patterns for the v5 save path without
+    re-tying or otherwise touching model parameters.
     """
     for module in model.modules():
         tied_weight_keys = getattr(module, "_tied_weights_keys", None)
         if isinstance(tied_weight_keys, (list, set, tuple)):
-            module._tied_weights_keys = {
-                pattern: pattern for pattern in tied_weight_keys
-            }
+            tie_word_embeddings = getattr(
+                getattr(module, "config", None), "tie_word_embeddings", False
+            )
+            module._tied_weights_keys = (
+                {pattern: pattern for pattern in tied_weight_keys}
+                if tie_word_embeddings
+                else {}
+            )
 
 
 def _prepare_checkpoint_model_class(
