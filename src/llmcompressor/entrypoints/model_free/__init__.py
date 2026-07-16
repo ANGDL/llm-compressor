@@ -46,6 +46,7 @@ def model_free_ptq(
     max_workers: int = 1,
     device: Optional[str | torch.device | list[str | torch.device]] = None,
     converter: Converter | None = None,
+    strict_symmetric: bool = False,
 ):
     """
     Quantize a model without the need for a model definition. This function
@@ -67,11 +68,14 @@ def model_free_ptq(
     :param device: gpu devices to accelerate quantization with.
     :param converter: optional converter to apply to the checkpoint to convert
         it to compressed-tensors format before running model-free PTQ
+    :param strict_symmetric: use the symmetric integer range [-127, 127] for
+        weight quantization instead of the default compressed-tensors range
+        [-128, 127].
     """
     # validate arguments
     model_files = get_checkpoint_files(model_stub)
 
-    scheme_name, scheme = validate_scheme(scheme)
+    scheme_name, scheme = validate_scheme(scheme, strict_symmetric=strict_symmetric)
     resolved_devices = _resolve_devices(device)
     validate_safetensors_index(model_files, scheme)
 
