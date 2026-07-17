@@ -9,7 +9,9 @@ __all__ = ["__version__", "__version_tuple__", "version", "version_tuple"]
 
 
 def _normalize_tag(tag: str) -> str:
-    # Accept both "v0.10.0" and "0.10.0".
+    # Fork releases use k-v* to avoid colliding with upstream tags.
+    if tag.startswith("k-v"):
+        return tag[3:]
     return tag[1:] if tag.startswith("v") else tag
 
 
