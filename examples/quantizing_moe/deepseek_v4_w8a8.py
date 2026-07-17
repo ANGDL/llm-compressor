@@ -54,7 +54,7 @@ Usage:
         --num_calibration_samples 512 --max_sequence_length 8192 --pipeline sequential  \
         --save_dir /ssd3/models
 3. Packed
-    python src/llmcompressor/utils/pack_int4_to_int8.py \
+    python -m llmcompressor.utils.pack_int4_to_int8 \
         -i /ssd3/models/DeepSeek-V4-Pro-WNA8-IMatrix-RTNunpacked/ \
         -o /ssd3/models/DeepSeek-V4-Pro-WNA8
 """

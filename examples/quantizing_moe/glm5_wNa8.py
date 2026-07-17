@@ -37,7 +37,7 @@ python glm5_wNa8.py --model_id /ssd3/models/GLM-5.1/ --save_dir /ssd2/models/ --
     --dataset_id ./ultrachat_200k ./calibration_data.jsonl --dataset_split train_sft \
     --indexer-ignore-mode indexer_all --dispatch_extra_memory_gb 10 --pipeline sequential
 3. 打包，确保输入路径正确
-python src/llmcompressor/utils/pack_int4_to_int8.py \
+python -m llmcompressor.utils.pack_int4_to_int8 \
     -i /ssd2/models/GLM-5.1-WNA8-IMatrix-RTN-unpacked/ \
     -o /ssd2/models/GLM-5.1-W4A8-v2
 """
