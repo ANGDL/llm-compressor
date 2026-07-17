@@ -20,6 +20,11 @@ from compressed_tensors.offload.dispatch import dispatch_model as _dispatch_mode
 from compressed_tensors.quantization import preset_name_to_scheme
 
 
+"""
+Usage:
+    python kimi2_5_w8a8.py --model_id /ssd3/models/Kimi-K2.6-bf16/ --dataset_id /data/quant/lmms-lab___flickr30k --text_calibration_samples 256 --modifier=RTN --observer imatrix_mse > k26.log 2>&1 &
+"""
+
 parser = argparse.ArgumentParser()
 parser.add_argument("--model_id", type=str, default="/ssd3/models/Kimi-K2.5_bf16")
 parser.add_argument("--save_dir", type=str, default="/ssd2/models/")

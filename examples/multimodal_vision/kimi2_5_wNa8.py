@@ -26,8 +26,9 @@ from compressed_tensors.quantization import QuantizationScheme
 
 
 """
-python kimi2_5_wNa8.py --model_id /ssd3/models/Kimi-K2.6-bf16/ --dataset_id /data/quant/lmms-lab___flickr30k --text_dataset_id /data/quant/ultrachat_200k --text_calibration_samples 256 --modifier=RTN --observer imatrix_mse > k26.log 2>&1 &
-python src/llmcompressor/utils/pack_int4_to_int8.py -i /ssd2/models/Kimi-K2.6-bf16-W4A8Experts-W8A8Other-IMatrix-RTN-unpacked/ -o /ssd3/models/Kimi-K2.6-w4a8-v2
+Usage:
+    python kimi2_5_wNa8.py --model_id /ssd3/models/Kimi-K2.6-bf16/ --dataset_id /data/quant/lmms-lab___flickr30k --text_dataset_id /data/quant/ultrachat_200k --text_calibration_samples 256 --modifier=RTN --observer imatrix_mse > k26.log 2>&1 &
+    python -m llmcompressor.utils.pack_int4_to_int8 -i /ssd2/models/Kimi-K2.6-bf16-W4A8Experts-W8A8Other-IMatrix-RTN-unpacked/ -o /ssd3/models/Kimi-K2.6-w4a8-v2
 """
 
 
