@@ -292,6 +292,7 @@ GitHub.sublime-settings
 [Dd]ebug/
 [Dd]ebugPublic/
 [Rr]elease/
+!.github/skills/release/
 [Rr]eleases/
 x64/
 x86/
