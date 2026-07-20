@@ -27,6 +27,7 @@ from .checkpoint import (
     WeightMap,
 )
 from .collect import collect_calibration_statistics
+from .finalize import finalize_streaming_checkpoint
 from .loading import TargetWeightLoader, build_meta_model
 from .materialization import (
     CastWeightMaterializer,
@@ -69,6 +70,7 @@ __all__ = [
     "fingerprint_json",
     "build_meta_model",
     "collect_calibration_statistics",
+    "finalize_streaming_checkpoint",
     "materialize_weights",
     "quantize_streaming",
 ]
