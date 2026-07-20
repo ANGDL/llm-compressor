@@ -1,5 +1,10 @@
 """Building blocks for out-of-core model compression workflows."""
 
+from .activations import (
+    BoundaryActivationStore,
+    DiskBoundaryActivationStore,
+    InMemoryBoundaryActivationStore,
+)
 from .artifacts import (
     CURRENT_SCHEMA_VERSION,
     ArtifactCompatibilityError,
@@ -32,9 +37,12 @@ __all__ = [
     "CURRENT_SCHEMA_VERSION",
     "ArtifactCompatibilityError",
     "ArtifactStore",
+    "BoundaryActivationStore",
     "CalibrationInfo",
     "CastWeightMaterializer",
     "CheckpointWeightSource",
+    "DiskBoundaryActivationStore",
+    "InMemoryBoundaryActivationStore",
     "MaterializerInfo",
     "RecipeInfo",
     "SequentialInfo",
