@@ -26,6 +26,7 @@ from .checkpoint import (
     TensorMetadata,
     WeightMap,
 )
+from .collect import collect_calibration_statistics
 from .loading import TargetWeightLoader, build_meta_model
 from .materialization import (
     CastWeightMaterializer,
@@ -66,5 +67,6 @@ __all__ = [
     "fingerprint_checkpoint",
     "fingerprint_json",
     "build_meta_model",
+    "collect_calibration_statistics",
     "materialize_weights",
 ]
