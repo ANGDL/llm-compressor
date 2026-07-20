@@ -14,7 +14,12 @@ from loguru import logger
 
 GPTQ_PRECISION = torch.float32
 
-__all__ = ["make_empty_hessian", "accumulate_hessian", "quantize_weight"]
+__all__ = [
+    "accumulate_hessian",
+    "make_empty_gptq_statistics",
+    "make_empty_hessian",
+    "quantize_weight",
+]
 
 _USE_INPLACE_HESSIAN = os.getenv("LLM_COMPRESSOR_USE_INPLACE_HESSIAN", "0") in ["1", "true", "True"]
 _USE_INPLACE_DEAD_MASK = os.getenv("LLM_COMPRESSOR_USE_INPLACE_DEAD_MASK", "0") in ["1", "true", "True"]
@@ -58,6 +63,21 @@ def make_empty_hessian(
     num_columns = weight.shape[1]
     device = device if device is not None else weight.device
     return torch.zeros((num_columns, num_columns), device=device, dtype=GPTQ_PRECISION)
+
+
+def make_empty_gptq_statistics(
+    module: torch.nn.Module,
+    device: torch.device | str | None = None,
+    count_device: torch.device | str | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Create the raw Hessian/count representation consumed by GPTQ."""
+
+    device = device if device is not None else module.weight.device
+    count_device = count_device if count_device is not None else device
+    return (
+        make_empty_hessian(module, device=torch.device(device)),
+        torch.zeros((), dtype=torch.int64, device=count_device),
+    )
 
 
 def accumulate_hessian(

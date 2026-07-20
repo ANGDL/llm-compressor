@@ -13,11 +13,56 @@ from llmcompressor.modifiers.utils.hooks import HooksMixin
 from llmcompressor.observers.base import MinMaxTuple, Observer
 from llmcompressor.observers.helpers import flatten_for_calibration
 
-__all__ = ["IMatrixMSEObserver"]
+__all__ = [
+    "IMatrixMSEObserver",
+    "accumulate_imatrix_statistics",
+    "make_empty_imatrix_statistics",
+]
 
 _GROUP_STRATEGIES = (QuantizationStrategy.GROUP, QuantizationStrategy.TENSOR_GROUP)
 
 IMATRIX_PRECISION = torch.float32
+
+
+def make_empty_imatrix_statistics(
+    in_features: int, device: torch.device | str = "cpu"
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Create the raw sum/count representation consumed by iMatrix observers."""
+
+    if not isinstance(in_features, int) or in_features <= 0:
+        raise ValueError(f"in_features must be a positive integer, got {in_features!r}")
+    return (
+        torch.zeros(in_features, dtype=IMATRIX_PRECISION, device=device),
+        torch.zeros((), dtype=torch.int64, device=device),
+    )
+
+
+def accumulate_imatrix_statistics(
+    inputs: torch.Tensor,
+    imatrix_sum: torch.Tensor,
+    imatrix_count: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Accumulate per-input-channel sum(x squared) and token count.
+
+    The accumulator device controls where collection happens. Existing oneshot
+    collection moves its accumulators to the activation device first; streaming
+    collection can instead keep them on CPU to bound accelerator memory.
+    """
+
+    if inputs.ndim == 0:
+        raise ValueError("iMatrix inputs must have at least one dimension")
+    if inputs.shape[-1] != imatrix_sum.numel():
+        raise ValueError(
+            f"iMatrix input width {inputs.shape[-1]} does not match accumulator "
+            f"width {imatrix_sum.numel()}"
+        )
+    values = inputs.detach().to(
+        device=imatrix_sum.device, dtype=IMATRIX_PRECISION
+    )
+    dimensions = tuple(range(values.ndim - 1))
+    imatrix_sum.add_(values.square().sum(dim=dimensions))
+    imatrix_count.add_(math.prod(values.shape[:-1]))
+    return imatrix_sum, imatrix_count
 
 
 @Observer.register("imatrix_mse")
@@ -86,9 +131,9 @@ class IMatrixMSEObserver(Observer):
         if not hasattr(module, "in_features"):
             return
 
-        in_features = module.in_features
-        module._imatrix_sum = torch.zeros(in_features, dtype=IMATRIX_PRECISION)
-        module._imatrix_count = torch.tensor(0, dtype=torch.int64)
+        module._imatrix_sum, module._imatrix_count = (
+            make_empty_imatrix_statistics(module.in_features)
+        )
 
         def _hook(mod, args):
             if (
@@ -110,16 +155,13 @@ class IMatrixMSEObserver(Observer):
             if x is None or not isinstance(x, torch.Tensor):
                 return
 
-            x_f = x.detach().to(IMATRIX_PRECISION)
-            device = x_f.device
-            n_tokens = math.prod(x_f.shape[:-1])
-            token_sum = x_f.pow(2).sum(dim=list(range(x_f.dim() - 1)))
-
-            mod._imatrix_sum = mod._imatrix_sum.to(device)
-            mod._imatrix_count = mod._imatrix_count.to(device)
-
-            mod._imatrix_sum.add_(token_sum)
-            mod._imatrix_count += n_tokens
+            mod._imatrix_sum = mod._imatrix_sum.to(x.device)
+            mod._imatrix_count = mod._imatrix_count.to(x.device)
+            mod._imatrix_sum, mod._imatrix_count = (
+                accumulate_imatrix_statistics(
+                    x, mod._imatrix_sum, mod._imatrix_count
+                )
+            )
 
         module._imatrix_hook = module.register_forward_pre_hook(_hook)
 
