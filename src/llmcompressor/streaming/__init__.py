@@ -32,6 +32,11 @@ from .materialization import (
     WeightMaterializer,
     materialize_weights,
 )
+from .statistics import (
+    GPTQStatisticsCollector,
+    IMatrixStatisticsCollector,
+    StatisticsCollectorGroup,
+)
 
 __all__ = [
     "CURRENT_SCHEMA_VERSION",
@@ -42,6 +47,8 @@ __all__ = [
     "CastWeightMaterializer",
     "CheckpointWeightSource",
     "DiskBoundaryActivationStore",
+    "GPTQStatisticsCollector",
+    "IMatrixStatisticsCollector",
     "InMemoryBoundaryActivationStore",
     "MaterializerInfo",
     "RecipeInfo",
@@ -50,6 +57,7 @@ __all__ = [
     "SourceCheckpointInfo",
     "SafetensorsWeightSource",
     "StreamingRunManifest",
+    "StatisticsCollectorGroup",
     "TargetStatisticsMetadata",
     "TargetWeightLoader",
     "TensorMetadata",
