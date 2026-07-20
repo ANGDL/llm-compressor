@@ -33,6 +33,7 @@ from .materialization import (
     WeightMaterializer,
     materialize_weights,
 )
+from .quantize import quantize_streaming
 from .statistics import (
     GPTQStatisticsCollector,
     IMatrixStatisticsCollector,
@@ -69,4 +70,5 @@ __all__ = [
     "build_meta_model",
     "collect_calibration_statistics",
     "materialize_weights",
+    "quantize_streaming",
 ]
