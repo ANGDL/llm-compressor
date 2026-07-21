@@ -189,16 +189,47 @@ def finalize_streaming_checkpoint(
                 (states_dir / f"{shard_name}.json").read_text(encoding="utf-8")
             ).get("quantized_modules", [])
         }
+        module_formats = {
+            module: format_name
+            for shard_name in expected_shards
+            for module, format_name in json.loads(
+                (states_dir / f"{shard_name}.json").read_text(encoding="utf-8")
+            ).get("module_formats", {}).items()
+        }
+        omitted_tied_weights = {
+            alias: canonical
+            for shard_name in expected_shards
+            for alias, canonical in json.loads(
+                (states_dir / f"{shard_name}.json").read_text(encoding="utf-8")
+            ).get("omitted_tied_weights", {}).items()
+        }
+        for alias, canonical in omitted_tied_weights.items():
+            if alias in weight_map:
+                raise ValueError(f"Omitted tied weight {alias!r} is still present")
+            if alias not in source_map:
+                raise ValueError(f"Unknown omitted tied weight {alias!r}")
+            if canonical not in weight_map:
+                raise ValueError(
+                    f"Canonical tensor {canonical!r} for tied weight {alias!r} "
+                    "is missing"
+                )
         for module_name in quantized_modules:
             names = {
                 name for name in weight_map if name.startswith(f"{module_name}.")
             }
-            if not any(
-                name.endswith(("weight_packed", "weight_compressed"))
-                for name in names
-            ):
+            format_name = module_formats.get(module_name)
+            expected_weights = (
+                {f"{module_name}.weight"}
+                if format_name in {"int-quantized", "float-quantized"}
+                else {
+                    f"{module_name}.weight_packed",
+                    f"{module_name}.weight_compressed",
+                }
+            )
+            if names.isdisjoint(expected_weights):
                 raise ValueError(
-                    f"Quantized module {module_name!r} has no compressed weight"
+                    f"Quantized module {module_name!r} has no weight for format "
+                    f"{format_name!r}"
                 )
             if f"{module_name}.weight_scale" not in names:
                 raise ValueError(
@@ -213,6 +244,8 @@ def finalize_streaming_checkpoint(
             ):
                 continue
             if source_name not in weight_map:
+                if source_name in omitted_tied_weights:
+                    continue
                 raise ValueError(
                     f"Non-quantized source tensor {source_name!r} is missing"
                 )

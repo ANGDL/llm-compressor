@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from typing import Callable, Iterator, TypeVar
 
 import torch
+from accelerate import init_empty_weights
 from torch import nn
 
 from llmcompressor.streaming.checkpoint import CheckpointWeightSource
@@ -19,12 +20,24 @@ _ModelT = TypeVar("_ModelT", bound=nn.Module)
 
 
 def build_meta_model(
-    factory: Callable[..., _ModelT], *args, **kwargs
+    factory: Callable[..., _ModelT],
+    *args,
+    keep_nonpersistent_buffers: bool = False,
+    **kwargs,
 ) -> _ModelT:
     """Construct a module while allocating parameters and buffers on meta."""
 
-    with torch.device("meta"):
-        model = factory(*args, **kwargs)
+    if keep_nonpersistent_buffers:
+        # Model-derived buffers such as rotary frequencies are not checkpoint
+        # weights, but traced prefix execution needs their real values.
+        with init_empty_weights(include_buffers=False):
+            model = factory(*args, **kwargs)
+        tie_weights = getattr(model, "tie_weights", None)
+        if callable(tie_weights):
+            tie_weights()
+    else:
+        with torch.device("meta"):
+            model = factory(*args, **kwargs)
     if not isinstance(model, nn.Module):
         raise TypeError("Meta model factory must return torch.nn.Module")
     return model

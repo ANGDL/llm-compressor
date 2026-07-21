@@ -41,6 +41,7 @@ from .statistics import (
     IMatrixStatisticsCollector,
     StatisticsCollectorGroup,
 )
+from .tracing import TracedBoundaryAdapter, trace_streaming_boundaries
 
 __all__ = [
     "CURRENT_SCHEMA_VERSION",
@@ -64,6 +65,7 @@ __all__ = [
     "StatisticsCollectorGroup",
     "TargetStatisticsMetadata",
     "TargetWeightLoader",
+    "TracedBoundaryAdapter",
     "TensorMetadata",
     "WeightMap",
     "WeightMaterializer",
@@ -74,5 +76,6 @@ __all__ = [
     "finalize_streaming_checkpoint",
     "materialize_weights",
     "quantize_streaming",
+    "trace_streaming_boundaries",
     "streaming_oneshot",
 ]
