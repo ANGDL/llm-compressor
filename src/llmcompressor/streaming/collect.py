@@ -213,6 +213,7 @@ def collect_calibration_statistics(
                 f"{target_name!r}"
             )
         with loader.loaded(target_name, device=device, dtype=target_dtype) as target:
+            target._streaming_target_index = index
             modules = dict(make_modules(target, target_name))
             if not modules:
                 raise ValueError(

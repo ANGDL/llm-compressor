@@ -13,6 +13,7 @@ from typing import Any
 
 import torch
 from compressed_tensors.compressors import compress_module
+from compressed_tensors.compressors.format import infer_module_format
 from compressed_tensors.quantization import QuantizationScheme
 from loguru import logger
 from safetensors.torch import save_file
@@ -40,6 +41,7 @@ from .materialization import (
     CastWeightMaterializer,
     WeightMaterializer,
 )
+from .tied_weights import infer_transformers_tied_weights
 
 __all__ = ["quantize_streaming"]
 
@@ -85,6 +87,7 @@ def _scheme_fingerprint(
         "use_gptq": use_gptq,
         "blocksize": blocksize,
         "dampening_frac": dampening_frac,
+        "tied_weight_policy": "deduplicate-identical-v1",
     }
     return fingerprint_json(value)
 
@@ -209,6 +212,7 @@ def quantize_streaming(
         raise ValueError("dampening_frac must be non-negative")
 
     source = SafetensorsWeightSource(checkpoint)
+    tied_weights = infer_transformers_tied_weights(checkpoint)
     artifact_store = ArtifactStore(artifact_dir)
     manifest = artifact_store.load_manifest()
     current_source = fingerprint_checkpoint(checkpoint)
@@ -274,6 +278,7 @@ def quantize_streaming(
         values = source.load_tensors(names, device=device)
         output = {name: value.to("cpu") for name, value in values.items()}
         quantized_modules = []
+        module_formats = {}
         for module_name, scheme in schemes.items():
             weight_name = f"{module_name}.weight"
             if weight_name not in values:
@@ -321,7 +326,25 @@ def quantize_streaming(
             for name, value in module.state_dict(prefix=prefix).items():
                 output[name] = value.detach().to("cpu").contiguous()
             quantized_modules.append(module_name)
+            module_formats[module_name] = (
+                scheme.format or infer_module_format(torch.nn.Linear, scheme).value
+            )
             del module, weight
+
+        omitted_tied_weights = {}
+        for alias, canonical in tied_weights.items():
+            if alias not in output or canonical not in source.tensor_names():
+                continue
+            canonical_value = (
+                output[canonical]
+                if canonical in output
+                else source.load_tensors([canonical], device=device)[canonical].to(
+                    "cpu"
+                )
+            )
+            if torch.equal(output[alias], canonical_value):
+                del output[alias]
+                omitted_tied_weights[alias] = canonical
 
         _atomic_safetensors(output_path, output)
         state = {
@@ -329,6 +352,8 @@ def quantize_streaming(
             "output_shard": output_name,
             "source_shard": source_shard.name,
             "quantized_modules": sorted(quantized_modules),
+            "module_formats": module_formats,
+            "omitted_tied_weights": omitted_tied_weights,
             "run_fingerprint": run_fingerprint,
             "tensor_names": sorted(output),
             "total_size": sum(tensor.nbytes for tensor in output.values()),
