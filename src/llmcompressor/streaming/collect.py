@@ -6,6 +6,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any
 
 import torch
+from loguru import logger
 from torch import nn
 
 from .activations import BoundaryActivationStore, DiskBoundaryActivationStore
@@ -193,19 +194,30 @@ def collect_calibration_statistics(
 
     for index, target_name in enumerate(targets):
         if store.is_target_complete(index):
+            logger.info(
+                f"streaming collect: skipping complete target "
+                f"{index + 1}/{len(targets)} {target_name}"
+            )
             continue
+        logger.info(
+            f"streaming collect: processing target "
+            f"{index + 1}/{len(targets)} {target_name}"
+        )
         if index == 0 and not boundaries.batch_indices(0):
             for batch_index, batch in enumerate(batch_factory()):
                 boundaries.put(0, batch_index, batch)
         batches = boundaries.batch_indices(index)
         if not batches:
             raise RuntimeError(
-                f"Missing calibration boundary {index}; cannot resume target {target_name!r}"
+                f"Missing calibration boundary {index}; cannot resume target "
+                f"{target_name!r}"
             )
         with loader.loaded(target_name, device=device, dtype=target_dtype) as target:
             modules = dict(make_modules(target, target_name))
             if not modules:
-                raise ValueError(f"No Linear modules found under target {target_name!r}")
+                raise ValueError(
+                    f"No Linear modules found under target {target_name!r}"
+                )
             collectors = []
             if "gptq" in algorithms:
                 collectors.append(GPTQStatisticsCollector(modules))
@@ -232,4 +244,8 @@ def collect_calibration_statistics(
         )
         store.commit_target(metadata, statistics)
         boundaries.delete(index)
+        logger.info(
+            f"streaming collect: committed target "
+            f"{index + 1}/{len(targets)} {target_name}"
+        )
     return store

@@ -14,6 +14,7 @@ from typing import Any
 import torch
 from compressed_tensors.compressors import compress_module
 from compressed_tensors.quantization import QuantizationScheme
+from loguru import logger
 from safetensors.torch import save_file
 
 from llmcompressor.entrypoints.model_free.lifecycle import (
@@ -263,7 +264,12 @@ def quantize_streaming(
                     "quantization configuration"
                 )
             if state.get("completed") is True and output_path.is_file():
+                logger.info(
+                    f"streaming quantize: skipping complete shard {output_name}"
+                )
                 continue
+
+        logger.info(f"streaming quantize: processing shard {output_name}")
 
         values = source.load_tensors(names, device=device)
         output = {name: value.to("cpu") for name, value in values.items()}
@@ -328,6 +334,7 @@ def quantize_streaming(
             "total_size": sum(tensor.nbytes for tensor in output.values()),
         }
         _atomic_json(state_path, state)
+        logger.info(f"streaming quantize: committed shard {output_name}")
         values.clear()
         output.clear()
 

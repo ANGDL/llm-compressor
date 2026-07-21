@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from loguru import logger
 from safetensors import safe_open
 
 from .artifacts import ArtifactStore, fingerprint_checkpoint
@@ -152,6 +153,7 @@ def finalize_streaming_checkpoint(
         output_shards: dict[str, dict[str, tuple[int, ...]]] = {}
         total_size = 0
         for shard_name in sorted(expected_shards):
+            logger.info(f"streaming finalize: validating shard {shard_name}")
             shard = shards_dir / shard_name
             state_path = states_dir / f"{shard_name}.json"
             if not shard.is_file() or not state_path.is_file():

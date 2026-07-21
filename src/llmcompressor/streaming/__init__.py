@@ -34,6 +34,7 @@ from .materialization import (
     WeightMaterializer,
     materialize_weights,
 )
+from .oneshot import streaming_oneshot
 from .quantize import quantize_streaming
 from .statistics import (
     GPTQStatisticsCollector,
@@ -73,4 +74,5 @@ __all__ = [
     "finalize_streaming_checkpoint",
     "materialize_weights",
     "quantize_streaming",
+    "streaming_oneshot",
 ]

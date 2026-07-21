@@ -31,3 +31,4 @@ from llmcompressor.core.session_functions import (
     reset_session,
 )
 from llmcompressor.entrypoints import Oneshot, oneshot, model_free_ptq
+from llmcompressor.streaming import streaming_oneshot
