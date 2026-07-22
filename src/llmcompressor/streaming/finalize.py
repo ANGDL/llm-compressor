@@ -15,7 +15,7 @@ from loguru import logger
 from safetensors import safe_open
 
 from .artifacts import ArtifactStore, fingerprint_checkpoint
-from .checkpoint import WeightMap
+from .materialization import CastWeightMaterializer, WeightMaterializer
 
 __all__ = ["finalize_streaming_checkpoint"]
 
@@ -75,9 +75,12 @@ def _read_shard_headers(shard: Path) -> tuple[dict[str, tuple[int, ...]], int]:
 
 
 def _update_config(
-    config: dict[str, Any], quantization_config: Mapping[str, Any] | None
+    config: dict[str, Any],
+    quantization_config: Mapping[str, Any] | None,
+    updates: Mapping[str, Any],
 ) -> dict[str, Any]:
     updated = dict(config)
+    updated.update(updates)
     qconfig = dict(quantization_config or updated.get("quantization_config", {}))
     qconfig.setdefault("quant_method", "compressed-tensors")
     qconfig.setdefault("format", "pack-quantized")
@@ -104,6 +107,7 @@ def finalize_streaming_checkpoint(
     staging_dir: str | Path,
     output_dir: str | Path,
     quantization_config: Mapping[str, Any] | None = None,
+    materializer: WeightMaterializer | None = None,
     copy_auxiliary_files: bool = True,
     validate_config: bool = True,
 ) -> Path:
@@ -127,9 +131,11 @@ def finalize_streaming_checkpoint(
         raise ValueError(
             "Calibration artifacts belong to a different source checkpoint"
         )
-    source_map = WeightMap.from_checkpoint(source_dir)
+    materializer = materializer or CastWeightMaterializer()
+    source = materializer.create_source(str(source_dir))
+    source_names = set(source.tensor_names())
     expected_shards = {
-        source_map.metadata(name).shard.name for name in source_map
+        source.metadata(name).shard.name for name in source_names
     }
     shards_dir = staging / "shards"
     states_dir = staging / "state"
@@ -206,7 +212,7 @@ def finalize_streaming_checkpoint(
         for alias, canonical in omitted_tied_weights.items():
             if alias in weight_map:
                 raise ValueError(f"Omitted tied weight {alias!r} is still present")
-            if alias not in source_map:
+            if alias not in source_names:
                 raise ValueError(f"Unknown omitted tied weight {alias!r}")
             if canonical not in weight_map:
                 raise ValueError(
@@ -235,7 +241,7 @@ def finalize_streaming_checkpoint(
                 raise ValueError(
                     f"Quantized module {module_name!r} has no weight scale"
                 )
-        for source_name in source_map:
+        for source_name in source_names:
             module_name, separator, tensor_name = source_name.rpartition(".")
             if (
                 separator
@@ -259,7 +265,11 @@ def finalize_streaming_checkpoint(
         config = json.loads(config_path.read_text(encoding="utf-8"))
         _atomic_json(
             temporary / "config.json",
-            _update_config(config, quantization_config),
+            _update_config(
+                config,
+                quantization_config,
+                materializer.output_config_updates(),
+            ),
         )
 
         if copy_auxiliary_files:

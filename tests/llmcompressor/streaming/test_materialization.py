@@ -11,6 +11,7 @@ from llmcompressor.streaming.checkpoint import (
 )
 from llmcompressor.streaming.materialization import (
     CastWeightMaterializer,
+    DeepSeekV4WeightMaterializer,
     WeightMaterializer,
     materialize_weights,
 )
@@ -166,3 +167,32 @@ def test_materializer_manifest_identity_is_stable_and_dtype_sensitive():
     assert first == second
     assert first.identifier.endswith("CastWeightMaterializer")
     assert first.config_sha256 != fp32.config_sha256
+
+
+def test_deepseek_v4_materializer_unpacks_fp4_blocks(tmp_path):
+    materializer = DeepSeekV4WeightMaterializer(fp4_block_size=32)
+    name = "model.layers.0.ffn.experts.0.w1.weight"
+    metadata = TensorMetadata(
+        name=name,
+        shape=(2, 2),
+        dtype=torch.int8,
+        shard=tmp_path / "model.safetensors",
+    )
+    packed = torch.tensor([[0x01, 0x29], [-0x6D, -0x0C]], dtype=torch.int8)
+    scale = torch.full((2, 1), 127, dtype=torch.uint8)
+
+    result = materializer.materialize(
+        name,
+        {name: packed, "model.layers.0.ffn.experts.0.w1.scale": scale},
+        target_dtype=torch.bfloat16,
+        device=torch.device("cpu"),
+    )
+
+    assert materializer.logical_shape(name, metadata) == (2, 4)
+    assert torch.equal(
+        result,
+        torch.tensor(
+            [[0.5, 0.0, -0.5, 1.0], [1.5, -0.5, 2.0, -6.0]],
+            dtype=torch.bfloat16,
+        ),
+    )

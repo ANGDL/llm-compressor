@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import ExitStack
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -16,13 +17,18 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 from llmcompressor.args import DatasetArguments
 from llmcompressor.datasets import get_calibration_dataloader
+from llmcompressor.modeling.moe.context import moe_calibration_context
+from llmcompressor.modeling.moe_context import (
+    moe_calibration_context as moe_module_replacement_context,
+)
+from llmcompressor.modeling.offset_norm import norm_calibration_context
 from llmcompressor.modifiers.gptq import GPTQModifier
 from llmcompressor.modifiers.quantization import QuantizationModifier
 from llmcompressor.recipe import Recipe
 
 from .artifacts import fingerprint_json
-from .checkpoint import SafetensorsWeightSource
 from .loading import build_meta_model
+from .materialization import CastWeightMaterializer, WeightMaterializer
 from .oneshot import _streaming_oneshot_from_boundaries
 from .tracing import trace_streaming_boundaries
 
@@ -130,6 +136,7 @@ def _prepare_messages_dataset(dataset: Any, tokenizer: Any) -> Any:
 def streaming_oneshot_from_pretrained(
     *,
     model: str | Path,
+    model_config: Any,
     dataset: Any,
     recipe: Any,
     output_dir: str | Path,
@@ -138,12 +145,14 @@ def streaming_oneshot_from_pretrained(
     max_seq_length: int | None,
     batch_size: int,
     shuffle_calibration_samples: bool,
+    moe_calibrate_all_experts: bool,
     splits: str | None,
     preprocessing_func: Callable[[Any], Any] | None,
     tokenizer: Any,
     dataset_fingerprint: str | None,
     device: torch.device | str,
     target_dtype: torch.dtype,
+    materializer: WeightMaterializer | None,
     blocksize: int,
     dampening_frac: float,
     seed: int | None,
@@ -153,7 +162,10 @@ def streaming_oneshot_from_pretrained(
     checkpoint = Path(model).expanduser()
     if not checkpoint.is_dir():
         raise ValueError("Pretrained streaming mode requires a local model directory")
-    config = AutoConfig.from_pretrained(checkpoint, local_files_only=True)
+    config = model_config or AutoConfig.from_pretrained(
+        checkpoint, local_files_only=True
+    )
+    materializer = materializer or CastWeightMaterializer()
     if tokenizer is None and not isinstance(dataset, DataLoader):
         tokenizer = AutoTokenizer.from_pretrained(checkpoint, local_files_only=True)
     if preprocessing_func is None and not isinstance(dataset, DataLoader):
@@ -180,9 +192,6 @@ def streaming_oneshot_from_pretrained(
         keep_nonpersistent_buffers=True,
     )
     schemes = _exact_schemes(meta_model, quantizer)
-    targets = tuple(
-        f"model.layers.{index}" for index in range(config.num_hidden_layers)
-    )
     normalized_recipe = parsed_recipe.model_dump(mode="json")
     uses_imatrix = any(
         scheme.weights is not None and scheme.weights.observer == "imatrix_mse"
@@ -211,43 +220,69 @@ def streaming_oneshot_from_pretrained(
         sample_batch = next(iter(dataloader))
     except StopIteration as error:
         raise ValueError("Streaming PTQ calibration dataset is empty") from error
-    adapter = trace_streaming_boundaries(
-        model=meta_model,
-        source=SafetensorsWeightSource(checkpoint),
-        sample_batch=sample_batch,
-        sequential_targets=tuple(
-            getattr(config, "_no_split_modules", ())
-            or getattr(meta_model, "_no_split_modules", ())
-        ),
-        target_names=targets,
-        device=device,
-        dtype=target_dtype,
-    )
+    with ExitStack() as stack:
+        stack.enter_context(norm_calibration_context(meta_model))
+        if moe_calibrate_all_experts:
+            stack.enter_context(moe_calibration_context())
+        stack.enter_context(
+            moe_module_replacement_context(
+                meta_model,
+                calibrate_all_experts=moe_calibrate_all_experts,
+            )
+        )
+        adapter = trace_streaming_boundaries(
+            model=meta_model,
+            source=materializer.create_source(str(checkpoint)),
+            sample_batch=sample_batch,
+            sequential_targets=tuple(
+                getattr(meta_model, "_no_split_modules", ())
+                or getattr(config, "_no_split_modules", ())
+            ),
+            device=device,
+            dtype=target_dtype,
+        )
+        targets = adapter.targets
+        covered = tuple(
+            name
+            for name in schemes
+            if any(
+                name == target or name.startswith(f"{target}.")
+                for target in targets
+            )
+        )
+        missing = sorted(set(schemes) - set(covered))
+        if missing:
+            raise ValueError(
+                "Recipe matches modules outside the inferred sequential targets: "
+                f"{missing}"
+            )
 
-    def boundaries():
-        return adapter.calibration_boundaries(dataloader)
+        def boundaries():
+            return adapter.calibration_boundaries(dataloader)
 
-    return _streaming_oneshot_from_boundaries(
-        model_factory=AutoModelForCausalLM.from_config,
-        checkpoint=checkpoint,
-        output_dir=output_dir,
-        work_dir=work_dir,
-        calibration_batches=boundaries,
-        targets=targets,
-        recipe=normalized_recipe,
-        dataset_fingerprint=fingerprint,
-        schemes=schemes,
-        model_args=(config,),
-        model_kwargs={"attn_implementation": "eager"},
-        forward_target=adapter.forward_target,
-        algorithms=algorithms,
-        use_gptq=use_gptq,
-        device=device,
-        target_dtype=target_dtype,
-        blocksize=blocksize,
-        dampening_frac=dampening_frac,
-        num_samples=num_calibration_samples,
-        max_seq_length=max_seq_length,
-        seed=seed,
-        validate_config=validate_config,
-    )
+        return _streaming_oneshot_from_boundaries(
+            model_factory=AutoModelForCausalLM.from_config,
+            checkpoint=checkpoint,
+            output_dir=output_dir,
+            work_dir=work_dir,
+            calibration_batches=boundaries,
+            targets=targets,
+            recipe=normalized_recipe,
+            dataset_fingerprint=fingerprint,
+            schemes=schemes,
+            model_args=(config,),
+            model_kwargs={"attn_implementation": "eager"},
+            execution_model=meta_model,
+            materializer=materializer,
+            forward_target=adapter.forward_target,
+            algorithms=algorithms,
+            use_gptq=use_gptq,
+            device=device,
+            target_dtype=target_dtype,
+            blocksize=blocksize,
+            dampening_frac=dampening_frac,
+            num_samples=num_calibration_samples,
+            max_seq_length=max_seq_length,
+            seed=seed,
+            validate_config=validate_config,
+        )

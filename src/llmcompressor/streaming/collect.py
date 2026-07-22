@@ -16,12 +16,11 @@ from .artifacts import (
     RecipeInfo,
     SequentialInfo,
     SoftwareInfo,
-    TargetStatisticsMetadata,
     StreamingRunManifest,
+    TargetStatisticsMetadata,
     fingerprint_checkpoint,
     fingerprint_json,
 )
-from .checkpoint import SafetensorsWeightSource
 from .loading import TargetWeightLoader, build_meta_model
 from .materialization import CastWeightMaterializer, WeightMaterializer
 from .statistics import (
@@ -117,6 +116,7 @@ def collect_calibration_statistics(
     dataset_fingerprint: str,
     model_args: Sequence[Any] = (),
     model_kwargs: Mapping[str, Any] | None = None,
+    execution_model: nn.Module | None = None,
     materializer: WeightMaterializer | None = None,
     target_module_selector: Callable[[nn.Module, str], Mapping[str, nn.Module]]
     | None = None,
@@ -160,7 +160,7 @@ def collect_calibration_statistics(
         raise ValueError("dataset_fingerprint must be a SHA-256 digest") from error
 
     materializer = materializer or CastWeightMaterializer()
-    source = SafetensorsWeightSource(checkpoint)
+    source = materializer.create_source(checkpoint)
     source_info = fingerprint_checkpoint(checkpoint)
     manifest = StreamingRunManifest(
         source=source_info,
@@ -179,7 +179,7 @@ def collect_calibration_statistics(
     store.initialize(manifest, normalized_recipe=recipe, targets=targets)
 
     kwargs = dict(model_kwargs or {})
-    model = build_meta_model(model_factory, *model_args, **kwargs)
+    model = execution_model or build_meta_model(model_factory, *model_args, **kwargs)
     loader = TargetWeightLoader(model, source, materializer)
     boundaries = boundary_store or DiskBoundaryActivationStore(
         store.root / "boundaries"
@@ -213,7 +213,7 @@ def collect_calibration_statistics(
                 f"{target_name!r}"
             )
         with loader.loaded(target_name, device=device, dtype=target_dtype) as target:
-            target._streaming_target_index = index
+            target._streaming_target_name = target_name
             modules = dict(make_modules(target, target_name))
             if not modules:
                 raise ValueError(

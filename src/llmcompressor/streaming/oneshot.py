@@ -55,6 +55,7 @@ def _streaming_oneshot_from_boundaries(
     schemes: Mapping[str, QuantizationScheme],
     model_args: Sequence[Any] = (),
     model_kwargs: Mapping[str, Any] | None = None,
+    execution_model: nn.Module | None = None,
     materializer: WeightMaterializer | None = None,
     target_module_selector: Callable[[nn.Module, str], Mapping[str, nn.Module]]
     | None = None,
@@ -96,6 +97,7 @@ def _streaming_oneshot_from_boundaries(
         dataset_fingerprint=dataset_fingerprint,
         model_args=model_args,
         model_kwargs=model_kwargs,
+        execution_model=execution_model,
         materializer=materializer,
         target_module_selector=target_module_selector,
         forward_target=forward_target,
@@ -154,6 +156,7 @@ def _streaming_oneshot_from_boundaries(
         staging_dir=staging_dir,
         output_dir=output,
         quantization_config=qconfig,
+        materializer=materializer,
         validate_config=validate_config,
     )
     logger.info(
@@ -166,6 +169,7 @@ def _streaming_oneshot_from_boundaries(
 def streaming_oneshot(
     *,
     model: str | Path | None = None,
+    model_config: Any = None,
     dataset: Any = None,
     recipe: Any = None,
     output_dir: str | Path,
@@ -174,6 +178,7 @@ def streaming_oneshot(
     max_seq_length: int | None = None,
     batch_size: int = 1,
     shuffle_calibration_samples: bool = True,
+    moe_calibrate_all_experts: bool = True,
     splits: str | None = None,
     preprocessing_func: Callable[[Any], Any] | None = None,
     tokenizer: Any = None,
@@ -216,6 +221,7 @@ def streaming_oneshot(
 
         return streaming_oneshot_from_pretrained(
             model=model,
+            model_config=model_config,
             dataset=dataset,
             recipe=recipe,
             output_dir=output_dir,
@@ -224,12 +230,14 @@ def streaming_oneshot(
             max_seq_length=max_seq_length,
             batch_size=batch_size,
             shuffle_calibration_samples=shuffle_calibration_samples,
+            moe_calibrate_all_experts=moe_calibrate_all_experts,
             splits=splits,
             preprocessing_func=preprocessing_func,
             tokenizer=tokenizer,
             dataset_fingerprint=dataset_fingerprint,
             device=device,
             target_dtype=target_dtype,
+            materializer=materializer,
             blocksize=blocksize,
             dampening_frac=dampening_frac,
             seed=seed,

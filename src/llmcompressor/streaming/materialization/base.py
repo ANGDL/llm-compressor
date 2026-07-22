@@ -10,6 +10,7 @@ import torch
 from llmcompressor.streaming.artifacts import MaterializerInfo, fingerprint_json
 from llmcompressor.streaming.checkpoint import (
     CheckpointWeightSource,
+    SafetensorsWeightSource,
     TensorMetadata,
 )
 
@@ -36,6 +37,20 @@ class WeightMaterializer(ABC):
         self, tensor_name: str, metadata: TensorMetadata
     ) -> list[str]:
         return []
+
+    def logical_shape(
+        self, tensor_name: str, metadata: TensorMetadata
+    ) -> tuple[int, ...]:
+        """Return the decoded tensor shape exposed to the model."""
+        return metadata.shape
+
+    def create_source(self, checkpoint: str) -> CheckpointWeightSource:
+        """Create the checkpoint view consumed by all streaming stages."""
+        return SafetensorsWeightSource(checkpoint)
+
+    def output_config_updates(self) -> Mapping[str, Any]:
+        """Return config fields required to reload the materialized output."""
+        return {}
 
     @abstractmethod
     def materialize(
@@ -87,10 +102,11 @@ def materialize_weights(
                 f"Materializer returned dtype {tensor.dtype} for {name!r}; "
                 f"expected {target_dtype}"
             )
-        if tuple(tensor.shape) != metadata[name].shape:
+        expected_shape = materializer.logical_shape(name, metadata[name])
+        if tuple(tensor.shape) != expected_shape:
             raise ValueError(
                 f"Materializer returned shape {tuple(tensor.shape)} for {name!r}; "
-                f"expected {metadata[name].shape}"
+                f"expected {expected_shape}"
             )
         if tensor.device != device:
             raise ValueError(

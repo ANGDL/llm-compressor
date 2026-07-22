@@ -31,6 +31,8 @@ from .finalize import finalize_streaming_checkpoint
 from .loading import TargetWeightLoader, build_meta_model
 from .materialization import (
     CastWeightMaterializer,
+    DeepSeekV4WeightMaterializer,
+    DeepSeekV4WeightSource,
     WeightMaterializer,
     materialize_weights,
 )
@@ -52,6 +54,8 @@ __all__ = [
     "CastWeightMaterializer",
     "CheckpointWeightSource",
     "DiskBoundaryActivationStore",
+    "DeepSeekV4WeightMaterializer",
+    "DeepSeekV4WeightSource",
     "GPTQStatisticsCollector",
     "IMatrixStatisticsCollector",
     "InMemoryBoundaryActivationStore",

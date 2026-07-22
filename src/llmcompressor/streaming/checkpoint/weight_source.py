@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import struct
 from collections import defaultdict
 from pathlib import Path
 from typing import Collection, Iterable, Protocol
@@ -52,5 +54,21 @@ class SafetensorsWeightSource:
         for shard, shard_names in grouped.items():
             with safe_open(shard, framework="pt", device=str(device)) as file:
                 for name in shard_names:
-                    result[name] = file.get_tensor(name)
+                    tensor_slice = file.get_slice(name)
+                    if tensor_slice.get_dtype() == "F8_E8M0":
+                        result[name] = _read_e8m0(shard, name).to(device)
+                    else:
+                        result[name] = file.get_tensor(name)
         return result
+
+
+def _read_e8m0(shard: Path, name: str) -> torch.Tensor:
+    """Read unsupported F8_E8M0 safetensors storage as uint8 bytes."""
+    with shard.open("rb") as file:
+        header_size = struct.unpack("<Q", file.read(8))[0]
+        header = json.loads(file.read(header_size))
+        info = header[name]
+        start, end = info["data_offsets"]
+        file.seek(8 + header_size + start)
+        storage = bytearray(file.read(end - start))
+    return torch.frombuffer(storage, dtype=torch.uint8).reshape(info["shape"])
