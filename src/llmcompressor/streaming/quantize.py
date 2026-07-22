@@ -36,7 +36,7 @@ from .artifacts import (
     fingerprint_checkpoint,
     fingerprint_json,
 )
-from .checkpoint import SafetensorsWeightSource
+from .checkpoint import SafetensorsWeightSource  # noqa: F401
 from .materialization import (
     CastWeightMaterializer,
     WeightMaterializer,
@@ -211,7 +211,8 @@ def quantize_streaming(
     if dampening_frac < 0:
         raise ValueError("dampening_frac must be non-negative")
 
-    source = SafetensorsWeightSource(checkpoint)
+    materializer = materializer or CastWeightMaterializer()
+    source = materializer.create_source(str(checkpoint))
     tied_weights = infer_transformers_tied_weights(checkpoint)
     artifact_store = ArtifactStore(artifact_dir)
     manifest = artifact_store.load_manifest()
@@ -220,7 +221,6 @@ def quantize_streaming(
         raise ArtifactCompatibilityError(
             "Calibration artifacts belong to a different source checkpoint"
         )
-    materializer = materializer or CastWeightMaterializer()
     if materializer.manifest_info(target_dtype=target_dtype) != manifest.materializer:
         raise ArtifactCompatibilityError(
             "Calibration artifacts were created with a different materializer "
@@ -276,7 +276,22 @@ def quantize_streaming(
         logger.info(f"streaming quantize: processing shard {output_name}")
 
         values = source.load_tensors(names, device=device)
-        output = {name: value.to("cpu") for name, value in values.items()}
+        output = {}
+        for name, value in values.items():
+            dependency_names = materializer.dependencies(
+                name, source.metadata(name)
+            )
+            if dependency_names:
+                dependency_values = source.load_tensors(
+                    dependency_names, device=device
+                )
+                value = materializer.materialize(
+                    name,
+                    {name: value, **dependency_values},
+                    target_dtype=target_dtype,
+                    device=device,
+                )
+            output[name] = value.to("cpu")
         quantized_modules = []
         module_formats = {}
         for module_name, scheme in schemes.items():
@@ -303,10 +318,11 @@ def quantize_streaming(
                 device=device,
             )
             metadata = source.metadata(weight_name)
+            expected_shape = materializer.logical_shape(weight_name, metadata)
             if (
                 not weight.dtype.is_floating_point
                 or weight.dtype != target_dtype
-                or tuple(weight.shape) != metadata.shape
+                or tuple(weight.shape) != expected_shape
                 or weight.device != device
             ):
                 raise ValueError(

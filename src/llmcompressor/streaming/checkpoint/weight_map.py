@@ -32,6 +32,10 @@ for _safetensors_name, _torch_name in (
     if hasattr(torch, _torch_name):
         _SAFETENSORS_DTYPES[_safetensors_name] = getattr(torch, _torch_name)
 
+# PyTorch has no unsigned E8M0 scalar dtype. Expose its storage as bytes so a
+# checkpoint-specific materializer can decode the exponent-only scale values.
+_SAFETENSORS_DTYPES["F8_E8M0"] = torch.uint8
+
 
 @dataclass(frozen=True)
 class TensorMetadata:

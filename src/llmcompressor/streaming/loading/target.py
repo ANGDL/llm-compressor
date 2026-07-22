@@ -30,8 +30,26 @@ def build_meta_model(
     if keep_nonpersistent_buffers:
         # Model-derived buffers such as rotary frequencies are not checkpoint
         # weights, but traced prefix execution needs their real values.
-        with init_empty_weights(include_buffers=False):
-            model = factory(*args, **kwargs)
+        configs = [
+            value
+            for value in (*args, *kwargs.values())
+            if hasattr(value, "to_dict")
+        ]
+        previous = [
+            (config, getattr(config, "_streaming_meta_init", None))
+            for config in configs
+        ]
+        try:
+            for config in configs:
+                config._streaming_meta_init = True
+            with init_empty_weights(include_buffers=False):
+                model = factory(*args, **kwargs)
+        finally:
+            for config, value in previous:
+                if value is None:
+                    delattr(config, "_streaming_meta_init")
+                else:
+                    config._streaming_meta_init = value
         tie_weights = getattr(model, "tie_weights", None)
         if callable(tie_weights):
             tie_weights()
@@ -64,7 +82,7 @@ class TargetWeightLoader:
         self.model = model
         self.source = source
         self.materializer = materializer or CastWeightMaterializer()
-        self._active_target: str | None = None
+        self._active_targets: set[str] = set()
 
     @contextmanager
     def loaded(
@@ -76,9 +94,9 @@ class TargetWeightLoader:
     ) -> Iterator[nn.Module]:
         """Yield a real target, then release all of its storage on any exit."""
 
-        if self._active_target is not None:
+        if target_name in self._active_targets:
             raise RuntimeError(
-                f"Target {self._active_target!r} is already materialized"
+                f"Target {target_name!r} is already materialized"
             )
         if not dtype.is_floating_point:
             raise TypeError(f"Target computation dtype must be floating, got {dtype}")
@@ -88,7 +106,7 @@ class TargetWeightLoader:
             raise ValueError(f"Unknown target module {target_name!r}") from error
 
         parameter_groups = self._group_tensors(target, parameters=True)
-        buffer_groups = self._group_tensors(target, parameters=False)
+        buffer_groups, runtime_buffer_groups = self._group_buffers(target)
         self._validate_meta(parameter_groups, "parameter")
         self._validate_meta(buffer_groups, "buffer")
 
@@ -98,20 +116,17 @@ class TargetWeightLoader:
         self._validate_shapes(buffer_sources, buffer_groups)
 
         device = torch.device(device)
-        parameter_values = materialize_weights(
-            self.source,
-            parameter_sources.values(),
-            self.materializer,
-            target_dtype=dtype,
-            device=device,
+        parameter_values = self._load_parameters(
+            parameter_sources, parameter_groups, dtype=dtype, device=device
         )
         buffer_values = self._load_buffers(
             buffer_sources, buffer_groups, dtype=dtype, device=device
         )
 
-        self._active_target = target_name
+        self._active_targets.add(target_name)
         installed_parameters = []
         installed_buffers = []
+        runtime_buffers = []
         try:
             installed_parameters = self._install_parameters(
                 target, parameter_groups, parameter_sources, parameter_values
@@ -119,13 +134,24 @@ class TargetWeightLoader:
             installed_buffers = self._install_buffers(
                 target, buffer_groups, buffer_sources, buffer_values
             )
+            runtime_buffers = self._move_runtime_buffers(
+                target, runtime_buffer_groups, device
+            )
+            reinitialize = getattr(
+                self.model, "_reinitialize_non_persistent_buffers", None
+            )
+            if callable(reinitialize) and any(
+                tensor.is_meta for tensor, _ in runtime_buffer_groups
+            ):
+                reinitialize()
             yield target
         finally:
             self._restore_meta_parameters(target, installed_parameters)
             self._restore_meta_buffers(target, installed_buffers)
+            self._restore_runtime_buffers(target, runtime_buffers)
             parameter_values.clear()
             buffer_values.clear()
-            self._active_target = None
+            self._active_targets.remove(target_name)
 
     @staticmethod
     def _group_tensors(
@@ -143,6 +169,60 @@ class TargetWeightLoader:
                 groups[identity] = (tensor, [])
             groups[identity][1].append(name)
         return list(groups.values())
+
+    @staticmethod
+    def _group_buffers(
+        target: nn.Module,
+    ) -> tuple[
+        list[tuple[torch.Tensor, list[str]]],
+        list[tuple[torch.Tensor, list[str]]],
+    ]:
+        persistent = {}
+        runtime = {}
+        for module_name, module in target.named_modules():
+            for name, tensor in module._buffers.items():
+                if tensor is None:
+                    continue
+                qualified = _join_name(module_name, name)
+                destination = (
+                    runtime
+                    if name in module._non_persistent_buffers_set
+                    else persistent
+                )
+                identity = id(tensor)
+                if identity not in destination:
+                    destination[identity] = (tensor, [])
+                destination[identity][1].append(qualified)
+        return list(persistent.values()), list(runtime.values())
+
+    @staticmethod
+    def _move_runtime_buffers(
+        target: nn.Module,
+        groups: list[tuple[torch.Tensor, list[str]]],
+        device: torch.device,
+    ) -> list[tuple[list[str], torch.Tensor]]:
+        moved = []
+        for original, aliases in groups:
+            value = (
+                torch.zeros(original.shape, dtype=original.dtype, device=device)
+                if original.is_meta
+                else original.to(device=device)
+            )
+            for alias in aliases:
+                owner, name = _owner_and_name(target, alias)
+                owner._buffers[name] = value
+            moved.append((aliases, original))
+        return moved
+
+    @staticmethod
+    def _restore_runtime_buffers(
+        target: nn.Module,
+        moved: list[tuple[list[str], torch.Tensor]],
+    ) -> None:
+        for aliases, original in moved:
+            for alias in aliases:
+                owner, name = _owner_and_name(target, alias)
+                owner._buffers[name] = original
 
     @staticmethod
     def _validate_meta(
@@ -169,6 +249,15 @@ class TargetWeightLoader:
         resolved = {}
         for tensor, aliases in groups:
             candidates = [_join_name(target_name, alias) for alias in aliases]
+            named = (
+                self.model.named_parameters(recurse=True, remove_duplicate=False)
+                if isinstance(tensor, nn.Parameter)
+                else self.model.named_buffers(recurse=True, remove_duplicate=False)
+            )
+            candidates.extend(
+                name for name, candidate in named if candidate is tensor
+            )
+            candidates = list(dict.fromkeys(candidates))
             matches = [name for name in candidates if name in available]
             if not matches:
                 raise KeyError(
@@ -186,7 +275,10 @@ class TargetWeightLoader:
     ) -> None:
         for tensor, _ in groups:
             source_name = sources[id(tensor)]
-            source_shape = self.source.metadata(source_name).shape
+            metadata = self.source.metadata(source_name)
+            source_shape = self.materializer.logical_shape(
+                source_name, metadata
+            )
             if source_shape != tuple(tensor.shape):
                 raise ValueError(
                     f"Checkpoint tensor {source_name!r} has shape {source_shape}; "
@@ -225,6 +317,40 @@ class TargetWeightLoader:
                 raise ValueError(
                     f"Buffer {source_name!r} has dtype {value.dtype}; "
                     f"expected {expected_dtype}"
+                )
+        return values
+
+    def _load_parameters(
+        self,
+        sources: dict[int, str],
+        groups: list[tuple[torch.Tensor, list[str]]],
+        *,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> dict[str, torch.Tensor]:
+        floating = []
+        non_floating = []
+        for tensor, _ in groups:
+            source_name = sources[id(tensor)]
+            if tensor.dtype.is_floating_point:
+                floating.append(source_name)
+            else:
+                non_floating.append(source_name)
+        values = materialize_weights(
+            self.source,
+            floating,
+            self.materializer,
+            target_dtype=dtype,
+            device=device,
+        )
+        values.update(self.source.load_tensors(non_floating, device=device))
+        for tensor, _ in groups:
+            source_name = sources[id(tensor)]
+            expected_dtype = dtype if tensor.dtype.is_floating_point else tensor.dtype
+            if values[source_name].dtype != expected_dtype:
+                raise ValueError(
+                    f"Parameter {source_name!r} has dtype "
+                    f"{values[source_name].dtype}; expected {expected_dtype}"
                 )
         return values
 

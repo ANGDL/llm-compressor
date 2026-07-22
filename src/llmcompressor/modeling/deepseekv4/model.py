@@ -19,6 +19,14 @@ default_dtype = torch.float32
 block_size = 128
 
 
+def _runtime_buffer_device(args: ModelConfig) -> torch.device | None:
+    return (
+        torch.device("meta")
+        if getattr(args, "_streaming_meta_init", False)
+        else None
+    )
+
+
 @contextmanager
 def set_dtype(dtype: torch.dtype):
     prev = torch.get_default_dtype()
@@ -119,7 +127,9 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = F
 
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     try:
-        from compressed_tensors.transform.utils.hadamard import deterministic_hadamard_matrix
+        from compressed_tensors.transform.utils.hadamard import (
+            deterministic_hadamard_matrix,
+        )
 
         hidden_size = x.size(-1)
         hadamard = deterministic_hadamard_matrix(hidden_size, x.dtype, x.device)
@@ -193,6 +203,7 @@ class Compressor(nn.Module):
                 overlap_factor * compress_ratio,
                 overlap_factor * self.head_dim,
                 dtype=torch.float32,
+                device=_runtime_buffer_device(args),
             ),
             persistent=False,
         )
@@ -202,6 +213,7 @@ class Compressor(nn.Module):
                 (args.max_batch_size, overlap_factor * compress_ratio, overlap_factor * self.head_dim),
                 float("-inf"),
                 dtype=torch.float32,
+                device=_runtime_buffer_device(args),
             ),
             persistent=False,
         )
@@ -300,7 +312,13 @@ class Indexer(nn.Module):
         self.compressor = Compressor(args, compress_ratio, self.head_dim, True)
         self.register_buffer(
             "kv_cache",
-            torch.zeros(args.max_batch_size, args.max_seq_len // compress_ratio, self.head_dim, dtype=torch.float32),
+            torch.zeros(
+                args.max_batch_size,
+                args.max_seq_len // compress_ratio,
+                self.head_dim,
+                dtype=torch.float32,
+                device=_runtime_buffer_device(args),
+            ),
             persistent=False,
         )
         self.freqs_cis: Optional[torch.Tensor] = None
@@ -389,7 +407,13 @@ class Attention(nn.Module):
             rope_theta = args.rope_theta
         self.register_buffer(
             "kv_cache",
-            torch.zeros(args.max_batch_size, kv_cache_size, self.head_dim, dtype=torch.float32),
+            torch.zeros(
+                args.max_batch_size,
+                kv_cache_size,
+                self.head_dim,
+                dtype=torch.float32,
+                device=_runtime_buffer_device(args),
+            ),
             persistent=False,
         )
         # `precompute_freqs_cis` is `@lru_cache`-d, so layers with matching
@@ -410,7 +434,7 @@ class Attention(nn.Module):
                 args.rope_factor,
                 args.beta_fast,
                 args.beta_slow,
-            ).clone(),
+            ).clone().to(device=_runtime_buffer_device(args)),
             persistent=False,
         )
 
@@ -686,7 +710,6 @@ class MTPBlock(Block):
 
 class Transformer(nn.Module):
     def __init__(self, args: ModelConfig):
-        default_dtype = torch.float32
         super().__init__()
         self.max_seq_len = args.max_seq_len
         self.hc_mult = args.hc_mult

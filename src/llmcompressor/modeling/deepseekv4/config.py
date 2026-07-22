@@ -20,7 +20,10 @@ class ModelConfig(PretrainedConfig):
         # model_type. This does not affect HF's dispatch path: that path uses
         # AutoConfig, which keeps returning HF's DeepseekV4Config for
         # "deepseek_v4".
-        if isinstance(config_dict, dict) and config_dict.get("model_type") == "deepseek_v4":
+        if (
+            isinstance(config_dict, dict)
+            and config_dict.get("model_type") == "deepseek_v4"
+        ):
             config_dict = dict(config_dict)
             config_dict["model_type"] = cls.model_type
         return super().from_dict(config_dict, **kwargs)
@@ -132,9 +135,17 @@ class ModelConfig(PretrainedConfig):
         self.torch_dtype = torch_dtype
         self.compress_rope_theta = compress_rope_theta
         self.compress_ratios = compress_ratios
-        # Keep the original DeepSeek quantization metadata without triggering
-        # transformers pre-quantized loading path on CPU-only environments.
-        self.source_quantization_config = dict(quantization_config or {})
+        # Raw DeepSeek FP4/FP8 metadata must not trigger Transformers' generic
+        # pre-quantized loader. Checkpoints produced by llm-compressor, however,
+        # need their compressed config preserved so weight_scale/zero_point
+        # tensors are initialized before loading.
+        quantization_config = dict(quantization_config or {})
+        is_compressed = quantization_config.get("quantization_status") == "compressed"
+        self.source_quantization_config = (
+            {} if is_compressed else quantization_config
+        )
+        if is_compressed:
+            kwargs["quantization_config"] = quantization_config
 
         super().__init__(
             bos_token_id=bos_token_id,
