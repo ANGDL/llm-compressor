@@ -91,6 +91,7 @@ class TargetWeightLoader:
         *,
         device: torch.device,
         dtype: torch.dtype = torch.bfloat16,
+        allow_missing_state: bool = False,
     ) -> Iterator[nn.Module]:
         """Yield a real target, then release all of its storage on any exit."""
 
@@ -110,8 +111,25 @@ class TargetWeightLoader:
         self._validate_meta(parameter_groups, "parameter")
         self._validate_meta(buffer_groups, "buffer")
 
-        parameter_sources = self._resolve_sources(target_name, parameter_groups)
-        buffer_sources = self._resolve_sources(target_name, buffer_groups)
+        parameter_sources = self._resolve_sources(
+            target_name, parameter_groups, allow_missing=allow_missing_state
+        )
+        buffer_sources = self._resolve_sources(
+            target_name, buffer_groups, allow_missing=allow_missing_state
+        )
+        parameter_groups = [
+            group for group in parameter_groups if id(group[0]) in parameter_sources
+        ]
+        buffer_groups = [
+            group for group in buffer_groups if id(group[0]) in buffer_sources
+        ]
+        auxiliary_parameters = (
+            self._materialize_missing_parameters(
+                target, device=device, dtype=dtype
+            )
+            if allow_missing_state
+            else []
+        )
         self._validate_shapes(parameter_sources, parameter_groups)
         self._validate_shapes(buffer_sources, buffer_groups)
 
@@ -149,9 +167,39 @@ class TargetWeightLoader:
             self._restore_meta_parameters(target, installed_parameters)
             self._restore_meta_buffers(target, installed_buffers)
             self._restore_runtime_buffers(target, runtime_buffers)
+            self._restore_auxiliary_parameters(target, auxiliary_parameters)
             parameter_values.clear()
             buffer_values.clear()
             self._active_targets.remove(target_name)
+
+    @staticmethod
+    def _materialize_missing_parameters(
+        target: nn.Module, *, device: torch.device, dtype: torch.dtype
+    ) -> list[tuple[str, nn.Parameter]]:
+        installed = []
+        for name, parameter in target.named_parameters(
+            recurse=True, remove_duplicate=False
+        ):
+            if not parameter.is_meta:
+                continue
+            owner, local_name = _owner_and_name(target, name)
+            value_dtype = (
+                dtype if parameter.dtype.is_floating_point else parameter.dtype
+            )
+            owner._parameters[local_name] = nn.Parameter(
+                torch.zeros(parameter.shape, dtype=value_dtype, device=device),
+                requires_grad=False,
+            )
+            installed.append((name, parameter))
+        return installed
+
+    @staticmethod
+    def _restore_auxiliary_parameters(
+        target: nn.Module, installed: list[tuple[str, nn.Parameter]]
+    ) -> None:
+        for name, original in installed:
+            owner, local_name = _owner_and_name(target, name)
+            owner._parameters[local_name] = original
 
     @staticmethod
     def _group_tensors(
@@ -203,14 +251,15 @@ class TargetWeightLoader:
     ) -> list[tuple[list[str], torch.Tensor]]:
         moved = []
         for original, aliases in groups:
-            value = (
-                torch.zeros(original.shape, dtype=original.dtype, device=device)
-                if original.is_meta
-                else original.to(device=device)
-            )
             for alias in aliases:
                 owner, name = _owner_and_name(target, alias)
-                owner._buffers[name] = value
+                owner._buffers[name] = (
+                    torch.zeros(
+                        original.shape, dtype=original.dtype, device=device
+                    )
+                    if original.is_meta
+                    else original.to(device=device)
+                )
             moved.append((aliases, original))
         return moved
 
@@ -244,6 +293,8 @@ class TargetWeightLoader:
         self,
         target_name: str,
         groups: list[tuple[torch.Tensor, list[str]]],
+        *,
+        allow_missing: bool = False,
     ) -> dict[int, str]:
         available = set(self.source.tensor_names())
         resolved = {}
@@ -260,6 +311,8 @@ class TargetWeightLoader:
             candidates = list(dict.fromkeys(candidates))
             matches = [name for name in candidates if name in available]
             if not matches:
+                if allow_missing:
+                    continue
                 raise KeyError(
                     "No checkpoint tensor matches model tensor aliases "
                     f"{candidates}. Fused or renamed checkpoint tensors require a "
@@ -369,7 +422,14 @@ class TargetWeightLoader:
             for alias in aliases:
                 owner, name = _owner_and_name(target, alias)
                 owner._parameters[name] = parameter
-            installed.append((aliases, original.requires_grad, original.dtype))
+            installed.append(
+                (
+                    aliases,
+                    original.requires_grad,
+                    original.dtype,
+                    tuple(original.shape),
+                )
+            )
         return installed
 
     @staticmethod
@@ -391,13 +451,13 @@ class TargetWeightLoader:
     @staticmethod
     def _restore_meta_parameters(
         target: nn.Module,
-        installed: list[tuple[list[str], bool, torch.dtype]],
+        installed: list[
+            tuple[list[str], bool, torch.dtype, tuple[int, ...]]
+        ],
     ) -> None:
-        for aliases, requires_grad, dtype in installed:
-            owner, name = _owner_and_name(target, aliases[0])
-            value = owner._parameters[name]
+        for aliases, requires_grad, dtype, shape in installed:
             meta = nn.Parameter(
-                torch.empty(value.shape, dtype=dtype, device="meta"),
+                torch.empty(shape, dtype=dtype, device="meta"),
                 requires_grad=requires_grad,
             )
             for alias in aliases:

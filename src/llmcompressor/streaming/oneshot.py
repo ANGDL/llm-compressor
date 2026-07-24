@@ -9,17 +9,29 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from compressed_tensors.compressors.format import infer_module_format
-from compressed_tensors.quantization import QuantizationConfig, QuantizationScheme
+import yaml
+from compressed_tensors.quantization import QuantizationScheme
 from loguru import logger
 from torch import nn
+
+from llmcompressor.recipe import Recipe
+from llmcompressor.utils.dev import resolve_execution_device
 
 from .collect import collect_calibration_statistics
 from .finalize import finalize_streaming_checkpoint
 from .materialization import WeightMaterializer
+from .output import build_quantization_config
 from .quantize import quantize_streaming
 
 __all__ = ["streaming_oneshot"]
+
+
+def _serialize_recipe(recipe: Any) -> str:
+    if isinstance(recipe, Mapping):
+        return yaml.safe_dump(
+            dict(recipe), allow_unicode=True, sort_keys=False, width=88
+        )
+    return Recipe.create_instance(recipe).yaml()
 
 
 def _directory_bytes(path: Path) -> int:
@@ -62,7 +74,7 @@ def _streaming_oneshot_from_boundaries(
     forward_target: Callable[[nn.Module, Any], Any] | None = None,
     algorithms: Sequence[str] = ("gptq", "imatrix"),
     use_gptq: bool = True,
-    device: torch.device | str = "cpu",
+    device: torch.device | str | None = None,
     target_dtype: torch.dtype = torch.bfloat16,
     blocksize: int = 128,
     dampening_frac: float = 0.01,
@@ -132,22 +144,7 @@ def _streaming_oneshot_from_boundaries(
         f"{_resource_summary(device, staging_dir)}"
     )
 
-    formats = {
-        scheme.format or infer_module_format(nn.Linear, scheme).value
-        for scheme in schemes.values()
-    }
-    config_groups: dict[str, QuantizationScheme] = {}
-    for index, (module_name, scheme) in enumerate(schemes.items()):
-        serialized = scheme.model_dump()
-        serialized["targets"] = [module_name]
-        config_groups[f"group_{index}"] = QuantizationScheme.model_validate(
-            serialized
-        )
-    qconfig = QuantizationConfig(
-        config_groups=config_groups,
-        format=next(iter(formats)) if len(formats) == 1 else "mixed-precision",
-        quantization_status="compressed",
-    ).model_dump(mode="json")
+    qconfig = build_quantization_config(schemes)
     started = time.monotonic()
     logger.info("streaming finalize: publishing checkpoint")
     result = finalize_streaming_checkpoint(
@@ -158,6 +155,7 @@ def _streaming_oneshot_from_boundaries(
         quantization_config=qconfig,
         materializer=materializer,
         validate_config=validate_config,
+        recipe_yaml=_serialize_recipe(recipe),
     )
     logger.info(
         f"streaming finalize: completed in {time.monotonic() - started:.2f}s; "
@@ -173,7 +171,7 @@ def streaming_oneshot(
     dataset: Any = None,
     recipe: Any = None,
     output_dir: str | Path,
-    work_dir: str | Path,
+    work_dir: str | Path | None = None,
     num_calibration_samples: int = 512,
     max_seq_length: int | None = None,
     batch_size: int = 1,
@@ -183,7 +181,7 @@ def streaming_oneshot(
     preprocessing_func: Callable[[Any], Any] | None = None,
     tokenizer: Any = None,
     dataset_fingerprint: str | None = None,
-    device: torch.device | str = "cpu",
+    device: torch.device | str | None = None,
     target_dtype: torch.dtype = torch.bfloat16,
     # Advanced boundary-mode arguments. These keep the low-level API available
     # for model adapters while normal callers use ``model`` and ``dataset``.
@@ -204,6 +202,8 @@ def streaming_oneshot(
     dampening_frac: float = 0.01,
     seed: int | None = None,
     validate_config: bool = True,
+    checkpoint_progress: bool = False,
+    overwrite_output: bool = False,
 ) -> Path:
     """Run resumable streaming PTQ.
 
@@ -212,6 +212,10 @@ def streaming_oneshot(
     model-prefix and decoder-target boundaries without loading the full model.
     Advanced callers may instead supply explicit boundary-mode arguments.
     """
+    device = resolve_execution_device(device)
+    if work_dir is None:
+        output = Path(output_dir).expanduser()
+        work_dir = output.with_name(f"{output.name}.streaming-work")
     if model is not None:
         if checkpoint is not None or calibration_batches is not None:
             raise ValueError(
@@ -242,6 +246,8 @@ def streaming_oneshot(
             dampening_frac=dampening_frac,
             seed=seed,
             validate_config=validate_config,
+            checkpoint_progress=checkpoint_progress,
+            overwrite_output=overwrite_output,
         )
 
     required = {

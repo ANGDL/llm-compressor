@@ -33,6 +33,7 @@ def test_finalize_builds_index_config_and_preserves_auxiliary_files(tmp_path):
         artifact_dir=artifacts,
         staging_dir=staging,
         output_dir=tmp_path / "output",
+        recipe_yaml="default_stage:\n  quantization_modifiers: {}\n",
         validate_config=False,
     )
     index = json.loads((output / "model.safetensors.index.json").read_text())
@@ -49,6 +50,9 @@ def test_finalize_builds_index_config_and_preserves_auxiliary_files(tmp_path):
     assert config["quantization_config"]["quantization_status"] == "compressed"
     assert (output / "tokenizer.json").is_file()
     assert (output / "FINALIZED").is_file()
+    assert (output / "recipe.yaml").read_text() == (
+        "default_stage:\n  quantization_modifiers: {}\n"
+    )
 
     for name, shard_name in index["weight_map"].items():
         with safe_open(output / shard_name, framework="pt", device="cpu") as file:

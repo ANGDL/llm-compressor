@@ -17,11 +17,12 @@ from transformers import (
 
 from llmcompressor.modifiers.quantization import QuantizationModifier
 from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
+from llmcompressor.recipe import Recipe
 from llmcompressor.streaming import (
-    ArtifactStore,
     DeepSeekV4WeightMaterializer,
     streaming_oneshot,
 )
+from llmcompressor.streaming.pretrained import _recipe_quantizer
 
 
 def _write_raw_deepseek_v4_checkpoint(checkpoint):
@@ -95,6 +96,14 @@ def _write_raw_deepseek_v4_checkpoint(checkpoint):
     config["model_type"] = "deepseek_v4"
     config["architectures"] = ["DeepseekV4ForCausalLM"]
     config_path.write_text(json.dumps(config))
+
+
+def test_pretrained_explains_autoround_output_adapter_requirement():
+    from llmcompressor.modifiers.autoround import AutoRoundModifier
+
+    recipe = Recipe.from_modifiers(AutoRoundModifier(scheme="W4A16"))
+    with pytest.raises(ValueError, match="dedicated streaming output adapter"):
+        _recipe_quantizer(recipe)
 
 
 def test_qwen3_pretrained_mode_hides_boundary_construction(tmp_path):
@@ -275,11 +284,14 @@ def test_deepseek_v4_preserves_input_ids_and_collects_all_experts(tmp_path):
     )
 
     assert (output / "FINALIZED").is_file()
-    statistics = ArtifactStore(
-        tmp_path / "work" / "artifacts"
-    ).load_target_statistics(1)
-    assert any("experts.0.w1.imatrix_sum" in name for name in statistics)
-    assert any("experts.1.w1.imatrix_sum" in name for name in statistics)
+    assert not list(
+        (tmp_path / "work" / "artifacts" / "statistics").glob(
+            "target-*"
+        )
+    )
+    assert not (tmp_path / "work" / "staging").exists()
+    assert (output / "model-subgraph-00000.safetensors").is_file()
+    assert (output / "model-subgraph-00001.safetensors").is_file()
     loaded = AutoModelForCausalLM.from_pretrained(
         output, local_files_only=True, dtype=torch.float32
     ).eval()

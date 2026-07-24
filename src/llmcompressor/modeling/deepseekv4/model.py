@@ -883,6 +883,22 @@ class DeepseekV4NativePreTrainedModel(PreTrainedModel):
                     device=module.kv_cache.device,
                 )
 
+        # Attention tracing can populate these unregistered runtime references
+        # while every buffer is still meta. Rebind them after all owning buffers
+        # have been materialized so streaming subgraph execution never follows a
+        # stale meta alias.
+        for module in self.modules():
+            if not isinstance(module, Attention) or not module.compress_ratio:
+                continue
+            compressor = module.compressor
+            if compressor is not None:
+                compressor.kv_cache = module.kv_cache[:, module.window_size :]
+                compressor.freqs_cis = module.freqs_cis
+            if module.indexer is not None:
+                module.indexer.freqs_cis = module.freqs_cis
+                module.indexer.compressor.kv_cache = module.indexer.kv_cache
+                module.indexer.compressor.freqs_cis = module.freqs_cis
+
 
 class DeepseekV4NativeForCausalLM(DeepseekV4NativePreTrainedModel, GenerationMixin):
     config: ModelConfig

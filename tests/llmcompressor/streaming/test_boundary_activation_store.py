@@ -207,3 +207,14 @@ def test_memory_reports_only_live_boundary_tensor_bytes():
     assert store.tensor_bytes() == first_size * 2
     store.delete(0)
     assert store.tensor_bytes() == first_size
+
+
+def test_memory_store_deduplicates_equal_boundary_tensors():
+    store = InMemoryBoundaryActivationStore(deduplicate_tensors=True)
+    mask = torch.tril(torch.ones(32, 32))
+
+    store.put(0, 0, {"mask_0": mask, "mask_1": mask.clone()})
+
+    assert store.tensor_bytes() == mask.untyped_storage().nbytes()
+    loaded = store.get(0, 0)
+    assert loaded["mask_0"].data_ptr() == loaded["mask_1"].data_ptr()
