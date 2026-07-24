@@ -39,6 +39,7 @@ from llmcompressor.modeling.deepseekv4.config import ModelConfig
 from llmcompressor.modifiers.quantization import QuantizationModifier
 from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
 from llmcompressor.streaming import DeepSeekV4WeightMaterializer, streaming_oneshot
+from llmcompressor.utils import ImatrixFallbackStats
 
 
 def positive_int(value: str) -> int:
@@ -223,22 +224,25 @@ def main() -> None:
             ignore=ignores,
         ),
     ]
-    result = streaming_oneshot(
-        model=args.model_id,
-        model_config=config,
-        dataset=dataset,
-        tokenizer=tokenizer,
-        recipe=recipe,
-        output_dir=args.output_dir,
-        work_dir=args.work_dir,
-        num_calibration_samples=args.num_calibration_samples,
-        max_seq_length=args.max_sequence_length,
-        batch_size=args.batch_size,
-        moe_calibrate_all_experts=args.moe_calibrate_all_experts,
-        materializer=DeepSeekV4WeightMaterializer(),
-        checkpoint_progress=args.checkpoint_progress,
-        overwrite_output=True,
-    )
+    imatrix_fallback_stats = ImatrixFallbackStats()
+    imatrix_fallback_stats.install_hooks()
+    with imatrix_fallback_stats:
+        result = streaming_oneshot(
+            model=args.model_id,
+            model_config=config,
+            dataset=dataset,
+            tokenizer=tokenizer,
+            recipe=recipe,
+            output_dir=args.output_dir,
+            work_dir=args.work_dir,
+            num_calibration_samples=args.num_calibration_samples,
+            max_seq_length=args.max_sequence_length,
+            batch_size=args.batch_size,
+            moe_calibrate_all_experts=args.moe_calibrate_all_experts,
+            materializer=DeepSeekV4WeightMaterializer(),
+            checkpoint_progress=args.checkpoint_progress,
+            overwrite_output=True,
+        )
     tokenizer.save_pretrained(result)
     print(
         f"Saved streaming DeepSeek-V4 {args.quant_mode.upper()} checkpoint to "

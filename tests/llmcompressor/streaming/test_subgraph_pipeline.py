@@ -16,6 +16,10 @@ from llmcompressor.modifiers.quantization import QuantizationModifier
 from llmcompressor.modifiers.transform import AWQModifier, SmoothQuantModifier
 from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
 from llmcompressor.streaming import streaming_oneshot
+from llmcompressor.streaming.pipeline import (
+    _empty_device_cache,
+    _write_loaded_target_direct,
+)
 
 
 def _checkpoint_tensors(path):
@@ -56,6 +60,40 @@ def _imatrix_recipe():
             ignore=["lm_head"],
         ),
     ]
+
+
+def test_direct_target_write_does_not_retain_tensor(tmp_path):
+    import gc
+    import weakref
+
+    class Loaded:
+        model = torch.nn.Module()
+
+        def state_tensors_under(self, _module_names):
+            tensor = torch.ones(8)
+            references.append(weakref.ref(tensor))
+            yield "layer.weight", tensor
+
+    class Writer:
+        def write_shard(self, _shard_id, tensors, **_kwargs):
+            assert set(tensors) == {"layer.weight"}
+
+    references = []
+    written = _write_loaded_target_direct(Writer(), Loaded(), "layer", "target-0")
+    gc.collect()
+
+    assert written == {"layer.weight"}
+    assert references[0]() is None
+
+
+def test_empty_device_cache_dispatches_to_execution_backend(monkeypatch):
+    calls = []
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: calls.append("cuda"))
+
+    _empty_device_cache(torch.device("cuda:0"))
+    _empty_device_cache(torch.device("cpu"))
+
+    assert calls == ["cuda"]
 
 
 def test_pretrained_streaming_writes_each_subgraph_as_final_shard(

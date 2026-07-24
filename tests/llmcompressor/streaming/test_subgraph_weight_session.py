@@ -130,14 +130,14 @@ def test_merges_modifier_working_set_across_checkpoint_shards(tmp_path, monkeypa
     model = build_meta_model(SessionModel)
     source = SafetensorsWeightSource(checkpoint)
     requests = []
-    original_load = source.load_tensors
+    original_iter = source.iter_tensor_groups
 
-    def recording_load(names, *, device):
-        names = tuple(names)
-        requests.append(names)
-        return original_load(names, device=device)
+    def recording_iter(groups, *, device):
+        groups = tuple(tuple(group) for group in groups)
+        requests.extend(groups)
+        return original_iter(groups, device=device)
 
-    monkeypatch.setattr(source, "load_tensors", recording_load)
+    monkeypatch.setattr(source, "iter_tensor_groups", recording_iter)
     session = SubgraphWeightSession(model, source)
     subgraph = subgraph_for("layers.0")
 
@@ -152,7 +152,7 @@ def test_merges_modifier_working_set_across_checkpoint_shards(tmp_path, monkeypa
         assert not next(model.final_norm.parameters()).is_meta
         assert_all_meta(model.layers[1])
 
-    loaded_names = {name for request in requests for name in request}
+    loaded_names = {name for group in requests for name in group}
     assert any(name.startswith("layers.0.") for name in loaded_names)
     assert any(name.startswith("final_norm.") for name in loaded_names)
     assert not any(name.startswith("layers.1.") for name in loaded_names)

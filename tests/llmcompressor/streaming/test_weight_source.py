@@ -95,6 +95,43 @@ def test_opens_each_requested_shard_once(sharded_checkpoint, monkeypatch):
     assert len(set(opened)) == 2
 
 
+def test_iter_tensor_groups_reuses_shards_and_releases_previous_group(
+    sharded_checkpoint, monkeypatch
+):
+    from llmcompressor.streaming.checkpoint import weight_source
+
+    source = SafetensorsWeightSource(sharded_checkpoint)
+    real_safe_open = weight_source.safe_open
+    opened = []
+
+    def recording_safe_open(path, *args, **kwargs):
+        opened.append(path)
+        return real_safe_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(weight_source, "safe_open", recording_safe_open)
+    groups = source.iter_tensor_groups(
+        [
+            ("layer0.weight", "layer0.bias"),
+            ("layer0.bias",),
+            ("layer1.weight", "layer1.scale"),
+        ],
+        device=torch.device("cpu"),
+    )
+
+    first = next(groups)
+    reference = weakref.ref(first["layer0.weight"])
+    del first
+    second = next(groups)
+
+    assert reference() is None
+    assert set(second) == {"layer0.bias"}
+    assert len(opened) == 1
+
+    third = next(groups)
+    assert set(third) == {"layer1.weight", "layer1.scale"}
+    assert len(opened) == 2
+
+
 def test_supports_single_safetensors_file(tmp_path):
     checkpoint = tmp_path / "model.safetensors"
     save_file({"weight": torch.ones(2, dtype=torch.bfloat16)}, checkpoint)

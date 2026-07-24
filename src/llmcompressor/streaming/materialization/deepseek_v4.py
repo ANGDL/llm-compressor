@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Iterator, Mapping
 
 import torch
 import torch.nn.functional as F
@@ -67,6 +67,29 @@ class DeepSeekV4WeightSource(CheckpointWeightSource):
         return {
             name: raw_values[self._logical_to_raw[name]] for name in requested
         }
+
+    def iter_tensor_groups(
+        self, groups, *, device: torch.device
+    ) -> Iterator[dict[str, torch.Tensor]]:
+        logical_groups = [tuple(dict.fromkeys(group)) for group in groups]
+        raw_groups = []
+        for group in logical_groups:
+            try:
+                raw_groups.append(tuple(self._logical_to_raw[name] for name in group))
+            except KeyError as error:
+                raise KeyError(
+                    f"Unknown DeepSeek-V4 tensor {error.args[0]!r}"
+                ) from error
+
+        for logical, raw, raw_values in zip(
+            logical_groups,
+            raw_groups,
+            self._source.iter_tensor_groups(raw_groups, device=device),
+        ):
+            yield {
+                logical_name: raw_values[raw_name]
+                for logical_name, raw_name in zip(logical, raw)
+            }
 
 
 class DeepSeekV4WeightMaterializer(WeightMaterializer):

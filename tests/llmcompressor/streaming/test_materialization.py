@@ -1,4 +1,5 @@
 import json
+import weakref
 from typing import Mapping
 
 import pytest
@@ -45,6 +46,21 @@ class InvalidMaterializer(WeightMaterializer):
         self, tensor_name, tensors, *, target_dtype, device
     ) -> torch.Tensor:
         return self.result
+
+
+class RawLifetimeMaterializer(ScaledIntMaterializer):
+    def __init__(self):
+        self.previous_raw = []
+
+    def materialize(self, tensor_name, tensors, *, target_dtype, device):
+        assert all(reference() is None for reference in self.previous_raw)
+        self.previous_raw = [weakref.ref(value) for value in tensors.values()]
+        return super().materialize(
+            tensor_name,
+            tensors,
+            target_dtype=target_dtype,
+            device=device,
+        )
 
 
 @pytest.fixture
@@ -106,6 +122,50 @@ def test_custom_materializer_loads_declared_dependency(sharded_checkpoint):
 
     expected = torch.arange(6, dtype=torch.bfloat16).reshape(2, 3) * 0.5
     assert torch.equal(result["layer1.weight"], expected)
+
+
+def test_materializer_releases_each_raw_group_before_loading_next(tmp_path):
+    path = tmp_path / "model.safetensors"
+    save_file(
+        {
+            "layer0.scale": torch.full((2, 1), 0.5),
+            "layer0.weight": torch.arange(6, dtype=torch.int8).reshape(2, 3),
+            "layer1.scale": torch.full((2, 1), 0.25),
+            "layer1.weight": torch.arange(6, dtype=torch.int8).reshape(2, 3),
+        },
+        path,
+    )
+    materializer = RawLifetimeMaterializer()
+
+    result = materialize_weights(
+        SafetensorsWeightSource(path),
+        ["layer0.weight", "layer1.weight"],
+        materializer,
+        target_dtype=torch.bfloat16,
+        device=torch.device("cpu"),
+    )
+
+    assert set(result) == {"layer0.weight", "layer1.weight"}
+
+
+def test_materializer_supports_legacy_source_without_group_iterator(
+    sharded_checkpoint,
+):
+    source = SafetensorsWeightSource(sharded_checkpoint)
+
+    class LegacySource:
+        metadata = source.metadata
+        load_tensors = source.load_tensors
+
+    result = materialize_weights(
+        LegacySource(),
+        ["layer1.weight"],
+        ScaledIntMaterializer(),
+        target_dtype=torch.bfloat16,
+        device=torch.device("cpu"),
+    )
+
+    assert result["layer1.weight"].dtype == torch.bfloat16
 
 
 def test_missing_materializer_dependency_reports_name(sharded_checkpoint):
