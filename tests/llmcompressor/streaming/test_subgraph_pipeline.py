@@ -18,6 +18,7 @@ from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
 from llmcompressor.streaming import streaming_oneshot
 from llmcompressor.streaming.pipeline import (
     _empty_device_cache,
+    _stage_logger,
     _write_loaded_target_direct,
 )
 
@@ -94,6 +95,15 @@ def test_empty_device_cache_dispatches_to_execution_backend(monkeypatch):
     _empty_device_cache(torch.device("cpu"))
 
     assert calls == ["cuda"]
+
+
+def test_stage_logger_only_monitors_execution_device():
+    model = torch.nn.Module()
+
+    assert _stage_logger(model, "cuda-stage", torch.device("cuda:3")).device_ids == (
+        3,
+    )
+    assert _stage_logger(model, "cpu-stage", torch.device("cpu")).device_ids == ()
 
 
 def test_pretrained_streaming_writes_each_subgraph_as_final_shard(

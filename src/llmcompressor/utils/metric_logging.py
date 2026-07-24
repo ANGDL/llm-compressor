@@ -10,6 +10,8 @@ from collections.abc import Iterable
 
 import torch
 from compressed_tensors.offload import is_distributed
+from loguru import logger
+
 from llmcompressor._torch_accelerator_compat import (
     accelerator_device_count,
     accelerator_get_memory_info,
@@ -17,18 +19,29 @@ from llmcompressor._torch_accelerator_compat import (
     accelerator_max_memory_allocated,
     current_device_index,
 )
-from loguru import logger
 
 __all__ = ["CompressionLogger"]
 
 
 class CompressionLogger:
     """
-    Log metrics related to compression algorithms
+    Log metrics related to compression algorithms.
+
+    :param module: module associated with the compression stage
+    :param device_ids: accelerator devices to inspect. ``None`` preserves the
+        legacy behavior of inspecting every visible device; an empty iterable
+        disables accelerator memory queries.
     """
 
-    def __init__(self, module: torch.nn.Module):
+    def __init__(
+        self,
+        module: torch.nn.Module,
+        device_ids: Iterable[int] | None = None,
+    ):
         self.module = module
+        self.device_ids = (
+            None if device_ids is None else tuple(dict.fromkeys(device_ids))
+        )
         self.start_tick = None
 
         self._name = None
@@ -58,7 +71,10 @@ class CompressionLogger:
         if not accelerator_is_available() or torch.mps.is_available():
             return
 
-        for device_id in _get_visible_devices():
+        device_ids = (
+            _get_visible_devices() if self.device_ids is None else self.device_ids
+        )
+        for device_id in device_ids:
             used_memory = accelerator_max_memory_allocated(device_id) / 1e9
             max_memory = accelerator_get_memory_info(device_id)[1] / 1e9
             if max_memory == 0:

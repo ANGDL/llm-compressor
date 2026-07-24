@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from time import perf_counter
 from typing import Any, Iterable, Mapping
 
 import torch
+from loguru import logger
 
 from llmcompressor.streaming.artifacts import MaterializerInfo, fingerprint_json
 from llmcompressor.streaming.checkpoint import (
@@ -13,6 +15,8 @@ from llmcompressor.streaming.checkpoint import (
     SafetensorsWeightSource,
     TensorMetadata,
 )
+
+_PROGRESS_INTERVAL = 64
 
 
 class WeightMaterializer(ABC):
@@ -62,6 +66,8 @@ class WeightMaterializer(ABC):
         device: torch.device,
     ) -> torch.Tensor:
         """Return one logical weight in the requested dtype and device."""
+
+
 def materialize_weights(
     source: CheckpointWeightSource,
     names: Iterable[str],
@@ -75,13 +81,21 @@ def materialize_weights(
     device = torch.device(device)
     requested = list(dict.fromkeys(names))
     metadata = {name: source.metadata(name) for name in requested}
-    tensor_groups = [
-        (
+    requests = []
+    for name in requested:
+        group = (
             name,
             *dict.fromkeys(materializer.dependencies(name, metadata[name])),
         )
-        for name in requested
-    ]
+        group_metadata = [source.metadata(group_name) for group_name in group]
+        requests.append((name, group, group_metadata))
+    requests.sort(
+        key=lambda request: min(
+            (item.shard.as_posix(), item.storage_index)
+            for item in request[2]
+        )
+    )
+    tensor_groups = [group for _, group, _ in requests]
 
     results = {}
     iter_groups = getattr(source, "iter_tensor_groups", None)
@@ -92,7 +106,31 @@ def materialize_weights(
             source.load_tensors(group, device=device) for group in tensor_groups
         )
     )
-    for name, raw_tensors in zip(requested, raw_groups):
+    raw_groups = iter(raw_groups)
+    total = len(requests)
+    started_at = perf_counter()
+    if total >= _PROGRESS_INTERVAL:
+        logger.info(
+            f"streaming materialization: loading {total} logical tensors "
+            f"onto {device}"
+        )
+    for index, (name, _, _) in enumerate(requests, start=1):
+        if total >= _PROGRESS_INTERVAL and (index - 1) % _PROGRESS_INTERVAL == 0:
+            logger.info(
+                "streaming materialization: loading tensors "
+                f"{index}-{min(index + _PROGRESS_INTERVAL - 1, total)}/{total}; "
+                f"first={name!r}, shard={metadata[name].shard.name!r}"
+            )
+        logger.debug(
+            f"streaming materialization: loading tensor {index}/{total} {name!r} "
+            f"from {metadata[name].shard.name!r}"
+        )
+        try:
+            raw_tensors = next(raw_groups)
+        except StopIteration as error:
+            raise RuntimeError(
+                "Checkpoint source returned fewer tensor groups than requested"
+            ) from error
         tensor = materializer.materialize(
             name, raw_tensors, target_dtype=target_dtype, device=device
         )
@@ -119,4 +157,11 @@ def materialize_weights(
                 f"expected {device}"
             )
         results[name] = tensor
+        if total >= _PROGRESS_INTERVAL and (
+            index % _PROGRESS_INTERVAL == 0 or index == total
+        ):
+            logger.info(
+                f"streaming materialization: materialized {index}/{total} tensors "
+                f"in {perf_counter() - started_at:.2f}s"
+            )
     return results

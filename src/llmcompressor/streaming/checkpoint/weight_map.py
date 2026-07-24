@@ -45,6 +45,7 @@ class TensorMetadata:
     shape: tuple[int, ...]
     dtype: torch.dtype
     shard: Path
+    storage_index: int = 0
 
 
 class WeightMap:
@@ -109,7 +110,14 @@ class WeightMap:
             if not shard.is_file():
                 raise FileNotFoundError(f"Missing checkpoint shard: {shard}")
             with safe_open(shard, framework="pt", device="cpu") as file:
-                actual_names = set(file.keys())
+                offset_keys = getattr(file, "offset_keys", None)
+                storage_names = tuple(
+                    offset_keys() if callable(offset_keys) else file.keys()
+                )
+                actual_names = set(storage_names)
+                storage_indices = {
+                    name: index for index, name in enumerate(storage_names)
+                }
                 expected_names = {
                     name
                     for name, mapped_shard in tensor_shards.items()
@@ -137,6 +145,7 @@ class WeightMap:
                         shape=tuple(tensor_slice.get_shape()),
                         dtype=dtype,
                         shard=shard,
+                        storage_index=storage_indices[name],
                     )
         return cls(tensors)
 
