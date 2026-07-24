@@ -11,6 +11,7 @@ import torch
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 from llmcompressor import oneshot
+from llmcompressor.modeling.mimo_v2_mtp import attach_mtp_layer
 from llmcompressor.pipelines.basic import pipeline as basic_pipeline
 from llmcompressor.pipelines.data_free import pipeline as data_free_pipeline
 from llmcompressor.modifiers.quantization import QuantizationModifier
@@ -86,6 +87,9 @@ class MiMoFP8BlockDequantizer(FP8BlockDequantizer):
         )
 
     def _qkv_rows_for_module(self, module_name: str) -> tuple[int, int, int]:
+        if ".mtp.layers." in module_name:
+            return self.swa_q_rows, self.swa_k_rows, self.swa_v_rows
+
         match = re.search(r"\.layers\.(\d+)\.self_attn\.qkv_proj$", module_name)
         if not match or self.hybrid_layer_pattern is None:
             return self.default_q_rows, self.default_k_rows, self.default_v_rows
@@ -492,6 +496,11 @@ def quantize_model(args):
     )
     tokenizer = AutoTokenizer.from_pretrained(args.bf16_dir, trust_remote_code=True)
 
+    # The remote model ignores model.mtp.layers.* during from_pretrained.
+    # Restore the three MTP blocks before calibration so their decoder
+    # projections are quantized and saved end-to-end.
+    attach_mtp_layer(model, args.bf16_dir)
+
     ds = load_dataset(
         args.dataset_id,
         split=f"{args.dataset_split}[:{args.num_calibration_samples}]",
@@ -512,6 +521,9 @@ def quantize_model(args):
         # r"re:.*self_attn.o_proj$",
         r"re:.*\.embed_tokens$",
         "lm_head",
+        # Keep the MTP input projection in BF16. The MTP decoder attention
+        # and MLP projections remain in the W8A8 quantization scope.
+        r"re:.*eh_proj$",
     ]
 
     scheme = preset_name_to_scheme("W8A8", ["Linear"])
