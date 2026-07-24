@@ -75,17 +75,24 @@ def materialize_weights(
     device = torch.device(device)
     requested = list(dict.fromkeys(names))
     metadata = {name: source.metadata(name) for name in requested}
-    dependencies = {
-        dependency
+    tensor_groups = [
+        (
+            name,
+            *dict.fromkeys(materializer.dependencies(name, metadata[name])),
+        )
         for name in requested
-        for dependency in materializer.dependencies(name, metadata[name])
-    }
-    raw_tensors = source.load_tensors(
-        [*requested, *sorted(dependencies)], device=device
-    )
+    ]
 
     results = {}
-    for name in requested:
+    iter_groups = getattr(source, "iter_tensor_groups", None)
+    raw_groups = (
+        iter_groups(tensor_groups, device=device)
+        if callable(iter_groups)
+        else (
+            source.load_tensors(group, device=device) for group in tensor_groups
+        )
+    )
+    for name, raw_tensors in zip(requested, raw_groups):
         tensor = materializer.materialize(
             name, raw_tensors, target_dtype=target_dtype, device=device
         )

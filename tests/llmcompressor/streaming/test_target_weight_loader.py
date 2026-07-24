@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import gc
-import json
 import weakref
 
 import pytest
@@ -218,14 +217,14 @@ def test_tied_parameters_load_once_and_remain_tied(tmp_path, monkeypatch):
     model = build_meta_model(TiedTarget)
     source = SafetensorsWeightSource(path)
     loaded_names = []
-    original_load = source.load_tensors
+    original_iter = source.iter_tensor_groups
 
-    def recording_load(names, *, device):
-        names = list(names)
-        loaded_names.extend(names)
-        return original_load(names, device=device)
+    def recording_iter(groups, *, device):
+        groups = tuple(tuple(group) for group in groups)
+        loaded_names.extend(name for group in groups for name in group)
+        return original_iter(groups, device=device)
 
-    monkeypatch.setattr(source, "load_tensors", recording_load)
+    monkeypatch.setattr(source, "iter_tensor_groups", recording_iter)
     loader = TargetWeightLoader(model, source)
 
     with loader.loaded("", device=torch.device("cpu"), dtype=torch.float32):

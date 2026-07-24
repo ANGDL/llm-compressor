@@ -5,8 +5,9 @@ from __future__ import annotations
 import json
 import struct
 from collections import defaultdict
+from contextlib import ExitStack
 from pathlib import Path
-from typing import Collection, Iterable, Protocol
+from typing import Collection, Iterable, Iterator, Protocol
 
 import torch
 from safetensors import safe_open
@@ -24,6 +25,10 @@ class CheckpointWeightSource(Protocol):
     def load_tensors(
         self, names: Iterable[str], *, device: torch.device
     ) -> dict[str, torch.Tensor]: ...
+
+    def iter_tensor_groups(
+        self, groups: Iterable[Iterable[str]], *, device: torch.device
+    ) -> Iterator[dict[str, torch.Tensor]]: ...
 
 
 class SafetensorsWeightSource:
@@ -60,6 +65,35 @@ class SafetensorsWeightSource:
                     else:
                         result[name] = file.get_tensor(name)
         return result
+
+    def iter_tensor_groups(
+        self, groups: Iterable[Iterable[str]], *, device: torch.device
+    ) -> Iterator[dict[str, torch.Tensor]]:
+        """Yield bounded tensor groups while reusing open shard handles."""
+
+        device = torch.device(device)
+        if device.type == "meta":
+            raise ValueError("Cannot load checkpoint tensors onto the meta device")
+
+        requested_groups = [tuple(dict.fromkeys(group)) for group in groups]
+        with ExitStack() as stack:
+            handles = {}
+            for names in requested_groups:
+                values = {}
+                for name in names:
+                    metadata = self.metadata(name)
+                    shard = metadata.shard
+                    if shard not in handles:
+                        handles[shard] = stack.enter_context(
+                            safe_open(shard, framework="pt", device=str(device))
+                        )
+                    file = handles[shard]
+                    tensor_slice = file.get_slice(name)
+                    if tensor_slice.get_dtype() == "F8_E8M0":
+                        values[name] = _read_e8m0(shard, name).to(device)
+                    else:
+                        values[name] = file.get_tensor(name)
+                yield values
 
 
 def _read_e8m0(shard: Path, name: str) -> torch.Tensor:
