@@ -12,7 +12,7 @@ from llmcompressor.pipelines.cache import IntermediatesCache
 from llmcompressor.pipelines.registry import CalibrationPipeline
 from llmcompressor.pipelines.sequential.helpers import handle_sequential_oom
 from llmcompressor.pipelines.sequential.plan import trace_sequential_plan
-from llmcompressor.utils.dev import get_main_device
+from llmcompressor.utils.dev import resolve_execution_device
 from llmcompressor.utils.helpers import DisableQuantization, calibration_forward_context
 from llmcompressor.utils.pytorch.module import infer_sequential_targets
 
@@ -80,7 +80,7 @@ class SequentialPipeline(CalibrationPipeline):
         session = active_session()
 
         # prepare model for sequential onloading
-        onload_device = get_main_device()
+        onload_device = resolve_execution_device()
         offload_device = torch.device(dataset_args.sequential_offload_device)
         set_onload_device(model, onload_device)
 

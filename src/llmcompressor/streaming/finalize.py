@@ -14,6 +14,8 @@ import torch
 from loguru import logger
 from safetensors import safe_open
 
+from llmcompressor.transformers.utils import RECIPE_FILE_NAME
+
 from .artifacts import ArtifactStore, fingerprint_checkpoint
 from .materialization import CastWeightMaterializer, WeightMaterializer
 
@@ -110,6 +112,10 @@ def finalize_streaming_checkpoint(
     materializer: WeightMaterializer | None = None,
     copy_auxiliary_files: bool = True,
     validate_config: bool = True,
+    cleanup_staging: bool = False,
+    publish_in_place: bool = False,
+    overwrite_output: bool = False,
+    recipe_yaml: str | None = None,
 ) -> Path:
     """Publish complete staging shards as a standard indexed checkpoint."""
     source_dir = Path(checkpoint).expanduser().resolve()
@@ -119,8 +125,13 @@ def finalize_streaming_checkpoint(
         raise ValueError(f"checkpoint must be a directory: {source_dir}")
     if output == source_dir:
         raise ValueError("output_dir must differ from the source checkpoint")
-    if output.exists():
+    if output.exists() and any(output.iterdir()) and not overwrite_output:
         raise FileExistsError(f"Refusing to overwrite existing output: {output}")
+    if publish_in_place and staging.stat().st_dev != output.parent.stat().st_dev:
+        raise OSError(
+            "work_dir and output_dir must be on the same filesystem for "
+            "copy-free publication"
+        )
 
     store = ArtifactStore(artifact_dir)
     manifest = store.load_manifest()
@@ -134,28 +145,31 @@ def finalize_streaming_checkpoint(
     materializer = materializer or CastWeightMaterializer()
     source = materializer.create_source(str(source_dir))
     source_names = set(source.tensor_names())
-    expected_shards = {
-        source.metadata(name).shard.name for name in source_names
-    }
-    shards_dir = staging / "shards"
-    states_dir = staging / "state"
+    shards_dir = staging if publish_in_place else staging / "shards"
+    states_dir = (
+        staging / ".streaming-state"
+        if publish_in_place
+        else staging / "state"
+    )
     if not shards_dir.is_dir() or not states_dir.is_dir():
         raise RuntimeError("Staging directory is incomplete")
     actual_shards = {path.name for path in shards_dir.glob("*.safetensors")}
     actual_states = {
         path.name.removesuffix(".json") for path in states_dir.glob("*.json")
     }
-    if actual_shards != expected_shards or actual_states != expected_shards:
+    if not actual_shards or actual_shards != actual_states:
         raise RuntimeError(
-            "Staging directory is incomplete: shard set does not match the "
-            "source checkpoint; "
-            f"expected={sorted(expected_shards)}, "
+            "Staging directory is incomplete: every final shard must have "
+            "exactly one state record; "
             f"shards={sorted(actual_shards)}, states={sorted(actual_states)}"
         )
+    expected_shards = actual_shards
 
-    temporary = output.parent / f".{output.name}.{uuid.uuid4().hex}.tmp"
+    temporary = staging if publish_in_place else (
+        output.parent / f".{output.name}.{uuid.uuid4().hex}.tmp"
+    )
     try:
-        temporary.mkdir(parents=True)
+        temporary.mkdir(parents=True, exist_ok=publish_in_place)
         output_shards: dict[str, dict[str, tuple[int, ...]]] = {}
         total_size = 0
         for shard_name in sorted(expected_shards):
@@ -174,7 +188,12 @@ def finalize_streaming_checkpoint(
                 raise ValueError(f"State total_size disagrees with {shard_name!r}")
             output_shards[shard_name] = headers
             total_size += shard_size
-            shutil.copy2(shard, temporary / shard_name)
+            if not publish_in_place:
+                destination = temporary / shard_name
+                try:
+                    os.link(shard, destination)
+                except OSError:
+                    shutil.copy2(shard, destination)
 
         weight_map: dict[str, str] = {}
         for shard_name, headers in output_shards.items():
@@ -271,11 +290,20 @@ def finalize_streaming_checkpoint(
                 materializer.output_config_updates(),
             ),
         )
+        if recipe_yaml is not None:
+            recipe_content = recipe_yaml.encode("utf-8")
+            if recipe_content and not recipe_content.endswith(b"\n"):
+                recipe_content += b"\n"
+            recipe_path = temporary / RECIPE_FILE_NAME
+            with recipe_path.open("wb") as file:
+                file.write(recipe_content)
+                file.flush()
+                os.fsync(file.fileno())
 
         if copy_auxiliary_files:
             for path in source_dir.iterdir():
                 if (
-                    path.name in {"config.json", _INDEX_NAME}
+                    path.name in {"config.json", RECIPE_FILE_NAME, _INDEX_NAME}
                     or path.suffix == ".safetensors"
                 ):
                     continue
@@ -288,8 +316,34 @@ def finalize_streaming_checkpoint(
         if validate_config:
             _validate_transformers_config(temporary)
         (temporary / _FINALIZED).write_bytes(b"")
-        os.replace(temporary, output)
+        if publish_in_place:
+            shutil.rmtree(states_dir)
+            backup = temporary.parent / "replaced-output"
+            if backup.exists():
+                raise FileExistsError(
+                    f"Cannot safely replace output while backup exists: {backup}"
+                )
+            replaced = False
+            if output.exists():
+                if any(output.iterdir()):
+                    os.replace(output, backup)
+                    replaced = True
+                else:
+                    output.rmdir()
+            try:
+                os.replace(temporary, output)
+            except Exception:
+                if replaced and not output.exists():
+                    os.replace(backup, output)
+                raise
+            if replaced:
+                shutil.rmtree(backup)
+        else:
+            os.replace(temporary, output)
     except Exception:
-        shutil.rmtree(temporary, ignore_errors=True)
+        if not publish_in_place:
+            shutil.rmtree(temporary, ignore_errors=True)
         raise
+    if cleanup_staging:
+        shutil.rmtree(staging)
     return output

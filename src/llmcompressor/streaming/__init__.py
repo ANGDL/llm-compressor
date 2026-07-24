@@ -23,12 +23,19 @@ from .artifacts import (
 from .checkpoint import (
     CheckpointWeightSource,
     SafetensorsWeightSource,
+    StreamingCheckpointWriter,
     TensorMetadata,
+    TensorRecord,
     WeightMap,
 )
 from .collect import collect_calibration_statistics
 from .finalize import finalize_streaming_checkpoint
-from .loading import TargetWeightLoader, build_meta_model
+from .loading import (
+    LoadedSubgraph,
+    SubgraphWeightSession,
+    TargetWeightLoader,
+    build_meta_model,
+)
 from .materialization import (
     CastWeightMaterializer,
     DeepSeekV4WeightMaterializer,
@@ -60,17 +67,21 @@ __all__ = [
     "IMatrixStatisticsCollector",
     "InMemoryBoundaryActivationStore",
     "MaterializerInfo",
+    "LoadedSubgraph",
     "RecipeInfo",
     "SequentialInfo",
     "SoftwareInfo",
     "SourceCheckpointInfo",
     "SafetensorsWeightSource",
     "StreamingRunManifest",
+    "StreamingCheckpointWriter",
     "StatisticsCollectorGroup",
     "TargetStatisticsMetadata",
     "TargetWeightLoader",
+    "SubgraphWeightSession",
     "TracedBoundaryAdapter",
     "TensorMetadata",
+    "TensorRecord",
     "WeightMap",
     "WeightMaterializer",
     "fingerprint_checkpoint",

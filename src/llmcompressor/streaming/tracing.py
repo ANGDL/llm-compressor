@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Iterator
 
@@ -16,9 +15,14 @@ from llmcompressor.pipelines.sequential.plan import (
     SequentialExecutionPlan,
     trace_sequential_plan,
 )
+from llmcompressor.utils.helpers import (
+    disable_cache,
+    disable_hf_kernels,
+    eval_context,
+)
 
 from .checkpoint import CheckpointWeightSource
-from .loading import TargetWeightLoader
+from .loading import SubgraphWeightSession, TargetWeightLoader
 from .materialization import WeightMaterializer
 
 __all__ = ["TracedBoundaryAdapter", "trace_streaming_boundaries"]
@@ -66,26 +70,6 @@ def _move_tensors(value: Any, device: torch.device) -> Any:
     return value
 
 
-@contextmanager
-def _loaded_modules(
-    loader: TargetWeightLoader,
-    module_names: Sequence[str],
-    *,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> Iterator[None]:
-    contexts = []
-    try:
-        for name in module_names:
-            context = loader.loaded(name, device=device, dtype=dtype)
-            context.__enter__()
-            contexts.append(context)
-        yield
-    finally:
-        for context in reversed(contexts):
-            context.__exit__(None, None, None)
-
-
 @dataclass
 class TracedBoundaryAdapter:
     """Execute original sequential subgraphs with checkpoint-backed weights."""
@@ -93,10 +77,9 @@ class TracedBoundaryAdapter:
     model: nn.Module
     plan: SequentialExecutionPlan
     loader: TargetWeightLoader
+    weight_session: SubgraphWeightSession
     device: torch.device
     dtype: torch.dtype
-    _prefix_modules: tuple[str, ...]
-    _target_modules: tuple[tuple[str, ...], ...]
     _target_subgraphs: tuple[Subgraph, ...]
 
     @property
@@ -117,13 +100,18 @@ class TracedBoundaryAdapter:
         """Execute the traced prefix without rewriting the model input contract."""
 
         prefix = self.plan.subgraphs[0]
-        with _loaded_modules(
-            self.loader,
-            self._prefix_modules,
+        with self.weight_session.loaded(
+            prefix,
             device=self.device,
             dtype=self.dtype,
+            include_modules=self._prefix_fallback_modules(),
         ):
-            with torch.no_grad():
+            with (
+                torch.no_grad(),
+                disable_cache(self.model),
+                eval_context(self.model),
+                disable_hf_kernels(self.model),
+            ):
                 for batch in batches:
                     if not isinstance(batch, Mapping):
                         raise TypeError(
@@ -132,6 +120,19 @@ class TracedBoundaryAdapter:
                     values = _move_tensors(dict(batch), self.device)
                     inputs = {name: values[name] for name in prefix.input_names}
                     yield prefix.forward(self.model, **inputs)
+
+    def _prefix_fallback_modules(self) -> tuple[str, ...]:
+        """Cover embeddings hidden behind traced call_function nodes."""
+
+        if "input_ids" not in self.plan.subgraphs[0].input_names:
+            return ()
+        get_embeddings = getattr(self.model, "get_input_embeddings", None)
+        if not callable(get_embeddings):
+            return ()
+        embedding = get_embeddings()
+        return tuple(
+            name for name, module in self.model.named_modules() if module is embedding
+        )
 
     def forward_target(self, target: nn.Module, value: Mapping[str, Any]):
         """Execute the original target partition from the shared trace plan."""
@@ -145,11 +146,11 @@ class TracedBoundaryAdapter:
         original = self.model.get_submodule(target_name)
         self.model.set_submodule(target_name, target)
         try:
-            with _loaded_modules(
-                self.loader,
-                self._target_modules[target_index],
+            with self.weight_session.loaded(
+                subgraph,
                 device=self.device,
                 dtype=self.dtype,
+                exclude_modules=(target_name,),
             ):
                 output = subgraph.forward(self.model, **inputs)
         finally:
@@ -188,29 +189,6 @@ def trace_streaming_boundaries(
             f"expected {plan.target_names}, got {tuple(target_names)}"
         )
 
-    prefix = plan.subgraphs[0]
-    prefix_modules = []
-    available = set(source.tensor_names())
-    input_embedding = (
-        model.get_input_embeddings()
-        if hasattr(model, "get_input_embeddings")
-        else None
-    )
-    embedding_name = next(
-        (name for name, module in model.named_modules() if module is input_embedding),
-        None,
-    )
-    if "input_ids" in prefix.input_names and embedding_name is not None:
-        prefix_modules.append(embedding_name)
-    for node in prefix.graph.find_nodes(op="call_module"):
-        name = str(node.target)
-        if any(
-            tensor == name or tensor.startswith(f"{name}.")
-            for tensor in available
-        ):
-            prefix_modules.append(name)
-
-    target_modules = []
     target_subgraphs = []
     for target_index, subgraph_index in enumerate(plan.target_subgraph_indices):
         target_name = plan.target_names[target_index]
@@ -218,25 +196,16 @@ def trace_streaming_boundaries(
             plan.subgraphs[subgraph_index], target_name
         )
         target_subgraphs.append(target_subgraph)
-        dependencies = []
-        for node in target_subgraph.graph.find_nodes(op="call_module"):
-            name = str(node.target)
-            if name == target_name or name.startswith(f"{target_name}."):
-                continue
-            if any(
-                tensor == name or tensor.startswith(f"{name}.")
-                for tensor in available
-            ):
-                dependencies.append(name)
-        target_modules.append(tuple(dict.fromkeys(dependencies)))
+
+    loader = TargetWeightLoader(model, source, materializer)
+    weight_session = SubgraphWeightSession(model, source, materializer)
 
     return TracedBoundaryAdapter(
         model=model,
         plan=plan,
-        loader=TargetWeightLoader(model, source, materializer),
+        loader=loader,
+        weight_session=weight_session,
         device=torch.device(device),
         dtype=dtype,
-        _prefix_modules=tuple(dict.fromkeys(prefix_modules)),
-        _target_modules=tuple(target_modules),
         _target_subgraphs=tuple(target_subgraphs),
     )

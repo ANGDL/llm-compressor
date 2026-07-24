@@ -62,8 +62,6 @@ class WeightMaterializer(ABC):
         device: torch.device,
     ) -> torch.Tensor:
         """Return one logical weight in the requested dtype and device."""
-
-
 def materialize_weights(
     source: CheckpointWeightSource,
     names: Iterable[str],

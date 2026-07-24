@@ -33,11 +33,31 @@ def _contains_kv_cache_name(name: object) -> bool:
     return isinstance(name, str) and name.lower() in _KV_CACHE_NAMES
 
 
-def _snapshot(value: Any, device: torch.device, path: str = "value") -> Any:
+def _snapshot(
+    value: Any,
+    device: torch.device,
+    path: str = "value",
+    *,
+    memo: dict[int, torch.Tensor] | None = None,
+    content_candidates: dict[tuple, list[torch.Tensor]] | None = None,
+) -> Any:
     """Detach supported values and reject opaque or KV-cache objects."""
 
     if isinstance(value, torch.Tensor):
-        return value.detach().to(device=device).clone()
+        memo = memo if memo is not None else {}
+        identity = id(value)
+        if identity in memo:
+            return memo[identity]
+        snapshot = value.detach().to(device=device).clone()
+        if content_candidates is not None:
+            signature = (snapshot.dtype, tuple(snapshot.shape))
+            for candidate in content_candidates.get(signature, ()):
+                if torch.equal(snapshot, candidate):
+                    memo[identity] = candidate
+                    return candidate
+            content_candidates.setdefault(signature, []).append(snapshot)
+        memo[identity] = snapshot
+        return snapshot
     if isinstance(value, _PRIMITIVE_TYPES):
         return value
     if is_dataclass(value) and not isinstance(value, type):
@@ -50,7 +70,11 @@ def _snapshot(value: Any, device: torch.device, path: str = "value") -> Any:
                     "boundary storage"
                 )
             values[field.name] = _snapshot(
-                field_value, device, f"{path}.{field.name}"
+                field_value,
+                device,
+                f"{path}.{field.name}",
+                memo=memo,
+                content_candidates=content_candidates,
             )
         try:
             return type(value)(**values)
@@ -60,12 +84,24 @@ def _snapshot(value: Any, device: torch.device, path: str = "value") -> Any:
             ) from error
     if isinstance(value, list):
         return [
-            _snapshot(item, device, f"{path}[{index}]")
+            _snapshot(
+                item,
+                device,
+                f"{path}[{index}]",
+                memo=memo,
+                content_candidates=content_candidates,
+            )
             for index, item in enumerate(value)
         ]
     if isinstance(value, tuple):
         return tuple(
-            _snapshot(item, device, f"{path}[{index}]")
+            _snapshot(
+                item,
+                device,
+                f"{path}[{index}]",
+                memo=memo,
+                content_candidates=content_candidates,
+            )
             for index, item in enumerate(value)
         )
     if isinstance(value, dict):
@@ -79,33 +115,47 @@ def _snapshot(value: Any, device: torch.device, path: str = "value") -> Any:
                 raise TypeError(
                     f"KV cache field {path}.{key} is not supported by boundary storage"
                 )
-            result[key] = _snapshot(item, device, f"{path}.{key}")
+            result[key] = _snapshot(
+                item,
+                device,
+                f"{path}.{key}",
+                memo=memo,
+                content_candidates=content_candidates,
+            )
         return result
     raise TypeError(
         f"Unsupported boundary value type {type(value).__qualname__} at {path}"
     )
 
 
-def _move(value: Any, device: torch.device) -> Any:
+def _move(
+    value: Any,
+    device: torch.device,
+    memo: dict[int, torch.Tensor] | None = None,
+) -> Any:
     """Rebuild a stored value with tensors moved to the consumer device."""
 
     if isinstance(value, torch.Tensor):
-        return value.to(device=device).clone()
+        memo = memo if memo is not None else {}
+        identity = id(value)
+        if identity not in memo:
+            memo[identity] = value.to(device=device).clone()
+        return memo[identity]
     if isinstance(value, _PRIMITIVE_TYPES):
         return value
     if is_dataclass(value) and not isinstance(value, type):
         return type(value)(
             **{
-                field.name: _move(getattr(value, field.name), device)
+                field.name: _move(getattr(value, field.name), device, memo)
                 for field in fields(value)
             }
         )
     if isinstance(value, list):
-        return [_move(item, device) for item in value]
+        return [_move(item, device, memo) for item in value]
     if isinstance(value, tuple):
-        return tuple(_move(item, device) for item in value)
+        return tuple(_move(item, device, memo) for item in value)
     if isinstance(value, dict):
-        return {key: _move(item, device) for key, item in value.items()}
+        return {key: _move(item, device, memo) for key, item in value.items()}
     raise TypeError(f"Stored boundary value has unsupported type {type(value)!r}")
 
 
@@ -165,16 +215,27 @@ class BoundaryActivationStore(ABC):
 class InMemoryBoundaryActivationStore(BoundaryActivationStore):
     """Keep detached activation snapshots on a configured device."""
 
-    def __init__(self, storage_device: torch.device | str = "cpu"):
+    def __init__(
+        self,
+        storage_device: torch.device | str = "cpu",
+        *,
+        deduplicate_tensors: bool = False,
+    ):
         self.storage_device = torch.device(storage_device)
         if self.storage_device.type == "meta":
             raise ValueError("Boundary activations cannot be stored on meta")
+        self.deduplicate_tensors = deduplicate_tensors
         self._boundaries: dict[int, dict[int, Any]] = {}
 
     def put(self, boundary: int, batch: int, value: Any) -> None:
         _check_index(boundary, "boundary")
         _check_index(batch, "batch")
-        snapshot = _snapshot(value, self.storage_device)
+        snapshot = _snapshot(
+            value,
+            self.storage_device,
+            memo={},
+            content_candidates={} if self.deduplicate_tensors else None,
+        )
         self._boundaries.setdefault(boundary, {})[batch] = snapshot
 
     def get(
@@ -188,7 +249,7 @@ class InMemoryBoundaryActivationStore(BoundaryActivationStore):
             raise KeyError(
                 f"Boundary {boundary}, batch {batch} is not committed"
             ) from error
-        return _move(value, torch.device(device))
+        return _move(value, torch.device(device), memo={})
 
     def batch_indices(self, boundary: int) -> tuple[int, ...]:
         _check_index(boundary, "boundary")

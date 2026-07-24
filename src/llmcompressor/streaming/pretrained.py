@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 from collections.abc import Callable
 from contextlib import ExitStack
 from copy import deepcopy
@@ -27,15 +28,26 @@ from llmcompressor.modifiers.quantization import QuantizationModifier
 from llmcompressor.recipe import Recipe
 
 from .artifacts import fingerprint_json
+from .finalize import finalize_streaming_checkpoint
 from .loading import build_meta_model
 from .materialization import CastWeightMaterializer, WeightMaterializer
-from .oneshot import _streaming_oneshot_from_boundaries
+from .output import build_quantization_config
+from .pipeline import run_subgraph_streaming_pipeline
 from .tracing import trace_streaming_boundaries
 
 __all__ = ["streaming_oneshot_from_pretrained"]
 
 
 def _recipe_quantizer(recipe: Recipe):
+    if any(
+        type(modifier).__name__ == "AutoRoundModifier"
+        for modifier in recipe.modifiers
+    ):
+        raise ValueError(
+            "Pretrained streaming mode does not yet support AutoRound: its "
+            "modifier owns quantization and checkpoint compression, which needs "
+            "a dedicated streaming output adapter"
+        )
     quantizers = [
         modifier
         for modifier in recipe.modifiers
@@ -46,16 +58,24 @@ def _recipe_quantizer(recipe: Recipe):
             "Pretrained streaming mode requires exactly one "
             "QuantizationModifier or GPTQModifier"
         )
+    supported_transforms = {
+        "AWQModifier",
+        "IMatrixGatherer",
+        "SparseGPTModifier",
+        "SmoothQuantModifier",
+        "WandaPruningModifier",
+    }
     unsupported = [
         type(modifier).__name__
         for modifier in recipe.modifiers
         if modifier is not quantizers[0]
-        and type(modifier).__name__ != "IMatrixGatherer"
+        and type(modifier).__name__ not in supported_transforms
     ]
     if unsupported:
         raise ValueError(
-            "Pretrained streaming mode only supports IMatrixGatherer plus one "
-            f"quantizer; got {unsupported}"
+            "Pretrained streaming mode supports AWQ, SmoothQuant, iMatrix, "
+            "SparseGPT, or Wanda plus one quantizer; "
+            f"got unsupported modifiers {unsupported}"
         )
     return quantizers[0]
 
@@ -157,9 +177,45 @@ def streaming_oneshot_from_pretrained(
     dampening_frac: float,
     seed: int | None,
     validate_config: bool,
+    checkpoint_progress: bool,
+    overwrite_output: bool,
 ) -> Path:
     """Run traced streaming PTQ with an oneshot-like model/dataset interface."""
     checkpoint = Path(model).expanduser()
+    output = Path(output_dir).expanduser()
+    work = Path(work_dir).expanduser()
+    resolved_output = output.resolve()
+    resolved_work = work.resolve()
+    if resolved_work.is_relative_to(resolved_output):
+        raise ValueError(
+            "work_dir must not be inside output_dir; use sibling directories so "
+            "working artifacts do not make output_dir appear pre-existing"
+        )
+    if resolved_output.is_relative_to(resolved_work):
+        raise ValueError(
+            "output_dir must not be inside work_dir; use sibling directories"
+        )
+    work.mkdir(parents=True, exist_ok=True)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    if not checkpoint_progress and work.stat().st_dev != output.parent.stat().st_dev:
+        raise OSError(
+            "work_dir and output_dir must be on the same filesystem for "
+            "copy-free publication"
+        )
+    if (
+        output.exists()
+        and (output / "FINALIZED").is_file()
+        and not overwrite_output
+    ):
+        return output
+    if output.exists() and any(output.iterdir()) and not overwrite_output:
+        raise FileExistsError(
+            f"Refusing to overwrite existing output: {output}. Pass "
+            "overwrite_output=True to replace it."
+        )
+    publish = work / "publish"
+    if not checkpoint_progress and publish.exists():
+        shutil.rmtree(publish)
     if not checkpoint.is_dir():
         raise ValueError("Pretrained streaming mode requires a local model directory")
     config = model_config or AutoConfig.from_pretrained(
@@ -184,27 +240,36 @@ def streaming_oneshot_from_pretrained(
         raise ValueError("Streaming PTQ requires calibration data")
 
     parsed_recipe = Recipe.create_instance(recipe)
+    for modifier in parsed_recipe.modifiers:
+        if type(modifier).__name__ == "IMatrixGatherer":
+            modifier.attach_by_initialize = False
     quantizer = _recipe_quantizer(parsed_recipe)
     meta_model = build_meta_model(
         AutoModelForCausalLM.from_config,
         config,
-        attn_implementation="eager",
         keep_nonpersistent_buffers=True,
     )
     schemes = _exact_schemes(meta_model, quantizer)
-    normalized_recipe = parsed_recipe.model_dump(mode="json")
     uses_imatrix = any(
         scheme.weights is not None and scheme.weights.observer == "imatrix_mse"
         for scheme in schemes.values()
     )
-    use_gptq = isinstance(quantizer, GPTQModifier)
-    if not use_gptq and not uses_imatrix:
-        raise ValueError("RTN streaming PTQ requires weights.observer='imatrix_mse'")
-    algorithms = tuple(
-        name
-        for name, enabled in (("gptq", use_gptq), ("imatrix", uses_imatrix))
-        if enabled
+    uses_calibration_transform = any(
+        type(modifier).__name__
+        in {
+            "AWQModifier",
+            "SmoothQuantModifier",
+            "SparseGPTModifier",
+            "WandaPruningModifier",
+        }
+        for modifier in parsed_recipe.modifiers
     )
+    use_gptq = isinstance(quantizer, GPTQModifier)
+    if not use_gptq and not uses_imatrix and not uses_calibration_transform:
+        raise ValueError(
+            "RTN streaming PTQ requires a calibration modifier or "
+            "weights.observer='imatrix_mse'"
+        )
     device = torch.device(device)
     fingerprint = _dataset_fingerprint(
         dataset,
@@ -238,6 +303,7 @@ def streaming_oneshot_from_pretrained(
                 getattr(meta_model, "_no_split_modules", ())
                 or getattr(config, "_no_split_modules", ())
             ),
+            materializer=materializer,
             device=device,
             dtype=target_dtype,
         )
@@ -257,32 +323,32 @@ def streaming_oneshot_from_pretrained(
                 f"{missing}"
             )
 
-        def boundaries():
-            return adapter.calibration_boundaries(dataloader)
-
-        return _streaming_oneshot_from_boundaries(
-            model_factory=AutoModelForCausalLM.from_config,
+        artifact_dir, staging_dir = run_subgraph_streaming_pipeline(
+            adapter=adapter,
             checkpoint=checkpoint,
-            output_dir=output_dir,
             work_dir=work_dir,
-            calibration_batches=boundaries,
-            targets=targets,
-            recipe=normalized_recipe,
+            calibration_batches=dataloader,
+            recipe=parsed_recipe,
             dataset_fingerprint=fingerprint,
-            schemes=schemes,
-            model_args=(config,),
-            model_kwargs={"attn_implementation": "eager"},
-            execution_model=meta_model,
             materializer=materializer,
-            forward_target=adapter.forward_target,
-            algorithms=algorithms,
-            use_gptq=use_gptq,
             device=device,
             target_dtype=target_dtype,
-            blocksize=blocksize,
-            dampening_frac=dampening_frac,
             num_samples=num_calibration_samples,
             max_seq_length=max_seq_length,
             seed=seed,
+            checkpoint_progress=checkpoint_progress,
+        )
+        qconfig = build_quantization_config(quantizer.resolved_config)
+        return finalize_streaming_checkpoint(
+            checkpoint=checkpoint,
+            artifact_dir=artifact_dir,
+            staging_dir=staging_dir,
+            output_dir=output_dir,
+            quantization_config=qconfig,
+            materializer=materializer,
             validate_config=validate_config,
+            cleanup_staging=False,
+            publish_in_place=not checkpoint_progress,
+            overwrite_output=overwrite_output,
+            recipe_yaml=parsed_recipe.yaml(),
         )

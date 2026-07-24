@@ -2,15 +2,10 @@
 
 from __future__ import annotations
 
-import json
-import os
-import shutil
-import uuid
 from collections import defaultdict
 from collections.abc import Mapping
 from copy import deepcopy
 from pathlib import Path
-from typing import Any
 
 import torch
 from compressed_tensors.compressors import compress_module
@@ -36,7 +31,10 @@ from .artifacts import (
     fingerprint_checkpoint,
     fingerprint_json,
 )
-from .checkpoint import SafetensorsWeightSource  # noqa: F401
+from .checkpoint import (
+    SafetensorsWeightSource,  # noqa: F401
+    StreamingCheckpointWriter,
+)
 from .materialization import (
     CastWeightMaterializer,
     WeightMaterializer,
@@ -44,88 +42,6 @@ from .materialization import (
 from .tied_weights import infer_transformers_tied_weights
 
 __all__ = ["quantize_streaming"]
-
-
-def _atomic_json(path: Path, value: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    try:
-        with temporary.open("w", encoding="utf-8") as file:
-            json.dump(value, file, ensure_ascii=False, indent=2, sort_keys=True)
-            file.write("\n")
-            file.flush()
-            os.fsync(file.fileno())
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
-_SAFETENSORS_DTYPES = {
-    torch.bool: "BOOL",
-    torch.float16: "F16",
-    torch.bfloat16: "BF16",
-    torch.float32: "F32",
-    torch.float64: "F64",
-    torch.int8: "I8",
-    torch.int16: "I16",
-    torch.int32: "I32",
-    torch.int64: "I64",
-    torch.uint8: "U8",
-}
-for _dtype, _name in (
-    ("float8_e4m3fn", "F8_E4M3"),
-    ("float8_e5m2", "F8_E5M2"),
-):
-    if hasattr(torch, _dtype):
-        _SAFETENSORS_DTYPES[getattr(torch, _dtype)] = _name
-
-
-def _write_tensor_bytes(
-    path: Path, tensor: torch.Tensor
-) -> tuple[str, tuple[int, ...], int]:
-    value = tensor.detach().to("cpu").contiguous()
-    try:
-        dtype_name = _SAFETENSORS_DTYPES[value.dtype]
-    except KeyError as error:
-        raise TypeError(f"Unsupported output dtype {value.dtype}") from error
-    storage = value.view(torch.uint8).numpy().tobytes()
-    path.write_bytes(storage)
-    return dtype_name, tuple(value.shape), len(storage)
-
-
-def _write_streaming_safetensors(
-    path: Path,
-    records: Mapping[str, tuple[Path, str, tuple[int, ...], int]],
-) -> int:
-    """Assemble a safetensors file from per-tensor disk records."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    offset = 0
-    header = {}
-    for name in sorted(records):
-        _tensor_path, dtype_name, shape, size = records[name]
-        header[name] = {
-            "dtype": dtype_name,
-            "shape": list(shape),
-            "data_offsets": [offset, offset + size],
-        }
-        offset += size
-    encoded = json.dumps(header, separators=(",", ":")).encode("utf-8")
-    # Safetensors requires the JSON header to be padded to an 8-byte boundary.
-    encoded += b" " * ((8 - len(encoded) % 8) % 8)
-    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    try:
-        with temporary.open("wb") as output:
-            output.write(len(encoded).to_bytes(8, byteorder="little"))
-            output.write(encoded)
-            for name in sorted(records):
-                with records[name][0].open("rb") as tensor_file:
-                    shutil.copyfileobj(tensor_file, output)
-            output.flush()
-            os.fsync(output.fileno())
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
-    return offset
 
 
 def _scheme_fingerprint(
@@ -303,8 +219,9 @@ def quantize_streaming(
         )
 
     staging = Path(staging_dir)
-    shards_dir = staging / "shards"
-    states_dir = staging / "state"
+    writer = StreamingCheckpointWriter(
+        staging, run_fingerprint=run_fingerprint
+    )
     device = torch.device(device)
     source_names = set(source.tensor_names())
     omitted_tied_weights = {}
@@ -325,118 +242,92 @@ def quantize_streaming(
         names_by_shard.items(), key=lambda item: item[0].name
     ):
         output_name = source_shard.name
-        output_path = shards_dir / output_name
-        state_path = states_dir / f"{output_name}.json"
-        if state_path.is_file():
-            state = json.loads(state_path.read_text(encoding="utf-8"))
-            if state.get("run_fingerprint") != run_fingerprint:
-                raise ArtifactCompatibilityError(
-                    f"Staging shard {output_name!r} belongs to a different "
-                    "quantization configuration"
-                )
-            if state.get("completed") is True and output_path.is_file():
-                logger.info(
-                    f"streaming quantize: skipping complete shard {output_name}"
-                )
-                continue
+        transaction_id = f"source-shard-{output_name}"
+        if writer.is_transaction_complete(transaction_id):
+            logger.info(
+                f"streaming quantize: skipping complete shard {output_name}"
+            )
+            continue
 
         logger.info(f"streaming quantize: processing shard {output_name}")
-        tensor_dir = staging / "tensors" / output_name
-        if tensor_dir.exists():
-            shutil.rmtree(tensor_dir)
-        tensor_dir.mkdir(parents=True, exist_ok=True)
-        records: dict[str, tuple[Path, str, tuple[int, ...], int]] = {}
-        quantized_modules = []
-        module_formats = {}
         quantized_weights = {
             f"{module_name}.weight": (module_name, scheme)
             for module_name, scheme in schemes.items()
         }
-        for tensor_index, name in enumerate(names):
-            if name in quantized_weights:
-                module_name, scheme = quantized_weights[name]
+        with writer.transaction(transaction_id) as transaction:
+            for name in names:
+                if name in quantized_weights:
+                    module_name, scheme = quantized_weights[name]
+                    dependency_names = materializer.dependencies(
+                        name, source.metadata(name)
+                    )
+                    requested = [name, *dependency_names]
+                    raw_values = source.load_tensors(requested, device=device)
+                    weight = materializer.materialize(
+                        name,
+                        raw_values,
+                        target_dtype=target_dtype,
+                        device=device,
+                    )
+                    metadata = source.metadata(name)
+                    expected_shape = materializer.logical_shape(name, metadata)
+                    if (
+                        not weight.dtype.is_floating_point
+                        or weight.dtype != target_dtype
+                        or tuple(weight.shape) != expected_shape
+                        or weight.device != device
+                    ):
+                        raise ValueError(
+                            f"Materializer returned an invalid tensor for {name!r}"
+                        )
+                    module = _quantize_module(
+                        weight,
+                        deepcopy(scheme),
+                        statistics[module_name],
+                        device=device,
+                        use_gptq=use_gptq,
+                        blocksize=blocksize,
+                        dampening_frac=dampening_frac,
+                    )
+                    for module_tensor_name, output_value in module.state_dict(
+                        prefix=f"{module_name}."
+                    ).items():
+                        transaction.write_tensor(
+                            module_tensor_name,
+                            output_value,
+                            output_shard=output_name,
+                        )
+                    transaction.mark_quantized(
+                        module_name,
+                        scheme.format
+                        or infer_module_format(torch.nn.Linear, scheme).value,
+                    )
+                    del module, weight, raw_values
+                    continue
+
+                raw_values = source.load_tensors([name], device=device)
+                value = raw_values[name]
                 dependency_names = materializer.dependencies(
                     name, source.metadata(name)
                 )
-                requested = [name, *dependency_names]
-                raw_values = source.load_tensors(requested, device=device)
-                weight = materializer.materialize(
-                    name,
-                    raw_values,
-                    target_dtype=target_dtype,
-                    device=device,
-                )
-                metadata = source.metadata(name)
-                expected_shape = materializer.logical_shape(name, metadata)
-                if (
-                    not weight.dtype.is_floating_point
-                    or weight.dtype != target_dtype
-                    or tuple(weight.shape) != expected_shape
-                    or weight.device != device
-                ):
-                    raise ValueError(
-                        f"Materializer returned an invalid tensor for {name!r}"
+                if dependency_names:
+                    raw_values.update(
+                        source.load_tensors(dependency_names, device=device)
                     )
-                module = _quantize_module(
-                    weight,
-                    deepcopy(scheme),
-                    statistics[module_name],
-                    device=device,
-                    use_gptq=use_gptq,
-                    blocksize=blocksize,
-                    dampening_frac=dampening_frac,
-                )
-                for module_tensor_name, output_value in module.state_dict(
-                    prefix=f"{module_name}."
-                ).items():
-                    tensor_path = tensor_dir / (
-                        f"{tensor_index:08d}-{len(records):08d}.bin"
+                    value = materializer.materialize(
+                        name,
+                        raw_values,
+                        target_dtype=target_dtype,
+                        device=device,
                     )
-                    record = _write_tensor_bytes(tensor_path, output_value)
-                    records[module_tensor_name] = (tensor_path, *record)
-                quantized_modules.append(module_name)
-                module_formats[module_name] = (
-                    scheme.format
-                    or infer_module_format(torch.nn.Linear, scheme).value
-                )
-                del module, weight, raw_values
-                continue
+                transaction.write_tensor(name, value, output_shard=output_name)
+                del raw_values, value
 
-            raw_values = source.load_tensors([name], device=device)
-            value = raw_values[name]
-            dependency_names = materializer.dependencies(
-                name, source.metadata(name)
-            )
-            if dependency_names:
-                raw_values.update(
-                    source.load_tensors(dependency_names, device=device)
-                )
-                value = materializer.materialize(
-                    name,
-                    raw_values,
-                    target_dtype=target_dtype,
-                    device=device,
-                )
-            tensor_path = tensor_dir / f"{tensor_index:08d}-{len(records):08d}.bin"
-            record = _write_tensor_bytes(tensor_path, value)
-            records[name] = (tensor_path, *record)
-            del raw_values, value
-
-        total_size = _write_streaming_safetensors(output_path, records)
-        shutil.rmtree(tensor_dir)
-        state = {
-            "completed": True,
-            "output_shard": output_name,
-            "source_shard": source_shard.name,
-            "quantized_modules": sorted(quantized_modules),
-            "module_formats": module_formats,
-            "omitted_tied_weights": omitted_tied_weights,
-            "run_fingerprint": run_fingerprint,
-            "tensor_names": sorted(records),
-            "total_size": total_size,
-        }
-        _atomic_json(state_path, state)
+            for alias, canonical in omitted_tied_weights.items():
+                transaction.omit_tied_weight(alias, canonical)
+            transaction.commit()
         logger.info(f"streaming quantize: committed shard {output_name}")
-        records.clear()
+
+    writer.assemble_shards()
 
     return staging
