@@ -57,6 +57,11 @@ def test_weight_map_reads_metadata_without_loading_tensors(sharded_checkpoint):
         "layer1.scale",
         "layer1.weight",
     }
+    shard_indices = {
+        name: weight_map.metadata(name).storage_index
+        for name in ("layer0.bias", "layer0.weight")
+    }
+    assert len(set(shard_indices.values())) == 2
 
 
 def test_loads_only_requested_tensors_across_shards(sharded_checkpoint):

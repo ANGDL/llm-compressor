@@ -168,6 +168,68 @@ def test_materializer_supports_legacy_source_without_group_iterator(
     assert result["layer1.weight"].dtype == torch.bfloat16
 
 
+def test_large_materialization_reports_incremental_progress(tmp_path, monkeypatch):
+    from llmcompressor.streaming.materialization import base
+
+    path = tmp_path / "model.safetensors"
+    save_file(
+        {f"layer{index}.weight": torch.ones(1) for index in range(65)},
+        path,
+    )
+    messages = []
+    monkeypatch.setattr(base.logger, "info", messages.append)
+
+    result = materialize_weights(
+        SafetensorsWeightSource(path),
+        [f"layer{index}.weight" for index in range(65)],
+        CastWeightMaterializer(),
+        target_dtype=torch.bfloat16,
+        device=torch.device("cpu"),
+    )
+
+    assert len(result) == 65
+    assert any("loading tensors 1-64/65" in message for message in messages)
+    assert any("materialized 64/65 tensors" in message for message in messages)
+    assert any("materialized 65/65 tensors" in message for message in messages)
+
+
+def test_materializer_reads_tensors_in_physical_storage_order(tmp_path, monkeypatch):
+    path = tmp_path / "model.safetensors"
+    save_file(
+        {
+            "layer.1.weight": torch.ones(1),
+            "layer.10.weight": torch.ones(1),
+            "layer.2.weight": torch.ones(1),
+        },
+        path,
+    )
+    source = SafetensorsWeightSource(path)
+    requested = list(reversed(source.tensor_names()))
+    expected = sorted(
+        requested,
+        key=lambda name: source.metadata(name).storage_index,
+    )
+    observed = []
+    original_iter = source.iter_tensor_groups
+
+    def recording_iter(groups, *, device):
+        groups = tuple(tuple(group) for group in groups)
+        observed.extend(group[0] for group in groups)
+        return original_iter(groups, device=device)
+
+    monkeypatch.setattr(source, "iter_tensor_groups", recording_iter)
+
+    materialize_weights(
+        source,
+        requested,
+        CastWeightMaterializer(),
+        target_dtype=torch.bfloat16,
+        device=torch.device("cpu"),
+    )
+
+    assert observed == expected
+
+
 def test_missing_materializer_dependency_reports_name(sharded_checkpoint):
     source = SafetensorsWeightSource(sharded_checkpoint)
 

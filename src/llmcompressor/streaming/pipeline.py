@@ -57,8 +57,15 @@ def _reset_peak_memory(device: torch.device) -> None:
         torch.cuda.reset_peak_memory_stats(device)
 
 
-def _stage_logger(model: torch.nn.Module, name: str) -> CompressionLogger:
-    metrics = CompressionLogger(model)
+def _stage_logger(
+    model: torch.nn.Module, name: str, device: torch.device
+) -> CompressionLogger:
+    device_ids = (
+        (device.index if device.index is not None else torch.cuda.current_device(),)
+        if device.type == "cuda"
+        else ()
+    )
+    metrics = CompressionLogger(model, device_ids=device_ids)
     metrics.set_results(name=name)
     return metrics
 
@@ -352,7 +359,7 @@ def run_subgraph_streaming_pipeline(
         # Always recreate it when the first subgraph is incomplete so a crash
         # while snapshotting the dataloader cannot leave a partial input set.
         logger.info("streaming pipeline: collecting initial calibration boundary")
-        with _stage_logger(adapter.model, "streaming/initial_boundary"):
+        with _stage_logger(adapter.model, "streaming/initial_boundary", device):
             boundaries.delete(0)
             for batch_index, boundary in enumerate(
                 adapter.calibration_boundaries(calibration_batches)
@@ -365,7 +372,7 @@ def run_subgraph_streaming_pipeline(
 
     logger.info("streaming pipeline: initializing modifier session")
     with create_session() as session:
-        with _stage_logger(adapter.model, "streaming/session_initialize"):
+        with _stage_logger(adapter.model, "streaming/session_initialize", device):
             session.initialize(
                 model=adapter.model,
                 recipe=recipe,
@@ -440,7 +447,9 @@ def run_subgraph_streaming_pipeline(
                 weight_stack = ExitStack()
                 try:
                     with _stage_logger(
-                        adapter.model, f"{stage_prefix}/weight_materialization"
+                        adapter.model,
+                        f"{stage_prefix}/weight_materialization",
+                        device,
                     ):
                         loaded = weight_stack.enter_context(
                             adapter.weight_session.loaded(
@@ -452,7 +461,9 @@ def run_subgraph_streaming_pipeline(
                     # storage, this is required by models such as DeepSeek-V4
                     # whose attention updates runtime KV buffers in place.
                     with _stage_logger(
-                        adapter.model, f"{stage_prefix}/calibration_forward"
+                        adapter.model,
+                        f"{stage_prefix}/calibration_forward",
+                        device,
                     ):
                         with DisableQuantization(adapter.model), torch.no_grad():
                             for batch_index in batches:
@@ -467,7 +478,7 @@ def run_subgraph_streaming_pipeline(
                                 subgraph.forward(adapter.model, **inputs)
                                 del inputs, value
                     with _stage_logger(
-                        adapter.model, f"{stage_prefix}/modifier_update"
+                        adapter.model, f"{stage_prefix}/modifier_update", device
                     ):
                         LifecycleCallbacks.sequential_epoch_end(
                             subgraph.submodules(adapter.model)
@@ -476,7 +487,9 @@ def run_subgraph_streaming_pipeline(
                             if is_module_quantized(module):
                                 freeze_module_quantization(module)
                     with _stage_logger(
-                        adapter.model, f"{stage_prefix}/activation_propagation"
+                        adapter.model,
+                        f"{stage_prefix}/activation_propagation",
+                        device,
                     ):
                         with HooksMixin.disable_hooks(), torch.no_grad():
                             for batch_index in batches:
@@ -505,13 +518,15 @@ def run_subgraph_streaming_pipeline(
                                 del inputs, output, value
 
                     with _stage_logger(
-                        adapter.model, f"{stage_prefix}/weight_compression"
+                        adapter.model,
+                        f"{stage_prefix}/weight_compression",
+                        device,
                     ):
                         for module in subgraph.submodules(adapter.model):
                             if is_module_quantized(module):
                                 compress_module(module)
                     with _stage_logger(
-                        adapter.model, f"{stage_prefix}/checkpoint_write"
+                        adapter.model, f"{stage_prefix}/checkpoint_write", device
                     ):
                         if transaction_writer is not None:
                             with transaction_writer.transaction(
@@ -543,13 +558,15 @@ def run_subgraph_streaming_pipeline(
                             )
                 finally:
                     with _stage_logger(
-                        adapter.model, f"{stage_prefix}/weight_unload"
+                        adapter.model, f"{stage_prefix}/weight_unload", device
                     ):
                         weight_stack.close()
                         boundaries.delete(target_index)
                         _empty_device_cache(device)
         finally:
-            with _stage_logger(adapter.model, "streaming/session_finalize"):
+            with _stage_logger(
+                adapter.model, "streaming/session_finalize", device
+            ):
                 LifecycleCallbacks.calibration_end()
                 session.finalize()
             logger.info("streaming pipeline: modifier session finalized")
@@ -577,7 +594,9 @@ def run_subgraph_streaming_pipeline(
         if alias in source_names and canonical in source_names
     }
     logger.info("streaming pipeline: writing remaining non-subgraph tensors")
-    with _stage_logger(adapter.model, "streaming/remaining_checkpoint_write"):
+    with _stage_logger(
+        adapter.model, "streaming/remaining_checkpoint_write", device
+    ):
         if direct_writer is not None:
             _write_remaining_direct_shards(
                 writer=direct_writer,
