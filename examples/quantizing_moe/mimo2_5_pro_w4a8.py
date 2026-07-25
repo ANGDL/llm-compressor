@@ -19,7 +19,12 @@ from llmcompressor.pipelines.data_free import pipeline as data_free_pipeline
 from llmcompressor.modifiers.quantization import QuantizationModifier
 from llmcompressor.modifiers.gptq import GPTQModifier
 from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
-from compressed_tensors.quantization import preset_name_to_scheme
+from compressed_tensors.quantization import QuantizationScheme
+from compressed_tensors.quantization.quant_args import (
+    QuantizationArgs,
+    QuantizationStrategy,
+    QuantizationType,
+)
 from compressed_tensors.offload.dispatch import dispatch_model as _dispatch_model
 
 
@@ -586,18 +591,41 @@ def quantize_model(args):
         r"re:.*eh_proj$",
     ]
 
-    experts_w4a8_scheme = preset_name_to_scheme(
-        "W4A8",
-        [
-            r"re:.*mlp\.experts\.\d+\.(gate|up|down)_proj$",
-        ],
+    weights_args_4 = QuantizationArgs(
+        num_bits=4,
+        type=QuantizationType.INT,
+        strategy=QuantizationStrategy.CHANNEL,
+        symmetric=True,
+        dynamic=False,
     )
-    other_linear_w8a8_scheme = preset_name_to_scheme(
-        "W8A8",
-        [
+    weights_args_8 = QuantizationArgs(
+        num_bits=8,
+        type=QuantizationType.INT,
+        strategy=QuantizationStrategy.CHANNEL,
+        symmetric=True,
+        dynamic=False,
+    )
+    activations_args = QuantizationArgs(
+        num_bits=8,
+        type=QuantizationType.INT,
+        strategy=QuantizationStrategy.TOKEN,
+        symmetric=True,
+        dynamic=True,
+        observer=None,
+    )
+
+    experts_w4a8_scheme = QuantizationScheme(
+        targets=[r"re:.*mlp\.experts\.\d+\.(gate|up|down)_proj$"],
+        weights=weights_args_4,
+        input_activations=activations_args,
+    )
+    other_linear_w8a8_scheme = QuantizationScheme(
+        targets=[
             r"re:.*self_attn\.(q|k|v|o)_proj$",
             r"re:.*mlp\.(gate|up|down)_proj$",
         ],
+        weights=weights_args_8,
+        input_activations=activations_args,
     )
     config_groups = {
         "experts_w4a8": experts_w4a8_scheme,
@@ -607,12 +635,8 @@ def quantize_model(args):
     tail_name = "-W4A8"
     recipes = []
     if args.observer == "imatrix_mse":
-        for scheme_name, scheme in config_groups.items():
-            if scheme.weights is None:
-                raise ValueError(
-                    f"{scheme_name} is missing weight quantization settings"
-                )
-            scheme.weights.observer = "imatrix_mse"
+        weights_args_4.observer = "imatrix_mse"
+        weights_args_8.observer = "imatrix_mse"
         recipes.append(IMatrixGatherer(ignore=ignores, attach_by_initialize=False))
         tail_name += "-IMatrix"
 
