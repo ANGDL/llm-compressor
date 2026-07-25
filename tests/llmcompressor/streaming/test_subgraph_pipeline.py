@@ -16,6 +16,7 @@ from llmcompressor.modifiers.pruning import (
 from llmcompressor.modifiers.quantization import QuantizationModifier
 from llmcompressor.modifiers.transform import AWQModifier, SmoothQuantModifier
 from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
+from llmcompressor.pipelines.sequential.helpers import Subgraph
 from llmcompressor.streaming import streaming_oneshot
 from llmcompressor.streaming.pipeline import (
     _empty_device_cache,
@@ -393,7 +394,7 @@ def test_streaming_gptq_matches_sequential_oneshot(tmp_path, monkeypatch):
     assert all(counts == (0, 0) for counts in remaining_statistics)
 
 
-def test_streaming_imatrix_rtn_matches_sequential_oneshot(tmp_path):
+def test_streaming_imatrix_rtn_matches_sequential_oneshot(tmp_path, monkeypatch):
     config = Qwen3Config(
         vocab_size=32,
         hidden_size=8,
@@ -423,6 +424,21 @@ def test_streaming_imatrix_rtn_matches_sequential_oneshot(tmp_path):
         pipeline="sequential",
         sequential_targets=["Qwen3DecoderLayer"],
     )
+
+    quantization_states = []
+    original_forward = Subgraph.forward
+
+    def record_quantization_state(subgraph, model, *args, **kwargs):
+        states = tuple(
+            module.quantization_enabled
+            for module in subgraph.submodules(model)
+            if hasattr(module, "quantization_scheme")
+        )
+        if states:
+            quantization_states.append(states)
+        return original_forward(subgraph, model, *args, **kwargs)
+
+    monkeypatch.setattr(Subgraph, "forward", record_quantization_state)
     streamed = streaming_oneshot(
         model=checkpoint,
         dataset=_calibration_data(),
@@ -433,6 +449,16 @@ def test_streaming_imatrix_rtn_matches_sequential_oneshot(tmp_path):
         num_calibration_samples=2,
         max_seq_length=4,
         target_dtype=torch.float32,
+    )
+
+    # Calibration and propagation should both bypass fake-quant QDQ, matching
+    # the ordinary sequential pipeline. The latter propagates algorithmic
+    # in-place weight changes (for example GPTQ), not simulated RTN outputs.
+    assert quantization_states
+    assert all(
+        enabled is False
+        for states in quantization_states
+        for enabled in states
     )
 
     expected = _checkpoint_tensors(baseline)
