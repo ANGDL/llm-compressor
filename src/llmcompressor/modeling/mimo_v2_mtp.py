@@ -237,20 +237,16 @@ def attach_mtp_layer(model, model_path: str) -> None:
         if input_ids is None:
             raise ValueError("MiMo-V2.5 MTP calibration requires input_ids.")
 
-        sequence_length = hidden_states.shape[1]
         for layer_offset, mtp_layer in enumerate(self.model.mtp.layers):
             prediction_distance = layer_offset + 1
-            mtp_sequence_length = sequence_length - prediction_distance
-            if mtp_sequence_length <= 0:
-                break
 
             # SGLang advances the draft token for each MTP step while every
             # MiMo-V2.5 layer consumes the target model's hidden states.
-            mtp_hidden_states = hidden_states[:, :mtp_sequence_length, :]
+            mtp_hidden_states = hidden_states[:, :-prediction_distance, :]
             mtp_input_ids = input_ids[:, prediction_distance:]
-            mtp_position_ids = position_ids[..., :mtp_sequence_length]
+            mtp_position_ids = position_ids[..., :-prediction_distance]
             mtp_cache_position = (
-                cache_position[:mtp_sequence_length]
+                cache_position[:-prediction_distance]
                 if cache_position is not None
                 else None
             )
