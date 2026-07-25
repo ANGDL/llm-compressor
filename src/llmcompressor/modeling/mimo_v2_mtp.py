@@ -128,7 +128,7 @@ class MiMoV2MTPLayer(nn.Module):
         token_embeddings = embed_tokens(input_ids)
         hidden_states = self.eh_proj(
             torch.cat(
-                [self.hnorm(previous_hidden_states), self.enorm(token_embeddings)],
+                [self.enorm(token_embeddings), self.hnorm(previous_hidden_states)],
                 dim=-1,
             )
         )
@@ -234,17 +234,37 @@ def attach_mtp_layer(model, model_path: str) -> None:
             position_ids = torch.arange(
                 hidden_states.shape[1], device=hidden_states.device
             ).unsqueeze(0)
-        position_embeddings = self.model.swa_rotary_emb(hidden_states, position_ids)
+        if input_ids is None:
+            raise ValueError("MiMo-V2.5 MTP calibration requires input_ids.")
 
-        mtp_hidden_states = hidden_states
-        for mtp_layer in self.model.mtp.layers:
-            mtp_hidden_states = mtp_layer(
+        sequence_length = hidden_states.shape[1]
+        for layer_offset, mtp_layer in enumerate(self.model.mtp.layers):
+            prediction_distance = layer_offset + 1
+            mtp_sequence_length = sequence_length - prediction_distance
+            if mtp_sequence_length <= 0:
+                break
+
+            # SGLang advances the draft token for each MTP step while every
+            # MiMo-V2.5 layer consumes the target model's hidden states.
+            mtp_hidden_states = hidden_states[:, :mtp_sequence_length, :]
+            mtp_input_ids = input_ids[:, prediction_distance:]
+            mtp_position_ids = position_ids[..., :mtp_sequence_length]
+            mtp_cache_position = (
+                cache_position[:mtp_sequence_length]
+                if cache_position is not None
+                else None
+            )
+            mtp_position_embeddings = self.model.swa_rotary_emb(
+                mtp_hidden_states, mtp_position_ids
+            )
+
+            mtp_layer(
                 previous_hidden_states=mtp_hidden_states,
-                input_ids=input_ids,
+                input_ids=mtp_input_ids,
                 embed_tokens=self.model.embed_tokens,
-                position_ids=position_ids,
-                cache_position=cache_position,
-                position_embeddings=position_embeddings,
+                position_ids=mtp_position_ids,
+                cache_position=mtp_cache_position,
+                position_embeddings=mtp_position_embeddings,
             )
 
         return CausalLMOutputWithPast(
