@@ -35,6 +35,50 @@ The advanced boundary-mode API remains available for model adapters that need
 custom target ordering or non-standard forward inputs. It requires a meta-model
 factory, ordered targets, precomputed boundary batches, and exact module schemes.
 
+## Overlapped loading and saving
+
+The pretrained API has two opt-in throughput features:
+
+```python
+streaming_oneshot(
+    ...,
+    device="cuda:0",
+    pipeline_devices=["cuda:0", "cuda:1"],
+    async_save=True,
+)
+```
+
+`pipeline_devices` enables a bounded two-GPU pipeline. While one GPU executes
+calibration, Modifier callbacks, quantized propagation, and compression for
+subgraph N, one background worker reads and materializes subgraph N+1 on the
+other GPU. The GPUs alternate after every subgraph. The worker receives an
+immutable load plan and never installs parameters or reads a changing model;
+all model mutation and forward execution remain ordered on the main thread.
+
+`async_save=True` synchronously snapshots a completed subgraph to independent
+CPU tensors, then encodes, validates, fsyncs, and atomically publishes its final
+safetensors shard on one background writer. At most one save is pending. If the
+disk cannot finish within the next quantization interval, the next submission
+waits instead of accumulating unbounded CPU snapshots. Each submission polls
+the previous result, and the pipeline drains every write before finalization
+builds `model.safetensors.index.json`.
+
+The steady-state schedule is therefore:
+
+| Interval | GPU 0 | GPU 1 | CPU writer |
+| --- | --- | --- | --- |
+| 1 | Quantize subgraph 0 | Load subgraph 1 | Idle |
+| 2 | Load subgraph 2 | Quantize subgraph 1 | Save subgraph 0 |
+| 3 | Quantize subgraph 2 | Load subgraph 3 | Save subgraph 1 |
+
+Both options default to disabled, so existing single-device behavior is
+unchanged. The first implementation accepts exactly two explicitly indexed CUDA
+devices. It deliberately keeps Modifier calls serial, but device-alternating
+execution is still observable to a Modifier that retains global, device-bound
+tensors. Validate iMatrix, RTN, and GPTQ on the target model before a long run.
+`checkpoint_progress=True` currently rejects both options because asynchronous
+completion would otherwise change the durable per-subgraph recovery boundary.
+
 The CLI exposes the same boundaries:
 
 ```bash
@@ -96,6 +140,18 @@ CPU execution:   RAM ~= T + A + H + Q + runtime temporary tensors
 CUDA execution: VRAM ~= T + A + H + runtime temporary tensors
                 RAM  ~= boundary storage + safetensors I/O buffers + Q
 ```
+
+With the optional overlap features enabled, capacity planning changes to:
+
+```text
+Two-GPU pipeline: VRAM per GPU ~= T + A + H + runtime temporary tensors
+                  aggregate VRAM can contain two decoded targets
+Async saving:     RAM adds at most one independent Q snapshot
+```
+
+The GPU-to-CPU snapshot is intentionally completed before the model target is
+unloaded, so the background writer never keeps model-owned GPU storage alive.
+Only safetensors encoding and durable disk publication are asynchronous.
 
 These are lower bounds, not allocator-independent guarantees. PyTorch,
 safetensors, quantization kernels, and Python bookkeeping add headroom. Use at

@@ -14,7 +14,11 @@ from llmcompressor.pipelines.sequential.helpers import Subgraph
 from llmcompressor.streaming.checkpoint import CheckpointWeightSource
 from llmcompressor.streaming.materialization import WeightMaterializer
 
-from .target import TargetWeightLoader
+from .target import (
+    PreparedTargetWeights,
+    TargetLoadPlan,
+    TargetWeightLoader,
+)
 
 __all__ = ["LoadedSubgraph", "SubgraphWeightSession"]
 
@@ -96,6 +100,28 @@ class LoadedSubgraph:
                 yield name, tensor
 
 
+@dataclass(frozen=True)
+class SubgraphLoadPlan:
+    """Resolved checkpoint-backed modules for one traced subgraph."""
+
+    module_names: tuple[str, ...]
+    targets: tuple[TargetLoadPlan, ...]
+
+
+@dataclass
+class PreparedSubgraphWeights:
+    """One subgraph's decoded values before model installation."""
+
+    model: nn.Module
+    plan: SubgraphLoadPlan
+    targets: list[PreparedTargetWeights]
+
+    def close(self) -> None:
+        for target in self.targets:
+            target.close()
+        self.targets.clear()
+
+
 class SubgraphWeightSession:
     """Infer and materialize the checkpoint-backed working set of a subgraph.
 
@@ -168,27 +194,75 @@ class SubgraphWeightSession:
         include_modules: Sequence[str] = (),
         exclude_modules: Sequence[str] = (),
     ) -> Iterator[LoadedSubgraph]:
+        plan = self.plan(
+            subgraph,
+            include_modules=include_modules,
+            exclude_modules=exclude_modules,
+        )
+        prepared = self.prepare(plan, device=device, dtype=dtype)
+        with self.installed(prepared) as loaded:
+            yield loaded
+
+    def plan(
+        self,
+        subgraph: Subgraph,
+        *,
+        include_modules: Sequence[str] = (),
+        exclude_modules: Sequence[str] = (),
+    ) -> SubgraphLoadPlan:
+        """Resolve a subgraph working set without loading checkpoint tensors."""
+
         module_names = self.working_set(
             subgraph,
             include_modules=include_modules,
             exclude_modules=exclude_modules,
         )
+        return SubgraphLoadPlan(
+            module_names=module_names,
+            targets=tuple(
+                self.loader.plan(name, allow_missing_state=True)
+                for name in module_names
+            ),
+        )
+
+    def prepare(
+        self,
+        plan: SubgraphLoadPlan,
+        *,
+        device: torch.device | str,
+        dtype: torch.dtype = torch.bfloat16,
+    ) -> PreparedSubgraphWeights:
+        """Materialize a plan without mutating the shared model."""
+
+        prepared = []
+        try:
+            for target in plan.targets:
+                prepared.append(
+                    self.loader.materialize(target, device=device, dtype=dtype)
+                )
+        except Exception:
+            for target in prepared:
+                target.close()
+            raise
+        return PreparedSubgraphWeights(self.model, plan, prepared)
+
+    @contextmanager
+    def installed(
+        self, prepared: PreparedSubgraphWeights
+    ) -> Iterator[LoadedSubgraph]:
+        """Install prepared weights and restore the model on context exit."""
+
+        module_names = prepared.plan.module_names
         registered_state = self._registered_state(module_names)
         runtime_attributes = self._runtime_tensor_attributes(module_names)
         with ExitStack() as stack:
+            stack.callback(prepared.close)
             stack.callback(self._restore_registered_state, registered_state)
             stack.callback(
                 self._restore_runtime_tensor_attributes, runtime_attributes
             )
-            for name in module_names:
-                stack.enter_context(
-                    self.loader.loaded(
-                        name,
-                        device=torch.device(device),
-                        dtype=dtype,
-                        allow_missing_state=True,
-                    )
-                )
+            for target in prepared.targets:
+                stack.enter_context(self.loader.installed(target))
             # Loading one subgraph can require several module contexts. A
             # model-specific buffer initializer invoked by an early context may
             # therefore bind plain tensor attributes to buffers that a later

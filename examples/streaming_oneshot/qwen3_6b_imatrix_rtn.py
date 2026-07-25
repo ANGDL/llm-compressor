@@ -15,6 +15,9 @@ from llmcompressor.streaming import streaming_oneshot
 MODEL = "/Users/ang/models/Qwen3-0.6B"
 OUTPUT_DIR = "/Users/ang/models/Qwen3-0.6B-W8A8-IMatrix-RTN"
 WORK_DIR = "/Users/ang/models/streaming-work-qwen3-0.6b"
+# Set to ["cuda:0", "cuda:1"] to overlap next-layer materialization with
+# current-layer quantization. Leave None for the original single-device path.
+PIPELINE_DEVICES = None
 
 # As with oneshot(), the dataset can instead be a pre-tokenized Hugging Face
 # Dataset or a PyTorch DataLoader. The shared tracer and checkpoint-backed
@@ -43,7 +46,10 @@ streaming_oneshot(
     work_dir=WORK_DIR,
     num_calibration_samples=16,
     max_seq_length=2048,
-    # Omit device to use the same automatic accelerator selection as oneshot.
+    device=PIPELINE_DEVICES[0] if PIPELINE_DEVICES else None,
+    pipeline_devices=PIPELINE_DEVICES,
+    # Snapshot one completed subgraph on CPU and write it in the background.
+    async_save=True,
     # Set True only when crash recovery is worth the intermediate disk writes.
     checkpoint_progress=False,
     # Replace a previous incomplete or completed quantization at OUTPUT_DIR.

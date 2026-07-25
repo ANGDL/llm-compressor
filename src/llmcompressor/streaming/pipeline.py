@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
@@ -36,7 +36,12 @@ from .artifacts import (
     fingerprint_checkpoint,
     fingerprint_json,
 )
-from .checkpoint import DirectSafetensorsWriter, StreamingCheckpointWriter
+from .checkpoint import (
+    AsyncDirectSafetensorsWriter,
+    DirectSafetensorsWriter,
+    StreamingCheckpointWriter,
+)
+from .loading import SubgraphPrefetcher
 from .materialization import WeightMaterializer, materialize_weights
 from .output import quantized_module_formats
 from .tied_weights import infer_transformers_tied_weights
@@ -68,6 +73,34 @@ def _stage_logger(
     metrics = CompressionLogger(model, device_ids=device_ids)
     metrics.set_results(name=name)
     return metrics
+
+
+def _resolve_pipeline_devices(
+    device: torch.device,
+    pipeline_devices: Sequence[torch.device | str] | None,
+) -> tuple[torch.device, ...]:
+    primary = torch.device(device)
+    if pipeline_devices is None:
+        return (primary,)
+    devices = tuple(torch.device(value) for value in pipeline_devices)
+    if not devices:
+        raise ValueError("pipeline_devices must not be empty")
+    if devices[0] != primary:
+        raise ValueError(
+            f"pipeline_devices must start with the primary device {primary}"
+        )
+    if len(devices) > 2:
+        raise ValueError("The first asynchronous pipeline supports two GPUs")
+    if len(set(devices)) != len(devices):
+        raise ValueError("pipeline_devices must be distinct")
+    if len(devices) == 2 and any(
+        value.type != "cuda" or value.index is None for value in devices
+    ):
+        raise ValueError(
+            "Multi-device streaming requires explicit CUDA devices such as "
+            "['cuda:0', 'cuda:1']"
+        )
+    return devices
 
 
 def _output_shard(source, tensor_name: str, owner_name: str) -> str:
@@ -303,9 +336,17 @@ def run_subgraph_streaming_pipeline(
     max_seq_length: int | None,
     seed: int | None,
     checkpoint_progress: bool = False,
+    pipeline_devices: Sequence[torch.device | str] | None = None,
+    async_save: bool = False,
 ) -> tuple[Path, Path]:
     """Calibrate, modify, propagate, and persist one subgraph at a time."""
 
+    execution_devices = _resolve_pipeline_devices(device, pipeline_devices)
+    if checkpoint_progress and (len(execution_devices) > 1 or async_save):
+        raise ValueError(
+            "Asynchronous prefetch and saving are not supported with "
+            "checkpoint_progress=True"
+        )
     work = Path(work_dir)
     artifact_dir = work / "artifacts"
     staging_dir = work / "staging"
@@ -328,13 +369,15 @@ def run_subgraph_streaming_pipeline(
         if checkpoint_progress
         else None
     )
-    direct_writer = (
+    direct_writer_base = (
         None
         if checkpoint_progress
         else DirectSafetensorsWriter(
             publish_dir, run_fingerprint=run_fingerprint
         )
     )
+    direct_writer = direct_writer_base
+    async_direct_writer = None
     boundaries: BoundaryActivationStore
     if checkpoint_progress:
         boundaries = DiskBoundaryActivationStore(work / "boundaries")
@@ -383,10 +426,39 @@ def run_subgraph_streaming_pipeline(
             )
             LifecycleCallbacks.calibration_start()
         logger.info("streaming pipeline: modifier session initialized")
+        if async_save:
+            if direct_writer_base is None:
+                raise RuntimeError("Asynchronous saving requires a direct writer")
+            async_direct_writer = AsyncDirectSafetensorsWriter(
+                direct_writer_base, max_pending=1
+            )
+            direct_writer = async_direct_writer
+        prefetcher = (
+            SubgraphPrefetcher(adapter.weight_session)
+            if len(execution_devices) > 1
+            else None
+        )
+        pipeline_failed = True
         try:
+            if prefetcher is not None and adapter.targets:
+                first_name = adapter.targets[0]
+                first_device = execution_devices[0]
+                first_plan = adapter.weight_session.plan(
+                    adapter.target_subgraphs[0]
+                )
+                _reset_peak_memory(first_device)
+                prefetcher.submit(
+                    first_plan,
+                    device=first_device,
+                    dtype=target_dtype,
+                    label=f"streaming/00001_{first_name}/weight_materialization",
+                )
             for target_index, (target_name, subgraph) in enumerate(
                 zip(adapter.targets, adapter.target_subgraphs)
             ):
+                target_device = execution_devices[
+                    target_index % len(execution_devices)
+                ]
                 transaction_id = f"subgraph-{target_index:05d}"
                 if (
                     transaction_writer is not None
@@ -432,7 +504,8 @@ def run_subgraph_streaming_pipeline(
                     f"{target_index + 1}/{len(adapter.targets)} {target_name}"
                 )
                 target_count = len(adapter.targets)
-                _reset_peak_memory(device)
+                if prefetcher is None:
+                    _reset_peak_memory(target_device)
                 stage_prefix = f"streaming/{target_index + 1:05d}_{target_name}"
                 logger.info(
                     "streaming pipeline: "
@@ -446,16 +519,47 @@ def run_subgraph_streaming_pipeline(
                     boundaries.delete(target_index + 1)
                 weight_stack = ExitStack()
                 try:
-                    with _stage_logger(
-                        adapter.model,
-                        f"{stage_prefix}/weight_materialization",
-                        device,
-                    ):
-                        loaded = weight_stack.enter_context(
-                            adapter.weight_session.loaded(
-                                subgraph, device=device, dtype=target_dtype
+                    if prefetcher is None:
+                        with _stage_logger(
+                            adapter.model,
+                            f"{stage_prefix}/weight_materialization",
+                            target_device,
+                        ):
+                            loaded = weight_stack.enter_context(
+                                adapter.weight_session.loaded(
+                                    subgraph,
+                                    device=target_device,
+                                    dtype=target_dtype,
+                                )
                             )
+                    else:
+                        prepared = prefetcher.take()
+                        next_plan = (
+                            adapter.weight_session.plan(
+                                adapter.target_subgraphs[target_index + 1]
+                            )
+                            if target_index + 1 < target_count
+                            else None
                         )
+                        loaded = weight_stack.enter_context(
+                            adapter.weight_session.installed(prepared)
+                        )
+                        if next_plan is not None:
+                            next_index = target_index + 1
+                            next_name = adapter.targets[next_index]
+                            next_device = execution_devices[
+                                next_index % len(execution_devices)
+                            ]
+                            _reset_peak_memory(next_device)
+                            prefetcher.submit(
+                                next_plan,
+                                device=next_device,
+                                dtype=target_dtype,
+                                label=(
+                                    f"streaming/{next_index + 1:05d}_{next_name}/"
+                                    "weight_materialization"
+                                ),
+                            )
                     # Match the ordinary sequential calibration pipeline: model
                     # execution is inference-only. Besides avoiding autograd
                     # storage, this is required by models such as DeepSeek-V4
@@ -463,13 +567,15 @@ def run_subgraph_streaming_pipeline(
                     with _stage_logger(
                         adapter.model,
                         f"{stage_prefix}/calibration_forward",
-                        device,
+                        target_device,
                     ):
                         with DisableQuantization(adapter.model), torch.no_grad():
                             for batch_index in batches:
                                 session.state.current_batch_idx = batch_index
                                 value = boundaries.get(
-                                    target_index, batch_index, device=device
+                                    target_index,
+                                    batch_index,
+                                    device=target_device,
                                 )
                                 inputs = {
                                     name: value[name]
@@ -478,7 +584,9 @@ def run_subgraph_streaming_pipeline(
                                 subgraph.forward(adapter.model, **inputs)
                                 del inputs, value
                     with _stage_logger(
-                        adapter.model, f"{stage_prefix}/modifier_update", device
+                        adapter.model,
+                        f"{stage_prefix}/modifier_update",
+                        target_device,
                     ):
                         LifecycleCallbacks.sequential_epoch_end(
                             subgraph.submodules(adapter.model)
@@ -489,12 +597,14 @@ def run_subgraph_streaming_pipeline(
                     with _stage_logger(
                         adapter.model,
                         f"{stage_prefix}/activation_propagation",
-                        device,
+                        target_device,
                     ):
                         with HooksMixin.disable_hooks(), torch.no_grad():
                             for batch_index in batches:
                                 value = boundaries.get(
-                                    target_index, batch_index, device=device
+                                    target_index,
+                                    batch_index,
+                                    device=target_device,
                                 )
                                 inputs = {
                                     name: value[name]
@@ -520,13 +630,15 @@ def run_subgraph_streaming_pipeline(
                     with _stage_logger(
                         adapter.model,
                         f"{stage_prefix}/weight_compression",
-                        device,
+                        target_device,
                     ):
                         for module in subgraph.submodules(adapter.model):
                             if is_module_quantized(module):
                                 compress_module(module)
                     with _stage_logger(
-                        adapter.model, f"{stage_prefix}/checkpoint_write", device
+                        adapter.model,
+                        f"{stage_prefix}/checkpoint_write",
+                        target_device,
                     ):
                         if transaction_writer is not None:
                             with transaction_writer.transaction(
@@ -558,18 +670,40 @@ def run_subgraph_streaming_pipeline(
                             )
                 finally:
                     with _stage_logger(
-                        adapter.model, f"{stage_prefix}/weight_unload", device
+                        adapter.model,
+                        f"{stage_prefix}/weight_unload",
+                        target_device,
                     ):
                         weight_stack.close()
                         boundaries.delete(target_index)
-                        _empty_device_cache(device)
+                        _empty_device_cache(target_device)
+            pipeline_failed = False
         finally:
-            with _stage_logger(
-                adapter.model, "streaming/session_finalize", device
-            ):
-                LifecycleCallbacks.calibration_end()
-                session.finalize()
-            logger.info("streaming pipeline: modifier session finalized")
+            try:
+                if prefetcher is not None:
+                    prefetcher.close(suppress_errors=pipeline_failed)
+                with _stage_logger(
+                    adapter.model, "streaming/session_finalize", device
+                ):
+                    LifecycleCallbacks.calibration_end()
+                    session.finalize()
+                logger.info("streaming pipeline: modifier session finalized")
+            except BaseException:
+                if async_direct_writer is not None:
+                    try:
+                        async_direct_writer.close()
+                    except Exception:
+                        logger.exception(
+                            "Asynchronous checkpoint writer failed while unwinding"
+                        )
+                raise
+            if pipeline_failed and async_direct_writer is not None:
+                try:
+                    async_direct_writer.close()
+                except Exception:
+                    logger.exception(
+                        "Asynchronous checkpoint writer failed while unwinding"
+                    )
 
     if direct_writer is not None:
         _initialize_run(
@@ -594,27 +728,40 @@ def run_subgraph_streaming_pipeline(
         if alias in source_names and canonical in source_names
     }
     logger.info("streaming pipeline: writing remaining non-subgraph tensors")
-    with _stage_logger(
-        adapter.model, "streaming/remaining_checkpoint_write", device
-    ):
-        if direct_writer is not None:
-            _write_remaining_direct_shards(
-                writer=direct_writer,
-                source=source,
-                materializer=materializer,
-                target_dtype=target_dtype,
-                written=written,
-                omitted=omitted,
-            )
-        else:
-            _copy_remaining_tensors(
-                writer=transaction_writer,
-                source=source,
-                materializer=materializer,
-                target_dtype=target_dtype,
-                written=written,
-                omitted=omitted,
-            )
-            transaction_writer.assemble_shards()
+    remaining_failed = True
+    try:
+        with _stage_logger(
+            adapter.model, "streaming/remaining_checkpoint_write", device
+        ):
+            if direct_writer is not None:
+                _write_remaining_direct_shards(
+                    writer=direct_writer,
+                    source=source,
+                    materializer=materializer,
+                    target_dtype=target_dtype,
+                    written=written,
+                    omitted=omitted,
+                )
+            else:
+                _copy_remaining_tensors(
+                    writer=transaction_writer,
+                    source=source,
+                    materializer=materializer,
+                    target_dtype=target_dtype,
+                    written=written,
+                    omitted=omitted,
+                )
+                transaction_writer.assemble_shards()
+        remaining_failed = False
+    finally:
+        if async_direct_writer is not None:
+            try:
+                async_direct_writer.close()
+            except Exception:
+                if not remaining_failed:
+                    raise
+                logger.exception(
+                    "Asynchronous checkpoint writer failed while unwinding"
+                )
     logger.info("streaming pipeline: completed")
     return artifact_dir, staging_dir if checkpoint_progress else publish_dir

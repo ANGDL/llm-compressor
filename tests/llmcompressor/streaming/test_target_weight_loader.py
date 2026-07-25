@@ -148,6 +148,44 @@ def test_loads_one_target_for_forward_then_restores_meta(tiny_checkpoint):
     assert next(model.layers[0].parameters()).dtype == torch.float32
 
 
+def test_prepare_does_not_mutate_model_before_install(tiny_checkpoint):
+    reference, path = tiny_checkpoint
+    model = build_meta_model(TinyModel)
+    loader = TargetWeightLoader(model, SafetensorsWeightSource(path))
+    original = model.layers[0].proj.weight
+
+    plan = loader.plan("layers.0")
+    prepared = loader.materialize(plan, device="cpu", dtype=torch.float32)
+
+    assert model.layers[0].proj.weight is original
+    _assert_all_meta(model)
+    with loader.installed(prepared):
+        assert not model.layers[0].proj.weight.is_meta
+        assert torch.equal(
+            model.layers[0].proj.weight, reference.layers[0].proj.weight
+        )
+
+    _assert_all_meta(model)
+
+
+def test_install_rejects_stale_prepared_plan(tiny_checkpoint):
+    _, path = tiny_checkpoint
+    model = build_meta_model(TinyModel)
+    loader = TargetWeightLoader(model, SafetensorsWeightSource(path))
+    prepared = loader.materialize(
+        loader.plan("layers.0"), device="cpu", dtype=torch.float32
+    )
+    model.layers[0].proj.weight = nn.Parameter(
+        torch.empty_like(model.layers[0].proj.weight, device="meta")
+    )
+
+    with pytest.raises(RuntimeError, match="stale"):
+        with loader.installed(prepared):
+            pass
+
+    assert not prepared.parameter_values
+
+
 def test_materialized_storage_does_not_grow_with_model_depth(tmp_path):
     active_bytes = []
     for layer_count in (2, 20):

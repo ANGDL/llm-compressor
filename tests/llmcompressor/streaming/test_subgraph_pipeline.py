@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import torch
 import yaml
 from safetensors import safe_open
@@ -18,6 +19,7 @@ from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
 from llmcompressor.streaming import streaming_oneshot
 from llmcompressor.streaming.pipeline import (
     _empty_device_cache,
+    _resolve_pipeline_devices,
     _stage_logger,
     _write_loaded_target_direct,
 )
@@ -106,6 +108,19 @@ def test_stage_logger_only_monitors_execution_device():
     assert _stage_logger(model, "cpu-stage", torch.device("cpu")).device_ids == ()
 
 
+def test_pipeline_devices_require_primary_then_one_explicit_cuda_device():
+    assert _resolve_pipeline_devices(
+        torch.device("cuda:0"), ["cuda:0", "cuda:1"]
+    ) == (torch.device("cuda:0"), torch.device("cuda:1"))
+
+    with pytest.raises(ValueError, match="start with"):
+        _resolve_pipeline_devices(
+            torch.device("cuda:0"), ["cuda:1", "cuda:0"]
+        )
+    with pytest.raises(ValueError, match="explicit CUDA"):
+        _resolve_pipeline_devices(torch.device("cpu"), ["cpu", "mps:0"])
+
+
 def test_pretrained_streaming_writes_each_subgraph_as_final_shard(
     tmp_path, monkeypatch
 ):
@@ -159,6 +174,7 @@ def test_pretrained_streaming_writes_each_subgraph_as_final_shard(
         num_calibration_samples=1,
         max_seq_length=4,
         target_dtype=torch.float32,
+        async_save=True,
     )
 
     assert (output / "FINALIZED").is_file()
