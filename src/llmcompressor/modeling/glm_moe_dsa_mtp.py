@@ -294,8 +294,9 @@ class GlmMoeDsaMTPLayer(nn.Module):
     def forward(
         self,
         token_hidden_states: torch.Tensor,
-        input_ids: torch.Tensor,
+        input_ids: Optional[torch.Tensor],
         embed_tokens: nn.Embedding,
+        input_embeds: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values=None,
@@ -303,7 +304,11 @@ class GlmMoeDsaMTPLayer(nn.Module):
         position_embeddings: Optional[tuple] = None,
         **kwargs,
     ) -> torch.Tensor:
-        token_embeds = embed_tokens(input_ids)          # (B, T, H)
+        if input_embeds is None:
+            if input_ids is None:
+                raise ValueError("Either input_ids or input_embeds must be provided")
+            input_embeds = embed_tokens(input_ids)
+        token_embeds = input_embeds
         mtp_input = torch.cat(
             [self.enorm(token_embeds), self.hnorm(token_hidden_states)],
             dim=-1,
@@ -460,22 +465,31 @@ def attach_mtp_layer(model, model_path: str) -> None:
             position_ids = torch.arange(
                 seq_len, device=hidden_states.device
             ).unsqueeze(0)
-        position_embeddings = self.model.rotary_emb(hidden_states, position_ids)
+        # NextN consumes token t+1 together with the target hidden at t. The
+        # first token has no preceding target hidden and is excluded.
+        if hidden_states.shape[1] > 1:
+            mtp_hidden_states = hidden_states[:, :-1, :]
+            mtp_position_ids = position_ids[:, 1:]
+            mtp_input_ids = input_ids[:, 1:] if input_ids is not None else None
+            mtp_input_embeds = (
+                inputs_embeds[:, 1:] if inputs_embeds is not None else None
+            )
+            mtp_position_embeddings = self.model.rotary_emb(
+                mtp_hidden_states, mtp_position_ids
+            )
 
-        self.mtp(
-            token_hidden_states=hidden_states,
-            input_ids=input_ids,
-            embed_tokens=self.model.embed_tokens,
-            # Do NOT pass the raw attention_mask here: the main model's forward
-            # converts the Long 0/1 padding mask to a 4D float causal mask
-            # internally, but we bypass that conversion.  SDPA rejects a Long
-            # mask, and for Hessian accumulation exact masking is irrelevant.
-            attention_mask=None,
-            position_ids=position_ids,
-            past_key_values=None,
-            cache_position=cache_position,
-            position_embeddings=position_embeddings,
-        )
+            self.mtp(
+                token_hidden_states=mtp_hidden_states,
+                input_ids=mtp_input_ids,
+                input_embeds=mtp_input_embeds,
+                embed_tokens=self.model.embed_tokens,
+                # The decoder constructs its causal/index mask when None.
+                attention_mask=None,
+                position_ids=mtp_position_ids,
+                past_key_values=None,
+                cache_position=None,
+                position_embeddings=mtp_position_embeddings,
+            )
 
         return CausalLMOutputWithPast(
             loss=loss,
