@@ -2,9 +2,13 @@ from types import SimpleNamespace
 
 import torch
 import torch.nn as nn
+from transformers.modeling_outputs import CausalLMOutputWithPast  # noqa: F401
 
 import llmcompressor.modeling.mimo_v2_mtp as mimo_v2_mtp
 from llmcompressor.modeling.mimo_v2_mtp import MiMoV2MTPLayer
+from llmcompressor.pipelines.sequential.helpers import trace_subgraphs
+
+# CausalLMOutputWithPast must remain in globals for the recompiled fake forward.
 
 
 class _CaptureProjection(nn.Module):
@@ -97,9 +101,17 @@ class _CausalLM(nn.Module):
     def __init__(self):
         super().__init__()
         self.anchor = nn.Parameter(torch.zeros(1))
-        self.config = SimpleNamespace(num_hidden_layers=4, vocab_size=32)
+        self.config = SimpleNamespace(
+            num_hidden_layers=4,
+            vocab_size=32,
+            _attn_implementation="eager",
+        )
         self.model = _Backbone()
         self.lm_head = nn.Identity()
+
+    @property
+    def device(self):
+        return self.anchor.device
 
 
 def test_attach_mtp_layer_uses_shifted_tokens_and_backbone_hidden(monkeypatch):
@@ -140,3 +152,27 @@ def test_attach_mtp_layer_uses_shifted_tokens_and_backbone_hidden(monkeypatch):
         )
 
     assert [call[0].shape[1] for call in model.model.rotary_calls] == [4, 3, 2]
+
+
+def test_attached_forward_is_traceable_by_sequential_pipeline(monkeypatch):
+    _RecordingMTPLayer.instances = []
+    monkeypatch.setattr(mimo_v2_mtp, "_count_mtp_layers", lambda _: 3)
+    monkeypatch.setattr(mimo_v2_mtp, "_load_mtp_tensors", lambda *_: {})
+    monkeypatch.setattr(mimo_v2_mtp, "MiMoV2MTPLayer", _RecordingMTPLayer)
+
+    model = _CausalLM()
+    mimo_v2_mtp.attach_mtp_layer(model, "unused")
+    sample_input = {
+        "input_ids": torch.tensor([[5, 6, 7, 8, 9]]),
+        "position_ids": torch.arange(5).unsqueeze(0),
+        "cache_position": torch.arange(5),
+    }
+
+    subgraphs = trace_subgraphs(
+        model,
+        sample_input,
+        sequential_targets=["_RecordingMTPLayer"],
+        ignore=[],
+    )
+
+    assert len(subgraphs) == 4
