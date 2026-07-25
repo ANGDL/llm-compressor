@@ -611,7 +611,15 @@ def run_subgraph_streaming_pipeline(
                         f"{stage_prefix}/activation_propagation",
                         target_device,
                     ):
-                        with HooksMixin.disable_hooks(), torch.no_grad():
+                        # Match SequentialPipeline: propagation captures the
+                        # modified full-precision output (or an algorithm's
+                        # in-place weight update), without adding fake-quant
+                        # QDQ to every quantized module.
+                        with (
+                            HooksMixin.disable_hooks(),
+                            DisableQuantization(adapter.model),
+                            torch.no_grad(),
+                        ):
                             for batch_index in batches:
                                 value = boundaries.get(
                                     target_index,
