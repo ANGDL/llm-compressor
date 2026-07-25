@@ -443,9 +443,14 @@ def run_subgraph_streaming_pipeline(
             if prefetcher is not None and adapter.targets:
                 first_name = adapter.targets[0]
                 first_device = execution_devices[0]
-                first_plan = adapter.weight_session.plan(
-                    adapter.target_subgraphs[0]
-                )
+                with _stage_logger(
+                    adapter.model,
+                    f"streaming/00001_{first_name}/weight_plan",
+                    first_device,
+                ):
+                    first_plan = adapter.weight_session.plan(
+                        adapter.target_subgraphs[0]
+                    )
                 _reset_peak_memory(first_device)
                 prefetcher.submit(
                     first_plan,
@@ -534,22 +539,29 @@ def run_subgraph_streaming_pipeline(
                             )
                     else:
                         prepared = prefetcher.take()
-                        next_plan = (
-                            adapter.weight_session.plan(
-                                adapter.target_subgraphs[target_index + 1]
-                            )
-                            if target_index + 1 < target_count
-                            else None
-                        )
-                        loaded = weight_stack.enter_context(
-                            adapter.weight_session.installed(prepared)
-                        )
-                        if next_plan is not None:
-                            next_index = target_index + 1
+                        next_index = target_index + 1
+                        if next_index < target_count:
                             next_name = adapter.targets[next_index]
                             next_device = execution_devices[
                                 next_index % len(execution_devices)
                             ]
+                            with _stage_logger(
+                                adapter.model,
+                                (
+                                    f"streaming/{next_index + 1:05d}_{next_name}/"
+                                    "weight_plan"
+                                ),
+                                next_device,
+                            ):
+                                next_plan = adapter.weight_session.plan(
+                                    adapter.target_subgraphs[next_index]
+                                )
+                        else:
+                            next_plan = None
+                        loaded = weight_stack.enter_context(
+                            adapter.weight_session.installed(prepared)
+                        )
+                        if next_plan is not None:
                             _reset_peak_memory(next_device)
                             prefetcher.submit(
                                 next_plan,

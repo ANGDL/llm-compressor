@@ -168,6 +168,61 @@ def test_prepare_does_not_mutate_model_before_install(tiny_checkpoint):
     _assert_all_meta(model)
 
 
+def test_plan_uses_local_names_without_scanning_the_full_model(
+    tiny_checkpoint, monkeypatch
+):
+    _, path = tiny_checkpoint
+    model = build_meta_model(TinyModel)
+    loader = TargetWeightLoader(model, SafetensorsWeightSource(path))
+
+    def fail_global_scan(*_args, **_kwargs):
+        raise AssertionError("local checkpoint names must not scan the full model")
+
+    monkeypatch.setattr(model, "named_parameters", fail_global_scan)
+    monkeypatch.setattr(model, "named_buffers", fail_global_scan)
+
+    plan = loader.plan("layers.0")
+
+    assert set(plan.parameter_sources.values()) == {
+        "layers.0.proj.weight",
+        "layers.0.proj.bias",
+        "layers.0.norm.weight",
+        "layers.0.norm.bias",
+    }
+    assert set(plan.buffer_sources.values()) == {"layers.0.step"}
+
+
+def test_plan_scans_global_aliases_once_for_omitted_tied_weight(
+    tmp_path, monkeypatch
+):
+    class TiedModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = nn.Embedding(8, 4)
+            self.lm_head = nn.Linear(4, 8, bias=False)
+            self.lm_head.weight = self.embed.weight
+
+    reference = TiedModel()
+    path = tmp_path / "model.safetensors"
+    save_file({"embed.weight": reference.embed.weight.detach().clone()}, path)
+    model = build_meta_model(TiedModel)
+    original_named_parameters = model.named_parameters
+    scans = 0
+
+    def record_scan(*args, **kwargs):
+        nonlocal scans
+        scans += 1
+        return original_named_parameters(*args, **kwargs)
+
+    monkeypatch.setattr(model, "named_parameters", record_scan)
+    loader = TargetWeightLoader(model, SafetensorsWeightSource(path))
+
+    plan = loader.plan("lm_head")
+
+    assert set(plan.parameter_sources.values()) == {"embed.weight"}
+    assert scans == 1
+
+
 def test_install_rejects_stale_prepared_plan(tiny_checkpoint):
     _, path = tiny_checkpoint
     model = build_meta_model(TinyModel)

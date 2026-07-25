@@ -112,6 +112,7 @@ class TargetWeightLoader:
         self.model = model
         self.source = source
         self.materializer = materializer or CastWeightMaterializer()
+        self._source_names = frozenset(source.tensor_names())
         self._active_targets: set[str] = set()
 
     @contextmanager
@@ -155,10 +156,16 @@ class TargetWeightLoader:
         self._validate_meta(buffer_groups, "buffer")
 
         parameter_sources = self._resolve_sources(
-            target_name, parameter_groups, allow_missing=allow_missing_state
+            target_name,
+            parameter_groups,
+            parameters=True,
+            allow_missing=allow_missing_state,
         )
         buffer_sources = self._resolve_sources(
-            target_name, buffer_groups, allow_missing=allow_missing_state
+            target_name,
+            buffer_groups,
+            parameters=False,
+            allow_missing=allow_missing_state,
         )
         parameter_groups = [
             group for group in parameter_groups if id(group[0]) in parameter_sources
@@ -415,22 +422,26 @@ class TargetWeightLoader:
         target_name: str,
         groups: list[tuple[torch.Tensor, list[str]]],
         *,
+        parameters: bool,
         allow_missing: bool = False,
     ) -> dict[int, str]:
-        available = set(self.source.tensor_names())
         resolved = {}
+        global_aliases = None
         for tensor, aliases in groups:
             candidates = [_join_name(target_name, alias) for alias in aliases]
-            named = (
-                self.model.named_parameters(recurse=True, remove_duplicate=False)
-                if isinstance(tensor, nn.Parameter)
-                else self.model.named_buffers(recurse=True, remove_duplicate=False)
-            )
-            candidates.extend(
-                name for name, candidate in named if candidate is tensor
-            )
-            candidates = list(dict.fromkeys(candidates))
-            matches = [name for name in candidates if name in available]
+            matches = [
+                name for name in candidates if name in self._source_names
+            ]
+            if not matches:
+                if global_aliases is None:
+                    global_aliases = self._global_tensor_aliases(
+                        parameters=parameters
+                    )
+                candidates.extend(global_aliases.get(id(tensor), ()))
+                candidates = list(dict.fromkeys(candidates))
+                matches = [
+                    name for name in candidates if name in self._source_names
+                ]
             if not matches:
                 if allow_missing:
                     continue
@@ -441,6 +452,19 @@ class TargetWeightLoader:
                 )
             resolved[id(tensor)] = matches[0]
         return resolved
+
+    def _global_tensor_aliases(
+        self, *, parameters: bool
+    ) -> dict[int, list[str]]:
+        named = (
+            self.model.named_parameters(recurse=True, remove_duplicate=False)
+            if parameters
+            else self.model.named_buffers(recurse=True, remove_duplicate=False)
+        )
+        aliases: dict[int, list[str]] = {}
+        for name, tensor in named:
+            aliases.setdefault(id(tensor), []).append(name)
+        return aliases
 
     def _validate_shapes(
         self,
