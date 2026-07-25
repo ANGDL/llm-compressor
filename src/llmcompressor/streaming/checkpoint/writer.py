@@ -10,17 +10,22 @@ import shutil
 import uuid
 from collections import defaultdict
 from collections.abc import Mapping
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 import torch
+from loguru import logger
+from safetensors import safe_open
 from safetensors.torch import save_file
 
 from llmcompressor.streaming.artifacts import ArtifactCompatibilityError
 
 __all__ = [
+    "AsyncDirectSafetensorsWriter",
     "DirectSafetensorsWriter",
     "StreamingCheckpointWriter",
     "TensorRecord",
@@ -71,6 +76,52 @@ def _atomic_json(path: Path, value: Any) -> None:
         _sync_directory(path.parent)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _cpu_snapshot(
+    tensors: Mapping[str, torch.Tensor],
+    *,
+    clone_cpu: bool = False,
+) -> dict[str, torch.Tensor]:
+    """Detach an immutable CPU snapshot from model-owned tensor storage."""
+
+    values = {}
+    for name, tensor in tensors.items():
+        value = tensor.detach().to("cpu").contiguous()
+        if clone_cpu and tensor.device.type == "cpu":
+            value = value.clone()
+        values[name] = value
+    return values
+
+
+def _validate_safetensors_header(
+    path: Path, tensors: Mapping[str, torch.Tensor]
+) -> None:
+    """Validate a newly encoded shard without loading its tensor payloads."""
+
+    with safe_open(path, framework="pt", device="cpu") as file:
+        actual_names = set(file.keys())
+        expected_names = set(tensors)
+        if actual_names != expected_names:
+            raise ValueError(
+                f"Encoded shard tensor names disagree for {path}: "
+                f"expected={sorted(expected_names)}, actual={sorted(actual_names)}"
+            )
+        for name, expected in tensors.items():
+            tensor_slice = file.get_slice(name)
+            actual_shape = tuple(tensor_slice.get_shape())
+            if actual_shape != tuple(expected.shape):
+                raise ValueError(
+                    f"Encoded shard shape disagrees for {name!r}: "
+                    f"expected={tuple(expected.shape)}, actual={actual_shape}"
+                )
+            expected_dtype = _SAFETENSORS_DTYPES.get(expected.dtype)
+            actual_dtype = tensor_slice.get_dtype()
+            if expected_dtype is not None and actual_dtype != expected_dtype:
+                raise ValueError(
+                    f"Encoded shard dtype disagrees for {name!r}: "
+                    f"expected={expected_dtype}, actual={actual_dtype}"
+                )
 
 
 @dataclass(frozen=True)
@@ -496,13 +547,11 @@ class DirectSafetensorsWriter:
         state_path = self.states_dir / f"{shard_name}.json"
         if output.exists() or state_path.exists():
             raise FileExistsError(f"Direct shard {shard_id!r} already exists")
-        values = {
-            name: tensor.detach().to("cpu").contiguous()
-            for name, tensor in tensors.items()
-        }
+        values = _cpu_snapshot(tensors)
         temporary = output.with_name(f".{output.name}.{uuid.uuid4().hex}.tmp")
         try:
             save_file(values, temporary)
+            _validate_safetensors_header(temporary, values)
             with temporary.open("rb") as file:
                 os.fsync(file.fileno())
             os.replace(temporary, output)
@@ -526,3 +575,129 @@ class DirectSafetensorsWriter:
             },
         )
         return output
+
+
+class AsyncDirectSafetensorsWriter(AbstractContextManager):
+    """Write final shards on one bounded background worker.
+
+    GPU-to-CPU snapshots remain synchronous so a submitted task never retains
+    model-owned accelerator storage. ``max_pending=1`` overlaps one disk write
+    with quantization while keeping host memory bounded to one target snapshot.
+    """
+
+    def __init__(
+        self,
+        writer: DirectSafetensorsWriter,
+        *,
+        max_pending: int = 1,
+    ):
+        if max_pending <= 0:
+            raise ValueError("max_pending must be positive")
+        self.writer = writer
+        self.max_pending = max_pending
+        self._executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="streaming-safetensors"
+        )
+        self._pending: list[tuple[str, Future[Path]]] = []
+        self._closed = False
+
+    def _check_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("Async safetensors writer is closed")
+
+    def _wait_oldest(self) -> None:
+        shard_id, future = self._pending.pop(0)
+        try:
+            future.result()
+        except Exception as error:
+            raise RuntimeError(
+                f"Asynchronous checkpoint write failed for {shard_id!r}"
+            ) from error
+
+    def poll(self) -> None:
+        """Raise completed worker failures without blocking active writes."""
+
+        self._check_open()
+        while self._pending and self._pending[0][1].done():
+            self._wait_oldest()
+
+    def _write(
+        self,
+        shard_id: str,
+        values: Mapping[str, torch.Tensor],
+        quantized_modules: Mapping[str, str],
+        omitted_tied_weights: Mapping[str, str],
+    ) -> Path:
+        started_at = perf_counter()
+        logger.info(
+            f"streaming checkpoint: asynchronous shard {shard_id!r} started"
+        )
+        output = self.writer.write_shard(
+            shard_id,
+            values,
+            quantized_modules=quantized_modules,
+            omitted_tied_weights=omitted_tied_weights,
+        )
+        logger.info(
+            f"streaming checkpoint: asynchronous shard {shard_id!r} completed "
+            f"in {perf_counter() - started_at:.2f}s"
+        )
+        return output
+
+    def write_shard(
+        self,
+        shard_id: str,
+        tensors: Mapping[str, torch.Tensor],
+        *,
+        quantized_modules: Mapping[str, str] | None = None,
+        omitted_tied_weights: Mapping[str, str] | None = None,
+    ) -> Path:
+        """Snapshot a shard on CPU and enqueue its durable write."""
+
+        self.poll()
+        while len(self._pending) >= self.max_pending:
+            self._wait_oldest()
+        values = _cpu_snapshot(tensors, clone_cpu=True)
+        output = self.writer.shards_dir / f"model-{shard_id}.safetensors"
+        future = self._executor.submit(
+            self._write,
+            shard_id,
+            values,
+            dict(quantized_modules or {}),
+            dict(omitted_tied_weights or {}),
+        )
+        self._pending.append((shard_id, future))
+        logger.info(
+            f"streaming checkpoint: queued asynchronous shard {shard_id!r}"
+        )
+        return output
+
+    def close(self) -> None:
+        """Drain all writes and propagate the first durable-write failure."""
+
+        if self._closed:
+            return
+        self._closed = True
+        error = None
+        try:
+            while self._pending:
+                try:
+                    self._wait_oldest()
+                except Exception as caught:
+                    if error is None:
+                        error = caught
+        finally:
+            self._executor.shutdown(wait=True)
+        if error is not None:
+            raise error
+
+    def __exit__(self, exc_type, _exc_val, _exc_tb):
+        try:
+            self.close()
+        except Exception:
+            if exc_type is None:
+                raise
+            logger.exception(
+                "Asynchronous checkpoint writer also failed while unwinding"
+            )
+        return False

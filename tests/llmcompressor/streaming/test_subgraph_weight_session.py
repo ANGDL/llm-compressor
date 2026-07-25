@@ -124,6 +124,26 @@ def test_loads_traced_working_set_and_restores_meta(tmp_path):
     assert_all_meta(model)
 
 
+def test_prepares_subgraph_without_installing_it(tmp_path):
+    reference = SessionModel()
+    checkpoint = checkpoint_for(reference, tmp_path)
+    model = build_meta_model(SessionModel)
+    session = SubgraphWeightSession(
+        model, SafetensorsWeightSource(checkpoint)
+    )
+    subgraph = subgraph_for("layers.0")
+
+    plan = session.plan(subgraph)
+    prepared = session.prepare(plan, device="cpu", dtype=torch.float32)
+
+    assert_all_meta(model)
+    with session.installed(prepared) as loaded:
+        assert loaded.module_names == ("layers.0",)
+        assert not next(model.layers[0].parameters()).is_meta
+
+    assert_all_meta(model)
+
+
 def test_merges_modifier_working_set_across_checkpoint_shards(tmp_path, monkeypatch):
     reference = SessionModel()
     checkpoint = checkpoint_for(reference, tmp_path)

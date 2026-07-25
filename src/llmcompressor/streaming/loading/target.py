@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import Callable, Iterator, TypeVar
 
 import torch
@@ -70,6 +71,35 @@ def _owner_and_name(module: nn.Module, qualified_name: str) -> tuple[nn.Module, 
     return module.get_submodule(owner_name) if owner_name else module, tensor_name
 
 
+@dataclass(frozen=True)
+class TargetLoadPlan:
+    """Immutable model-side description of one checkpoint-backed target."""
+
+    name: str
+    target: nn.Module
+    parameter_groups: list[tuple[torch.Tensor, list[str]]]
+    buffer_groups: list[tuple[torch.Tensor, list[str]]]
+    runtime_buffer_groups: list[tuple[torch.Tensor, list[str]]]
+    parameter_sources: dict[int, str]
+    buffer_sources: dict[int, str]
+    allow_missing_state: bool
+
+
+@dataclass
+class PreparedTargetWeights:
+    """Materialized values that are not installed into the shared model yet."""
+
+    plan: TargetLoadPlan
+    device: torch.device
+    dtype: torch.dtype
+    parameter_values: dict[str, torch.Tensor]
+    buffer_values: dict[str, torch.Tensor]
+
+    def close(self) -> None:
+        self.parameter_values.clear()
+        self.buffer_values.clear()
+
+
 class TargetWeightLoader:
     """Materialize exactly one model target and restore it to meta on exit."""
 
@@ -95,12 +125,25 @@ class TargetWeightLoader:
     ) -> Iterator[nn.Module]:
         """Yield a real target, then release all of its storage on any exit."""
 
+        plan = self.plan(
+            target_name, allow_missing_state=allow_missing_state
+        )
+        prepared = self.materialize(plan, device=device, dtype=dtype)
+        with self.installed(prepared) as target:
+            yield target
+
+    def plan(
+        self,
+        target_name: str,
+        *,
+        allow_missing_state: bool = False,
+    ) -> TargetLoadPlan:
+        """Resolve model aliases and source names without loading tensors."""
+
         if target_name in self._active_targets:
             raise RuntimeError(
                 f"Target {target_name!r} is already materialized"
             )
-        if not dtype.is_floating_point:
-            raise TypeError(f"Target computation dtype must be floating, got {dtype}")
         try:
             target = self.model.get_submodule(target_name)
         except AttributeError as error:
@@ -123,43 +166,103 @@ class TargetWeightLoader:
         buffer_groups = [
             group for group in buffer_groups if id(group[0]) in buffer_sources
         ]
-        auxiliary_parameters = (
-            self._materialize_missing_parameters(
-                target, device=device, dtype=dtype
-            )
-            if allow_missing_state
-            else []
-        )
         self._validate_shapes(parameter_sources, parameter_groups)
         self._validate_shapes(buffer_sources, buffer_groups)
+        return TargetLoadPlan(
+            name=target_name,
+            target=target,
+            parameter_groups=parameter_groups,
+            buffer_groups=buffer_groups,
+            runtime_buffer_groups=runtime_buffer_groups,
+            parameter_sources=parameter_sources,
+            buffer_sources=buffer_sources,
+            allow_missing_state=allow_missing_state,
+        )
+
+    def materialize(
+        self,
+        plan: TargetLoadPlan,
+        *,
+        device: torch.device | str,
+        dtype: torch.dtype = torch.bfloat16,
+    ) -> PreparedTargetWeights:
+        """Read and decode a plan without mutating the shared model."""
+
+        if not dtype.is_floating_point:
+            raise TypeError(f"Target computation dtype must be floating, got {dtype}")
 
         device = torch.device(device)
         parameter_values = self._load_parameters(
-            parameter_sources, parameter_groups, dtype=dtype, device=device
+            plan.parameter_sources,
+            plan.parameter_groups,
+            dtype=dtype,
+            device=device,
         )
-        buffer_values = self._load_buffers(
-            buffer_sources, buffer_groups, dtype=dtype, device=device
+        try:
+            buffer_values = self._load_buffers(
+                plan.buffer_sources,
+                plan.buffer_groups,
+                dtype=dtype,
+                device=device,
+            )
+        except Exception:
+            parameter_values.clear()
+            raise
+        return PreparedTargetWeights(
+            plan=plan,
+            device=device,
+            dtype=dtype,
+            parameter_values=parameter_values,
+            buffer_values=buffer_values,
         )
 
-        self._active_targets.add(target_name)
+    @contextmanager
+    def installed(
+        self, prepared: PreparedTargetWeights
+    ) -> Iterator[nn.Module]:
+        """Install prepared values on the main thread and restore meta state."""
+
+        plan = prepared.plan
+        target = plan.target
+        if plan.name in self._active_targets:
+            prepared.close()
+            raise RuntimeError(f"Target {plan.name!r} is already materialized")
+        try:
+            self._validate_plan_is_current(plan)
+        except Exception:
+            prepared.close()
+            raise
+
+        self._active_targets.add(plan.name)
+        auxiliary_parameters = []
         installed_parameters = []
         installed_buffers = []
         runtime_buffers = []
         try:
+            if plan.allow_missing_state:
+                auxiliary_parameters = self._materialize_missing_parameters(
+                    target, device=prepared.device, dtype=prepared.dtype
+                )
             installed_parameters = self._install_parameters(
-                target, parameter_groups, parameter_sources, parameter_values
+                target,
+                plan.parameter_groups,
+                plan.parameter_sources,
+                prepared.parameter_values,
             )
             installed_buffers = self._install_buffers(
-                target, buffer_groups, buffer_sources, buffer_values
+                target,
+                plan.buffer_groups,
+                plan.buffer_sources,
+                prepared.buffer_values,
             )
             runtime_buffers = self._move_runtime_buffers(
-                target, runtime_buffer_groups, device
+                target, plan.runtime_buffer_groups, prepared.device
             )
             reinitialize = getattr(
                 self.model, "_reinitialize_non_persistent_buffers", None
             )
             if callable(reinitialize) and any(
-                tensor.is_meta for tensor, _ in runtime_buffer_groups
+                tensor.is_meta for tensor, _ in plan.runtime_buffer_groups
             ):
                 reinitialize()
             yield target
@@ -168,9 +271,27 @@ class TargetWeightLoader:
             self._restore_meta_buffers(target, installed_buffers)
             self._restore_runtime_buffers(target, runtime_buffers)
             self._restore_auxiliary_parameters(target, auxiliary_parameters)
-            parameter_values.clear()
-            buffer_values.clear()
-            self._active_targets.remove(target_name)
+            prepared.close()
+            self._active_targets.remove(plan.name)
+
+    @staticmethod
+    def _validate_plan_is_current(plan: TargetLoadPlan) -> None:
+        for original, aliases in plan.parameter_groups:
+            for alias in aliases:
+                owner, name = _owner_and_name(plan.target, alias)
+                if owner._parameters.get(name) is not original:
+                    raise RuntimeError(
+                        f"Prepared target plan for {plan.name!r} is stale at "
+                        f"parameter {alias!r}"
+                    )
+        for original, aliases in plan.buffer_groups:
+            for alias in aliases:
+                owner, name = _owner_and_name(plan.target, alias)
+                if owner._buffers.get(name) is not original:
+                    raise RuntimeError(
+                        f"Prepared target plan for {plan.name!r} is stale at "
+                        f"buffer {alias!r}"
+                    )
 
     @staticmethod
     def _materialize_missing_parameters(

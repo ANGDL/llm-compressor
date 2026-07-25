@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import shutil
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import ExitStack
 from copy import deepcopy
 from pathlib import Path
@@ -179,6 +179,8 @@ def streaming_oneshot_from_pretrained(
     validate_config: bool,
     checkpoint_progress: bool,
     overwrite_output: bool,
+    pipeline_devices: Sequence[torch.device | str] | None,
+    async_save: bool,
 ) -> Path:
     """Run traced streaming PTQ with an oneshot-like model/dataset interface."""
     checkpoint = Path(model).expanduser()
@@ -337,6 +339,8 @@ def streaming_oneshot_from_pretrained(
             max_seq_length=max_seq_length,
             seed=seed,
             checkpoint_progress=checkpoint_progress,
+            pipeline_devices=pipeline_devices,
+            async_save=async_save,
         )
         qconfig = build_quantization_config(quantizer.resolved_config)
         return finalize_streaming_checkpoint(

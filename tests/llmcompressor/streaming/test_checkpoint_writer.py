@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 
 import pytest
 import torch
@@ -10,7 +11,11 @@ from llmcompressor.streaming import (
     ArtifactCompatibilityError,
     StreamingCheckpointWriter,
 )
-from llmcompressor.streaming.checkpoint import DirectSafetensorsWriter
+from llmcompressor.streaming.checkpoint import (
+    AsyncDirectSafetensorsWriter,
+    DirectSafetensorsWriter,
+)
+from llmcompressor.streaming.checkpoint import writer as writer_module
 
 
 def read_shard(path):
@@ -171,3 +176,62 @@ def test_direct_writer_publishes_final_shard_without_tensor_payloads(tmp_path):
     )
     assert not (tmp_path / "transactions").exists()
     assert not list(tmp_path.rglob("*.bin"))
+
+
+def test_async_direct_writer_returns_before_disk_write_finishes(tmp_path):
+    direct = DirectSafetensorsWriter(tmp_path, run_fingerprint="run-a")
+    original = direct.write_shard
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocked_write(*args, **kwargs):
+        started.set()
+        assert release.wait(timeout=5)
+        return original(*args, **kwargs)
+
+    direct.write_shard = blocked_write
+    writer = AsyncDirectSafetensorsWriter(direct)
+    source = torch.ones(4)
+    try:
+        output = writer.write_shard("subgraph-00000", {"weight": source})
+        assert started.wait(timeout=5)
+        assert not output.exists()
+        source.zero_()
+        release.set()
+        writer.close()
+    finally:
+        release.set()
+        writer.close()
+
+    assert torch.equal(read_shard(output)["weight"], torch.ones(4))
+
+
+def test_async_direct_writer_propagates_background_failure(tmp_path):
+    direct = DirectSafetensorsWriter(tmp_path, run_fingerprint="run-a")
+
+    def failed_write(*_args, **_kwargs):
+        raise OSError("disk full")
+
+    direct.write_shard = failed_write
+    writer = AsyncDirectSafetensorsWriter(direct)
+    writer.write_shard("subgraph-00000", {"weight": torch.ones(4)})
+
+    with pytest.raises(RuntimeError, match="subgraph-00000"):
+        writer.close()
+
+
+def test_direct_writer_publishes_state_only_after_header_validation(
+    tmp_path, monkeypatch
+):
+    writer = DirectSafetensorsWriter(tmp_path, run_fingerprint="run-a")
+    monkeypatch.setattr(
+        writer_module,
+        "_validate_safetensors_header",
+        lambda *_args: (_ for _ in ()).throw(ValueError("invalid header")),
+    )
+
+    with pytest.raises(ValueError, match="invalid header"):
+        writer.write_shard("subgraph-00000", {"weight": torch.ones(4)})
+
+    assert not list(tmp_path.glob("*.safetensors"))
+    assert not list((tmp_path / ".streaming-state").glob("*.json"))

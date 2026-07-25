@@ -204,6 +204,8 @@ def streaming_oneshot(
     validate_config: bool = True,
     checkpoint_progress: bool = False,
     overwrite_output: bool = False,
+    pipeline_devices: Sequence[torch.device | str] | None = None,
+    async_save: bool = False,
 ) -> Path:
     """Run resumable streaming PTQ.
 
@@ -248,6 +250,13 @@ def streaming_oneshot(
             validate_config=validate_config,
             checkpoint_progress=checkpoint_progress,
             overwrite_output=overwrite_output,
+            pipeline_devices=pipeline_devices,
+            async_save=async_save,
+        )
+
+    if pipeline_devices is not None or async_save:
+        raise ValueError(
+            "pipeline_devices and async_save currently require pretrained mode"
         )
 
     required = {
