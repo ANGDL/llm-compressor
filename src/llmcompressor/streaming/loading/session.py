@@ -141,6 +141,21 @@ class SubgraphWeightSession:
         self.source = source
         self.loader = TargetWeightLoader(model, source, materializer)
         self._source_names = set(source.tensor_names())
+        self._checkpoint_modules = self._build_checkpoint_modules(
+            self._source_names
+        )
+
+    @staticmethod
+    def _build_checkpoint_modules(source_names: Iterable[str]) -> frozenset[str]:
+        modules = set()
+        for tensor_name in source_names:
+            owner = tensor_name
+            while True:
+                owner, separator, _ = owner.rpartition(".")
+                modules.add(owner)
+                if not separator:
+                    break
+        return frozenset(modules)
 
     def working_set(
         self,
@@ -309,11 +324,7 @@ class SubgraphWeightSession:
                 setattr(module, name, value)
 
     def _has_checkpoint_state(self, module_name: str) -> bool:
-        prefix = f"{module_name}." if module_name else ""
-        return any(
-            name == module_name or name.startswith(prefix)
-            for name in self._source_names
-        )
+        return module_name in self._checkpoint_modules
 
     def _registered_state(
         self, module_names: Sequence[str]
