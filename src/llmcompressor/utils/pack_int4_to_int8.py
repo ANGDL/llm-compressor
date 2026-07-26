@@ -195,7 +195,12 @@ class Int8Packer:
         for file in os.listdir(self.model_path):
             if file.endswith('.safetensors') or file == 'model.safetensors.index.json':
                 continue
-            shutil.copy(os.path.join(self.model_path, file), os.path.join(self.save_path, file))
+            source_path = os.path.join(self.model_path, file)
+            destination_path = os.path.join(self.save_path, file)
+            if os.path.isdir(source_path):
+                shutil.copytree(source_path, destination_path, dirs_exist_ok=True)
+            else:
+                shutil.copy(source_path, destination_path)
 
         print("Done")
 
