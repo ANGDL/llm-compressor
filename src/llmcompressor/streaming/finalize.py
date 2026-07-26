@@ -11,11 +11,11 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from loguru import logger
 from safetensors import safe_open
 
 from llmcompressor.transformers.utils import RECIPE_FILE_NAME
 
+from ._logging import streaming_logger
 from .artifacts import ArtifactStore, fingerprint_checkpoint
 from .materialization import CastWeightMaterializer, WeightMaterializer
 
@@ -23,7 +23,6 @@ __all__ = ["finalize_streaming_checkpoint"]
 
 _INDEX_NAME = "model.safetensors.index.json"
 _FINALIZED = "FINALIZED"
-
 
 def _atomic_json(path: Path, value: Any) -> None:
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
@@ -172,8 +171,14 @@ def finalize_streaming_checkpoint(
         temporary.mkdir(parents=True, exist_ok=publish_in_place)
         output_shards: dict[str, dict[str, tuple[int, ...]]] = {}
         total_size = 0
-        for shard_name in sorted(expected_shards):
-            logger.info(f"streaming finalize: validating shard {shard_name}")
+        sorted_shards = sorted(expected_shards)
+        width = max(2, len(str(len(sorted_shards))))
+        for shard_index, shard_name in enumerate(sorted_shards, start=1):
+            streaming_logger.info(
+                f"finalize | [{shard_index:0{width}d}/"
+                f"{len(sorted_shards):0{width}d}] "
+                f"validate | shard={shard_name}"
+            )
             shard = shards_dir / shard_name
             state_path = states_dir / f"{shard_name}.json"
             if not shard.is_file() or not state_path.is_file():

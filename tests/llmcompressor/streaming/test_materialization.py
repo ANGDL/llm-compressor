@@ -168,7 +168,7 @@ def test_materializer_supports_legacy_source_without_group_iterator(
     assert result["layer1.weight"].dtype == torch.bfloat16
 
 
-def test_large_materialization_reports_incremental_progress(tmp_path, monkeypatch):
+def test_large_materialization_reports_debug_progress(tmp_path, monkeypatch):
     from llmcompressor.streaming.materialization import base
 
     path = tmp_path / "model.safetensors"
@@ -177,7 +177,7 @@ def test_large_materialization_reports_incremental_progress(tmp_path, monkeypatc
         path,
     )
     messages = []
-    monkeypatch.setattr(base.logger, "info", messages.append)
+    monkeypatch.setattr(base.streaming_logger, "debug", messages.append)
 
     result = materialize_weights(
         SafetensorsWeightSource(path),
@@ -188,9 +188,9 @@ def test_large_materialization_reports_incremental_progress(tmp_path, monkeypatc
     )
 
     assert len(result) == 65
-    assert any("loading tensors 1-64/65" in message for message in messages)
-    assert any("materialized 64/65 tensors" in message for message in messages)
-    assert any("materialized 65/65 tensors" in message for message in messages)
+    assert any("tensors=1-64/65" in message for message in messages)
+    assert any("progress=64/65" in message for message in messages)
+    assert any("progress=65/65" in message for message in messages)
 
 
 def test_materializer_reads_tensors_in_physical_storage_order(tmp_path, monkeypatch):

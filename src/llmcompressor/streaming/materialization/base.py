@@ -7,7 +7,6 @@ from time import perf_counter
 from typing import Any, Iterable, Mapping
 
 import torch
-from loguru import logger
 
 from llmcompressor.streaming.artifacts import MaterializerInfo, fingerprint_json
 from llmcompressor.streaming.checkpoint import (
@@ -16,8 +15,9 @@ from llmcompressor.streaming.checkpoint import (
     TensorMetadata,
 )
 
-_PROGRESS_INTERVAL = 64
+from .._logging import streaming_logger
 
+_PROGRESS_INTERVAL = 64
 
 class WeightMaterializer(ABC):
     """Decode a logical floating-point weight and declare its dependencies."""
@@ -110,18 +110,17 @@ def materialize_weights(
     total = len(requests)
     started_at = perf_counter()
     if total >= _PROGRESS_INTERVAL:
-        logger.info(
-            f"streaming materialization: loading {total} logical tensors "
-            f"onto {device}"
+        streaming_logger.info(
+            f"weights | materialize | tensors={total} | device={device}"
         )
     for index, (name, _, _) in enumerate(requests, start=1):
         if total >= _PROGRESS_INTERVAL and (index - 1) % _PROGRESS_INTERVAL == 0:
-            logger.info(
-                "streaming materialization: loading tensors "
+            streaming_logger.debug(
+                "weights | loading chunk | tensors="
                 f"{index}-{min(index + _PROGRESS_INTERVAL - 1, total)}/{total}; "
                 f"first={name!r}, shard={metadata[name].shard.name!r}"
             )
-        logger.debug(
+        streaming_logger.debug(
             f"streaming materialization: loading tensor {index}/{total} {name!r} "
             f"from {metadata[name].shard.name!r}"
         )
@@ -160,8 +159,8 @@ def materialize_weights(
         if total >= _PROGRESS_INTERVAL and (
             index % _PROGRESS_INTERVAL == 0 or index == total
         ):
-            logger.info(
-                f"streaming materialization: materialized {index}/{total} tensors "
-                f"in {perf_counter() - started_at:.2f}s"
+            streaming_logger.debug(
+                f"weights | progress={index}/{total} | "
+                f"time={perf_counter() - started_at:.2f}s"
             )
     return results
