@@ -18,6 +18,7 @@ MODULE = importlib.util.module_from_spec(MODULE_SPEC)
 MODULE_SPEC.loader.exec_module(MODULE)
 
 QuantConfigParser = MODULE.QuantConfigParser
+Int8Packer = MODULE.Int8Packer
 _pack_int4_to_int8 = MODULE._pack_int4_to_int8
 
 
@@ -84,3 +85,49 @@ def test_quant_config_parser_matches_regex_against_module_name(tmp_path):
     parser = QuantConfigParser(str(tmp_path))
     assert parser.is_int4_layer("model.layers.0.self_attn.q_proj.weight")
     assert not parser.is_int4_layer("model.layers.0.self_attn.k_proj.weight")
+
+
+@pytest.mark.unit
+def test_int8_packer_copies_model_subdirectories(tmp_path, monkeypatch):
+    model_path = tmp_path / "model"
+    save_path = tmp_path / "packed"
+    model_path.mkdir()
+    (model_path / "config.json").write_text(
+        json.dumps(
+            {
+                "quantization_config": {
+                    "config_groups": {
+                        "group_0": {
+                            "weights": {"num_bits": 4, "type": "int"},
+                            "targets": ["Linear"],
+                        }
+                    }
+                }
+            }
+        )
+    )
+    MODULE.save_file(
+        {"model.layers.0.weight": torch.tensor([[1, 2]], dtype=torch.int8)},
+        model_path / "model-00001.safetensors",
+    )
+    (model_path / "inference").mkdir()
+    (model_path / "inference" / "generation_config.json").write_text("{}")
+
+    class SynchronousPool:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def imap_unordered(self, function, iterable):
+            return map(function, iterable)
+
+    monkeypatch.setattr(MODULE, "Pool", SynchronousPool)
+
+    Int8Packer(str(model_path), str(save_path)).save()
+
+    assert (save_path / "inference" / "generation_config.json").read_text() == "{}"
