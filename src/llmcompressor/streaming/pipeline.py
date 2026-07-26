@@ -5,12 +5,12 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping, Sequence
 from contextlib import ExitStack
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 import torch
 from compressed_tensors.compressors import compress_module
 from compressed_tensors.quantization.utils import is_module_quantized
-from loguru import logger
 
 from llmcompressor.core import LifecycleCallbacks, create_session
 from llmcompressor.modifiers.quantization.calibration import (
@@ -21,6 +21,7 @@ from llmcompressor.recipe import Recipe
 from llmcompressor.utils.helpers import DisableQuantization
 from llmcompressor.utils.metric_logging import CompressionLogger
 
+from ._logging import streaming_logger
 from .activations import (
     BoundaryActivationStore,
     DiskBoundaryActivationStore,
@@ -71,8 +72,16 @@ def _stage_logger(
         else ()
     )
     metrics = CompressionLogger(model, device_ids=device_ids)
-    metrics.set_results(name=name)
+    metrics.set_results(
+        name="streaming",
+        summary=f"{name} | device={device}",
+    )
     return metrics
+
+
+def _target_label(index: int, total: int, target: str) -> str:
+    width = max(2, len(str(total)))
+    return f"[{index + 1:0{width}d}/{total:0{width}d}] {target}"
 
 
 def _resolve_pipeline_devices(
@@ -401,21 +410,25 @@ def run_subgraph_streaming_pipeline(
         # Boundary zero is not covered by a preceding subgraph transaction.
         # Always recreate it when the first subgraph is incomplete so a crash
         # while snapshotting the dataloader cannot leave a partial input set.
-        logger.info("streaming pipeline: collecting initial calibration boundary")
-        with _stage_logger(adapter.model, "streaming/initial_boundary", device):
+        streaming_logger.info("setup | collecting initial calibration boundary")
+        with _stage_logger(
+            adapter.model, "[setup] initial boundary", device
+        ):
             boundaries.delete(0)
             for batch_index, boundary in enumerate(
                 adapter.calibration_boundaries(calibration_batches)
             ):
                 boundaries.put(0, batch_index, boundary)
-        logger.info(
-            "streaming pipeline: initial calibration boundary collected "
-            f"for {len(boundaries.batch_indices(0))} batches"
+        streaming_logger.info(
+            "setup | initial boundary ready | "
+            f"batches={len(boundaries.batch_indices(0))}"
         )
 
-    logger.info("streaming pipeline: initializing modifier session")
+    streaming_logger.info("setup | initializing modifier session")
     with create_session() as session:
-        with _stage_logger(adapter.model, "streaming/session_initialize", device):
+        with _stage_logger(
+            adapter.model, "[setup] initialize modifiers", device
+        ):
             session.initialize(
                 model=adapter.model,
                 recipe=recipe,
@@ -425,7 +438,7 @@ def run_subgraph_streaming_pipeline(
                 copy_data=False,
             )
             LifecycleCallbacks.calibration_start()
-        logger.info("streaming pipeline: modifier session initialized")
+        streaming_logger.info("setup | modifier session ready")
         if async_save:
             if direct_writer_base is None:
                 raise RuntimeError("Asynchronous saving requires a direct writer")
@@ -443,9 +456,10 @@ def run_subgraph_streaming_pipeline(
             if prefetcher is not None and adapter.targets:
                 first_name = adapter.targets[0]
                 first_device = execution_devices[0]
+                first_label = _target_label(0, len(adapter.targets), first_name)
                 with _stage_logger(
                     adapter.model,
-                    f"streaming/00001_{first_name}/weight_plan",
+                    f"{first_label} | plan weights",
                     first_device,
                 ):
                     first_plan = adapter.weight_session.plan(
@@ -456,7 +470,7 @@ def run_subgraph_streaming_pipeline(
                     first_plan,
                     device=first_device,
                     dtype=target_dtype,
-                    label=f"streaming/00001_{first_name}/weight_materialization",
+                    label=f"{first_label} | load weights",
                 )
             for target_index, (target_name, subgraph) in enumerate(
                 zip(adapter.targets, adapter.target_subgraphs)
@@ -469,10 +483,10 @@ def run_subgraph_streaming_pipeline(
                     transaction_writer is not None
                     and transaction_writer.is_transaction_complete(transaction_id)
                 ):
-                    logger.info(
-                        "streaming pipeline: restoring committed subgraph "
-                        f"{target_index + 1}/{len(adapter.targets)} {target_name}"
+                    label = _target_label(
+                        target_index, len(adapter.targets), target_name
                     )
+                    streaming_logger.info(f"{label} | restoring checkpoint")
                     metadata = next(
                         value
                         for value in transaction_writer.committed_metadata()
@@ -504,19 +518,17 @@ def run_subgraph_streaming_pipeline(
                     raise RuntimeError(
                         f"Missing boundary {target_index} for {target_name!r}"
                     )
-                logger.info(
-                    "streaming pipeline: processing subgraph "
-                    f"{target_index + 1}/{len(adapter.targets)} {target_name}"
-                )
                 target_count = len(adapter.targets)
+                target_label = _target_label(
+                    target_index, target_count, target_name
+                )
                 if prefetcher is None:
                     _reset_peak_memory(target_device)
-                stage_prefix = f"streaming/{target_index + 1:05d}_{target_name}"
-                logger.info(
-                    "streaming pipeline: "
-                    f"subgraph {target_index + 1}/{target_count} {target_name}: "
-                    "starting"
+                streaming_logger.info(
+                    f"{target_label} | start | "
+                    f"batches={len(batches)} | device={target_device}"
                 )
+                target_started_at = perf_counter()
                 # A previous attempt can fail after publishing only part of the
                 # next external boundary but before committing its transaction.
                 # Rebuild it from scratch so stale batches are never consumed.
@@ -527,7 +539,7 @@ def run_subgraph_streaming_pipeline(
                     if prefetcher is None:
                         with _stage_logger(
                             adapter.model,
-                            f"{stage_prefix}/weight_materialization",
+                            f"{target_label} | load weights",
                             target_device,
                         ):
                             loaded = weight_stack.enter_context(
@@ -542,15 +554,15 @@ def run_subgraph_streaming_pipeline(
                         next_index = target_index + 1
                         if next_index < target_count:
                             next_name = adapter.targets[next_index]
+                            next_label = _target_label(
+                                next_index, target_count, next_name
+                            )
                             next_device = execution_devices[
                                 next_index % len(execution_devices)
                             ]
                             with _stage_logger(
                                 adapter.model,
-                                (
-                                    f"streaming/{next_index + 1:05d}_{next_name}/"
-                                    "weight_plan"
-                                ),
+                                f"{next_label} | plan weights",
                                 next_device,
                             ):
                                 next_plan = adapter.weight_session.plan(
@@ -567,10 +579,7 @@ def run_subgraph_streaming_pipeline(
                                 next_plan,
                                 device=next_device,
                                 dtype=target_dtype,
-                                label=(
-                                    f"streaming/{next_index + 1:05d}_{next_name}/"
-                                    "weight_materialization"
-                                ),
+                                label=f"{next_label} | load weights",
                             )
                     # Match the ordinary sequential calibration pipeline: model
                     # execution is inference-only. Besides avoiding autograd
@@ -578,7 +587,7 @@ def run_subgraph_streaming_pipeline(
                     # whose attention updates runtime KV buffers in place.
                     with _stage_logger(
                         adapter.model,
-                        f"{stage_prefix}/calibration_forward",
+                        f"{target_label} | calibration",
                         target_device,
                     ):
                         with DisableQuantization(adapter.model), torch.no_grad():
@@ -597,7 +606,7 @@ def run_subgraph_streaming_pipeline(
                                 del inputs, value
                     with _stage_logger(
                         adapter.model,
-                        f"{stage_prefix}/modifier_update",
+                        f"{target_label} | modifier update",
                         target_device,
                     ):
                         LifecycleCallbacks.sequential_epoch_end(
@@ -608,7 +617,7 @@ def run_subgraph_streaming_pipeline(
                                 freeze_module_quantization(module)
                     with _stage_logger(
                         adapter.model,
-                        f"{stage_prefix}/activation_propagation",
+                        f"{target_label} | activation propagation",
                         target_device,
                     ):
                         # Match SequentialPipeline: propagation captures the
@@ -649,7 +658,7 @@ def run_subgraph_streaming_pipeline(
 
                     with _stage_logger(
                         adapter.model,
-                        f"{stage_prefix}/weight_compression",
+                        f"{target_label} | compress weights",
                         target_device,
                     ):
                         for module in subgraph.submodules(adapter.model):
@@ -657,7 +666,7 @@ def run_subgraph_streaming_pipeline(
                                 compress_module(module)
                     with _stage_logger(
                         adapter.model,
-                        f"{stage_prefix}/checkpoint_write",
+                        f"{target_label} | queue checkpoint",
                         target_device,
                     ):
                         if transaction_writer is not None:
@@ -691,29 +700,33 @@ def run_subgraph_streaming_pipeline(
                 finally:
                     with _stage_logger(
                         adapter.model,
-                        f"{stage_prefix}/weight_unload",
+                        f"{target_label} | unload weights",
                         target_device,
                     ):
                         weight_stack.close()
                         boundaries.delete(target_index)
                         _empty_device_cache(target_device)
+                streaming_logger.info(
+                    f"{target_label} | complete | "
+                    f"time={perf_counter() - target_started_at:.2f}s"
+                )
             pipeline_failed = False
         finally:
             try:
                 if prefetcher is not None:
                     prefetcher.close(suppress_errors=pipeline_failed)
                 with _stage_logger(
-                    adapter.model, "streaming/session_finalize", device
+                    adapter.model, "[finalize] modifier session", device
                 ):
                     LifecycleCallbacks.calibration_end()
                     session.finalize()
-                logger.info("streaming pipeline: modifier session finalized")
+                streaming_logger.info("finalize | modifier session complete")
             except BaseException:
                 if async_direct_writer is not None:
                     try:
                         async_direct_writer.close()
                     except Exception:
-                        logger.exception(
+                        streaming_logger.exception(
                             "Asynchronous checkpoint writer failed while unwinding"
                         )
                 raise
@@ -721,7 +734,7 @@ def run_subgraph_streaming_pipeline(
                 try:
                     async_direct_writer.close()
                 except Exception:
-                    logger.exception(
+                    streaming_logger.exception(
                         "Asynchronous checkpoint writer failed while unwinding"
                     )
 
@@ -747,11 +760,11 @@ def run_subgraph_streaming_pipeline(
         ).items()
         if alias in source_names and canonical in source_names
     }
-    logger.info("streaming pipeline: writing remaining non-subgraph tensors")
+    streaming_logger.info("finalize | writing static model tensors")
     remaining_failed = True
     try:
         with _stage_logger(
-            adapter.model, "streaming/remaining_checkpoint_write", device
+            adapter.model, "[finalize] write static tensors", device
         ):
             if direct_writer is not None:
                 _write_remaining_direct_shards(
@@ -780,8 +793,8 @@ def run_subgraph_streaming_pipeline(
             except Exception:
                 if not remaining_failed:
                     raise
-                logger.exception(
+                streaming_logger.exception(
                     "Asynchronous checkpoint writer failed while unwinding"
                 )
-    logger.info("streaming pipeline: completed")
+    streaming_logger.info("complete")
     return artifact_dir, staging_dir if checkpoint_progress else publish_dir

@@ -46,14 +46,18 @@ class CompressionLogger:
 
         self._name = None
         self._loss = None
+        self._summary = None
 
     def set_results(
         self,
         name: str | None = None,
         loss: float | None = None,
+        *,
+        summary: str | None = None,
     ):
         self._name = name
         self._loss = loss
+        self._summary = summary
 
     def __enter__(self) -> "CompressionLogger":
         self.start_tick = time.time()
@@ -64,29 +68,54 @@ class CompressionLogger:
 
         patch = logger.patch(lambda r: r.update(function=(self._name or "compress")))
 
-        patch.log("METRIC", f"time {(stop_tick - self.start_tick):.2f}s")
+        elapsed = stop_tick - self.start_tick
+        memory = self._memory_results()
+
+        if self._summary is not None:
+            parts = [self._summary, f"time={elapsed:.2f}s"]
+            if self._loss is not None:
+                parts.append(f"error={self._loss:.2f}")
+            parts.extend(
+                f"cuda:{device_id} peak={used:.2f}/{total:.1f} GB ({percent:.1f}%)"
+                for device_id, used, total, percent in memory
+            )
+            patch.log("METRIC", " | ".join(parts))
+            return
+
+        patch.log("METRIC", f"time {elapsed:.2f}s")
         if self._loss is not None:
             patch.log("METRIC", f"error {self._loss:.2f}")
+        for device_id, _used, total, percent in memory:
+            patch.log(
+                "METRIC",
+                (
+                    f"Accelerator {device_id} | usage: {percent:.2f}%"
+                    f" | total memory: {total:.1f} Gb"
+                ),
+            )
 
+    def _memory_results(self) -> list[tuple[int, float, float, float]]:
         if not accelerator_is_available() or torch.mps.is_available():
-            return
+            return []
 
         device_ids = (
             _get_visible_devices() if self.device_ids is None else self.device_ids
         )
+        results = []
         for device_id in device_ids:
             used_memory = accelerator_max_memory_allocated(device_id) / 1e9
             max_memory = accelerator_get_memory_info(device_id)[1] / 1e9
             if max_memory == 0:
                 continue
-            perc_used = 100 * used_memory / max_memory
-            patch.log(
-                "METRIC",
+            results.append(
                 (
-                    f"Accelerator {device_id} | usage: {perc_used:.2f}%"
-                    f" | total memory: {max_memory:.1f} Gb"
-                ),
+                    device_id,
+                    used_memory,
+                    max_memory,
+                    100 * used_memory / max_memory,
+                )
             )
+        return results
 
 
 def _get_visible_devices() -> Iterable:

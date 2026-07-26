@@ -18,11 +18,12 @@ from time import perf_counter
 from typing import Any
 
 import torch
-from loguru import logger
 from safetensors import safe_open
 from safetensors.torch import save_file
 
 from llmcompressor.streaming.artifacts import ArtifactCompatibilityError
+
+from .._logging import streaming_logger
 
 __all__ = [
     "AsyncDirectSafetensorsWriter",
@@ -629,18 +630,16 @@ class AsyncDirectSafetensorsWriter(AbstractContextManager):
         omitted_tied_weights: Mapping[str, str],
     ) -> Path:
         started_at = perf_counter()
-        logger.info(
-            f"streaming checkpoint: asynchronous shard {shard_id!r} started"
-        )
+        streaming_logger.info(f"save | shard={shard_id} | started")
         output = self.writer.write_shard(
             shard_id,
             values,
             quantized_modules=quantized_modules,
             omitted_tied_weights=omitted_tied_weights,
         )
-        logger.info(
-            f"streaming checkpoint: asynchronous shard {shard_id!r} completed "
-            f"in {perf_counter() - started_at:.2f}s"
+        streaming_logger.info(
+            f"save | shard={shard_id} | complete | "
+            f"time={perf_counter() - started_at:.2f}s"
         )
         return output
 
@@ -667,9 +666,7 @@ class AsyncDirectSafetensorsWriter(AbstractContextManager):
             dict(omitted_tied_weights or {}),
         )
         self._pending.append((shard_id, future))
-        logger.info(
-            f"streaming checkpoint: queued asynchronous shard {shard_id!r}"
-        )
+        streaming_logger.info(f"save | shard={shard_id} | queued")
         return output
 
     def close(self) -> None:
@@ -697,7 +694,7 @@ class AsyncDirectSafetensorsWriter(AbstractContextManager):
         except Exception:
             if exc_type is None:
                 raise
-            logger.exception(
+            streaming_logger.exception(
                 "Asynchronous checkpoint writer also failed while unwinding"
             )
         return False

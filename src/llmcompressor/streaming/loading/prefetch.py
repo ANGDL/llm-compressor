@@ -6,10 +6,10 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import AbstractContextManager, nullcontext
 
 import torch
-from loguru import logger
 
 from llmcompressor.utils.metric_logging import CompressionLogger
 
+from .._logging import streaming_logger
 from .session import (
     PreparedSubgraphWeights,
     SubgraphLoadPlan,
@@ -52,7 +52,10 @@ class SubgraphPrefetcher(AbstractContextManager):
             metrics = CompressionLogger(
                 self.session.model, device_ids=self._device_ids(device)
             )
-            metrics.set_results(name=label)
+            metrics.set_results(
+                name="streaming",
+                summary=f"{label} | device={device}",
+            )
             with metrics:
                 return self.session.prepare(plan, device=device, dtype=dtype)
 
@@ -77,10 +80,7 @@ class SubgraphPrefetcher(AbstractContextManager):
                 self._prepare, label, plan, resolved, dtype
             ),
         )
-        logger.info(
-            f"streaming pipeline: queued weight prefetch {label!r} "
-            f"on {resolved}"
-        )
+        streaming_logger.info(f"{label} | queued | device={resolved}")
 
     def take(self) -> PreparedSubgraphWeights:
         """Wait for and transfer ownership of the pending prepared weights."""
