@@ -78,3 +78,10 @@ def test_scale_dtype_is_independent_from_strict_symmetric():
 
     assert scheme.weights.observer == "strict_symmetric_minmax"
     assert scheme.weights.scale_dtype is None
+
+
+def test_model_free_rejects_float64_scale_dtype():
+    from llmcompressor.entrypoints.model_free.validate import validate_scheme
+
+    with pytest.raises(ValueError, match="float64.*not supported"):
+        validate_scheme("W8A8", scale_dtype=torch.float64)

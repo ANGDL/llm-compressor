@@ -1,5 +1,6 @@
 from unittest.mock import patch
 
+import pytest
 import torch
 from compressed_tensors.quantization import (
     QuantizationArgs,
@@ -19,6 +20,57 @@ class _FakeDecoderLayer(nn.Module):
         self.q_proj = nn.Linear(64, 64)
         self.k_proj = nn.Linear(64, 64)
         self.v_proj = nn.Linear(64, 64)
+
+
+def test_initialize_quantization_applies_scale_dtype():
+    model = nn.Sequential(nn.Linear(4, 2, bias=False, dtype=torch.bfloat16))
+    modifier = QuantizationModifier(
+        config_groups={
+            "group_0": QuantizationScheme(
+                targets=["Linear"],
+                weights=QuantizationArgs(
+                    num_bits=8,
+                    type="int",
+                    strategy="channel",
+                    symmetric=True,
+                    scale_dtype=torch.float32,
+                ),
+            )
+        }
+    )
+
+    modifier.initialize_quantization(model)
+
+    assert model[0].weight_scale.dtype == torch.float32
+
+
+def test_initialize_quantization_rejects_float64_scale_dtype():
+    modifier = QuantizationModifier(
+        config_groups={
+            "group_0": QuantizationScheme(
+                targets=["Linear"],
+                weights=QuantizationArgs(scale_dtype=torch.float64),
+            )
+        }
+    )
+
+    with pytest.raises(ValueError, match="float64.*not supported"):
+        modifier.resolve_quantization_config()
+
+
+def test_initialize_quantization_rejects_unrelated_scale_dtype():
+    model = nn.Sequential(nn.Linear(4, 2, bias=False, dtype=torch.bfloat16))
+    modifier = QuantizationModifier(
+        config_groups={
+            "group_0": QuantizationScheme(
+                targets=["Linear"],
+                weights=QuantizationArgs(scale_dtype=torch.float16),
+            )
+        }
+    )
+
+    with pytest.raises(ValueError, match="supported dtypes"):
+        modifier.initialize_quantization(model)
 
 
 def test_sequential_epoch_end_only_observes_passed_modules():

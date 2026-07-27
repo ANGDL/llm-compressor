@@ -11,6 +11,8 @@ from compressed_tensors.utils.safetensors_load import (
 )
 from loguru import logger
 
+from llmcompressor.modifiers.quantization.scale_dtype import validate_scale_dtype
+
 from .helpers import invert_mapping
 from .microscale import get_fused_names, is_microscale_scheme
 
@@ -42,6 +44,7 @@ def validate_scheme(
         scheme.weights.observer = "strict_symmetric_minmax"
 
     if scale_dtype is not None:
+        validate_scale_dtype(scale_dtype)
         scheme.weights.scale_dtype = scale_dtype
 
     # activation quantization must be dynamic
