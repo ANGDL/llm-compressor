@@ -109,8 +109,16 @@ class CalibrationGlmMoeDsaMoE(MoECalibrationModule):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         residuals = hidden_states
         orig_shape = hidden_states.shape
-        router_logits = self.gate(hidden_states)
-        topk_indices, topk_weights = self.route_tokens_to_experts(router_logits)
+        gate_output = self.gate(hidden_states)
+        if isinstance(gate_output, tuple) and len(gate_output) == 3:
+            # GlmMoeDsaTopkRouter returns logits, weights, then indices.
+            _, topk_weights, topk_indices = gate_output
+        else:
+            # Compatibility with model variants whose gate is a plain Linear.
+            router_logits = (
+                gate_output[0] if isinstance(gate_output, tuple) else gate_output
+            )
+            topk_indices, topk_weights = self.route_tokens_to_experts(router_logits)
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
 
         final_hidden_states = torch.zeros_like(hidden_states, dtype=topk_weights.dtype)
