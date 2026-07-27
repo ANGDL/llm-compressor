@@ -637,7 +637,7 @@ def quantize_model(args):
     if args.observer == "imatrix_mse":
         weights_args_4.observer = "imatrix_mse"
         weights_args_8.observer = "imatrix_mse"
-        recipes.append(IMatrixGatherer(ignore=ignores, attach_by_initialize=False))
+        recipes.append(IMatrixGatherer(ignore=ignores))
         tail_name += "-IMatrix"
 
     if args.modifier == "GPTQ":
@@ -667,8 +667,6 @@ def quantize_model(args):
         max_seq_length=args.max_sequence_length,
         num_calibration_samples=args.num_calibration_samples,
         batch_size=1,
-        sequential_targets=['MiMoV2MLP', 'MiMoV2Attention'],
-        pipeline="sequential",
     )
 
     save_name = args.bf16_dir.rstrip("/").split("/")[-1] + tail_name + "-unpacked"

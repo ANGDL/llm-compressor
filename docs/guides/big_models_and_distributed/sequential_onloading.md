@@ -31,9 +31,23 @@ Before a model can be sequentially onloaded, it must first be broken up into dis
 *This image depicts the sequential text decoder layers of the Llama3.2-Vision model. Each of the individual decoder layers is onloaded separately*
 
 ## Sequential Targets and Usage ##
-You can use sequential onloading by calling `oneshot` with the `pipeline="sequential"` argument. Note that this pipeline is the default for all oneshot calls which require calibration data. If the sequential pipeline proves to be problematic, you can specify `pipeline="basic"` to use a basic pipeline which does not require sequential onloading, but only works performantly when the model is small enough to fit into the available VRAM.
+You can opt into sequential onloading by calling `oneshot` with the
+`pipeline="sequential"` argument. The default pipeline is `independent`. If the
+sequential pipeline proves to be problematic, use `pipeline="independent"` so
+each modifier receives its own calibration pass, or `pipeline="basic"` to share
+one non-sequential pass across modifiers. Non-sequential pipelines only work
+performantly when the model fits into the available memory.
 
 If you are compressing a model using a GPU with a small amount of memory, you may need to change your sequential targets. Sequential targets control how many weights to onload to the GPU at a time. By default, the sequential targets are decoder layers which may include large MoE layers. In these cases, setting the `sequential_targets="Linear"` argument in `oneshot` will result in lower VRAM usage, but a longer runtime.
+
+Sequential target matching does not guarantee that a target becomes an FX
+subgraph boundary. A custom model may call matched modules inside
+tensor-dependent control flow or another operation that the tracer must wrap as
+a function. Wrapped calls do not expose their inner modules as `call_module`
+nodes, so those modules will not receive sequential boundary updates. Do not
+ignore warnings that matched targets were omitted. Use a trace-visible parent
+target or switch to `pipeline="independent"`, then verify that every quantized
+module has finite qparams before saving.
 
 ![sequential_onloading](../../assets/seq_targets.jpg)
 
