@@ -12,6 +12,8 @@ from compressed_tensors.quantization import (
 )
 from loguru import logger
 
+from llmcompressor.modifiers.quantization.scale_dtype import validate_scale_dtype
+
 GPTQ_PRECISION = torch.float32
 
 __all__ = [
@@ -138,6 +140,7 @@ def quantize_weight(
     actorder = quant_args.actorder
     final_shape = module.weight.shape
     final_dtype = module.weight.dtype
+    validate_scale_dtype(quant_args.scale_dtype, final_dtype)
     W = module.weight.clone()
     H = hessian
 
@@ -306,7 +309,7 @@ def quantize_weight(
     loss = torch.sum(losses).item()
     q_param_dict = {
         "weight": W,
-        "weight_scale": scale.to(dtype=final_dtype),
+        "weight_scale": scale.to(dtype=quant_args.scale_dtype or final_dtype),
         "weight_zero_point": zero_point.to(dtype=quant_args.zp_dtype),
     }
     if global_scale:

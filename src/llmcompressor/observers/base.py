@@ -9,6 +9,7 @@ from compressed_tensors.quantization.utils import calculate_qparams, generate_gp
 from compressed_tensors.registry.registry import RegistryMixin
 from torch import distributed as dist
 
+from llmcompressor.modifiers.quantization.scale_dtype import validate_scale_dtype
 from llmcompressor.observers.fusion import FusionHandler
 from llmcompressor.observers.helpers import flatten_for_calibration
 
@@ -109,11 +110,20 @@ class Observer(InternalModule, RegistryMixin):
             self.has_statistics
         ), "No statistics available. Call observer(value) first."
 
+        validate_scale_dtype(self.args.scale_dtype, self.min_vals.dtype)
+
         global_scale = self.get_global_scale()
 
+        min_vals, max_vals = self.min_vals, self.max_vals
+        if self.args.scale_dtype in (torch.float32,):
+            compute_dtype = self.args.scale_dtype
+            if min_vals.dtype != compute_dtype:
+                min_vals = min_vals.to(compute_dtype)
+                max_vals = max_vals.to(compute_dtype)
+
         scale, zero_point = calculate_qparams(
-            min_vals=self.min_vals,
-            max_vals=self.max_vals,
+            min_vals=min_vals,
+            max_vals=max_vals,
             quantization_args=self.args,
             global_scale=global_scale,
         )

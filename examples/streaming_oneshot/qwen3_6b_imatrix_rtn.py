@@ -7,6 +7,8 @@ never modified. Intermediate recovery data is not written unless
 `checkpoint_progress` is enabled.
 """
 
+import torch
+from compressed_tensors.quantization import preset_name_to_scheme
 from datasets import load_dataset
 from llmcompressor.modifiers.quantization import QuantizationModifier
 from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
@@ -28,12 +30,14 @@ dataset = load_dataset(
     split="train_sft[:16]",
 )
 
+w8a8_scheme = preset_name_to_scheme("W8A8", ["Linear"])
+w8a8_scheme.weights.observer = "imatrix_mse"
+w8a8_scheme.weights.scale_dtype = torch.float32
+
 recipe = [
     IMatrixGatherer(ignore=["lm_head"]),
     QuantizationModifier(
-        scheme="W8A8",
-        targets=["Linear"],
-        weight_observer="imatrix_mse",
+        config_groups={"group_0": w8a8_scheme},
         ignore=["lm_head"],
     ),
 ]

@@ -24,6 +24,40 @@ from llmcompressor.utils.transformers import get_embeddings
 __all__ = ["modify_save_pretrained"]
 
 
+_QUANTIZATION_BUFFER_NAMES = {
+    "q_scale",
+    "k_scale",
+    "v_scale",
+    "input_global_scale",
+    "input_scale",
+    "input_shape",
+    "input_zero_point",
+    "input_g_idx",
+    "weight_global_scale",
+    "weight_scale",
+    "weight_shape",
+    "weight_zero_point",
+    "weight_g_idx",
+    "output_global_scale",
+    "output_scale",
+    "output_shape",
+    "output_zero_point",
+    "output_g_idx",
+}
+
+
+def _register_quantization_qparams_as_buffers(model: torch.nn.Module) -> None:
+    """Make non-trainable qparams compatible with accelerate offload removal."""
+    with OffloadCache.disable_onloading():
+        for module in model.modules():
+            for name in tuple(module._parameters):
+                if name not in _QUANTIZATION_BUFFER_NAMES:
+                    continue
+                parameter = module._parameters.pop(name)
+                if parameter is not None:
+                    module.register_buffer(name, parameter.detach(), persistent=True)
+
+
 def _filter_container_modules_from_ignore(
     model: torch.nn.Module,
     ignore: list[str],
@@ -199,6 +233,7 @@ def modify_save_pretrained(model: PreTrainedModel):
             _retie_embeddings(model)
 
             # convert to accelerate offloaded for optimal saving with transformers
+            _register_quantization_qparams_as_buffers(model)
             to_accelerate(model)
 
             with suspend_distributed_timeout():
