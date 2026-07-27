@@ -38,6 +38,12 @@ each modifier receives its own calibration pass, or `pipeline="basic"` to share
 one non-sequential pass across modifiers. Non-sequential pipelines only work
 performantly when the model fits into the available memory.
 
+`pipeline="independent"` isolates modifiers; it does not guarantee that every
+modifier avoids sequential tracing. Calibration-dependent modifiers can still
+infer the sequential implementation internally, so they require a valid,
+trace-visible `sequential_targets` value. Use a parent module such as a decoder
+layer when nested calls are hidden by model control flow.
+
 If you are compressing a model using a GPU with a small amount of memory, you may need to change your sequential targets. Sequential targets control how many weights to onload to the GPU at a time. By default, the sequential targets are decoder layers which may include large MoE layers. In these cases, setting the `sequential_targets="Linear"` argument in `oneshot` will result in lower VRAM usage, but a longer runtime.
 
 Sequential target matching does not guarantee that a target becomes an FX
