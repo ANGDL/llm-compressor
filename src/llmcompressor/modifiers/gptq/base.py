@@ -30,7 +30,7 @@ from llmcompressor.core import Event, State
 from llmcompressor.modifiers import Modifier
 from llmcompressor.modifiers.gptq.gptq_quantize import (
     accumulate_hessian,
-    make_empty_hessian,
+    make_empty_gptq_statistics,
     quantize_weight,
 )
 from llmcompressor.modifiers.quantization.calibration import (
@@ -274,9 +274,12 @@ class GPTQModifier(Modifier, QuantizationMixin):
             init_device = (
                 "cpu" if self.offload_hessians else get_execution_device(module)
             )
-            self._hessians[module] = make_empty_hessian(module, device=init_device)
-            self._num_samples[module] = torch.zeros(
-                tuple(), device=get_execution_device(module)
+            self._hessians[module], self._num_samples[module] = (
+                make_empty_gptq_statistics(
+                    module,
+                    device=init_device,
+                    count_device=get_execution_device(module),
+                )
             )
 
         # Accumulate hessian with input with optional offloading

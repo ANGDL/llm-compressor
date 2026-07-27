@@ -1,0 +1,800 @@
+"""Per-subgraph closed-loop execution for streaming PTQ."""
+
+from __future__ import annotations
+
+from collections.abc import Iterable, Mapping, Sequence
+from contextlib import ExitStack
+from pathlib import Path
+from time import perf_counter
+from typing import Any
+
+import torch
+from compressed_tensors.compressors import compress_module
+from compressed_tensors.quantization.utils import is_module_quantized
+
+from llmcompressor.core import LifecycleCallbacks, create_session
+from llmcompressor.modifiers.quantization.calibration import (
+    freeze_module_quantization,
+)
+from llmcompressor.modifiers.utils.hooks import HooksMixin
+from llmcompressor.recipe import Recipe
+from llmcompressor.utils.helpers import DisableQuantization
+from llmcompressor.utils.metric_logging import CompressionLogger
+
+from ._logging import streaming_logger
+from .activations import (
+    BoundaryActivationStore,
+    DiskBoundaryActivationStore,
+    InMemoryBoundaryActivationStore,
+)
+from .artifacts import (
+    ArtifactStore,
+    CalibrationInfo,
+    RecipeInfo,
+    SequentialInfo,
+    SoftwareInfo,
+    StreamingRunManifest,
+    fingerprint_checkpoint,
+    fingerprint_json,
+)
+from .checkpoint import (
+    AsyncDirectSafetensorsWriter,
+    DirectSafetensorsWriter,
+    StreamingCheckpointWriter,
+)
+from .loading import SubgraphPrefetcher
+from .materialization import WeightMaterializer, materialize_weights
+from .output import quantized_module_formats
+from .tied_weights import infer_transformers_tied_weights
+from .tracing import TracedBoundaryAdapter
+
+__all__ = ["run_subgraph_streaming_pipeline"]
+
+
+def _empty_device_cache(device: torch.device) -> None:
+    backend = getattr(torch, device.type, None)
+    empty_cache = getattr(backend, "empty_cache", None)
+    if callable(empty_cache):
+        empty_cache()
+
+
+def _reset_peak_memory(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+
+
+def _stage_logger(
+    model: torch.nn.Module, name: str, device: torch.device
+) -> CompressionLogger:
+    device_ids = (
+        (device.index if device.index is not None else torch.cuda.current_device(),)
+        if device.type == "cuda"
+        else ()
+    )
+    metrics = CompressionLogger(model, device_ids=device_ids)
+    metrics.set_results(
+        name="streaming",
+        summary=f"{name} | device={device}",
+    )
+    return metrics
+
+
+def _target_label(index: int, total: int, target: str) -> str:
+    width = max(2, len(str(total)))
+    return f"[{index + 1:0{width}d}/{total:0{width}d}] {target}"
+
+
+def _resolve_pipeline_devices(
+    device: torch.device,
+    pipeline_devices: Sequence[torch.device | str] | None,
+) -> tuple[torch.device, ...]:
+    primary = torch.device(device)
+    if pipeline_devices is None:
+        return (primary,)
+    devices = tuple(torch.device(value) for value in pipeline_devices)
+    if not devices:
+        raise ValueError("pipeline_devices must not be empty")
+    if devices[0] != primary:
+        raise ValueError(
+            f"pipeline_devices must start with the primary device {primary}"
+        )
+    if len(devices) > 2:
+        raise ValueError("The first asynchronous pipeline supports two GPUs")
+    if len(set(devices)) != len(devices):
+        raise ValueError("pipeline_devices must be distinct")
+    if len(devices) == 2 and any(
+        value.type != "cuda" or value.index is None for value in devices
+    ):
+        raise ValueError(
+            "Multi-device streaming requires explicit CUDA devices such as "
+            "['cuda:0', 'cuda:1']"
+        )
+    return devices
+
+
+def _output_shard(source, tensor_name: str, owner_name: str) -> str:
+    available = set(source.tensor_names())
+    if tensor_name in available:
+        return source.metadata(tensor_name).shard.name
+    candidate = owner_name
+    while candidate:
+        weight_name = f"{candidate}.weight"
+        if weight_name in available:
+            return source.metadata(weight_name).shard.name
+        candidate = candidate.rpartition(".")[0]
+    shards = {source.metadata(name).shard.name for name in available}
+    if len(shards) == 1:
+        return next(iter(shards))
+    raise KeyError(f"Cannot assign output shard for tensor {tensor_name!r}")
+
+
+def _initialize_run(
+    *,
+    checkpoint: str | Path,
+    artifact_dir: Path,
+    recipe: Recipe,
+    dataset_fingerprint: str,
+    targets: tuple[str, ...],
+    materializer: WeightMaterializer,
+    target_dtype: torch.dtype,
+    num_samples: int,
+    max_seq_length: int | None,
+    seed: int | None,
+    persist: bool = True,
+) -> str:
+    normalized_recipe = recipe.model_dump(mode="json")
+    source_info = fingerprint_checkpoint(checkpoint)
+    run_fingerprint = fingerprint_json(
+        {
+            "source": source_info.content_fingerprint,
+            "recipe": normalized_recipe,
+            "dataset": dataset_fingerprint,
+            "targets": targets,
+            "materializer": materializer.manifest_info(
+                target_dtype=target_dtype
+            ).config_sha256,
+        }
+    )
+    manifest = StreamingRunManifest(
+        source=source_info,
+        recipe=RecipeInfo(fingerprint_json(normalized_recipe)),
+        calibration=CalibrationInfo(
+            dataset_fingerprint=dataset_fingerprint,
+            num_samples=num_samples,
+            max_seq_length=max_seq_length,
+            seed=seed,
+        ),
+        sequential=SequentialInfo(targets),
+        materializer=materializer.manifest_info(target_dtype=target_dtype),
+        software=SoftwareInfo.from_versions({"torch": torch.__version__}),
+    )
+    if persist:
+        ArtifactStore(artifact_dir).initialize(
+            manifest, normalized_recipe=normalized_recipe, targets=targets
+        )
+    return run_fingerprint
+
+
+def _write_loaded_target(
+    transaction, loaded, target_name: str, source
+) -> set[str]:
+    written = set()
+    formats = quantized_module_formats(
+        loaded.model.named_modules(), prefix=target_name
+    )
+    for name, tensor in loaded.state_tensors_under((target_name,)):
+        owner_name = name.rpartition(".")[0]
+        transaction.write_tensor(
+            name,
+            tensor,
+            output_shard=_output_shard(source, name, owner_name),
+        )
+        written.add(name)
+
+    for module_name, format_name in formats.items():
+        transaction.mark_quantized(module_name, format_name)
+        # Compression formats such as pack-quantized replace the source weight
+        # with weight_packed/weight_shape. Mark the original source tensor as
+        # consumed so the fallback copier cannot reintroduce a second raw weight.
+        written.add(f"{module_name}.weight")
+    return written
+
+
+def _loaded_target_delta(loaded, target_name: str):
+    tensors = dict(loaded.state_tensors_under((target_name,)))
+    formats = quantized_module_formats(
+        loaded.model.named_modules(), prefix=target_name
+    )
+    written = set(tensors)
+    for module_name in formats:
+        written.add(f"{module_name}.weight")
+    return tensors, formats, written
+
+
+def _write_loaded_target_direct(
+    writer: DirectSafetensorsWriter,
+    loaded,
+    target_name: str,
+    shard_id: str,
+) -> set[str]:
+    """Write one target and release all device tensor references before returning."""
+
+    tensors, formats, written = _loaded_target_delta(loaded, target_name)
+    try:
+        if tensors:
+            writer.write_shard(
+                shard_id,
+                tensors,
+                quantized_modules=formats,
+            )
+        return written
+    finally:
+        tensors.clear()
+
+
+def _write_remaining_direct_shards(
+    *,
+    writer: DirectSafetensorsWriter,
+    source,
+    materializer: WeightMaterializer,
+    target_dtype: torch.dtype,
+    written: set[str],
+    omitted: Mapping[str, str],
+) -> None:
+    """Copy non-subgraph tensors into bounded final static shards."""
+
+    omitted_metadata = dict(omitted)
+    tensors: dict[str, torch.Tensor] = {}
+    tensor_bytes = 0
+    shard_index = 0
+    max_shard_bytes = 256 * 1024 * 1024
+
+    def flush() -> None:
+        nonlocal omitted_metadata, shard_index, tensor_bytes
+        if not tensors:
+            return
+        writer.write_shard(
+            f"static-{shard_index:05d}",
+            tensors,
+            omitted_tied_weights=omitted_metadata,
+        )
+        tensors.clear()
+        omitted_metadata = {}
+        shard_index += 1
+        tensor_bytes = 0
+
+    for name in source.tensor_names():
+        if name in written or name in omitted:
+            continue
+        metadata = source.metadata(name)
+        if metadata.dtype.is_floating_point or materializer.dependencies(
+            name, metadata
+        ):
+            value = materialize_weights(
+                source,
+                (name,),
+                materializer,
+                target_dtype=target_dtype,
+                device=torch.device("cpu"),
+            )[name]
+        else:
+            value = source.load_tensors(
+                (name,), device=torch.device("cpu")
+            )[name]
+        value_bytes = value.numel() * value.element_size()
+        if tensors and tensor_bytes + value_bytes > max_shard_bytes:
+            flush()
+        tensors[name] = value
+        tensor_bytes += value_bytes
+        written.add(name)
+    flush()
+
+
+def _copy_remaining_tensors(
+    *,
+    writer: StreamingCheckpointWriter,
+    source,
+    materializer: WeightMaterializer,
+    target_dtype: torch.dtype,
+    written: set[str],
+    omitted: Mapping[str, str],
+) -> None:
+    for index, name in enumerate(source.tensor_names()):
+        if name in written or name in omitted:
+            continue
+        transaction_id = f"source-tensor-{index:08d}"
+        if writer.is_transaction_complete(transaction_id):
+            continue
+        metadata = source.metadata(name)
+        if metadata.dtype.is_floating_point or materializer.dependencies(
+            name, metadata
+        ):
+            value = materialize_weights(
+                source,
+                (name,),
+                materializer,
+                target_dtype=target_dtype,
+                device=torch.device("cpu"),
+            )[name]
+        else:
+            value = source.load_tensors(
+                (name,), device=torch.device("cpu")
+            )[name]
+        with writer.transaction(transaction_id) as transaction:
+            transaction.write_tensor(
+                name, value, output_shard=metadata.shard.name
+            )
+            for alias, canonical in omitted.items():
+                transaction.omit_tied_weight(alias, canonical)
+            transaction.commit()
+        del value
+
+
+def run_subgraph_streaming_pipeline(
+    *,
+    adapter: TracedBoundaryAdapter,
+    checkpoint: str | Path,
+    work_dir: str | Path,
+    calibration_batches: Iterable[Mapping[str, Any]],
+    recipe: Recipe,
+    dataset_fingerprint: str,
+    materializer: WeightMaterializer,
+    device: torch.device,
+    target_dtype: torch.dtype,
+    num_samples: int,
+    max_seq_length: int | None,
+    seed: int | None,
+    checkpoint_progress: bool = False,
+    pipeline_devices: Sequence[torch.device | str] | None = None,
+    async_save: bool = False,
+) -> tuple[Path, Path]:
+    """Calibrate, modify, propagate, and persist one subgraph at a time."""
+
+    execution_devices = _resolve_pipeline_devices(device, pipeline_devices)
+    if checkpoint_progress and (len(execution_devices) > 1 or async_save):
+        raise ValueError(
+            "Asynchronous prefetch and saving are not supported with "
+            "checkpoint_progress=True"
+        )
+    work = Path(work_dir)
+    artifact_dir = work / "artifacts"
+    staging_dir = work / "staging"
+    publish_dir = work / "publish"
+    run_fingerprint = _initialize_run(
+        checkpoint=checkpoint,
+        artifact_dir=artifact_dir,
+        recipe=recipe,
+        dataset_fingerprint=dataset_fingerprint,
+        targets=adapter.targets,
+        materializer=materializer,
+        target_dtype=target_dtype,
+        num_samples=num_samples,
+        max_seq_length=max_seq_length,
+        seed=seed,
+        persist=checkpoint_progress,
+    )
+    transaction_writer = (
+        StreamingCheckpointWriter(staging_dir, run_fingerprint=run_fingerprint)
+        if checkpoint_progress
+        else None
+    )
+    direct_writer_base = (
+        None
+        if checkpoint_progress
+        else DirectSafetensorsWriter(
+            publish_dir, run_fingerprint=run_fingerprint
+        )
+    )
+    direct_writer = direct_writer_base
+    async_direct_writer = None
+    boundaries: BoundaryActivationStore
+    if checkpoint_progress:
+        boundaries = DiskBoundaryActivationStore(work / "boundaries")
+    else:
+        boundaries = InMemoryBoundaryActivationStore(
+            storage_device="cpu", deduplicate_tensors=True
+        )
+    source = adapter.weight_session.source
+    written: set[str] = set()
+    first_transaction = "subgraph-00000"
+    if transaction_writer is None or not transaction_writer.is_transaction_complete(
+        first_transaction
+    ):
+        if transaction_writer is not None and transaction_writer.has_transaction(
+            first_transaction
+        ):
+            raise RuntimeError(
+                f"Committed transaction {first_transaction!r} is corrupt; "
+                "refusing to replace durable output"
+            )
+        # Boundary zero is not covered by a preceding subgraph transaction.
+        # Always recreate it when the first subgraph is incomplete so a crash
+        # while snapshotting the dataloader cannot leave a partial input set.
+        streaming_logger.info("setup | collecting initial calibration boundary")
+        with _stage_logger(
+            adapter.model, "[setup] initial boundary", device
+        ):
+            boundaries.delete(0)
+            for batch_index, boundary in enumerate(
+                adapter.calibration_boundaries(calibration_batches)
+            ):
+                boundaries.put(0, batch_index, boundary)
+        streaming_logger.info(
+            "setup | initial boundary ready | "
+            f"batches={len(boundaries.batch_indices(0))}"
+        )
+
+    streaming_logger.info("setup | initializing modifier session")
+    with create_session() as session:
+        with _stage_logger(
+            adapter.model, "[setup] initialize modifiers", device
+        ):
+            session.initialize(
+                model=adapter.model,
+                recipe=recipe,
+                start=-1,
+                calib_data=calibration_batches,
+                sequential_targets=adapter.targets,
+                copy_data=False,
+            )
+            LifecycleCallbacks.calibration_start()
+        streaming_logger.info("setup | modifier session ready")
+        if async_save:
+            if direct_writer_base is None:
+                raise RuntimeError("Asynchronous saving requires a direct writer")
+            async_direct_writer = AsyncDirectSafetensorsWriter(
+                direct_writer_base, max_pending=1
+            )
+            direct_writer = async_direct_writer
+        prefetcher = (
+            SubgraphPrefetcher(adapter.weight_session)
+            if len(execution_devices) > 1
+            else None
+        )
+        pipeline_failed = True
+        try:
+            if prefetcher is not None and adapter.targets:
+                first_name = adapter.targets[0]
+                first_device = execution_devices[0]
+                first_label = _target_label(0, len(adapter.targets), first_name)
+                with _stage_logger(
+                    adapter.model,
+                    f"{first_label} | plan weights",
+                    first_device,
+                ):
+                    first_plan = adapter.weight_session.plan(
+                        adapter.target_subgraphs[0]
+                    )
+                _reset_peak_memory(first_device)
+                prefetcher.submit(
+                    first_plan,
+                    device=first_device,
+                    dtype=target_dtype,
+                    label=f"{first_label} | load weights",
+                )
+            for target_index, (target_name, subgraph) in enumerate(
+                zip(adapter.targets, adapter.target_subgraphs)
+            ):
+                target_device = execution_devices[
+                    target_index % len(execution_devices)
+                ]
+                transaction_id = f"subgraph-{target_index:05d}"
+                if (
+                    transaction_writer is not None
+                    and transaction_writer.is_transaction_complete(transaction_id)
+                ):
+                    label = _target_label(
+                        target_index, len(adapter.targets), target_name
+                    )
+                    streaming_logger.info(f"{label} | restoring checkpoint")
+                    metadata = next(
+                        value
+                        for value in transaction_writer.committed_metadata()
+                        if value["transaction_id"] == transaction_id
+                    )
+                    written.update(
+                        record["name"] for record in metadata["records"]
+                    )
+                    committed_boundary = transaction_writer.committed_boundary(
+                        transaction_id
+                    )
+                    if committed_boundary is not None:
+                        boundary_index, values = committed_boundary
+                        boundaries.delete(boundary_index)
+                        for batch_index, value in enumerate(values):
+                            boundaries.put(boundary_index, batch_index, value)
+                    boundaries.delete(target_index)
+                    continue
+                if (
+                    transaction_writer is not None
+                    and transaction_writer.has_transaction(transaction_id)
+                ):
+                    raise RuntimeError(
+                        f"Committed transaction {transaction_id!r} is corrupt; "
+                        "refusing to replace durable output"
+                    )
+                batches = boundaries.batch_indices(target_index)
+                if not batches:
+                    raise RuntimeError(
+                        f"Missing boundary {target_index} for {target_name!r}"
+                    )
+                target_count = len(adapter.targets)
+                target_label = _target_label(
+                    target_index, target_count, target_name
+                )
+                if prefetcher is None:
+                    _reset_peak_memory(target_device)
+                streaming_logger.info(
+                    f"{target_label} | start | "
+                    f"batches={len(batches)} | device={target_device}"
+                )
+                target_started_at = perf_counter()
+                # A previous attempt can fail after publishing only part of the
+                # next external boundary but before committing its transaction.
+                # Rebuild it from scratch so stale batches are never consumed.
+                if target_index + 1 < len(adapter.targets):
+                    boundaries.delete(target_index + 1)
+                weight_stack = ExitStack()
+                try:
+                    if prefetcher is None:
+                        with _stage_logger(
+                            adapter.model,
+                            f"{target_label} | load weights",
+                            target_device,
+                        ):
+                            loaded = weight_stack.enter_context(
+                                adapter.weight_session.loaded(
+                                    subgraph,
+                                    device=target_device,
+                                    dtype=target_dtype,
+                                )
+                            )
+                    else:
+                        prepared = prefetcher.take()
+                        next_index = target_index + 1
+                        if next_index < target_count:
+                            next_name = adapter.targets[next_index]
+                            next_label = _target_label(
+                                next_index, target_count, next_name
+                            )
+                            next_device = execution_devices[
+                                next_index % len(execution_devices)
+                            ]
+                            with _stage_logger(
+                                adapter.model,
+                                f"{next_label} | plan weights",
+                                next_device,
+                            ):
+                                next_plan = adapter.weight_session.plan(
+                                    adapter.target_subgraphs[next_index]
+                                )
+                        else:
+                            next_plan = None
+                        loaded = weight_stack.enter_context(
+                            adapter.weight_session.installed(prepared)
+                        )
+                        if next_plan is not None:
+                            _reset_peak_memory(next_device)
+                            prefetcher.submit(
+                                next_plan,
+                                device=next_device,
+                                dtype=target_dtype,
+                                label=f"{next_label} | load weights",
+                            )
+                    # Match the ordinary sequential calibration pipeline: model
+                    # execution is inference-only. Besides avoiding autograd
+                    # storage, this is required by models such as DeepSeek-V4
+                    # whose attention updates runtime KV buffers in place.
+                    with _stage_logger(
+                        adapter.model,
+                        f"{target_label} | calibration",
+                        target_device,
+                    ):
+                        with DisableQuantization(adapter.model), torch.no_grad():
+                            for batch_index in batches:
+                                session.state.current_batch_idx = batch_index
+                                value = boundaries.get(
+                                    target_index,
+                                    batch_index,
+                                    device=target_device,
+                                )
+                                inputs = {
+                                    name: value[name]
+                                    for name in subgraph.input_names
+                                }
+                                subgraph.forward(adapter.model, **inputs)
+                                del inputs, value
+                    with _stage_logger(
+                        adapter.model,
+                        f"{target_label} | modifier update",
+                        target_device,
+                    ):
+                        LifecycleCallbacks.sequential_epoch_end(
+                            subgraph.submodules(adapter.model)
+                        )
+                        for module in subgraph.submodules(adapter.model):
+                            if is_module_quantized(module):
+                                freeze_module_quantization(module)
+                    with _stage_logger(
+                        adapter.model,
+                        f"{target_label} | activation propagation",
+                        target_device,
+                    ):
+                        # Match SequentialPipeline: propagation captures the
+                        # modified full-precision output (or an algorithm's
+                        # in-place weight update), without adding fake-quant
+                        # QDQ to every quantized module.
+                        with (
+                            HooksMixin.disable_hooks(),
+                            DisableQuantization(adapter.model),
+                            torch.no_grad(),
+                        ):
+                            for batch_index in batches:
+                                value = boundaries.get(
+                                    target_index,
+                                    batch_index,
+                                    device=target_device,
+                                )
+                                inputs = {
+                                    name: value[name]
+                                    for name in subgraph.input_names
+                                }
+                                output = subgraph.forward(adapter.model, **inputs)
+                                if target_index + 1 < len(adapter.targets):
+                                    next_value = {**value, **output}
+                                    for consumed in adapter.plan.subgraphs[
+                                        adapter.plan.target_subgraph_indices[
+                                            target_index
+                                        ]
+                                    ].consumed_names:
+                                        next_value.pop(consumed, None)
+                                    boundaries.put(
+                                        target_index + 1,
+                                        batch_index,
+                                        next_value,
+                                    )
+                                    del next_value
+                                del inputs, output, value
+
+                    with _stage_logger(
+                        adapter.model,
+                        f"{target_label} | compress weights",
+                        target_device,
+                    ):
+                        for module in subgraph.submodules(adapter.model):
+                            if is_module_quantized(module):
+                                compress_module(module)
+                    with _stage_logger(
+                        adapter.model,
+                        f"{target_label} | queue checkpoint",
+                        target_device,
+                    ):
+                        if transaction_writer is not None:
+                            with transaction_writer.transaction(
+                                transaction_id
+                            ) as transaction:
+                                if target_index + 1 < len(adapter.targets):
+                                    for batch_index in batches:
+                                        transaction.write_boundary(
+                                            batch_index,
+                                            boundaries.get(
+                                                target_index + 1, batch_index
+                                            ),
+                                            boundary=target_index + 1,
+                                        )
+                                written.update(
+                                    _write_loaded_target(
+                                        transaction, loaded, target_name, source
+                                    )
+                                )
+                                transaction.commit()
+                        else:
+                            written.update(
+                                _write_loaded_target_direct(
+                                    direct_writer,
+                                    loaded,
+                                    target_name,
+                                    transaction_id,
+                                )
+                            )
+                finally:
+                    with _stage_logger(
+                        adapter.model,
+                        f"{target_label} | unload weights",
+                        target_device,
+                    ):
+                        weight_stack.close()
+                        boundaries.delete(target_index)
+                        _empty_device_cache(target_device)
+                streaming_logger.info(
+                    f"{target_label} | complete | "
+                    f"time={perf_counter() - target_started_at:.2f}s"
+                )
+            pipeline_failed = False
+        finally:
+            try:
+                if prefetcher is not None:
+                    prefetcher.close(suppress_errors=pipeline_failed)
+                with _stage_logger(
+                    adapter.model, "[finalize] modifier session", device
+                ):
+                    LifecycleCallbacks.calibration_end()
+                    session.finalize()
+                streaming_logger.info("finalize | modifier session complete")
+            except BaseException:
+                if async_direct_writer is not None:
+                    try:
+                        async_direct_writer.close()
+                    except Exception:
+                        streaming_logger.exception(
+                            "Asynchronous checkpoint writer failed while unwinding"
+                        )
+                raise
+            if pipeline_failed and async_direct_writer is not None:
+                try:
+                    async_direct_writer.close()
+                except Exception:
+                    streaming_logger.exception(
+                        "Asynchronous checkpoint writer failed while unwinding"
+                    )
+
+    if direct_writer is not None:
+        _initialize_run(
+            checkpoint=checkpoint,
+            artifact_dir=artifact_dir,
+            recipe=recipe,
+            dataset_fingerprint=dataset_fingerprint,
+            targets=adapter.targets,
+            materializer=materializer,
+            target_dtype=target_dtype,
+            num_samples=num_samples,
+            max_seq_length=max_seq_length,
+            seed=seed,
+        )
+
+    source_names = set(source.tensor_names())
+    omitted = {
+        alias: canonical
+        for alias, canonical in infer_transformers_tied_weights(
+            checkpoint
+        ).items()
+        if alias in source_names and canonical in source_names
+    }
+    streaming_logger.info("finalize | writing static model tensors")
+    remaining_failed = True
+    try:
+        with _stage_logger(
+            adapter.model, "[finalize] write static tensors", device
+        ):
+            if direct_writer is not None:
+                _write_remaining_direct_shards(
+                    writer=direct_writer,
+                    source=source,
+                    materializer=materializer,
+                    target_dtype=target_dtype,
+                    written=written,
+                    omitted=omitted,
+                )
+            else:
+                _copy_remaining_tensors(
+                    writer=transaction_writer,
+                    source=source,
+                    materializer=materializer,
+                    target_dtype=target_dtype,
+                    written=written,
+                    omitted=omitted,
+                )
+                transaction_writer.assemble_shards()
+        remaining_failed = False
+    finally:
+        if async_direct_writer is not None:
+            try:
+                async_direct_writer.close()
+            except Exception:
+                if not remaining_failed:
+                    raise
+                streaming_logger.exception(
+                    "Asynchronous checkpoint writer failed while unwinding"
+                )
+    streaming_logger.info("complete")
+    return artifact_dir, staging_dir if checkpoint_progress else publish_dir

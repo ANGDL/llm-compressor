@@ -106,7 +106,10 @@ def moe_calibration_context(
 
     # Step 2: Replace modules with progress bar
     if modules_to_replace:
-        logger.info(f"Found {len(modules_to_replace)} MoE modules to replace")
+        logger.info(
+            f"Found {len(modules_to_replace)} MoE modules to replace; "
+            f"calibrate_all_experts={calibrate_all_experts}"
+        )
         for name, class_name in tqdm(
             modules_to_replace, desc="Replacing MoE modules for calibration"
         ):

@@ -9,13 +9,15 @@ import torch
 from compressed_tensors.offload import dispatch_model, load_offloaded_model
 from compressed_tensors.utils import deprecated, patch_attr
 from huggingface_hub import snapshot_download
-from llmcompressor._torch_accelerator_compat import (
-    accelerator_is_available,
-    current_accelerator_type,
-)
 from loguru import logger
 from safetensors.torch import save_file
 from transformers import AutoModelForCausalLM, PreTrainedModel
+
+from llmcompressor._torch_accelerator_compat import (
+    accelerator_device,
+    accelerator_is_available,
+    current_accelerator_type,
+)
 
 try:
     # Transformers < v5 support
@@ -199,6 +201,28 @@ def get_main_device() -> torch.device:
     else:
         logger.warning("No accelerator available! Compressing model on CPU instead")
         return torch.device("cpu")
+
+
+def resolve_execution_device(
+    device: torch.device | str | None = None,
+) -> torch.device:
+    """Resolve a requested device to the concrete device used by tensors.
+
+    Automatic selection follows :func:`get_main_device`. An accelerator without
+    an explicit index, such as ``mps`` or ``cuda``, is resolved to the current
+    physical device so downstream loaders and validators share one identity.
+    """
+
+    resolved = get_main_device() if device is None else torch.device(device)
+    if resolved.type in {"cpu", "meta"} or resolved.index is not None:
+        return resolved
+    current = accelerator_device()
+    if current.type != resolved.type:
+        raise ValueError(
+            f"Requested accelerator {resolved.type!r}, but the current "
+            f"accelerator is {current.type!r}"
+        )
+    return current
 
 
 def get_high_precision() -> torch.dtype:
