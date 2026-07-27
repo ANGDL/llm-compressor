@@ -1,9 +1,10 @@
 import math
+from unittest.mock import patch
 
 import pytest
 import torch
 import torch.fx
-from transformers import AutoModelForCausalLM
+from transformers import AutoModelForCausalLM, PretrainedConfig
 
 from llmcompressor.args.dataset_arguments import DatasetArguments
 from llmcompressor.pipelines.sequential.helpers import (
@@ -43,6 +44,35 @@ class DummyModelMultipleSequentialLayers(torch.nn.Module):
         x = self.layer5(x)
         x = self.layer6(x)
         return x
+
+
+class _SequentialTarget(torch.nn.Module):
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        return value + 1
+
+
+class _DataDependentTargetCall(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.target = _SequentialTarget()
+
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        if value.numel() > 0:
+            value = self.target(value)
+        return value
+
+
+class _ModelWithHiddenSequentialTarget(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.config = PretrainedConfig()
+        self.device = torch.device("cpu")
+        self.visible_target = _SequentialTarget()
+        self.data_dependent = _DataDependentTargetCall()
+
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        value = self.visible_target(value)
+        return self.data_dependent(value)
 
 
 def test_get_sequential_ancestors():
@@ -106,6 +136,33 @@ def test_topological_partition_invalid():
 
     with pytest.raises(ValueError):
         topological_partition(gm, targets, 0)
+
+
+def test_trace_subgraphs_warns_when_matched_target_is_hidden_by_autowrap():
+    model = _ModelWithHiddenSequentialTarget()
+
+    with patch(
+        "llmcompressor.pipelines.sequential.helpers.logger.warning"
+    ) as warning:
+        subgraphs = trace_subgraphs(
+            model,
+            {"value": torch.ones(1)},
+            sequential_targets=["_SequentialTarget"],
+            ignore=[],
+        )
+
+    covered_modules = {
+        module for subgraph in subgraphs for module in subgraph.submodules(model)
+    }
+    assert model.visible_target in covered_modules
+    assert model.data_dependent.target not in covered_modules
+    messages = [call.args[0] for call in warning.call_args_list]
+    message = next(
+        message for message in messages if message.startswith("Sequential tracing left")
+    )
+    assert "1/2 matched target modules outside all subgraphs" in message
+    assert "data_dependent.target" in message
+    assert "pipeline='independent'" in message
 
 
 @pytest.mark.parametrize("targets_per_subgraph", [1, 2, 3, 4, 5])

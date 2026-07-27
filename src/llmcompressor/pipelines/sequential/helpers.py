@@ -147,6 +147,34 @@ def trace_subgraphs(
     subgraphs = partition_graph(model, partitions)
     trace_consumed_names(subgraphs)
 
+    # A target can be matched by name but hidden inside an autowrapped forward
+    # or data-dependent control flow, so it may not appear as an FX call_module
+    # node. Report this before sequential calibration silently skips its boundary.
+    matched_names = {}
+    for name, module in match_named_modules(model, sequential_targets):
+        matched_names.setdefault(module, name)
+    covered_modules = set()
+    for subgraph in subgraphs:
+        covered_modules.update(subgraph.submodules(model, recurse=True))
+    uncovered_target_names = [
+        name for module, name in matched_names.items() if module not in covered_modules
+    ]
+    if uncovered_target_names:
+        preview_size = 10
+        preview = ", ".join(uncovered_target_names[:preview_size])
+        if len(uncovered_target_names) > preview_size:
+            preview += f", ... (+{len(uncovered_target_names) - preview_size} more)"
+        logger.warning(
+            "Sequential tracing left "
+            f"{len(uncovered_target_names)}/{len(matched_names)} matched target "
+            "modules "
+            "outside all subgraphs: "
+            f"{preview}. Calls hidden inside autowrapped or data-dependent control "
+            "flow are not represented as call_module nodes. Uncovered modules will "
+            "not receive sequential boundary updates. "
+            "Use a trace-visible parent target or pipeline='independent'."
+        )
+
     # As currently implemented, `topological_partition` generates an extra subgraph at
     # the beginning which does not contain a target. This adds a little more runtime,
     # and could be folded into the first subgraph in the future
