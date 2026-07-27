@@ -49,7 +49,9 @@ from llmcompressor.modifiers.quantization.calibration import (
     freeze_module_quantization,
     initialize_observer,
     reset_quantization_status,
+    set_quantization_scale_dtype,
 )
+from llmcompressor.modifiers.quantization.scale_dtype import validate_scale_dtype
 from llmcompressor.modifiers.quantization.group_size_validation import (
     validate_group_size_divisibility,
 )
@@ -256,6 +258,7 @@ class QuantizationMixin(HooksMixin):
             config.kv_cache_scheme = None
 
         apply_quantization_config(model, config)
+        model.apply(set_quantization_scale_dtype)
 
         if not self.bypass_divisibility_checks:
             validate_group_size_divisibility(model, self.resolved_targets, self.ignore)
@@ -474,6 +477,16 @@ class QuantizationMixin(HooksMixin):
             # was provided directly (not derived from scheme)
             for scheme_obj in config_groups.values():
                 self._apply_observer_overrides(scheme_obj)
+
+        for scheme_obj in config_groups.values():
+            for args_name in (
+                "weights",
+                "input_activations",
+                "output_activations",
+            ):
+                args = getattr(scheme_obj, args_name, None)
+                validate_scale_dtype(getattr(args, "scale_dtype", None))
+        validate_scale_dtype(getattr(kv_cache_scheme, "scale_dtype", None))
 
         return QuantizationConfig(
             config_groups=config_groups,

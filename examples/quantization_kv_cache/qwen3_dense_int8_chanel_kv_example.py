@@ -1,4 +1,8 @@
+import os
+
+import torch
 from compressed_tensors.offload import dispatch_model
+from compressed_tensors.quantization import preset_name_to_scheme
 from compressed_tensors.quantization.quant_args import (
   QuantizationArgs,
   QuantizationStrategy,
@@ -9,8 +13,6 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from llmcompressor import oneshot
 from llmcompressor.modifiers.quantization import QuantizationModifier
-
-import os
 
 # Select model and load it.
 model_id = "/Users/ang/models/Qwen3-0.6B-Base"
@@ -70,9 +72,10 @@ kv_cache_args = QuantizationArgs(
 )
 
 # Configure the quantization algorithm to run.
+weight_scheme = preset_name_to_scheme("W8A8", ["Linear"])
+weight_scheme.weights.scale_dtype = torch.float32
 recipe = QuantizationModifier(
-    targets="Linear",
-    scheme="W8A8",
+    config_groups={"group_0": weight_scheme},
     ignore=["lm_head"],
     kv_cache_scheme=kv_cache_args,
 )

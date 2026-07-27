@@ -99,6 +99,24 @@ class TestGlobalMinMaxTensorGroup:
 class TestBasicFunctionality:
     """Sanity checks for the happy path."""
 
+    def test_float32_scale_dtype_supports_bfloat16_weights(self):
+        module = _make_linear_with_importance().to(dtype=torch.bfloat16)
+        args = QuantizationArgs(
+            num_bits=8,
+            symmetric=True,
+            strategy="channel",
+            observer="imatrix_mse",
+            scale_dtype=torch.float32,
+        )
+        observer = Observer.load_from_registry(
+            "imatrix_mse", base_name="weight", args=args
+        )
+        observer.attach(module)
+
+        qparams = observer(module.weight).get_qparams()
+
+        assert qparams["scale"].dtype == torch.float32
+
     def test_channel_strategy(self):
         module = _make_linear_with_importance(in_features=8, out_features=4)
         observer = _make_observer(module, strategy="channel")

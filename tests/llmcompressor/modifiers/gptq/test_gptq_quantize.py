@@ -60,6 +60,28 @@ def test_quantize_weight_group_strategy_actorder(actorder):
         assert q_param_dict["weight_g_idx"].shape == (8,)
 
 
+@torch.no_grad()
+def test_quantize_weight_preserves_requested_scale_dtype():
+    module = torch.nn.Linear(8, 6, bias=False, dtype=torch.bfloat16)
+    quant_args = QuantizationArgs(
+        num_bits=8,
+        symmetric=True,
+        strategy="channel",
+        scale_dtype=torch.float32,
+    )
+    module.quantization_scheme = QuantizationScheme(
+        targets=["Linear"], weights=quant_args
+    )
+    initialize_observer(module, "weight")
+    observe(module, "weight")
+
+    hessian = make_empty_hessian(module)
+    hessian += torch.eye(hessian.shape[0], dtype=hessian.dtype, device=hessian.device)
+    _, q_param_dict = quantize_weight(module, quant_args, hessian)
+
+    assert q_param_dict["weight_scale"].dtype == torch.float32
+
+
 @pytest.mark.parametrize(
     "actorder",
     [None, ActivationOrdering.WEIGHT],

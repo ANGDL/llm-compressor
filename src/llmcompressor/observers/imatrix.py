@@ -278,6 +278,9 @@ def _grid_search(
     """
     min_val = torch.amin(observed, dim=(0, -1))
     max_val = torch.amax(observed, dim=(0, -1))
+    if args.scale_dtype == torch.float32:
+        min_val = min_val.float()
+        max_val = max_val.float()
     best_error = torch.full(
         min_val.shape,
         torch.finfo(torch.float32).max,

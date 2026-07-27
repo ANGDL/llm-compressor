@@ -9,6 +9,7 @@ from llmcompressor.modifiers.quantization.calibration import (
     freeze_module_quantization,
     initialize_observer,
     observe,
+    set_quantization_scale_dtype,
     update_qparams,
 )
 from llmcompressor.observers.helpers import flatten_for_calibration
@@ -45,9 +46,7 @@ def initialize_quantized_linear(
     module.weight.data.copy_(weight)
     initialize_module_for_quantization(module, scheme, force_zero_point=False)
 
-    scale_dtype = scheme.weights.scale_dtype
-    if scale_dtype is not None and hasattr(module, "weight_scale"):
-        module.weight_scale.data = module.weight_scale.data.to(scale_dtype)
+    set_quantization_scale_dtype(module)
 
     return module
 

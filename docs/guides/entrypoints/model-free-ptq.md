@@ -63,6 +63,10 @@ weight quantization uses `absmax / 127` while the default `W8A8` preset uses
 conversion flow that uses strict `/127` scaling and stores scales in FP32, pass
 both options explicitly:
 
+Supported scale dtypes are the source tensor dtype and `torch.float32`.
+Microscale formats may additionally use `torch.float8_e4m3fn` for local scales.
+`torch.float64` is not supported.
+
 ```python
 import torch
 
