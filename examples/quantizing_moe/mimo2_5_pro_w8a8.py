@@ -564,7 +564,12 @@ def quantize_model(args):
         max_seq_length=args.max_sequence_length,
         num_calibration_samples=args.num_calibration_samples,
         batch_size=1,
-        sequential_targets=['MiMoV2MLP', 'MiMoV2Attention']
+        # Independent runs each modifier separately, but its calibration-capable
+        # modifiers still infer the sequential implementation internally. Use the
+        # trace-visible decoder layer as the boundary; expert modules are nested
+        # under it and must not be selected as direct FX targets.
+        sequential_targets=["MiMoV2DecoderLayer"],
+        pipeline="independent",
     )
 
     save_name = args.bf16_dir.rstrip("/").split("/")[-1] + tail_name
