@@ -183,6 +183,7 @@ setup(
     entry_points={
         "console_scripts": [
             "llmcompressor.trace=llmcompressor.transformers.tracing.debug:main",
+            "llmcompressor.streaming=llmcompressor.streaming.cli:main",
             # reindex_fused_weights is deprecated
             "llmcompressor.reindex_fused_weights=llmcompressor.entrypoints.model_free.reindex_fused_weights:main",
         ]

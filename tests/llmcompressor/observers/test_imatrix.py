@@ -3,9 +3,28 @@ import torch
 from compressed_tensors.quantization.quant_args import QuantizationArgs
 
 import llmcompressor.observers.imatrix as imatrix
+from llmcompressor.observers.imatrix import (
+    accumulate_imatrix_statistics,
+    make_empty_imatrix_statistics,
+)
 from llmcompressor.modifiers.utils.hooks import HooksMixin
 from llmcompressor.observers.base import Observer
 from llmcompressor.observers.imatrix import _grid_search
+
+
+def test_shared_statistics_primitives_match_sum_squared_definition():
+    inputs = torch.tensor(
+        [[[1.0, 2.0, 3.0], [2.0, 3.0, 4.0]]], dtype=torch.bfloat16
+    )
+    imatrix_sum, imatrix_count = make_empty_imatrix_statistics(3)
+
+    imatrix_sum, imatrix_count = accumulate_imatrix_statistics(
+        inputs, imatrix_sum, imatrix_count
+    )
+
+    expected = inputs.float().square().sum(dim=(0, 1))
+    assert torch.equal(imatrix_sum, expected)
+    assert imatrix_count.item() == 2
 
 # ---------------------------------------------------------------------------
 # Helpers
