@@ -21,6 +21,7 @@ import argparse
 import os
 from typing import Any, cast
 
+import torch
 from compressed_tensors.offload import dispatch_model
 from compressed_tensors.quantization import QuantizationScheme, preset_name_to_scheme
 from compressed_tensors.quantization.quant_args import (
@@ -238,11 +239,12 @@ def _build_config_groups(scheme_name: str) -> dict[str, QuantizationScheme]:
 config_groups = _build_config_groups(args.scheme)
 
 
-# Apply observer to every group's weights (in-place on the QuantizationArgs).
-if args.observer in ("mse", "imatrix_mse"):
-    for group_name, group_scheme in config_groups.items():
-        if group_scheme.weights is None:
-            raise RuntimeError(f"Scheme group {group_name!r} missing weights args")
+# Configure every group's weight qparams in-place on the QuantizationArgs.
+for group_name, group_scheme in config_groups.items():
+    if group_scheme.weights is None:
+        raise RuntimeError(f"Scheme group {group_name!r} missing weights args")
+    group_scheme.weights.scale_dtype = torch.float32
+    if args.observer in ("mse", "imatrix_mse"):
         group_scheme.weights.observer = args.observer
 
 

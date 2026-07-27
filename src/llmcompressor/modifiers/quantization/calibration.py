@@ -3,6 +3,8 @@ from itertools import product
 from typing import Any
 
 import torch
+from compressed_tensors.offload import disable_onloading
+from compressed_tensors.offload.cache import OffloadCache
 from compressed_tensors.quantization import (
     DynamicType,
     QuantizationArgs,
@@ -16,6 +18,7 @@ from compressed_tensors.utils import (
 from loguru import logger
 from torch.nn import Module
 
+from llmcompressor.modifiers.quantization.scale_dtype import validate_scale_dtype
 from llmcompressor.observers import Observer
 
 __all__ = [
@@ -27,10 +30,51 @@ __all__ = [
     "freeze_module_quantization",
     "apply_calibration_status",
     "reset_quantization_status",
+    "set_quantization_scale_dtype",
     "calibrate_query_hook",
     "calibrate_key_hook",
     "calibrate_value_hook",
 ]
+
+
+def set_quantization_scale_dtype(module: Module) -> None:
+    """Set initialized scale holders to the dtype requested by their scheme."""
+    scheme = getattr(module, "quantization_scheme", None)
+    if scheme is None:
+        return
+
+    for base_name, args_name in (
+        ("input", "input_activations"),
+        ("weight", "weights"),
+        ("output", "output_activations"),
+        ("q", "input_activations"),
+        ("k", "input_activations"),
+        ("v", "input_activations"),
+    ):
+        args = getattr(scheme, args_name, None)
+        scale_dtype = getattr(args, "scale_dtype", None)
+        scale_name = f"{base_name}_scale"
+        if scale_dtype is None:
+            continue
+
+        if isinstance(module._parameters, OffloadCache):
+            # Registering a new tensor through the cache avoids a dtype-losing copy_
+            # into the placeholder created by compressed-tensors.
+            with disable_onloading():
+                parameter = module._parameters.get(scale_name)
+                if parameter is not None:
+                    validate_scale_dtype(scale_dtype, parameter.dtype)
+                if parameter is not None and parameter.dtype != scale_dtype:
+                    module._parameters[scale_name] = torch.nn.Parameter(
+                        parameter.to(scale_dtype), requires_grad=False
+                    )
+        else:
+            if not hasattr(module, scale_name):
+                continue
+            parameter = getattr(module, scale_name)
+            validate_scale_dtype(scale_dtype, parameter.dtype)
+            if parameter.dtype != scale_dtype:
+                parameter.data = parameter.data.to(scale_dtype)
 
 
 def initialize_observer(

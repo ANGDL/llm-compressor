@@ -15,6 +15,7 @@ from compressed_tensors.quantization.utils import is_module_quantized
 from llmcompressor.core import LifecycleCallbacks, create_session
 from llmcompressor.modifiers.quantization.calibration import (
     freeze_module_quantization,
+    set_quantization_scale_dtype,
 )
 from llmcompressor.modifiers.utils.hooks import HooksMixin
 from llmcompressor.recipe import Recipe
@@ -663,6 +664,7 @@ def run_subgraph_streaming_pipeline(
                     ):
                         for module in subgraph.submodules(adapter.model):
                             if is_module_quantized(module):
+                                set_quantization_scale_dtype(module)
                                 compress_module(module)
                     with _stage_logger(
                         adapter.model,

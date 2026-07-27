@@ -10,9 +10,25 @@ from llmcompressor import oneshot
 from llmcompressor.args import DatasetArguments
 from llmcompressor.pytorch.utils import tensors_to_device
 from llmcompressor.transformers.data import TextGenerationDataset
+from llmcompressor.transformers.compression.compressed_tensors_utils import (
+    _register_quantization_qparams_as_buffers,
+)
 from tests.testing_utils import parse_params, requires_gpu
 
 CONFIGS_DIRECTORY = "tests/llmcompressor/transformers/compression/configs"
+
+
+def test_quantization_qparams_are_saved_as_buffers():
+    model = torch.nn.Sequential(torch.nn.Linear(4, 2, bias=False))
+    model[0].register_parameter(
+        "k_scale", torch.nn.Parameter(torch.ones(2), requires_grad=False)
+    )
+
+    _register_quantization_qparams_as_buffers(model)
+
+    assert "k_scale" not in dict(model[0].named_parameters())
+    assert "k_scale" in dict(model[0].named_buffers())
+    assert "0.k_scale" in model.state_dict()
 
 
 def _get_dataloader(dataset_args, tokenizer):

@@ -22,6 +22,7 @@ from llmcompressor.modifiers.quantization.calibration import (
     freeze_module_quantization,
     initialize_observer,
     observe,
+    set_quantization_scale_dtype,
     update_qparams,
 )
 
@@ -151,6 +152,10 @@ def _quantize_module(
             setattr(module, name, torch.nn.Parameter(value, requires_grad=False))
     else:
         update_qparams(module, "weight")
+        # Updating qparams can replace holders created with the materialized
+        # weight dtype; restore the explicitly requested scale dtype before
+        # serializing the compressed module.
+        set_quantization_scale_dtype(module)
 
     freeze_module_quantization(module)
     compress_module(module)

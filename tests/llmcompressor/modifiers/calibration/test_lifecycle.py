@@ -1,5 +1,6 @@
 import pytest
 import torch
+from compressed_tensors.offload import offload_module
 from compressed_tensors.quantization import (
     FP8_E4M3_DATA,
     QuantizationScheme,
@@ -10,7 +11,16 @@ from compressed_tensors.quantization import (
 from compressed_tensors.quantization.quant_args import QuantizationArgs
 from compressed_tensors.quantization.quant_config import QuantizationStatus
 
-from llmcompressor.modifiers.quantization.calibration import initialize_observer
+from llmcompressor.modifiers.quantization.calibration import (
+    initialize_observer,
+    observe,
+    set_quantization_scale_dtype,
+    update_qparams,
+)
+from llmcompressor.modifiers.quantization.scale_dtype import (
+    get_supported_scale_dtypes,
+    validate_scale_dtype,
+)
 
 
 @pytest.mark.parametrize(
@@ -163,6 +173,65 @@ def test_static_weight_quantization(
 
     assert torch.allclose(output.T, exp_quant.to(output.dtype))
     assert torch.nn.functional.mse_loss(output.T, linear.weight) <= exp_loss
+
+
+def test_scale_dtype_is_applied_to_holder_and_observer_calculation():
+    args = QuantizationArgs(
+        num_bits=8,
+        type="int",
+        strategy="channel",
+        symmetric=True,
+        scale_dtype=torch.float32,
+    )
+    linear = torch.nn.Linear(4, 2, bias=False, dtype=torch.bfloat16)
+    scheme = QuantizationScheme(targets=[], weights=args)
+    initialize_module_for_quantization(linear, scheme)
+
+    assert linear.weight_scale.dtype == torch.bfloat16
+    set_quantization_scale_dtype(linear)
+    assert linear.weight_scale.dtype == torch.float32
+
+    initialize_observer(linear, "weight")
+    observe(linear, "weight")
+    update_qparams(linear, "weight")
+    assert linear.weight_scale.dtype == torch.float32
+
+
+def test_scale_dtype_is_applied_to_offloaded_holder():
+    args = QuantizationArgs(
+        num_bits=8,
+        type="int",
+        strategy="channel",
+        symmetric=True,
+        scale_dtype=torch.float32,
+    )
+    linear = torch.nn.Linear(4, 2, bias=False, dtype=torch.bfloat16)
+    offload_module(linear, onload_device="cpu", offload_device="cpu")
+    initialize_module_for_quantization(
+        linear, QuantizationScheme(targets=[], weights=args)
+    )
+
+    set_quantization_scale_dtype(linear)
+
+    assert linear.weight_scale.dtype == torch.float32
+    assert isinstance(linear._parameters["weight_scale"], torch.nn.Parameter)
+
+
+def test_float64_scale_dtype_is_rejected():
+    with pytest.raises(ValueError, match="float64.*not supported"):
+        validate_scale_dtype(torch.float64, torch.bfloat16)
+
+
+def test_scale_dtype_support_is_tensor_dtype_float32_and_fp8():
+    supported = get_supported_scale_dtypes(torch.bfloat16)
+
+    assert torch.bfloat16 in supported
+    assert torch.float32 in supported
+    assert FP8_E4M3_DATA.dtype in supported
+    assert torch.float64 not in supported
+
+    with pytest.raises(ValueError, match="supported dtypes"):
+        validate_scale_dtype(torch.float16, torch.bfloat16)
 
 
 @pytest.mark.parametrize(
