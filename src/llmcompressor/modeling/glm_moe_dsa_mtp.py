@@ -458,38 +458,62 @@ def attach_mtp_layer(model, model_path: str) -> None:
             )
 
         # ---- MTP forward ----
-        # Activations flow through MTP Linear layers for GPTQ Hessian
-        # accumulation.  The MTP logits are intentionally discarded.
+        # Activations flow through MTP Linear layers for calibration statistics.
+        # The MTP logits are intentionally discarded.
         if position_ids is None:
-            seq_len = hidden_states.shape[1]
-            position_ids = torch.arange(
-                seq_len, device=hidden_states.device
-            ).unsqueeze(0)
+            if cache_position is not None:
+                position_ids = cache_position.unsqueeze(0)
+            else:
+                seq_len = hidden_states.shape[1]
+                position_ids = torch.arange(
+                    seq_len, device=hidden_states.device
+                ).unsqueeze(0)
+
         # NextN consumes token t+1 together with the target hidden at t. The
         # first token has no preceding target hidden and is excluded.
-        if hidden_states.shape[1] > 1:
-            mtp_hidden_states = hidden_states[:, :-1, :]
-            mtp_position_ids = position_ids[:, 1:]
-            mtp_input_ids = input_ids[:, 1:] if input_ids is not None else None
-            mtp_input_embeds = (
-                inputs_embeds[:, 1:] if inputs_embeds is not None else None
+        mtp_hidden_states = hidden_states[:, :-1, :]
+        mtp_position_ids = position_ids[:, 1:]
+        mtp_input_ids = input_ids[:, 1:] if input_ids is not None else None
+        mtp_input_embeds = inputs_embeds[:, 1:] if inputs_embeds is not None else None
+
+        # Build an explicit additive mask. With shifted absolute position IDs,
+        # GlmMoeDsaAttention's mask=None fallback compares local key indices
+        # against absolute positions and exposes one future token. The generic
+        # SDPA mask helper can also optimize an all-valid causal mask to None.
+        key_positions = mtp_position_ids[:, None, None, :]
+        query_positions = mtp_position_ids[:, None, :, None]
+        mtp_attention_mask = mtp_hidden_states.new_zeros(
+            (
+                mtp_hidden_states.shape[0],
+                1,
+                mtp_hidden_states.shape[1],
+                mtp_hidden_states.shape[1],
             )
-            mtp_position_embeddings = self.model.rotary_emb(
-                mtp_hidden_states, mtp_position_ids
+        )
+        mtp_attention_mask = mtp_attention_mask.masked_fill(
+            key_positions > query_positions, -1e4
+        )
+        if attention_mask is not None:
+            mtp_padding_mask = attention_mask[:, 1:]
+            mtp_attention_mask = mtp_attention_mask.masked_fill(
+                mtp_padding_mask[:, None, None, :] == 0,
+                -1e4,
             )
 
-            self.mtp(
-                token_hidden_states=mtp_hidden_states,
-                input_ids=mtp_input_ids,
-                input_embeds=mtp_input_embeds,
-                embed_tokens=self.model.embed_tokens,
-                # The decoder constructs its causal/index mask when None.
-                attention_mask=None,
-                position_ids=mtp_position_ids,
-                past_key_values=None,
-                cache_position=None,
-                position_embeddings=mtp_position_embeddings,
-            )
+        mtp_position_embeddings = self.model.rotary_emb(
+            mtp_hidden_states, mtp_position_ids
+        )
+        self.mtp(
+            token_hidden_states=mtp_hidden_states,
+            input_ids=mtp_input_ids,
+            input_embeds=mtp_input_embeds,
+            embed_tokens=self.model.embed_tokens,
+            attention_mask=mtp_attention_mask,
+            position_ids=mtp_position_ids,
+            past_key_values=None,
+            cache_position=None,
+            position_embeddings=mtp_position_embeddings,
+        )
 
         return CausalLMOutputWithPast(
             loss=loss,
