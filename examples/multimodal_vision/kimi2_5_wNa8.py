@@ -25,7 +25,7 @@ from compressed_tensors.quantization import QuantizationScheme
 
 
 """
-python kimi2_5_wNa8.py --model_id /ssd3/models/Kimi-K2.6-bf16/ --dataset_id /data/quant/lmms-lab___flickr30k --text_dataset_id /data/quant/ultrachat_200k --text_calibration_samples 256 --modifier=RTN --observer imatrix_mse > k26.log 2>&1 &
+python kimi2_5_wNa8.py --model_id /ssd3/models/Kimi-K2.6-bf16/ --dataset_id /data/quant/lmms-lab___flickr30k --text_dataset_id /data/quant/ultrachat_200k --text_calibration_samples 256 --modifier=RTN --observer imatrix_mse --use_float32_weight_scale > k26.log 2>&1 &
 python src/llmcompressor/utils/pack_int4_to_int8.py -i /ssd2/models/Kimi-K2.6-bf16-W4A8Experts-W8A8Other-IMatrix-RTN-unpacked/ -o /ssd3/models/Kimi-K2.6-w4a8-v2
 """
 
@@ -68,6 +68,12 @@ parser.add_argument(
     type=float,
     default=20.0,
     help="Reserved memory per GPU for dispatch_model. Lower this if dispatch fails.",
+)
+parser.add_argument(
+    "--use_float32_weight_scale",
+    action=argparse.BooleanOptionalAction,
+    default=False,
+    help="Use float32 for weight scales in quantization.",
 )
 args = parser.parse_args()
 
@@ -300,6 +306,11 @@ other_linear_w8_scheme = QuantizationScheme(
     weights=weights_args_8,
     input_activations=activations_args,
 )
+
+# Set the weight scale dtype based on the argument.
+if args.use_float32_weight_scale:
+    experts_w4_scheme.weights.scale_dtype = torch.float32
+    other_linear_w8_scheme.weights.scale_dtype = torch.float32
 
 
 # Configure the quantization algorithm to run.
