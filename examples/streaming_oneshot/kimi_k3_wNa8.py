@@ -44,8 +44,8 @@ from compressed_tensors.quantization.quant_args import (
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
-import llmcompressor.modeling.kimi_k3  # noqa: F401 - registers K3 MoE adapter
 from datasets import Dataset, concatenate_datasets, load_dataset
+from llmcompressor.modeling.kimi_k3 import patch_kimi_k3_transformers_compat
 from llmcompressor.modifiers.quantization import QuantizationModifier
 from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
 from llmcompressor.streaming import KimiK3WeightMaterializer, streaming_oneshot
@@ -239,6 +239,7 @@ def _other_targets_from_index(
 
 def _register_k3_model(model_id: Path):
     """Load K3 remote classes and make ``AutoModelForCausalLM.from_config`` work."""
+    patch_kimi_k3_transformers_compat()
     config = AutoConfig.from_pretrained(
         model_id, trust_remote_code=True, local_files_only=True
     )

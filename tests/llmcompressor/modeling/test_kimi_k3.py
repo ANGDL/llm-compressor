@@ -1,7 +1,24 @@
+from unittest.mock import patch
+
 import torch
 from torch import nn
+from transformers.utils import generic as transformers_generic
+from transformers.utils.output_capturing import OutputRecorder
 
-from llmcompressor.modeling.kimi_k3 import CalibrationKimiK3SparseMoeBlock
+from llmcompressor.modeling.kimi_k3 import (
+    CalibrationKimiK3SparseMoeBlock,
+    patch_kimi_k3_transformers_compat,
+)
+
+
+def test_kimi_k3_transformers_output_recorder_compat():
+    with patch.object(transformers_generic, "OutputRecorder", create=True):
+        del transformers_generic.OutputRecorder
+
+        patch_kimi_k3_transformers_compat()
+        patch_kimi_k3_transformers_compat()
+
+        assert transformers_generic.OutputRecorder is OutputRecorder
 
 
 class _FixedGate(nn.Module):
