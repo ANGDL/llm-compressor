@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import inspect
+
 import torch
 import torch.nn.functional as F
+from transformers import PreTrainedModel
 from transformers.utils import generic as transformers_generic
+from transformers.utils import import_utils
 
 from llmcompressor.modeling.moe_context import MoECalibrationModule
 
@@ -14,16 +18,90 @@ __all__ = [
 ]
 
 
-def patch_kimi_k3_transformers_compat() -> None:
-    """Restore the Transformers import path used by K3 checkpoint code."""
-    if hasattr(transformers_generic, "OutputRecorder"):
+def _patch_flash_attn_varlen_func() -> None:
+    """Drop ``deterministic`` for flash-attn versions that do not accept it."""
+    try:
+        import flash_attn
+    except ImportError:
         return
 
-    # Transformers 5.13 moved OutputRecorder out of utils.generic, while the
-    # K3 checkpoint from the same API generation still imports the old path.
-    from transformers.utils.output_capturing import OutputRecorder
+    function = getattr(flash_attn, "flash_attn_varlen_func", None)
+    if function is None or getattr(function, "_kimi_k3_compat_patched", False):
+        return
+    try:
+        supports_deterministic = (
+            "deterministic" in inspect.signature(function).parameters
+        )
+    except (TypeError, ValueError):
+        supports_deterministic = False
+    if supports_deterministic:
+        return
 
-    transformers_generic.OutputRecorder = OutputRecorder
+    def compatible_flash_attn_varlen_func(*args, **kwargs):
+        kwargs.pop("deterministic", None)
+        return function(*args, **kwargs)
+
+    compatible_flash_attn_varlen_func._kimi_k3_compat_patched = True
+    compatible_flash_attn_varlen_func.__wrapped__ = function
+    flash_attn.flash_attn_varlen_func = compatible_flash_attn_varlen_func
+
+
+def _patch_transformers_v5_for_checkpoint_code() -> None:
+    """Restore Transformers APIs and capability flags used by K3."""
+    if not hasattr(import_utils, "is_torch_fx_available"):
+        import_utils.is_torch_fx_available = lambda: hasattr(torch, "fx")
+
+    if getattr(PreTrainedModel, "_kimi_k3_fa2_compat_patched", False):
+        return
+    original_flash_attn_can_dispatch = PreTrainedModel._flash_attn_can_dispatch
+
+    def flash_attn_can_dispatch(self, flash_attn_version, is_init_check=False):
+        supports_fa2 = getattr(self, "_supports_flash_attn_2", False)
+        if flash_attn_version != 2 or not supports_fa2 or self._supports_flash_attn:
+            return original_flash_attn_can_dispatch(
+                self, flash_attn_version, is_init_check
+            )
+
+        self._supports_flash_attn = True
+        try:
+            return original_flash_attn_can_dispatch(
+                self, flash_attn_version, is_init_check
+            )
+        finally:
+            self._supports_flash_attn = False
+
+    PreTrainedModel._flash_attn_can_dispatch = flash_attn_can_dispatch
+    PreTrainedModel._kimi_k3_fa2_compat_patched = True
+
+
+def patch_kimi_k3_transformers_compat(model_class: type | None = None) -> None:
+    """Adapt K3 checkpoint code to the installed Transformers API."""
+    _patch_transformers_v5_for_checkpoint_code()
+    _patch_flash_attn_varlen_func()
+
+    if not hasattr(transformers_generic, "OutputRecorder"):
+        # Transformers 5.13 moved OutputRecorder out of utils.generic, while the
+        # K3 checkpoint from the same API generation still imports the old path.
+        from transformers.utils.output_capturing import OutputRecorder
+
+        transformers_generic.OutputRecorder = OutputRecorder
+
+    if model_class is None:
+        return
+
+    tie_weights = model_class.tie_weights
+    if "recompute_mapping" in inspect.signature(tie_weights).parameters or getattr(
+        tie_weights, "_kimi_k3_compat_patched", False
+    ):
+        return
+
+    def compatible_tie_weights(self, *args, **kwargs):
+        # K3's override takes no arguments and delegates to language_model. New
+        # Transformers versions pass their tied-weight bookkeeping arguments.
+        return tie_weights(self)
+
+    compatible_tie_weights._kimi_k3_compat_patched = True
+    model_class.tie_weights = compatible_tie_weights
 
 
 @MoECalibrationModule.register("KimiSparseMoeBlock")
