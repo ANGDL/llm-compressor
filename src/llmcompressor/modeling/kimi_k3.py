@@ -4,10 +4,26 @@ from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
+from transformers.utils import generic as transformers_generic
 
 from llmcompressor.modeling.moe_context import MoECalibrationModule
 
-__all__ = ["CalibrationKimiK3SparseMoeBlock"]
+__all__ = [
+    "CalibrationKimiK3SparseMoeBlock",
+    "patch_kimi_k3_transformers_compat",
+]
+
+
+def patch_kimi_k3_transformers_compat() -> None:
+    """Restore the Transformers import path used by K3 checkpoint code."""
+    if hasattr(transformers_generic, "OutputRecorder"):
+        return
+
+    # Transformers 5.13 moved OutputRecorder out of utils.generic, while the
+    # K3 checkpoint from the same API generation still imports the old path.
+    from transformers.utils.output_capturing import OutputRecorder
+
+    transformers_generic.OutputRecorder = OutputRecorder
 
 
 @MoECalibrationModule.register("KimiSparseMoeBlock")
