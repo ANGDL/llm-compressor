@@ -56,6 +56,12 @@ class WeightMaterializer(ABC):
         """Return config fields required to reload the materialized output."""
         return {}
 
+    def transform_output_config(
+        self, config: Mapping[str, Any]
+    ) -> Mapping[str, Any]:
+        """Apply checkpoint-specific cleanup after output metadata is merged."""
+        return config
+
     @abstractmethod
     def materialize(
         self,

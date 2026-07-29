@@ -287,14 +287,15 @@ def finalize_streaming_checkpoint(
         if not config_path.is_file():
             raise FileNotFoundError(f"Missing source config: {config_path}")
         config = json.loads(config_path.read_text(encoding="utf-8"))
-        _atomic_json(
-            temporary / "config.json",
-            _update_config(
-                config,
-                quantization_config,
-                materializer.output_config_updates(),
-            ),
+        output_config = _update_config(
+            config,
+            quantization_config,
+            materializer.output_config_updates(),
         )
+        output_config = materializer.transform_output_config(output_config)
+        if not isinstance(output_config, Mapping):
+            raise TypeError("Materializer returned a non-mapping output config")
+        _atomic_json(temporary / "config.json", dict(output_config))
         if recipe_yaml is not None:
             recipe_content = recipe_yaml.encode("utf-8")
             if recipe_content and not recipe_content.endswith(b"\n"):

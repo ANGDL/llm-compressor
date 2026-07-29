@@ -40,6 +40,8 @@ from .materialization import (
     CastWeightMaterializer,
     DeepSeekV4WeightMaterializer,
     DeepSeekV4WeightSource,
+    KimiK3WeightMaterializer,
+    KimiK3WeightSource,
     WeightMaterializer,
     materialize_weights,
 )
@@ -63,6 +65,8 @@ __all__ = [
     "DiskBoundaryActivationStore",
     "DeepSeekV4WeightMaterializer",
     "DeepSeekV4WeightSource",
+    "KimiK3WeightMaterializer",
+    "KimiK3WeightSource",
     "GPTQStatisticsCollector",
     "IMatrixStatisticsCollector",
     "InMemoryBoundaryActivationStore",
