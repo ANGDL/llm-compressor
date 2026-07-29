@@ -10,10 +10,44 @@ from compressed_tensors.quantization import (
     QuantizationConfig,
     QuantizationScheme,
     QuantizationStatus,
+    QuantizationType,
 )
-from torch import nn
+from torch import Tensor, nn
 
-__all__ = ["build_quantization_config", "quantized_module_formats"]
+from llmcompressor.utils.int4_packing import pack_int4_to_int8_cpu_snapshot
+
+__all__ = [
+    "build_quantization_config",
+    "prepare_quantized_tensor_for_save",
+    "quantized_module_formats",
+]
+
+
+def prepare_quantized_tensor_for_save(
+    name: str,
+    tensor: Tensor,
+    scheme: QuantizationScheme,
+    *,
+    format_name: str,
+    pack_to_int8: bool,
+) -> Tensor:
+    """Apply output-layout transforms after module compression and before I/O.
+
+    Packed INT4 weights are returned as independent CPU snapshots so completed
+    results cannot accumulate in accelerator memory while a target is saved.
+    """
+
+    if not pack_to_int8 or not name.endswith(".weight"):
+        return tensor
+    weights = scheme.weights
+    if (
+        format_name != CompressionFormat.int_quantized.value
+        or weights is None
+        or weights.num_bits != 4
+        or weights.type != QuantizationType.INT.value
+    ):
+        return tensor
+    return pack_int4_to_int8_cpu_snapshot(tensor)
 
 
 def quantized_module_formats(

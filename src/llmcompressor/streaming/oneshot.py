@@ -82,6 +82,7 @@ def _streaming_oneshot_from_boundaries(
     max_seq_length: int | None = None,
     seed: int | None = None,
     validate_config: bool = True,
+    pack_to_int8: bool = True,
 ) -> Path:
     """Run collect, quantize, and finalize with resumable intermediates."""
     work = Path(work_dir)
@@ -138,6 +139,7 @@ def _streaming_oneshot_from_boundaries(
         target_dtype=target_dtype,
         blocksize=blocksize,
         dampening_frac=dampening_frac,
+        pack_to_int8=pack_to_int8,
     )
     logger.info(
         f"streaming quantize: completed in {time.monotonic() - started:.2f}s; "
@@ -206,6 +208,7 @@ def streaming_oneshot(
     overwrite_output: bool = False,
     pipeline_devices: Sequence[torch.device | str] | None = None,
     async_save: bool = False,
+    pack_to_int8: bool = True,
 ) -> Path:
     """Run resumable streaming PTQ.
 
@@ -213,6 +216,10 @@ def streaming_oneshot(
     ``dataset``, and a standard quantization recipe. The sequential tracer derives
     model-prefix and decoder-target boundaries without loading the full model.
     Advanced callers may instead supply explicit boundary-mode arguments.
+
+    By default, INT4 weights using the ``int-quantized`` W4A8 layout are packed
+    two values per INT8 immediately before checkpoint I/O. Set
+    ``pack_to_int8=False`` to retain the legacy unpacked layout.
     """
     device = resolve_execution_device(device)
     if work_dir is None:
@@ -252,6 +259,7 @@ def streaming_oneshot(
             overwrite_output=overwrite_output,
             pipeline_devices=pipeline_devices,
             async_save=async_save,
+            pack_to_int8=pack_to_int8,
         )
 
     if pipeline_devices is not None or async_save:
@@ -297,4 +305,5 @@ def streaming_oneshot(
         max_seq_length=max_seq_length,
         seed=seed,
         validate_config=validate_config,
+        pack_to_int8=pack_to_int8,
     )

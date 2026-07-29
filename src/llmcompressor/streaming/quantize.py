@@ -40,6 +40,7 @@ from .materialization import (
     CastWeightMaterializer,
     WeightMaterializer,
 )
+from .output import prepare_quantized_tensor_for_save
 from .tied_weights import infer_transformers_tied_weights
 
 __all__ = ["quantize_streaming"]
@@ -51,6 +52,7 @@ def _scheme_fingerprint(
     use_gptq: bool,
     blocksize: int,
     dampening_frac: float,
+    pack_to_int8: bool,
 ) -> str:
     value = {
         "schemes": {
@@ -60,6 +62,7 @@ def _scheme_fingerprint(
         "use_gptq": use_gptq,
         "blocksize": blocksize,
         "dampening_frac": dampening_frac,
+        "pack_to_int8": pack_to_int8,
         "tied_weight_policy": "deduplicate-identical-v1",
     }
     return fingerprint_json(value)
@@ -174,12 +177,15 @@ def quantize_streaming(
     target_dtype: torch.dtype = torch.bfloat16,
     blocksize: int = 128,
     dampening_frac: float = 0.01,
+    pack_to_int8: bool = True,
 ) -> Path:
     """Quantize exact named Linear modules into resumable staging shards.
 
     Stage two deliberately does not create a model index or config. Each state
     record is written only after its corresponding shard has been atomically
     published. Stage three consumes these records to build the final checkpoint.
+    INT4 ``int-quantized`` weights are packed before transaction payloads are
+    written unless ``pack_to_int8`` is disabled.
     """
     if not schemes:
         raise ValueError("schemes must contain at least one exact module name")
@@ -210,6 +216,7 @@ def quantize_streaming(
         use_gptq=use_gptq,
         blocksize=blocksize,
         dampening_frac=dampening_frac,
+        pack_to_int8=pack_to_int8,
     )
 
     missing_weights = [
@@ -294,9 +301,22 @@ def quantize_streaming(
                         blocksize=blocksize,
                         dampening_frac=dampening_frac,
                     )
+                    format_name = (
+                        module.quantization_scheme.format
+                        or infer_module_format(
+                            type(module), module.quantization_scheme
+                        ).value
+                    )
                     for module_tensor_name, output_value in module.state_dict(
                         prefix=f"{module_name}."
                     ).items():
+                        output_value = prepare_quantized_tensor_for_save(
+                            module_tensor_name,
+                            output_value,
+                            module.quantization_scheme,
+                            format_name=format_name,
+                            pack_to_int8=pack_to_int8,
+                        )
                         transaction.write_tensor(
                             module_tensor_name,
                             output_value,
@@ -304,8 +324,7 @@ def quantize_streaming(
                         )
                     transaction.mark_quantized(
                         module_name,
-                        scheme.format
-                        or infer_module_format(torch.nn.Linear, scheme).value,
+                        format_name,
                     )
                     del module, weight, raw_values
                     continue

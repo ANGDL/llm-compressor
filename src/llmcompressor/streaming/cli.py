@@ -70,6 +70,7 @@ def build_parser() -> argparse.ArgumentParser:
     quantize.add_argument("--device", default="cpu")
     quantize.add_argument("--dtype", default="bfloat16")
     quantize.add_argument("--no-gptq", action="store_true")
+    quantize.add_argument("--no-pack-to-int8", action="store_true")
 
     finalize = commands.add_parser("finalize")
     finalize.add_argument("--checkpoint", required=True)
@@ -84,6 +85,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--output", required=True)
     run.add_argument("--schemes", required=True)
     run.add_argument("--no-gptq", action="store_true")
+    run.add_argument("--no-pack-to-int8", action="store_true")
     run.add_argument("--skip-config-validation", action="store_true")
     return parser
 
@@ -122,6 +124,7 @@ def main(argv: list[str] | None = None) -> None:
             use_gptq=not args.no_gptq,
             device=args.device,
             target_dtype=_dtype(args.dtype),
+            pack_to_int8=not args.no_pack_to_int8,
         )
     elif args.command == "finalize":
         finalize_streaming_checkpoint(
@@ -148,4 +151,5 @@ def main(argv: list[str] | None = None) -> None:
             device=args.device,
             target_dtype=_dtype(args.dtype),
             validate_config=not args.skip_config_validation,
+            pack_to_int8=not args.no_pack_to_int8,
         )

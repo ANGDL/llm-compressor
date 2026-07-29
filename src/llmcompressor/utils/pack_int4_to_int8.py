@@ -1,31 +1,22 @@
-import os
+import argparse
 import json
+import os
 import re
 import shutil
 from multiprocessing import Pool
+
+import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
-import argparse
 from tqdm import tqdm
-import torch
+
+from llmcompressor.utils.int4_packing import pack_int4_to_int8
 
 
 def _pack_int4_to_int8(tensor):
-    """Pack two int4 values into one int8 value."""
-    if tensor.ndim != 2:
-        raise ValueError(f"Expected 2D tensor, but got {tensor.ndim}D")
+    """Backward-compatible wrapper for the shared packing implementation."""
 
-    rows, cols = tensor.shape
-    if cols % 2 != 0:
-        raise ValueError(
-            f"Expected even number of columns for int4 packing, but got shape {tensor.shape}"
-        )
-
-    # Pack along the last dimension so values from different rows are never mixed.
-    low = tensor[:, 0::2] & 0x0F
-    high = tensor[:, 1::2] & 0x0F
-    qweight_int8_pack = (high << 4) | low
-    return qweight_int8_pack.reshape(rows, cols // 2)
+    return pack_int4_to_int8(tensor)
 
 
 def _process_tensor_file(args):
