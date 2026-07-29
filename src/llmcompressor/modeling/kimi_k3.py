@@ -1,0 +1,91 @@
+"""Calibration replacement for the checkpoint-native Kimi K3 MoE block."""
+
+from __future__ import annotations
+
+import torch
+import torch.nn.functional as F
+
+from llmcompressor.modeling.moe_context import MoECalibrationModule
+
+__all__ = ["CalibrationKimiK3SparseMoeBlock"]
+
+
+@MoECalibrationModule.register("KimiSparseMoeBlock")
+class CalibrationKimiK3SparseMoeBlock(MoECalibrationModule):
+    """Run every K3 routed expert while preserving the original top-k output.
+
+    K3 first projects the hidden state into a latent routed-expert dimension,
+    then applies the expert, optional latent RMSNorm, and a latent up-projection.
+    The calibration wrapper retains those projections and the shared experts so
+    their input statistics are collected exactly as in the reference model.
+    """
+
+    is_permanent = True
+
+    def __init__(
+        self,
+        original: torch.nn.Module,
+        config,
+        calibrate_all_experts: bool = True,
+    ):
+        super().__init__()
+        self.config = getattr(original, "config", config)
+        self.hidden_dim = original.hidden_dim
+        self.num_experts = original.num_experts
+        self.top_k = original.top_k
+        self.experts = original.experts
+        self.gate = original.gate
+        self.shared_experts = getattr(original, "shared_experts", None)
+        self.use_latent_moe = getattr(original, "use_latent_moe", False)
+        self.routed_expert_down_proj = getattr(
+            original, "routed_expert_down_proj", None
+        )
+        self.routed_expert_norm = getattr(original, "routed_expert_norm", None)
+        self.routed_expert_up_proj = getattr(original, "routed_expert_up_proj", None)
+        self.calibrate_all_experts = calibrate_all_experts
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        original_shape = hidden_states.shape
+        residual = hidden_states
+        topk_indices, topk_weights = self.gate(hidden_states)
+        flat_hidden = hidden_states.reshape(-1, hidden_states.shape[-1])
+
+        if self.use_latent_moe:
+            flat_hidden = self.routed_expert_down_proj(flat_hidden)
+
+        output = torch.zeros_like(flat_hidden, dtype=topk_weights.dtype)
+        expert_mask = F.one_hot(topk_indices, num_classes=self.num_experts).permute(
+            2, 0, 1
+        )
+
+        for expert_index, expert in enumerate(self.experts):
+            token_indices, weight_indices = torch.where(expert_mask[expert_index])
+            has_tokens = token_indices.numel() > 0
+            if self.calibrate_all_experts:
+                expert_output = expert(flat_hidden)
+                if has_tokens:
+                    weights = topk_weights[token_indices, weight_indices]
+                    output.index_add_(
+                        0,
+                        token_indices,
+                        expert_output[token_indices] * weights.unsqueeze(-1),
+                    )
+            elif has_tokens:
+                expert_output = expert(flat_hidden[token_indices])
+                weights = topk_weights[token_indices, weight_indices]
+                output.index_add_(
+                    0,
+                    token_indices,
+                    expert_output * weights.unsqueeze(-1),
+                )
+
+        output = output.to(flat_hidden.dtype)
+        if self.use_latent_moe:
+            if self.routed_expert_norm is not None:
+                output = self.routed_expert_norm(output)
+            output = self.routed_expert_up_proj(output)
+
+        output = output.view(original_shape)
+        if self.shared_experts is not None:
+            output = output + self.shared_experts(residual)
+        return output

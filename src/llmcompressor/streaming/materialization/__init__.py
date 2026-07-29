@@ -3,11 +3,14 @@
 from .base import WeightMaterializer, materialize_weights
 from .deepseek_v4 import DeepSeekV4WeightMaterializer, DeepSeekV4WeightSource
 from .default import CastWeightMaterializer
+from .kimi_k3 import KimiK3WeightMaterializer, KimiK3WeightSource
 
 __all__ = [
     "CastWeightMaterializer",
     "DeepSeekV4WeightMaterializer",
     "DeepSeekV4WeightSource",
+    "KimiK3WeightMaterializer",
+    "KimiK3WeightSource",
     "WeightMaterializer",
     "materialize_weights",
 ]

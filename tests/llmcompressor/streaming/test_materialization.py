@@ -13,6 +13,8 @@ from llmcompressor.streaming.checkpoint import (
 from llmcompressor.streaming.materialization import (
     CastWeightMaterializer,
     DeepSeekV4WeightMaterializer,
+    KimiK3WeightMaterializer,
+    KimiK3WeightSource,
     WeightMaterializer,
     materialize_weights,
 )
@@ -318,3 +320,87 @@ def test_deepseek_v4_materializer_unpacks_fp4_blocks(tmp_path):
             dtype=torch.bfloat16,
         ),
     )
+
+
+def test_kimi_k3_source_maps_packed_expert_to_logical_weight(tmp_path):
+    path = tmp_path / "model.safetensors"
+    raw_name = (
+        "language_model.model.layers.1.block_sparse_moe.experts.0.w1.weight_packed"
+    )
+    scale_name = raw_name.removesuffix("_packed") + "_scale"
+    save_file(
+        {
+            raw_name: torch.tensor([[0x01, 0x29], [0x93, 0xF4]], dtype=torch.uint8),
+            scale_name: torch.full((2, 1), 127, dtype=torch.uint8),
+        },
+        path,
+    )
+    source = KimiK3WeightSource(path)
+    logical_name = raw_name.removesuffix("_packed")
+
+    assert set(source.tensor_names()) == {logical_name}
+    assert source.metadata(logical_name).shape == (2, 2)
+    assert source.metadata(logical_name).dtype == torch.uint8
+
+    result = materialize_weights(
+        source,
+        [logical_name],
+        KimiK3WeightMaterializer(fp4_block_size=4),
+        target_dtype=torch.bfloat16,
+        device=torch.device("cpu"),
+    )[logical_name]
+
+    assert torch.equal(
+        result,
+        torch.tensor(
+            [[0.5, 0.0, -0.5, 1.0], [1.5, -0.5, 2.0, -6.0]],
+            dtype=torch.bfloat16,
+        ),
+    )
+
+
+def test_kimi_k3_materializer_rejects_mismatched_scale_shape(tmp_path):
+    materializer = KimiK3WeightMaterializer(fp4_block_size=4)
+    name = "language_model.model.layers.1.block_sparse_moe.experts.0.w1.weight"
+
+    with pytest.raises(ValueError, match="scale shape"):
+        materializer.materialize(
+            name,
+            {
+                name: torch.zeros((2, 2), dtype=torch.uint8),
+                name.removesuffix(".weight") + ".weight_scale": torch.zeros(
+                    (2, 2), dtype=torch.uint8
+                ),
+            },
+            target_dtype=torch.bfloat16,
+            device=torch.device("cpu"),
+        )
+
+
+def test_kimi_k3_materializer_decodes_ue8m0_endpoints():
+    decoded = KimiK3WeightMaterializer._decode_e8m0(
+        torch.tensor([0, 127, 255], dtype=torch.uint8)
+    )
+
+    assert decoded[0].item() == 0.0
+    assert decoded[1].item() == 1.0
+    assert torch.isinf(decoded[2])
+
+
+def test_kimi_k3_output_config_removes_source_mxfp4_metadata():
+    source_config = {
+        "model_type": "kimi_k3",
+        "quantization_config": {"format": "int-quantized"},
+        "text_config": {
+            "model_type": "kimi_linear",
+            "quantization_config": {"format": "mxfp4-pack-quantized"},
+        },
+    }
+
+    output_config = KimiK3WeightMaterializer().transform_output_config(source_config)
+
+    assert output_config["quantization_config"] == {"format": "int-quantized"}
+    assert "quantization_config" not in output_config["text_config"]
+    assert source_config["text_config"]["quantization_config"] == {
+        "format": "mxfp4-pack-quantized"
+    }
