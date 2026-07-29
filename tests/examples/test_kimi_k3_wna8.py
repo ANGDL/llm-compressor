@@ -58,6 +58,15 @@ def test_k3_multimodal_message_uses_image_field():
     assert "image_url" not in image_part
 
 
+def test_k3_model_level_output_residual_stays_outside_decoder_targets():
+    assert KIMI_K3_WNA8._OTHER_LINEAR_RE.fullmatch(
+        "language_model.model.layers.1.self_attention_res_proj"
+    )
+    assert not KIMI_K3_WNA8._OTHER_LINEAR_RE.fullmatch(
+        "language_model.model.output_attn_res_proj"
+    )
+
+
 @pytest.mark.parametrize("samples", [0, 3])
 def test_text_dataset_can_be_disabled(monkeypatch, samples):
     calls = []

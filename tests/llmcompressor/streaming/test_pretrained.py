@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import struct
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -23,6 +24,7 @@ from llmcompressor.streaming import (
     streaming_oneshot,
 )
 from llmcompressor.streaming.pretrained import _recipe_quantizer
+from llmcompressor.streaming.tracing import trace_streaming_boundaries
 
 
 def _write_raw_deepseek_v4_checkpoint(checkpoint):
@@ -106,7 +108,7 @@ def test_pretrained_explains_autoround_output_adapter_requirement():
         _recipe_quantizer(recipe)
 
 
-def test_qwen3_pretrained_mode_hides_boundary_construction(tmp_path):
+def test_qwen3_pretrained_mode_hides_boundary_construction(tmp_path, monkeypatch):
     config = Qwen3Config(
         vocab_size=32,
         hidden_size=8,
@@ -131,6 +133,11 @@ def test_qwen3_pretrained_mode_hides_boundary_construction(tmp_path):
         batch_size=1,
     )
 
+    trace_boundaries = Mock(wraps=trace_streaming_boundaries)
+    monkeypatch.setattr(
+        "llmcompressor.streaming.pretrained.trace_streaming_boundaries",
+        trace_boundaries,
+    )
     output = streaming_oneshot(
         model=checkpoint,
         dataset=dataset,
@@ -152,6 +159,11 @@ def test_qwen3_pretrained_mode_hides_boundary_construction(tmp_path):
     )
 
     assert (output / "FINALIZED").is_file()
+    assert (
+        "_update_linear_attn_mask"
+        in trace_boundaries.call_args.kwargs["tracing_ignore"]
+    )
+    assert trace_boundaries.call_args.kwargs["model"].training is False
     assert '"lm_head.weight"' not in (
         output / "model.safetensors.index.json"
     ).read_text()

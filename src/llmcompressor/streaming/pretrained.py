@@ -252,6 +252,7 @@ def streaming_oneshot_from_pretrained(
         config,
         keep_nonpersistent_buffers=True,
     )
+    meta_model.eval()
     schemes = _exact_schemes(meta_model, quantizer)
     uses_imatrix = any(
         scheme.weights is not None and scheme.weights.observer == "imatrix_mse"
@@ -309,6 +310,7 @@ def streaming_oneshot_from_pretrained(
             materializer=materializer,
             device=device,
             dtype=target_dtype,
+            tracing_ignore=dataset_args.tracing_ignore,
         )
         targets = adapter.targets
         covered = tuple(

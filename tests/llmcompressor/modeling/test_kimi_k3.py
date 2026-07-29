@@ -1,3 +1,4 @@
+import sys
 from types import ModuleType
 from unittest.mock import patch
 
@@ -42,6 +43,59 @@ def test_kimi_k3_transformers_tie_weights_compat():
     assert model.called
     assert patched_tie_weights is CheckpointModel.tie_weights
     assert patched_tie_weights is not original_tie_weights
+
+
+def test_kimi_k3_transformers_v5_remote_model_compat():
+    calls = []
+
+    def create_causal_mask(*, inputs_embeds, attention_mask, past_key_values):
+        calls.append((inputs_embeds, attention_mask, past_key_values))
+        return "mask"
+
+    class KimiLinearModel:
+        def __init__(self, config):
+            config._attn_implementation = "flash_attention_2"
+            self._use_flash_attention_2 = True
+
+    linear_module = ModuleType("test_kimi_k3_linear_module")
+    linear_module.create_causal_mask = create_causal_mask
+    linear_module.KimiLinearModel = KimiLinearModel
+    linear_lm_class = type(
+        "KimiLinearForCausalLM",
+        (),
+        {"__module__": linear_module.__name__},
+    )
+    outer_module = ModuleType("test_kimi_k3_outer_module")
+    outer_module.KimiLinearForCausalLM = linear_lm_class
+
+    class CheckpointModel:
+        def tie_weights(self):
+            pass
+
+    CheckpointModel.__module__ = outer_module.__name__
+    with patch.dict(
+        sys.modules,
+        {
+            linear_module.__name__: linear_module,
+            outer_module.__name__: outer_module,
+        },
+    ):
+        patch_kimi_k3_transformers_compat(CheckpointModel)
+        patch_kimi_k3_transformers_compat(CheckpointModel)
+
+        config = type("Config", (), {"_attn_implementation": "eager"})()
+        model = KimiLinearModel(config)
+        result = linear_module.create_causal_mask(
+            input_embeds="embeds",
+            attention_mask="attention",
+            cache_position="position",
+            past_key_values="cache",
+        )
+
+    assert result == "mask"
+    assert calls == [("embeds", "attention", "cache")]
+    assert config._attn_implementation == "eager"
+    assert model._use_flash_attention_2 is False
 
 
 def test_kimi_k3_flash_attn_compat_drops_unsupported_deterministic_keyword():

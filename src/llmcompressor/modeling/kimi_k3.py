@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import sys
 
 import torch
 import torch.nn.functional as F
@@ -74,6 +75,61 @@ def _patch_transformers_v5_for_checkpoint_code() -> None:
     PreTrainedModel._kimi_k3_fa2_compat_patched = True
 
 
+def _patch_kimi_k3_remote_model(model_class: type) -> None:
+    """Patch APIs captured as globals by K3's dynamically loaded text model."""
+    model_module = sys.modules.get(model_class.__module__)
+    linear_lm_class = getattr(model_module, "KimiLinearForCausalLM", None)
+    linear_module = (
+        sys.modules.get(linear_lm_class.__module__)
+        if linear_lm_class is not None
+        else None
+    )
+    if linear_module is None:
+        return
+
+    create_causal_mask = getattr(linear_module, "create_causal_mask", None)
+    if create_causal_mask is not None and not getattr(
+        create_causal_mask, "_kimi_k3_compat_patched", False
+    ):
+        parameters = inspect.signature(create_causal_mask).parameters
+        rename_input = (
+            "inputs_embeds" in parameters and "input_embeds" not in parameters
+        )
+        drop_cache_position = "cache_position" not in parameters
+        if rename_input or drop_cache_position:
+
+            def compatible_create_causal_mask(*args, **kwargs):
+                if rename_input and "input_embeds" in kwargs:
+                    kwargs["inputs_embeds"] = kwargs.pop("input_embeds")
+                if drop_cache_position:
+                    kwargs.pop("cache_position", None)
+                return create_causal_mask(*args, **kwargs)
+
+            compatible_create_causal_mask._kimi_k3_compat_patched = True
+            compatible_create_causal_mask.__wrapped__ = create_causal_mask
+            linear_module.create_causal_mask = compatible_create_causal_mask
+
+    linear_model_class = getattr(linear_module, "KimiLinearModel", None)
+    if linear_model_class is None:
+        return
+    original_init = linear_model_class.__init__
+    if getattr(original_init, "_kimi_k3_compat_patched", False):
+        return
+
+    def compatible_linear_model_init(self, config, *args, **kwargs):
+        requested_attention = getattr(config, "_attn_implementation", None)
+        original_init(self, config, *args, **kwargs)
+        if requested_attention not in (None, "flash_attention_2"):
+            # K3 unconditionally selects FA2 after constructing its layers. Keep
+            # an explicit eager/SDPA request usable for CPU calibration and tests.
+            config._attn_implementation = requested_attention
+            self._use_flash_attention_2 = False
+
+    compatible_linear_model_init._kimi_k3_compat_patched = True
+    compatible_linear_model_init.__wrapped__ = original_init
+    linear_model_class.__init__ = compatible_linear_model_init
+
+
 def patch_kimi_k3_transformers_compat(model_class: type | None = None) -> None:
     """Adapt K3 checkpoint code to the installed Transformers API."""
     _patch_transformers_v5_for_checkpoint_code()
@@ -88,6 +144,8 @@ def patch_kimi_k3_transformers_compat(model_class: type | None = None) -> None:
 
     if model_class is None:
         return
+
+    _patch_kimi_k3_remote_model(model_class)
 
     tie_weights = model_class.tie_weights
     if "recompute_mapping" in inspect.signature(tie_weights).parameters or getattr(
