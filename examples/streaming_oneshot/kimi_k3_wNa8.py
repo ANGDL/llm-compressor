@@ -17,13 +17,17 @@ Example::
 
     python examples/streaming_oneshot/kimi_k3_wNa8.py \
         --model-id /Users/ang/models/K3 \
-        --dataset-id /path/to/calibration.jsonl \
+        --dataset-id lmms-lab/flickr30k \
+        --dataset-split test \
+        --text-dataset-id HuggingFaceH4/ultrachat_200k \
+        --text-dataset-split train_sft \
         --output-dir /Users/ang/models/K3-WNA8
 
 The K3 remote model code requires its normal runtime dependencies (including
-``tiktoken``, ``einops`` and ``fla-core``).  This repository does not need the
-full 96-shard checkpoint for the static MXFP4 decoder checks, but a complete
-checkpoint is required to run the end-to-end streaming job.
+``tiktoken``, ``einops``, ``fla-core``, ``flash-attn`` and ``torchvision``).
+This repository does not need the full 96-shard checkpoint for the static MXFP4
+decoder checks, but a complete checkpoint is required to run the end-to-end
+streaming job.
 """
 
 from __future__ import annotations
@@ -35,16 +39,18 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
+import torch
 from compressed_tensors.quantization import QuantizationScheme
 from compressed_tensors.quantization.quant_args import (
     QuantizationArgs,
     QuantizationStrategy,
     QuantizationType,
 )
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from torch.utils.data import DataLoader
+from transformers import AutoConfig, AutoModelForCausalLM, AutoProcessor
 from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
-from datasets import Dataset, concatenate_datasets, load_dataset
+from datasets import Dataset, load_dataset
 from llmcompressor.modeling.kimi_k3 import patch_kimi_k3_transformers_compat
 from llmcompressor.modifiers.quantization import QuantizationModifier
 from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
@@ -92,6 +98,13 @@ def positive_int(value: str) -> int:
     return parsed
 
 
+def non_negative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("value must be a non-negative integer")
+    return parsed
+
+
 def _is_local_json(path: str) -> bool:
     candidate = Path(path).expanduser()
     return candidate.is_file() or candidate.suffix.lower() in {".json", ".jsonl"}
@@ -103,43 +116,133 @@ def _load_source(source_id: str, split: str, samples: int) -> Dataset:
     return load_dataset(source_id, split=f"{split}[:{samples}]")
 
 
-def load_calibration_dataset(
-    source_ids: list[str], split: str, samples: int, seed: int = 42
-) -> Dataset:
-    """Load multiple sources while keeping the requested total sample count."""
-    if not source_ids:
-        raise ValueError("At least one calibration dataset is required")
-    if samples < len(source_ids):
+def load_calibration_datasets(
+    dataset_id: str,
+    dataset_split: str,
+    text_dataset_id: str | None,
+    text_dataset_split: str,
+    num_calibration_samples: int,
+    text_calibration_samples: int,
+    seed: int = 42,
+) -> tuple[Dataset, list[dict[str, Any]]]:
+    """Load multimodal and text calibration data from independent splits."""
+    multimodal_dataset = _load_source(
+        dataset_id,
+        dataset_split,
+        num_calibration_samples,
+    ).shuffle(seed=seed)
+
+    if text_dataset_id is None or text_calibration_samples == 0:
+        return multimodal_dataset, []
+
+    text_dataset = _load_source(
+        text_dataset_id,
+        text_dataset_split,
+        text_calibration_samples,
+    ).shuffle(seed=seed)
+    return multimodal_dataset, list(text_dataset)
+
+
+def _normalize_text_content(content: Any) -> list[dict[str, str]]:
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}]
+    if isinstance(content, dict):
+        content = [content]
+
+    normalized = []
+    for item in content if isinstance(content, list) else []:
+        if isinstance(item, str):
+            normalized.append({"type": "text", "text": item})
+        elif isinstance(item, dict):
+            text = item.get("text")
+            if text is None and item.get("type") == "reasoning":
+                text = item.get("reasoning")
+            if isinstance(text, str):
+                normalized.append({"type": "text", "text": text})
+    return normalized
+
+
+def _format_text_example(example: dict[str, Any]) -> list[dict[str, Any]]:
+    if "messages" not in example:
+        if isinstance(example.get("text"), str):
+            return [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": example["text"]}],
+                }
+            ]
+        raise ValueError("Text calibration examples must contain 'messages' or 'text'")
+
+    messages = []
+    for message in example["messages"]:
+        if not isinstance(message, dict) or "role" not in message:
+            raise ValueError("Text calibration messages must contain a role")
+        content = _normalize_text_content(message.get("content", ""))
+        if content:
+            messages.append({"role": message["role"], "content": content})
+    if not messages:
+        raise ValueError("Text calibration example contains no usable messages")
+    return messages
+
+
+def _build_multimodal_messages(example: dict[str, Any]) -> list[dict[str, Any]]:
+    if "image" not in example or "caption" not in example:
         raise ValueError(
-            "num-calibration-samples must be at least the number of dataset "
-            f"sources ({samples} < {len(source_ids)})"
+            "Multimodal calibration examples must contain 'image' and 'caption'"
         )
-    base, remainder = divmod(samples, len(source_ids))
-    parts = []
-    for index, source_id in enumerate(source_ids):
-        count = base + (index < remainder)
-        parts.append(_load_source(source_id, split, count).shuffle(seed=seed))
-    if len(parts) == 1:
-        return parts[0]
-    columns = [tuple(part.column_names) for part in parts]
-    if any(value != columns[0] for value in columns[1:]):
-        raise ValueError(f"Calibration sources have different schemas: {columns}")
-    return concatenate_datasets(parts)
+    caption = example["caption"]
+    if isinstance(caption, (list, tuple)):
+        if not caption:
+            raise ValueError("Multimodal calibration example has an empty caption")
+        caption = caption[0]
+    if not isinstance(caption, str):
+        raise ValueError("Multimodal calibration caption must be a string")
+
+    return [
+        {
+            "role": "user",
+            "content": [
+                # K3 expects image data under the key matching the content type.
+                {"type": "image", "image": example["image"]},
+                {"type": "text", "text": "What does the image show?"},
+            ],
+        },
+        {
+            "role": "assistant",
+            "content": [{"type": "text", "text": caption}],
+        },
+    ]
 
 
-def _preprocess_example(example: dict[str, Any], *, tokenizer: Any) -> dict[str, Any]:
-    """Normalize common JSON calibration schemas to a tokenizer ``text`` field."""
-    if "input_ids" in example:
-        return example
-    if "text" in example:
-        return {"text": example["text"]}
-    if "messages" in example:
-        return {
-            "text": tokenizer.apply_chat_template(example["messages"], tokenize=False)
-        }
-    raise ValueError(
-        "Calibration examples must contain 'input_ids', 'text', or 'messages'"
+def _preprocess_multimodal_example(
+    example: dict[str, Any],
+    index: int,
+    *,
+    processor: Any,
+    text_examples: list[dict[str, Any]],
+    max_sequence_length: int,
+) -> dict[str, Any]:
+    messages = _build_multimodal_messages(example)
+    if text_examples:
+        messages.extend(_format_text_example(text_examples[index % len(text_examples)]))
+    return processor(
+        messages=messages,
+        padding=False,
+        max_length=max_sequence_length,
+        truncation=True,
     )
+
+
+def _collate_multimodal_batch(batch: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
+    if len(batch) != 1:
+        raise ValueError("Kimi K3 multimodal calibration requires batch-size=1")
+    return {
+        key: torch.tensor(
+            value,
+            dtype=torch.bfloat16 if key == "pixel_values" else None,
+        )
+        for key, value in batch[0].items()
+    }
 
 
 def _index_weight_map(model_id: Path) -> dict[str, str]:
@@ -249,6 +352,7 @@ def _register_k3_model(model_id: Path):
     model_class = get_class_from_dynamic_module(
         model_ref, str(model_id), local_files_only=True
     )
+    patch_kimi_k3_transformers_compat(model_class)
     try:
         AutoConfig.register(config.model_type, type(config))
     except ValueError:
@@ -286,14 +390,37 @@ def _int_scheme(num_bits: int, targets: list[str]) -> QuantizationScheme:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model-id", type=Path, required=True)
-    parser.add_argument("--dataset-id", nargs="+", required=True)
-    parser.add_argument("--dataset-split", default="train")
-    parser.add_argument("--num-calibration-samples", type=positive_int, default=32)
-    parser.add_argument("--max-sequence-length", type=positive_int, default=2048)
-    parser.add_argument("--batch-size", type=positive_int, default=1)
-    parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--work-dir", type=Path, default=None)
+    parser.add_argument("--model-id", "--model_id", type=Path, required=True)
+    parser.add_argument("--dataset-id", "--dataset_id", required=True)
+    parser.add_argument("--dataset-split", "--dataset_split", default="test")
+    parser.add_argument("--text-dataset-id", "--text_dataset_id", default=None)
+    parser.add_argument(
+        "--text-dataset-split",
+        "--text_dataset_split",
+        default="train_sft",
+    )
+    parser.add_argument(
+        "--num-calibration-samples",
+        "--num_calibration_samples",
+        type=positive_int,
+        default=32,
+    )
+    parser.add_argument(
+        "--text-calibration-samples",
+        "--text_calibration_samples",
+        type=non_negative_int,
+        default=128,
+        help="Number of text conversations to cycle across multimodal samples.",
+    )
+    parser.add_argument(
+        "--max-sequence-length",
+        "--max_sequence_length",
+        type=positive_int,
+        default=2048,
+    )
+    parser.add_argument("--batch-size", "--batch_size", type=positive_int, default=1)
+    parser.add_argument("--output-dir", "--output_dir", type=Path, required=True)
+    parser.add_argument("--work-dir", "--work_dir", type=Path, default=None)
     parser.add_argument(
         "--moe-calibrate-all-experts",
         action=argparse.BooleanOptionalAction,
@@ -301,21 +428,41 @@ def main() -> None:
         help="Collect iMatrix statistics for every K3 routed expert.",
     )
     args = parser.parse_args()
+    if args.batch_size != 1:
+        parser.error("Kimi K3 multimodal calibration requires --batch-size 1")
 
     model_id = args.model_id.expanduser().resolve()
     config = _register_k3_model(model_id)
     expert_pattern, expert_targets = _expert_targets_from_index(model_id)
     other_pattern, other_targets = _other_targets_from_index(model_id, expert_targets)
 
-    tokenizer = AutoTokenizer.from_pretrained(
+    processor = AutoProcessor.from_pretrained(
         model_id,
         trust_remote_code=True,
         local_files_only=True,
     )
-    dataset = load_calibration_dataset(
+    multimodal_dataset, text_examples = load_calibration_datasets(
         args.dataset_id,
         args.dataset_split,
+        args.text_dataset_id,
+        args.text_dataset_split,
         args.num_calibration_samples,
+        args.text_calibration_samples,
+    )
+    dataset = multimodal_dataset.map(
+        partial(
+            _preprocess_multimodal_example,
+            processor=processor,
+            text_examples=text_examples,
+            max_sequence_length=args.max_sequence_length,
+        ),
+        with_indices=True,
+        remove_columns=multimodal_dataset.column_names,
+    )
+    calibration_dataloader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        collate_fn=_collate_multimodal_batch,
     )
 
     ignores = [
@@ -336,22 +483,22 @@ def main() -> None:
     result = streaming_oneshot(
         model=model_id,
         model_config=config,
-        dataset=dataset,
-        preprocessing_func=partial(_preprocess_example, tokenizer=tokenizer),
-        tokenizer=tokenizer,
+        dataset=calibration_dataloader,
+        tokenizer=processor,
         recipe=recipe,
         output_dir=args.output_dir,
         work_dir=args.work_dir,
         num_calibration_samples=args.num_calibration_samples,
         max_seq_length=args.max_sequence_length,
         batch_size=args.batch_size,
+        shuffle_calibration_samples=False,
         moe_calibrate_all_experts=args.moe_calibrate_all_experts,
         materializer=KimiK3WeightMaterializer(),
         # K3 downstream readers expect packed INT4 tensors in the output.
         pack_to_int8=True,
         overwrite_output=True,
     )
-    tokenizer.save_pretrained(result)
+    processor.save_pretrained(result)
     print(
         f"Saved Kimi K3 WNA8 checkpoint to {result} "
         f"(INT4 routed experts={len(expert_targets)}, "
