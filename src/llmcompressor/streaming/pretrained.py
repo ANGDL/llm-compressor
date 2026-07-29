@@ -181,6 +181,7 @@ def streaming_oneshot_from_pretrained(
     overwrite_output: bool,
     pipeline_devices: Sequence[torch.device | str] | None,
     async_save: bool,
+    pack_to_int8: bool,
 ) -> Path:
     """Run traced streaming PTQ with an oneshot-like model/dataset interface."""
     checkpoint = Path(model).expanduser()
@@ -341,6 +342,7 @@ def streaming_oneshot_from_pretrained(
             checkpoint_progress=checkpoint_progress,
             pipeline_devices=pipeline_devices,
             async_save=async_save,
+            pack_to_int8=pack_to_int8,
         )
         qconfig = build_quantization_config(quantizer.resolved_config)
         return finalize_streaming_checkpoint(

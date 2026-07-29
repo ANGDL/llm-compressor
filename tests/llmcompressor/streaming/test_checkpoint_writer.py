@@ -206,6 +206,58 @@ def test_async_direct_writer_returns_before_disk_write_finishes(tmp_path):
     assert torch.equal(read_shard(output)["weight"], torch.ones(4))
 
 
+def test_async_direct_writer_takes_owned_cpu_snapshot_without_clone(tmp_path):
+    direct = DirectSafetensorsWriter(tmp_path, run_fingerprint="run-a")
+    original = direct.write_shard
+    started = threading.Event()
+    release = threading.Event()
+    source = torch.ones(4)
+
+    def blocked_write(_shard_id, tensors, **kwargs):
+        assert tensors["weight"].data_ptr() == source.data_ptr()
+        started.set()
+        assert release.wait(timeout=5)
+        return original(_shard_id, tensors, **kwargs)
+
+    direct.write_shard = blocked_write
+    writer = AsyncDirectSafetensorsWriter(direct)
+    try:
+        output = writer.write_shard(
+            "subgraph-00000",
+            {"weight": source},
+            owned_cpu_tensors={"weight"},
+        )
+        assert started.wait(timeout=5)
+        release.set()
+        writer.close()
+    finally:
+        release.set()
+        writer.close()
+
+    assert torch.equal(read_shard(output)["weight"], torch.ones(4))
+
+
+def test_async_direct_writer_rejects_invalid_owned_cpu_snapshot(tmp_path):
+    direct = DirectSafetensorsWriter(tmp_path, run_fingerprint="run-a")
+    writer = AsyncDirectSafetensorsWriter(direct)
+    non_contiguous = torch.ones((2, 2)).t()
+    try:
+        with pytest.raises(ValueError, match="contiguous CPU tensor"):
+            writer.write_shard(
+                "subgraph-00000",
+                {"weight": non_contiguous},
+                owned_cpu_tensors={"weight"},
+            )
+        with pytest.raises(ValueError, match="not present"):
+            writer.write_shard(
+                "subgraph-00000",
+                {"weight": torch.ones(4)},
+                owned_cpu_tensors={"missing"},
+            )
+    finally:
+        writer.close()
+
+
 def test_async_direct_writer_propagates_background_failure(tmp_path):
     direct = DirectSafetensorsWriter(tmp_path, run_fingerprint="run-a")
 

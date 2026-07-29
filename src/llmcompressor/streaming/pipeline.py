@@ -45,7 +45,10 @@ from .checkpoint import (
 )
 from .loading import SubgraphPrefetcher
 from .materialization import WeightMaterializer, materialize_weights
-from .output import quantized_module_formats
+from .output import (
+    prepare_quantized_tensor_for_save,
+    quantized_module_formats,
+)
 from .tied_weights import infer_transformers_tied_weights
 from .tracing import TracedBoundaryAdapter
 
@@ -141,6 +144,7 @@ def _initialize_run(
     num_samples: int,
     max_seq_length: int | None,
     seed: int | None,
+    pack_to_int8: bool,
     persist: bool = True,
 ) -> str:
     normalized_recipe = recipe.model_dump(mode="json")
@@ -154,6 +158,7 @@ def _initialize_run(
             "materializer": materializer.manifest_info(
                 target_dtype=target_dtype
             ).config_sha256,
+            "output": {"pack_to_int8": pack_to_int8},
         }
     )
     manifest = StreamingRunManifest(
@@ -176,8 +181,34 @@ def _initialize_run(
     return run_fingerprint
 
 
+def _prepare_loaded_tensor_for_save(
+    loaded,
+    name: str,
+    tensor: torch.Tensor,
+    formats: Mapping[str, str],
+    *,
+    pack_to_int8: bool,
+) -> torch.Tensor:
+    owner_name, separator, local_name = name.rpartition(".")
+    if not separator or local_name != "weight" or owner_name not in formats:
+        return tensor
+    module = loaded.model.get_submodule(owner_name)
+    return prepare_quantized_tensor_for_save(
+        name,
+        tensor,
+        module.quantization_scheme,
+        format_name=formats[owner_name],
+        pack_to_int8=pack_to_int8,
+    )
+
+
 def _write_loaded_target(
-    transaction, loaded, target_name: str, source
+    transaction,
+    loaded,
+    target_name: str,
+    source,
+    *,
+    pack_to_int8: bool,
 ) -> set[str]:
     written = set()
     formats = quantized_module_formats(
@@ -185,6 +216,13 @@ def _write_loaded_target(
     )
     for name, tensor in loaded.state_tensors_under((target_name,)):
         owner_name = name.rpartition(".")[0]
+        tensor = _prepare_loaded_tensor_for_save(
+            loaded,
+            name,
+            tensor,
+            formats,
+            pack_to_int8=pack_to_int8,
+        )
         transaction.write_tensor(
             name,
             tensor,
@@ -201,15 +239,27 @@ def _write_loaded_target(
     return written
 
 
-def _loaded_target_delta(loaded, target_name: str):
-    tensors = dict(loaded.state_tensors_under((target_name,)))
+def _loaded_target_delta(loaded, target_name: str, *, pack_to_int8: bool):
     formats = quantized_module_formats(
         loaded.model.named_modules(), prefix=target_name
     )
+    tensors = {}
+    owned_cpu_tensors = set()
+    for name, tensor in loaded.state_tensors_under((target_name,)):
+        prepared = _prepare_loaded_tensor_for_save(
+            loaded,
+            name,
+            tensor,
+            formats,
+            pack_to_int8=pack_to_int8,
+        )
+        tensors[name] = prepared
+        if prepared is not tensor and prepared.device.type == "cpu":
+            owned_cpu_tensors.add(name)
     written = set(tensors)
     for module_name in formats:
         written.add(f"{module_name}.weight")
-    return tensors, formats, written
+    return tensors, formats, written, owned_cpu_tensors
 
 
 def _write_loaded_target_direct(
@@ -217,16 +267,23 @@ def _write_loaded_target_direct(
     loaded,
     target_name: str,
     shard_id: str,
+    *,
+    pack_to_int8: bool = True,
 ) -> set[str]:
     """Write one target and release all device tensor references before returning."""
 
-    tensors, formats, written = _loaded_target_delta(loaded, target_name)
+    tensors, formats, written, owned_cpu_tensors = _loaded_target_delta(
+        loaded,
+        target_name,
+        pack_to_int8=pack_to_int8,
+    )
     try:
         if tensors:
             writer.write_shard(
                 shard_id,
                 tensors,
                 quantized_modules=formats,
+                owned_cpu_tensors=owned_cpu_tensors,
             )
         return written
     finally:
@@ -348,6 +405,7 @@ def run_subgraph_streaming_pipeline(
     checkpoint_progress: bool = False,
     pipeline_devices: Sequence[torch.device | str] | None = None,
     async_save: bool = False,
+    pack_to_int8: bool = True,
 ) -> tuple[Path, Path]:
     """Calibrate, modify, propagate, and persist one subgraph at a time."""
 
@@ -372,6 +430,7 @@ def run_subgraph_streaming_pipeline(
         num_samples=num_samples,
         max_seq_length=max_seq_length,
         seed=seed,
+        pack_to_int8=pack_to_int8,
         persist=checkpoint_progress,
     )
     transaction_writer = (
@@ -686,7 +745,11 @@ def run_subgraph_streaming_pipeline(
                                         )
                                 written.update(
                                     _write_loaded_target(
-                                        transaction, loaded, target_name, source
+                                        transaction,
+                                        loaded,
+                                        target_name,
+                                        source,
+                                        pack_to_int8=pack_to_int8,
                                     )
                                 )
                                 transaction.commit()
@@ -697,6 +760,7 @@ def run_subgraph_streaming_pipeline(
                                     loaded,
                                     target_name,
                                     transaction_id,
+                                    pack_to_int8=pack_to_int8,
                                 )
                             )
                 finally:
@@ -752,6 +816,7 @@ def run_subgraph_streaming_pipeline(
             num_samples=num_samples,
             max_seq_length=max_seq_length,
             seed=seed,
+            pack_to_int8=pack_to_int8,
         )
 
     source_names = set(source.tensor_names())

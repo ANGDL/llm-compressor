@@ -16,3 +16,24 @@ def test_cli_validates_computation_dtype():
     assert _dtype("bfloat16") is torch.bfloat16
     with pytest.raises(ValueError, match="floating-point"):
         _dtype("int8")
+
+
+def test_cli_can_disable_packing_to_int8():
+    parser = build_parser()
+
+    args = parser.parse_args(
+        [
+            "quantize",
+            "--checkpoint",
+            "checkpoint",
+            "--artifacts",
+            "artifacts",
+            "--staging",
+            "staging",
+            "--schemes",
+            "schemes.json",
+            "--no-pack-to-int8",
+        ]
+    )
+
+    assert args.no_pack_to_int8 is True

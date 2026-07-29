@@ -103,10 +103,13 @@ def test_finalize_refuses_existing_or_source_output(tmp_path):
         )
 
 
-def test_finalize_accepts_int_quantized_dense_weight(tmp_path):
+@pytest.mark.parametrize(("num_bits", "expected_columns"), [(8, 4), (4, 2)])
+def test_finalize_accepts_int_quantized_weight(
+    tmp_path, num_bits, expected_columns
+):
     checkpoint, artifacts, _, _ = prepare(tmp_path)
     dense_scheme = scheme()
-    dense_scheme.weights.num_bits = 8
+    dense_scheme.weights.num_bits = num_bits
     dense_scheme.input_activations = QuantizationArgs(
         num_bits=8, strategy="token", dynamic=True
     )
@@ -130,6 +133,12 @@ def test_finalize_accepts_int_quantized_dense_weight(tmp_path):
     index = json.loads((output / "model.safetensors.index.json").read_text())
     assert "layers.0.weight" in index["weight_map"]
     assert "layers.0.weight_packed" not in index["weight_map"]
+    with safe_open(
+        output / index["weight_map"]["layers.0.weight"],
+        framework="pt",
+        device="cpu",
+    ) as file:
+        assert file.get_tensor("layers.0.weight").shape == (4, expected_columns)
 
 
 def test_finalize_omits_identical_declared_tied_weight(tmp_path, monkeypatch):

@@ -25,6 +25,7 @@ from llmcompressor.streaming import (
     collect_calibration_statistics,
     quantize_streaming,
 )
+from llmcompressor.utils.int4_packing import pack_int4_to_int8
 
 
 class TwoLayer(nn.Module):
@@ -43,6 +44,17 @@ def scheme(*, observer=None):
             observer=observer,
         ),
     )
+
+
+def w4a8_scheme(*, observer=None):
+    value = scheme(observer=observer)
+    value.input_activations = QuantizationArgs(
+        num_bits=8,
+        type="int",
+        strategy="token",
+        dynamic=True,
+    )
+    return value
 
 
 def prepare(tmp_path, *, algorithms=("gptq", "imatrix")):
@@ -140,6 +152,53 @@ def test_gptq_matches_existing_quantize_and_compress_path(tmp_path):
     assert torch.equal(actual["layers.0.bias"], model.layers[0].bias)
 
 
+def test_w4a8_is_packed_before_transaction_payload_is_written(tmp_path):
+    checkpoint, artifacts, _, _ = prepare(tmp_path)
+    packed_output = quantize_streaming(
+        checkpoint=checkpoint,
+        artifact_dir=artifacts,
+        staging_dir=tmp_path / "packed",
+        schemes={"layers.0": w4a8_scheme()},
+        target_dtype=torch.float32,
+    )
+    unpacked_output = quantize_streaming(
+        checkpoint=checkpoint,
+        artifact_dir=artifacts,
+        staging_dir=tmp_path / "unpacked",
+        schemes={"layers.0": w4a8_scheme()},
+        target_dtype=torch.float32,
+        pack_to_int8=False,
+    )
+
+    packed = read_shard(
+        packed_output / "shards/model-00001-of-00002.safetensors"
+    )
+    unpacked = read_shard(
+        unpacked_output / "shards/model-00001-of-00002.safetensors"
+    )
+    assert packed["layers.0.weight"].shape == (4, 2)
+    assert unpacked["layers.0.weight"].shape == (4, 4)
+    assert torch.equal(
+        packed["layers.0.weight"],
+        pack_int4_to_int8(unpacked["layers.0.weight"]),
+    )
+
+    metadata = json.loads(
+        (
+            packed_output
+            / "transactions/source-shard-model-00001-of-00002.safetensors"
+            / "metadata.json"
+        ).read_text()
+    )
+    weight_record = next(
+        record
+        for record in metadata["records"]
+        if record["name"] == "layers.0.weight"
+    )
+    assert weight_record["shape"] == [4, 2]
+    assert weight_record["size"] == 8
+
+
 def test_imatrix_and_resume_skip_completed_shard(tmp_path, monkeypatch):
     checkpoint, artifacts, _, _ = prepare(tmp_path)
     staging = tmp_path / "staging"
@@ -169,6 +228,17 @@ def test_imatrix_and_resume_skip_completed_shard(tmp_path, monkeypatch):
     assert first.read_bytes() == before
     assert not (staging / "model.safetensors.index.json").exists()
     assert not (staging / "config.json").exists()
+
+    with pytest.raises(ArtifactCompatibilityError, match="different quantization"):
+        quantize_streaming(
+            checkpoint=checkpoint,
+            artifact_dir=artifacts,
+            staging_dir=staging,
+            schemes=schemes,
+            use_gptq=False,
+            target_dtype=torch.float32,
+            pack_to_int8=False,
+        )
 
     with pytest.raises(ArtifactCompatibilityError, match="different quantization"):
         quantize_streaming(

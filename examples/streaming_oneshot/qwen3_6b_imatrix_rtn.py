@@ -1,4 +1,4 @@
-"""Quantize a local Qwen3-0.6B checkpoint with streaming iMatrix + RTN.
+"""Quantize a local Qwen3-0.6B checkpoint to W4A8 with streaming iMatrix + RTN.
 
 The shared Sequential Pipeline tracer derives the ordered decoder subgraphs.
 Each subgraph is loaded, calibrated, quantized, written once as a final shard,
@@ -15,8 +15,8 @@ from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
 from llmcompressor.streaming import streaming_oneshot
 
 MODEL = "/Users/ang/models/Qwen3-0.6B"
-OUTPUT_DIR = "/Users/ang/models/Qwen3-0.6B-W8A8-IMatrix-RTN"
-WORK_DIR = "/Users/ang/models/streaming-work-qwen3-0.6b"
+OUTPUT_DIR = "/Users/ang/models/Qwen3-0.6B-W4A8-IMatrix-RTN"
+WORK_DIR = "/Users/ang/models/streaming-work-qwen3-0.6b-w4a8"
 # Set to ["cuda:0", "cuda:1"] to overlap next-layer materialization with
 # current-layer quantization. Leave None for the original single-device path.
 PIPELINE_DEVICES = None
@@ -30,14 +30,14 @@ dataset = load_dataset(
     split="train_sft[:16]",
 )
 
-w8a8_scheme = preset_name_to_scheme("W8A8", ["Linear"])
-w8a8_scheme.weights.observer = "imatrix_mse"
-w8a8_scheme.weights.scale_dtype = torch.float32
+w4a8_scheme = preset_name_to_scheme("W4A8", ["Linear"])
+w4a8_scheme.weights.observer = "imatrix_mse"
+w4a8_scheme.weights.scale_dtype = torch.float32
 
 recipe = [
     IMatrixGatherer(ignore=["lm_head"]),
     QuantizationModifier(
-        config_groups={"group_0": w8a8_scheme},
+        config_groups={"group_0": w4a8_scheme},
         ignore=["lm_head"],
     ),
 ]
@@ -58,4 +58,5 @@ streaming_oneshot(
     checkpoint_progress=False,
     # Replace a previous incomplete or completed quantization at OUTPUT_DIR.
     overwrite_output=True,
+    pack_to_int8=True,
 )

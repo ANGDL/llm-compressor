@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 import torch
 import yaml
+from compressed_tensors.quantization import QuantizationArgs, QuantizationScheme
 from safetensors import safe_open
 from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, Qwen3Config, Qwen3ForCausalLM
@@ -88,6 +91,111 @@ def test_direct_target_write_does_not_retain_tensor(tmp_path):
 
     assert written == {"layer.weight"}
     assert references[0]() is None
+
+
+def test_direct_target_write_packs_w4a8_before_writer_snapshot():
+    class Loaded:
+        model = torch.nn.Module()
+        model.layer = torch.nn.Linear(4, 2, bias=False)
+        model.layer.quantization_scheme = QuantizationScheme(
+            targets=["layer"],
+            weights=QuantizationArgs(
+                num_bits=4,
+                type="int",
+                strategy="channel",
+                symmetric=True,
+            ),
+            input_activations=QuantizationArgs(
+                num_bits=8,
+                type="int",
+                strategy="token",
+                dynamic=True,
+            ),
+        )
+
+        def state_tensors_under(self, _module_names):
+            yield "layer.weight", torch.tensor(
+                [[-8, -1, 0, 7], [1, 2, 3, 4]], dtype=torch.int8
+            )
+
+    class Writer:
+        def write_shard(self, _shard_id, tensors, **kwargs):
+            assert tensors["layer.weight"].device.type == "cpu"
+            assert kwargs["owned_cpu_tensors"] == {"layer.weight"}
+            captured.update(
+                {name: value.clone() for name, value in tensors.items()}
+            )
+            assert kwargs["quantized_modules"] == {"layer": "int-quantized"}
+
+    captured = {}
+    written = _write_loaded_target_direct(
+        Writer(), Loaded(), "layer", "target-0"
+    )
+
+    assert written == {"layer.weight"}
+    assert captured["layer.weight"].shape == (2, 2)
+    assert captured["layer.weight"].tolist() == [[-8, 112], [33, 67]]
+
+
+@pytest.mark.parametrize("async_save", [False, True])
+def test_pretrained_streaming_packs_w4a8_final_shard(tmp_path, async_save):
+    config = Qwen3Config(
+        vocab_size=32,
+        hidden_size=8,
+        intermediate_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=4,
+        max_position_embeddings=32,
+        tie_word_embeddings=True,
+    )
+    checkpoint = tmp_path / "checkpoint"
+    Qwen3ForCausalLM(config).save_pretrained(
+        checkpoint, safe_serialization=True
+    )
+    scheme = QuantizationScheme(
+        targets=["Linear"],
+        weights=QuantizationArgs(
+            num_bits=4,
+            type="int",
+            strategy="channel",
+            symmetric=True,
+            observer="imatrix_mse",
+        ),
+        input_activations=QuantizationArgs(
+            num_bits=8,
+            type="int",
+            strategy="token",
+            dynamic=True,
+        ),
+    )
+
+    output = streaming_oneshot(
+        model=checkpoint,
+        dataset=_calibration_data(),
+        dataset_fingerprint="7" * 64,
+        recipe=[
+            IMatrixGatherer(ignore=["lm_head"]),
+            QuantizationModifier(
+                config_groups={"group_0": scheme}, ignore=["lm_head"]
+            ),
+        ],
+        output_dir=tmp_path / "output",
+        work_dir=tmp_path / "work",
+        num_calibration_samples=2,
+        max_seq_length=4,
+        target_dtype=torch.float32,
+        async_save=async_save,
+    )
+
+    tensors = _checkpoint_tensors(output)
+    weight = tensors["model.layers.0.self_attn.q_proj.weight"]
+    assert weight.dtype is torch.int8
+    assert weight.shape == (8, 4)
+    saved_config = json.loads((output / "config.json").read_text())
+    assert saved_config["quantization_config"]["format"] == "int-quantized"
+    assert not (tmp_path / "work/staging/transactions").exists()
 
 
 def test_empty_device_cache_dispatches_to_execution_backend(monkeypatch):

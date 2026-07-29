@@ -9,7 +9,7 @@ import pickle
 import shutil
 import uuid
 from collections import defaultdict
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
@@ -83,11 +83,26 @@ def _cpu_snapshot(
     tensors: Mapping[str, torch.Tensor],
     *,
     clone_cpu: bool = False,
+    owned_cpu_tensors: Collection[str] = (),
 ) -> dict[str, torch.Tensor]:
-    """Detach an immutable CPU snapshot from model-owned tensor storage."""
+    """Detach CPU snapshots, accepting explicitly transferred storage as-is."""
+
+    owned = set(owned_cpu_tensors)
+    unknown = owned.difference(tensors)
+    if unknown:
+        raise ValueError(
+            f"Owned CPU snapshots are not present in the shard: {sorted(unknown)}"
+        )
 
     values = {}
     for name, tensor in tensors.items():
+        if name in owned:
+            if tensor.device.type != "cpu" or not tensor.is_contiguous():
+                raise ValueError(
+                    f"Owned snapshot {name!r} must be a contiguous CPU tensor"
+                )
+            values[name] = tensor.detach()
+            continue
         value = tensor.detach().to("cpu").contiguous()
         if clone_cpu and tensor.device.type == "cpu":
             value = value.clone()
@@ -538,6 +553,7 @@ class DirectSafetensorsWriter:
         *,
         quantized_modules: Mapping[str, str] | None = None,
         omitted_tied_weights: Mapping[str, str] | None = None,
+        owned_cpu_tensors: Collection[str] = (),
     ) -> Path:
         if not shard_id or Path(shard_id).name != shard_id:
             raise ValueError(f"Invalid shard id {shard_id!r}")
@@ -548,7 +564,7 @@ class DirectSafetensorsWriter:
         state_path = self.states_dir / f"{shard_name}.json"
         if output.exists() or state_path.exists():
             raise FileExistsError(f"Direct shard {shard_id!r} already exists")
-        values = _cpu_snapshot(tensors)
+        values = _cpu_snapshot(tensors, owned_cpu_tensors=owned_cpu_tensors)
         temporary = output.with_name(f".{output.name}.{uuid.uuid4().hex}.tmp")
         try:
             save_file(values, temporary)
@@ -650,13 +666,23 @@ class AsyncDirectSafetensorsWriter(AbstractContextManager):
         *,
         quantized_modules: Mapping[str, str] | None = None,
         omitted_tied_weights: Mapping[str, str] | None = None,
+        owned_cpu_tensors: Collection[str] = (),
     ) -> Path:
-        """Snapshot a shard on CPU and enqueue its durable write."""
+        """Snapshot a shard on CPU and enqueue its durable write.
+
+        Names in ``owned_cpu_tensors`` transfer immutable tensor storage to the
+        writer and are not cloned. Callers must not mutate those tensors after
+        this method returns.
+        """
 
         self.poll()
         while len(self._pending) >= self.max_pending:
             self._wait_oldest()
-        values = _cpu_snapshot(tensors, clone_cpu=True)
+        values = _cpu_snapshot(
+            tensors,
+            clone_cpu=True,
+            owned_cpu_tensors=owned_cpu_tensors,
+        )
         output = self.writer.shards_dir / f"model-{shard_id}.safetensors"
         future = self._executor.submit(
             self._write,
