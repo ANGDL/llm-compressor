@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from operator import getitem
 from typing import Any, Iterator
 
 import torch
@@ -34,17 +35,28 @@ def _project_through_target(subgraph: Subgraph, target_name: str) -> Subgraph:
     graph = Graph()
     node_map = {}
     target_node = None
+    output_nodes = []
     for node in subgraph.graph.nodes:
         if node.op == "output":
             break
+        if target_node is not None:
+            if node.op != "call_function" or node.target is not getitem:
+                break
+            if any(dependency not in node_map for dependency in node.all_input_nodes):
+                break
         copied = graph.node_copy(node, lambda dependency: node_map[dependency])
         node_map[node] = copied
         if node.op == "call_module" and str(node.target) == target_name:
             target_node = copied
-            break
+            output_nodes = [(node, copied)]
+        elif target_node is not None:
+            output_nodes = [
+                pair for pair in output_nodes if pair[0] not in node.all_input_nodes
+            ]
+            output_nodes.append((node, copied))
     if target_node is None:
         raise ValueError(f"Target {target_name!r} is absent from traced partition")
-    graph.output({target_node.name: target_node})
+    graph.output({node.name: copied for node, copied in output_nodes})
     for node in reversed(tuple(graph.nodes)):
         if node.op in {"placeholder", "get_attr"} and not node.users:
             graph.erase_node(node)

@@ -11,7 +11,9 @@ The recipe is deliberately fixed to IMatrixGatherer + QuantizationModifier
 (RTN).  Activation and weight quantization are symmetric; weights are static
 per-channel and activations are dynamic per-token.  ``pack_to_int8=True`` is
 also fixed because K3's downstream compressed-tensors/vLLM loaders consume the
-packed INT4 layout.
+packed INT4 layout.  The model-level ``output_attn_res_proj`` remains in its
+source dtype because K3 invokes it inside an autowrapped method after the
+decoder loop; all decoder-layer residual projections remain INT8 targets.
 
 Example::
 
@@ -82,7 +84,6 @@ _OTHER_LINEAR_SUFFIXES = (
     "routed_expert_up_proj",
     "self_attention_res_proj",
     "mlp_res_proj",
-    "output_attn_res_proj",
 )
 _OTHER_LINEAR_RE = re.compile(
     r"^language_model\.model\.(?:.*\.)?(?:"
@@ -424,7 +425,7 @@ def main() -> None:
     parser.add_argument(
         "--moe-calibrate-all-experts",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help="Collect iMatrix statistics for every K3 routed expert.",
     )
     args = parser.parse_args()
