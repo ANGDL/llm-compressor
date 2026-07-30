@@ -387,6 +387,44 @@ def test_kimi_k3_materializer_decodes_ue8m0_endpoints():
     assert torch.isinf(decoded[2])
 
 
+def test_kimi_k3_materializer_kda_a_log_configuration_and_shape(tmp_path):
+    materializer = KimiK3WeightMaterializer(kda_num_heads=96)
+    name = "language_model.model.layers.0.self_attn.A_log"
+    metadata = TensorMetadata(
+        name=name,
+        shape=(128,),
+        dtype=torch.float32,
+        shard=tmp_path / "model.safetensors",
+    )
+    source = torch.arange(128, dtype=torch.float32)
+
+    result = materializer.materialize(
+        name,
+        {name: source},
+        target_dtype=torch.bfloat16,
+        device=torch.device("cpu"),
+    )
+
+    assert materializer.configuration()["kda_num_heads"] == 96
+    assert materializer.logical_shape(name, metadata) == (96,)
+    assert torch.equal(result, source[:96].to(torch.bfloat16))
+
+
+@pytest.mark.parametrize("shape", [(95,), (1, 1, 128, 1)])
+def test_kimi_k3_materializer_rejects_invalid_kda_a_log_shape(tmp_path, shape):
+    materializer = KimiK3WeightMaterializer(kda_num_heads=96)
+    name = "language_model.model.layers.0.self_attn.A_log"
+    metadata = TensorMetadata(
+        name=name,
+        shape=shape,
+        dtype=torch.float32,
+        shard=tmp_path / "model.safetensors",
+    )
+
+    with pytest.raises(ValueError, match="KDA A_log checkpoint tensor"):
+        materializer.logical_shape(name, metadata)
+
+
 def test_kimi_k3_output_config_removes_source_mxfp4_metadata():
     source_config = {
         "model_type": "kimi_k3",

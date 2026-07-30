@@ -367,6 +367,21 @@ def _register_k3_model(model_id: Path):
     return config
 
 
+def _kda_num_heads(config: Any) -> int:
+    text_config = getattr(config, "text_config", None)
+    linear_attn_config = getattr(text_config, "linear_attn_config", None)
+    if isinstance(linear_attn_config, dict):
+        num_heads = linear_attn_config.get("num_heads")
+    else:
+        num_heads = getattr(linear_attn_config, "num_heads", None)
+    if isinstance(num_heads, bool) or not isinstance(num_heads, int) or num_heads <= 0:
+        raise ValueError(
+            "Kimi K3 text_config.linear_attn_config.num_heads must be a "
+            "positive integer"
+        )
+    return num_heads
+
+
 def _int_scheme(num_bits: int, targets: list[str]) -> QuantizationScheme:
     return QuantizationScheme(
         targets=targets,
@@ -494,7 +509,7 @@ def main() -> None:
         batch_size=args.batch_size,
         shuffle_calibration_samples=False,
         moe_calibrate_all_experts=args.moe_calibrate_all_experts,
-        materializer=KimiK3WeightMaterializer(),
+        materializer=KimiK3WeightMaterializer(kda_num_heads=_kda_num_heads(config)),
         # K3 downstream readers expect packed INT4 tensors in the output.
         pack_to_int8=True,
         overwrite_output=True,

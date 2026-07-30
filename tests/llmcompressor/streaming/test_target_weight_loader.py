@@ -10,6 +10,7 @@ from torch import nn
 from transformers import LlamaConfig, LlamaForCausalLM
 
 from llmcompressor.streaming import (
+    KimiK3WeightMaterializer,
     SafetensorsWeightSource,
     TargetWeightLoader,
     build_meta_model,
@@ -48,6 +49,14 @@ class RemoteStyleBlock(nn.Module):
 
     def forward(self, inputs):
         return self.projection(inputs) * self.gate
+
+
+class KdaModel(nn.Module):
+    def __init__(self, num_heads: int):
+        super().__init__()
+        self.layer = nn.Module()
+        self.layer.self_attn = nn.Module()
+        self.layer.self_attn.A_log = nn.Parameter(torch.empty(num_heads))
 
 
 def _write_checkpoint(model: nn.Module, path, *, overrides=None):
@@ -374,6 +383,23 @@ def test_rejects_shape_mismatch_before_installing(tiny_checkpoint, tmp_path):
             "layers.0", device=torch.device("cpu"), dtype=torch.float32
         ):
             pass
+
+    _assert_all_meta(model)
+
+
+def test_kimi_k3_kda_a_log_uses_configured_head_count(tmp_path):
+    path = tmp_path / "model.safetensors"
+    source = torch.arange(128, dtype=torch.float32)
+    save_file({"layer.self_attn.A_log": source}, path)
+    model = build_meta_model(KdaModel, num_heads=96)
+    loader = TargetWeightLoader(
+        model,
+        SafetensorsWeightSource(path),
+        materializer=KimiK3WeightMaterializer(kda_num_heads=96),
+    )
+
+    with loader.loaded("layer", device=torch.device("cpu"), dtype=torch.float32):
+        assert torch.equal(model.layer.self_attn.A_log, source[:96])
 
     _assert_all_meta(model)
 
