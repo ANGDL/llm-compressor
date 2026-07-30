@@ -470,9 +470,7 @@ def test_kimi_k3_routed_experts_load_only_when_invoked(tmp_path, monkeypatch):
     plan = loader.plan(prefix)
 
     assert plan.deferred_modules == tuple(
-        f"{expert_prefix}.{expert_index}.{projection}"
-        for expert_index in range(2)
-        for projection in ("w1", "w2", "w3")
+        f"{expert_prefix}.{expert_index}" for expert_index in range(2)
     )
     with loader.loaded(prefix, device=torch.device("cpu"), dtype=torch.float32):
         layer = model.language_model.model.layers[0]
@@ -482,6 +480,7 @@ def test_kimi_k3_routed_experts_load_only_when_invoked(tmp_path, monkeypatch):
             for parameter in layer.block_sparse_moe.experts.parameters()
         )
         layer.block_sparse_moe.experts[0](torch.ones(1, 4))
+        layer.block_sparse_moe.experts[0](torch.ones(1, 4))
         assert all(
             parameter.is_meta
             for parameter in layer.block_sparse_moe.experts.parameters()
@@ -489,6 +488,8 @@ def test_kimi_k3_routed_experts_load_only_when_invoked(tmp_path, monkeypatch):
 
     assert any(f"{expert_prefix}.0" in name for name in loaded_names)
     assert not any(f"{expert_prefix}.1" in name for name in loaded_names)
+    expert_loads = [name for name in loaded_names if name.startswith(expert_prefix)]
+    assert len(expert_loads) == 6
     _assert_all_meta(model)
 
 

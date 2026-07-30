@@ -151,7 +151,7 @@ class KimiK3WeightMaterializer(WeightMaterializer):
             "key_layout": "kimi-k3-weight-packed-weight-scale",
             "fp4_layout": "e2m1-low-nibble-first",
             "scale_layout": "ue8m0",
-            "routed_expert_loading": "deferred-per-linear",
+            "routed_expert_loading": "deferred-per-expert-cpu-cache",
         }
 
     def create_source(self, checkpoint: str) -> CheckpointWeightSource:
@@ -193,7 +193,19 @@ class KimiK3WeightMaterializer(WeightMaterializer):
     ) -> str | None:
         if not self._is_packed_expert(tensor_name, metadata):
             return None
-        return tensor_name.removesuffix(".weight")
+        projection_name = tensor_name.removesuffix(".weight")
+        expert_name, _, projection = projection_name.rpartition(".")
+        if projection not in {"w1", "w2", "w3"}:
+            raise ValueError(
+                f"Unsupported Kimi K3 expert projection {projection_name!r}"
+            )
+        return expert_name
+
+    def deferred_cache_device(self) -> torch.device:
+        # K3's routed experts are decoded from MXFP4 once per decoder layer,
+        # then onloaded one expert at a time just like ordinary oneshot's CPU
+        # OffloadCache. Keeping the decoded cache off CUDA bounds GPU residency.
+        return torch.device("cpu")
 
     def logical_shape(
         self, tensor_name: str, metadata: TensorMetadata
