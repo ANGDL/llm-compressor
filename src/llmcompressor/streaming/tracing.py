@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
+from itertools import chain
 from operator import getitem
 from typing import Any, Iterator
 
@@ -27,6 +29,12 @@ from .loading import SubgraphWeightSession, TargetWeightLoader
 from .materialization import WeightMaterializer
 
 __all__ = ["TracedBoundaryAdapter", "trace_streaming_boundaries"]
+
+
+class _PrefixDependencyDetected(RuntimeError):
+    def __init__(self, module_name: str):
+        super().__init__(module_name)
+        self.module_name = module_name
 
 
 def _project_through_target(subgraph: Subgraph, target_name: str) -> Subgraph:
@@ -93,6 +101,7 @@ class TracedBoundaryAdapter:
     device: torch.device
     dtype: torch.dtype
     _target_subgraphs: tuple[Subgraph, ...]
+    _prefix_runtime_modules: tuple[str, ...] | None = None
 
     @property
     def targets(self) -> tuple[str, ...]:
@@ -112,11 +121,21 @@ class TracedBoundaryAdapter:
         """Execute the traced prefix without rewriting the model input contract."""
 
         prefix = self.plan.subgraphs[0]
+        batch_iterator = iter(batches)
+        if self._prefix_runtime_modules is None:
+            try:
+                sample_batch = next(batch_iterator)
+            except StopIteration as error:
+                raise ValueError("Streaming calibration batches are empty") from error
+            self._prefix_runtime_modules = self._discover_prefix_runtime_modules(
+                prefix, sample_batch
+            )
+            batch_iterator = chain((sample_batch,), batch_iterator)
         with self.weight_session.loaded(
             prefix,
             device=self.device,
             dtype=self.dtype,
-            include_modules=self._prefix_fallback_modules(),
+            include_modules=self._prefix_runtime_modules,
         ):
             with (
                 torch.no_grad(),
@@ -124,7 +143,7 @@ class TracedBoundaryAdapter:
                 eval_context(self.model),
                 disable_hf_kernels(self.model),
             ):
-                for batch in batches:
+                for batch in batch_iterator:
                     if not isinstance(batch, Mapping):
                         raise TypeError(
                             "Traced streaming calibration batches must be mappings"
@@ -133,18 +152,98 @@ class TracedBoundaryAdapter:
                     inputs = {name: values[name] for name in prefix.input_names}
                     yield prefix.forward(self.model, **inputs)
 
-    def _prefix_fallback_modules(self) -> tuple[str, ...]:
-        """Cover embeddings hidden behind traced call_function nodes."""
+    def _discover_prefix_runtime_modules(
+        self, prefix: Subgraph, sample_batch: Mapping[str, Any]
+    ) -> tuple[str, ...]:
+        """Discover checkpoint branches hidden inside autowrapped prefix calls."""
 
-        if "input_ids" not in self.plan.subgraphs[0].input_names:
-            return ()
-        get_embeddings = getattr(self.model, "get_input_embeddings", None)
-        if not callable(get_embeddings):
-            return ()
-        embedding = get_embeddings()
-        return tuple(
-            name for name, module in self.model.named_modules() if module is embedding
-        )
+        if not isinstance(sample_batch, Mapping):
+            raise TypeError("Traced streaming calibration batches must be mappings")
+        candidates = self._prefix_dependency_candidates()
+        discovered = []
+        values = _move_tensors(dict(sample_batch), self.device)
+        inputs = {name: values[name] for name in prefix.input_names}
+
+        with (
+            torch.no_grad(),
+            disable_cache(self.model),
+            eval_context(self.model),
+            disable_hf_kernels(self.model),
+        ):
+            while True:
+                pending = tuple(name for name in candidates if name not in discovered)
+                with self.weight_session.loaded(
+                    prefix,
+                    device=self.device,
+                    dtype=self.dtype,
+                    include_modules=discovered,
+                ):
+                    try:
+                        with self._detect_prefix_dependency_calls(pending):
+                            prefix.forward(self.model, **inputs)
+                    except Exception as error:
+                        dependency = self._dependency_from_exception(error)
+                        if dependency is None:
+                            raise
+                    else:
+                        return tuple(discovered)
+                discovered.append(dependency)
+
+    def _prefix_dependency_candidates(self) -> tuple[str, ...]:
+        target_ancestors = {""}
+        for target_name in self.plan.target_names:
+            current = target_name
+            while current:
+                target_ancestors.add(current)
+                current, _, _ = current.rpartition(".")
+
+        candidates = []
+        for name, _module in self.model.named_modules():
+            if not name or name in target_ancestors:
+                continue
+            parent, _, _ = name.rpartition(".")
+            if parent in target_ancestors and self.weight_session.has_checkpoint_state(
+                name
+            ):
+                candidates.append(name)
+        return tuple(candidates)
+
+    @contextmanager
+    def _detect_prefix_dependency_calls(self, candidates: Sequence[str]):
+        handles = []
+
+        def hook(module_name: str, module: nn.Module, _args):
+            if any(parameter.is_meta for parameter in module.parameters()):
+                raise _PrefixDependencyDetected(module_name)
+            if any(buffer.is_meta for buffer in module.buffers()):
+                raise _PrefixDependencyDetected(module_name)
+
+        try:
+            for module_name in candidates:
+                root = self.model.get_submodule(module_name)
+                for module in root.modules():
+                    handles.append(
+                        module.register_forward_pre_hook(
+                            lambda module, args, name=module_name: hook(
+                                name, module, args
+                            )
+                        )
+                    )
+            yield
+        finally:
+            for handle in handles:
+                handle.remove()
+
+    @staticmethod
+    def _dependency_from_exception(error: Exception) -> str | None:
+        current: BaseException | None = error
+        seen = set()
+        while current is not None and id(current) not in seen:
+            if isinstance(current, _PrefixDependencyDetected):
+                return current.module_name
+            seen.add(id(current))
+            current = current.__cause__ or current.__context__
+        return None
 
     def forward_target(self, target: nn.Module, value: Mapping[str, Any]):
         """Execute the original target partition from the shared trace plan."""
