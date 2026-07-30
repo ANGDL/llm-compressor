@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -65,6 +66,14 @@ def test_k3_model_level_output_residual_stays_outside_decoder_targets():
     assert not KIMI_K3_WNA8._OTHER_LINEAR_RE.fullmatch(
         "language_model.model.output_attn_res_proj"
     )
+
+
+def test_kda_num_heads_comes_from_text_config():
+    config = SimpleNamespace(
+        text_config=SimpleNamespace(linear_attn_config={"num_heads": 96})
+    )
+
+    assert KIMI_K3_WNA8._kda_num_heads(config) == 96
 
 
 @pytest.mark.parametrize("samples", [0, 3])

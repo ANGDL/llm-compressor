@@ -95,7 +95,9 @@ def test_tiny_kimi_k3_streaming_wna8_end_to_end(tmp_path):
             batch_size=1,
             shuffle_calibration_samples=False,
             moe_calibrate_all_experts=False,
-            materializer=KimiK3WeightMaterializer(),
+            materializer=KimiK3WeightMaterializer(
+                kda_num_heads=KIMI_K3_WNA8._kda_num_heads(config)
+            ),
             target_dtype=torch.float32,
             pack_to_int8=True,
             overwrite_output=True,

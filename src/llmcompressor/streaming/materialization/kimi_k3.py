@@ -30,6 +30,7 @@ __all__ = ["KimiK3WeightMaterializer", "KimiK3WeightSource"]
 _PACKED_SUFFIX = ".weight_packed"
 _SCALE_SUFFIX = ".weight_scale"
 _EXPERT_MARKER = ".block_sparse_moe.experts."
+_KDA_A_LOG_SUFFIX = ".self_attn.A_log"
 
 
 def _logical_name(raw_name: str) -> str:
@@ -102,7 +103,7 @@ class KimiK3WeightSource(CheckpointWeightSource):
 
 
 class KimiK3WeightMaterializer(WeightMaterializer):
-    """Decode K3 MXFP4 routed experts into BF16/FP32 computation weights."""
+    """Materialize K3 checkpoint layouts into model-compatible weights."""
 
     _FP4_TABLE = torch.tensor(
         (
@@ -126,14 +127,27 @@ class KimiK3WeightMaterializer(WeightMaterializer):
         dtype=torch.float32,
     )
 
-    def __init__(self, *, fp4_block_size: int = 32):
+    def __init__(
+        self,
+        *,
+        fp4_block_size: int = 32,
+        kda_num_heads: int | None = None,
+    ):
         if fp4_block_size <= 0:
             raise ValueError("Kimi K3 fp4_block_size must be positive")
+        if kda_num_heads is not None and (
+            isinstance(kda_num_heads, bool)
+            or not isinstance(kda_num_heads, int)
+            or kda_num_heads <= 0
+        ):
+            raise ValueError("Kimi K3 kda_num_heads must be a positive integer")
         self.fp4_block_size = fp4_block_size
+        self.kda_num_heads = kda_num_heads
 
     def configuration(self) -> Mapping[str, Any]:
         return {
             "fp4_block_size": self.fp4_block_size,
+            "kda_num_heads": self.kda_num_heads,
             "key_layout": "kimi-k3-weight-packed-weight-scale",
             "fp4_layout": "e2m1-low-nibble-first",
             "scale_layout": "ue8m0",
@@ -178,7 +192,26 @@ class KimiK3WeightMaterializer(WeightMaterializer):
     ) -> tuple[int, ...]:
         if self._is_packed_expert(tensor_name, metadata):
             return (*metadata.shape[:-1], metadata.shape[-1] * 2)
+        if self._is_kda_a_log(tensor_name):
+            self._validate_kda_a_log_shape(metadata.shape)
+            return (self.kda_num_heads,)
         return metadata.shape
+
+    def _is_kda_a_log(self, tensor_name: str) -> bool:
+        return self.kda_num_heads is not None and tensor_name.endswith(
+            _KDA_A_LOG_SUFFIX
+        )
+
+    def _validate_kda_a_log_shape(self, shape: tuple[int, ...]) -> None:
+        if len(shape) != 1:
+            raise ValueError(
+                f"Kimi K3 KDA A_log checkpoint tensor must be 1D; got shape {shape}"
+            )
+        if shape[0] < self.kda_num_heads:
+            raise ValueError(
+                "Kimi K3 KDA A_log checkpoint tensor is shorter than num_heads: "
+                f"{shape[0]} < {self.kda_num_heads}"
+            )
 
     @staticmethod
     def _decode_e8m0(scale: torch.Tensor) -> torch.Tensor:
@@ -222,7 +255,10 @@ class KimiK3WeightMaterializer(WeightMaterializer):
         device: torch.device,
     ) -> torch.Tensor:
         weight = tensors[tensor_name].to(device)
-        if (
+        if self._is_kda_a_log(tensor_name):
+            self._validate_kda_a_log_shape(tuple(weight.shape))
+            result = weight[: self.kda_num_heads]
+        elif (
             weight.dtype == torch.uint8
             and tensor_name.endswith(".weight")
             and _EXPERT_MARKER in tensor_name
