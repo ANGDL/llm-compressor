@@ -64,14 +64,23 @@ def test_tiny_kimi_k3_streaming_wna8_end_to_end(tmp_path):
                 ignore=ignores,
             ),
         ]
+        image_patches = torch.linspace(
+            -1.0,
+            1.0,
+            steps=4 * 3 * 14 * 14,
+            dtype=torch.float32,
+        ).reshape(4, 3, 14, 14)
         dataset = DataLoader(
             [
                 {
-                    "input_ids": torch.tensor([1, 4, 5, 2]),
-                    "attention_mask": torch.ones(4, dtype=torch.long),
+                    "input_ids": torch.tensor([[1, 3, 4, 2]]),
+                    "attention_mask": torch.ones((1, 4), dtype=torch.long),
+                    "pixel_values": image_patches,
+                    "grid_thws": torch.tensor([[1, 2, 2]], dtype=torch.long),
                 }
             ],
             batch_size=1,
+            collate_fn=lambda batch: batch[0],
         )
         output = streaming_oneshot(
             model=checkpoint,

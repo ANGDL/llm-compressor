@@ -1,3 +1,4 @@
+import ast
 import sys
 from types import ModuleType
 from unittest.mock import patch
@@ -15,6 +16,7 @@ from llmcompressor.modeling.kimi_k3 import (
     _patch_transformers_v5_for_checkpoint_code,
     patch_kimi_k3_transformers_compat,
 )
+from llmcompressor.pipelines.sequential.ast_utils.auto_wrapper import AutoWrapper
 
 
 def test_kimi_k3_transformers_output_recorder_compat():
@@ -67,6 +69,12 @@ def test_kimi_k3_transformers_v5_remote_model_compat():
     )
     outer_module = ModuleType("test_kimi_k3_outer_module")
     outer_module.KimiLinearForCausalLM = linear_lm_class
+    vision_model_class = type(
+        "MoonViT3dPretrainedModel",
+        (),
+        {"_supports_sdpa": True},
+    )
+    outer_module.MoonViT3dPretrainedModel = vision_model_class
 
     class CheckpointModel:
         def tie_weights(self):
@@ -91,9 +99,29 @@ def test_kimi_k3_transformers_v5_remote_model_compat():
             cache_position="position",
             past_key_values="cache",
         )
+        tree = ast.parse(
+            "def forward(input_embeds, attention_mask):\n"
+            "    return create_causal_mask(\n"
+            "        input_embeds=input_embeds,\n"
+            "        attention_mask=attention_mask,\n"
+            "        cache_position=None,\n"
+            "        past_key_values=None,\n"
+            "    )\n"
+        )
+        wrapped_source = ast.unparse(
+            AutoWrapper(
+                {"create_causal_mask": linear_module.create_causal_mask},
+                ["create_causal_mask"],
+            ).auto_wrap(tree)
+        )
 
     assert result == "mask"
     assert calls == [("embeds", "attention", "cache")]
+    assert linear_module.create_causal_mask.__name__ == "create_causal_mask"
+    assert "def wrapped_0" in wrapped_source
+    assert "return wrapped_0(attention_mask, input_embeds)" in wrapped_source
+    assert vision_model_class._supports_sdpa is False
+    assert not hasattr(CheckpointModel, "_streaming_prefix_module_dependencies")
     assert config._attn_implementation == "eager"
     assert model._use_flash_attention_2 is False
 

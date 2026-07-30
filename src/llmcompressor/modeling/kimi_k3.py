@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import sys
+from functools import wraps
 
 import torch
 import torch.nn.functional as F
@@ -38,12 +39,12 @@ def _patch_flash_attn_varlen_func() -> None:
     if supports_deterministic:
         return
 
+    @wraps(function)
     def compatible_flash_attn_varlen_func(*args, **kwargs):
         kwargs.pop("deterministic", None)
         return function(*args, **kwargs)
 
     compatible_flash_attn_varlen_func._kimi_k3_compat_patched = True
-    compatible_flash_attn_varlen_func.__wrapped__ = function
     flash_attn.flash_attn_varlen_func = compatible_flash_attn_varlen_func
 
 
@@ -78,6 +79,11 @@ def _patch_transformers_v5_for_checkpoint_code() -> None:
 def _patch_kimi_k3_remote_model(model_class: type) -> None:
     """Patch APIs captured as globals by K3's dynamically loaded text model."""
     model_module = sys.modules.get(model_class.__module__)
+    vision_model_class = getattr(model_module, "MoonViT3dPretrainedModel", None)
+    if vision_model_class is not None:
+        # K3's vision attention dispatch only defines eager and FA2. Advertising
+        # SDPA lets Transformers 5 select a backend the checkpoint cannot execute.
+        vision_model_class._supports_sdpa = False
     linear_lm_class = getattr(model_module, "KimiLinearForCausalLM", None)
     linear_module = (
         sys.modules.get(linear_lm_class.__module__)
@@ -98,6 +104,7 @@ def _patch_kimi_k3_remote_model(model_class: type) -> None:
         drop_cache_position = "cache_position" not in parameters
         if rename_input or drop_cache_position:
 
+            @wraps(create_causal_mask)
             def compatible_create_causal_mask(*args, **kwargs):
                 if rename_input and "input_embeds" in kwargs:
                     kwargs["inputs_embeds"] = kwargs.pop("input_embeds")
@@ -106,7 +113,6 @@ def _patch_kimi_k3_remote_model(model_class: type) -> None:
                 return create_causal_mask(*args, **kwargs)
 
             compatible_create_causal_mask._kimi_k3_compat_patched = True
-            compatible_create_causal_mask.__wrapped__ = create_causal_mask
             linear_module.create_causal_mask = compatible_create_causal_mask
 
     linear_model_class = getattr(linear_module, "KimiLinearModel", None)
