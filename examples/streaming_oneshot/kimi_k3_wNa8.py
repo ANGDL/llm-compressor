@@ -510,6 +510,8 @@ def main() -> None:
         shuffle_calibration_samples=False,
         moe_calibrate_all_experts=args.moe_calibrate_all_experts,
         materializer=KimiK3WeightMaterializer(kda_num_heads=_kda_num_heads(config)),
+        # Routed expert linears are decoded, quantized, and committed on demand.
+        checkpoint_progress=True,
         # K3 downstream readers expect packed INT4 tensors in the output.
         pack_to_int8=True,
         overwrite_output=True,
