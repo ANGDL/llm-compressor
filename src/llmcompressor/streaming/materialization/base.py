@@ -48,6 +48,18 @@ class WeightMaterializer(ABC):
         """Return the decoded tensor shape exposed to the model."""
         return metadata.shape
 
+    def deferred_module(
+        self, tensor_name: str, metadata: TensorMetadata
+    ) -> str | None:
+        """Return a module that should be materialized only when invoked.
+
+        The returned name must own ``tensor_name``. Parent target loads omit all
+        state under that module, while loading the deferred module itself remains
+        eager. This keeps unusually large conditional branches, such as routed
+        experts, outside the resident target working set.
+        """
+        return None
+
     def create_source(self, checkpoint: str) -> CheckpointWeightSource:
         """Create the checkpoint view consumed by all streaming stages."""
         return SafetensorsWeightSource(checkpoint)

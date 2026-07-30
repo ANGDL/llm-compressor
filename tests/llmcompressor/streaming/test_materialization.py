@@ -406,6 +406,10 @@ def test_kimi_k3_materializer_kda_a_log_configuration_and_shape(tmp_path):
     )
 
     assert materializer.configuration()["kda_num_heads"] == 96
+    assert (
+        materializer.configuration()["routed_expert_loading"]
+        == "deferred-per-linear"
+    )
     assert materializer.logical_shape(name, metadata) == (96,)
     assert torch.equal(result, source[:96].to(torch.bfloat16))
 

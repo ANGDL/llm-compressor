@@ -151,6 +151,7 @@ class KimiK3WeightMaterializer(WeightMaterializer):
             "key_layout": "kimi-k3-weight-packed-weight-scale",
             "fp4_layout": "e2m1-low-nibble-first",
             "scale_layout": "ue8m0",
+            "routed_expert_loading": "deferred-per-linear",
         }
 
     def create_source(self, checkpoint: str) -> CheckpointWeightSource:
@@ -186,6 +187,13 @@ class KimiK3WeightMaterializer(WeightMaterializer):
         if self._is_packed_expert(tensor_name, metadata):
             return [f"{tensor_name.removesuffix('.weight')}{_SCALE_SUFFIX}"]
         return []
+
+    def deferred_module(
+        self, tensor_name: str, metadata: TensorMetadata
+    ) -> str | None:
+        if not self._is_packed_expert(tensor_name, metadata):
+            return None
+        return tensor_name.removesuffix(".weight")
 
     def logical_shape(
         self, tensor_name: str, metadata: TensorMetadata

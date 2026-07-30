@@ -45,6 +45,7 @@ class LoadedSubgraph:
 
     model: nn.Module
     module_names: tuple[str, ...]
+    deferred_module_names: tuple[str, ...] = ()
 
     @property
     def modules(self) -> tuple[nn.Module, ...]:
@@ -218,6 +219,30 @@ class SubgraphWeightSession:
         with self.installed(prepared) as loaded:
             yield loaded
 
+    @contextmanager
+    def loaded_module(
+        self,
+        module_name: str,
+        *,
+        device: torch.device | str,
+        dtype: torch.dtype = torch.bfloat16,
+    ) -> Iterator[nn.Module]:
+        """Load one deferred module and fully restore modifier mutations."""
+
+        registered_state = self._registered_state((module_name,))
+        runtime_attributes = self._runtime_tensor_attributes((module_name,))
+        try:
+            with self.loader.loaded(
+                module_name,
+                device=torch.device(device),
+                dtype=dtype,
+                allow_missing_state=True,
+            ) as module:
+                yield module
+        finally:
+            self._restore_registered_state(registered_state)
+            self._restore_runtime_tensor_attributes(runtime_attributes)
+
     def plan(
         self,
         subgraph: Subgraph,
@@ -288,7 +313,18 @@ class SubgraphWeightSession:
             )
             if callable(reinitialize):
                 reinitialize()
-            yield LoadedSubgraph(self.model, module_names)
+            deferred_module_names = tuple(
+                dict.fromkeys(
+                    name
+                    for target in prepared.plan.targets
+                    for name in target.deferred_modules
+                )
+            )
+            yield LoadedSubgraph(
+                self.model,
+                module_names,
+                deferred_module_names=deferred_module_names,
+            )
 
     def _runtime_tensor_attributes(
         self, module_names: Sequence[str]

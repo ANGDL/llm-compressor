@@ -82,6 +82,7 @@ class TargetLoadPlan:
     runtime_buffer_groups: list[tuple[torch.Tensor, list[str]]]
     parameter_sources: dict[int, str]
     buffer_sources: dict[int, str]
+    deferred_modules: tuple[str, ...]
     allow_missing_state: bool
 
 
@@ -167,8 +168,20 @@ class TargetWeightLoader:
             parameters=False,
             allow_missing=allow_missing_state,
         )
+        deferred_modules = self._deferred_modules(
+            target_name, parameter_sources
+        )
+        deferred_ids = {
+            identity
+            for identity, source_name in parameter_sources.items()
+            if self._is_deferred_source(source_name, deferred_modules)
+        }
+        for identity in deferred_ids:
+            del parameter_sources[identity]
         parameter_groups = [
-            group for group in parameter_groups if id(group[0]) in parameter_sources
+            group
+            for group in parameter_groups
+            if id(group[0]) in parameter_sources
         ]
         buffer_groups = [
             group for group in buffer_groups if id(group[0]) in buffer_sources
@@ -183,7 +196,40 @@ class TargetWeightLoader:
             runtime_buffer_groups=runtime_buffer_groups,
             parameter_sources=parameter_sources,
             buffer_sources=buffer_sources,
+            deferred_modules=deferred_modules,
             allow_missing_state=allow_missing_state,
+        )
+
+    def _deferred_modules(
+        self, target_name: str, sources: dict[int, str]
+    ) -> tuple[str, ...]:
+        modules = []
+        for source_name in sources.values():
+            metadata = self.source.metadata(source_name)
+            module_name = self.materializer.deferred_module(source_name, metadata)
+            if module_name is None or module_name == target_name:
+                continue
+            if not source_name.startswith(f"{module_name}."):
+                raise ValueError(
+                    f"Deferred module {module_name!r} does not own checkpoint "
+                    f"tensor {source_name!r}"
+                )
+            if target_name and not module_name.startswith(f"{target_name}."):
+                raise ValueError(
+                    f"Deferred module {module_name!r} does not belong to target "
+                    f"{target_name!r}"
+                )
+            modules.append(module_name)
+        return tuple(dict.fromkeys(modules))
+
+    @staticmethod
+    def _is_deferred_source(
+        source_name: str, deferred_modules: tuple[str, ...]
+    ) -> bool:
+        return any(
+            source_name == module_name
+            or source_name.startswith(f"{module_name}.")
+            for module_name in deferred_modules
         )
 
     def materialize(
@@ -245,10 +291,14 @@ class TargetWeightLoader:
         installed_parameters = []
         installed_buffers = []
         runtime_buffers = []
+        deferred_forwards = []
         try:
             if plan.allow_missing_state:
                 auxiliary_parameters = self._materialize_missing_parameters(
-                    target, device=prepared.device, dtype=prepared.dtype
+                    target,
+                    device=prepared.device,
+                    dtype=prepared.dtype,
+                    exclude_modules=self._relative_deferred_modules(plan),
                 )
             installed_parameters = self._install_parameters(
                 target,
@@ -272,8 +322,14 @@ class TargetWeightLoader:
                 tensor.is_meta for tensor, _ in plan.runtime_buffer_groups
             ):
                 reinitialize()
+            deferred_forwards = self._install_deferred_forwards(
+                plan.deferred_modules,
+                device=prepared.device,
+                dtype=prepared.dtype,
+            )
             yield target
         finally:
+            self._restore_deferred_forwards(deferred_forwards)
             self._restore_meta_parameters(target, installed_parameters)
             self._restore_meta_buffers(target, installed_buffers)
             self._restore_runtime_buffers(target, runtime_buffers)
@@ -302,12 +358,21 @@ class TargetWeightLoader:
 
     @staticmethod
     def _materialize_missing_parameters(
-        target: nn.Module, *, device: torch.device, dtype: torch.dtype
+        target: nn.Module,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+        exclude_modules: tuple[str, ...] = (),
     ) -> list[tuple[str, nn.Parameter]]:
         installed = []
         for name, parameter in target.named_parameters(
             recurse=True, remove_duplicate=False
         ):
+            if any(
+                name == module_name or name.startswith(f"{module_name}.")
+                for module_name in exclude_modules
+            ):
+                continue
             if not parameter.is_meta:
                 continue
             owner, local_name = _owner_and_name(target, name)
@@ -320,6 +385,61 @@ class TargetWeightLoader:
             )
             installed.append((name, parameter))
         return installed
+
+    @staticmethod
+    def _relative_deferred_modules(plan: TargetLoadPlan) -> tuple[str, ...]:
+        prefix = f"{plan.name}." if plan.name else ""
+        return tuple(
+            name.removeprefix(prefix) for name in plan.deferred_modules
+        )
+
+    def _install_deferred_forwards(
+        self,
+        module_names: tuple[str, ...],
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> list[tuple[nn.Module, bool, object]]:
+        # This is the checkpoint-backed equivalent of compressed-tensors'
+        # OffloadCache forward wrapper used by ordinary oneshot.
+        installed = []
+        try:
+            for module_name in module_names:
+                module = self.model.get_submodule(module_name)
+                had_instance_forward = "forward" in module.__dict__
+                previous = module.__dict__.get("forward")
+                original_forward = module.forward
+
+                def deferred_forward(
+                    *args,
+                    _module_name=module_name,
+                    _original_forward=original_forward,
+                    **kwargs,
+                ):
+                    with self.loaded(
+                        _module_name,
+                        device=device,
+                        dtype=dtype,
+                        allow_missing_state=True,
+                    ):
+                        return _original_forward(*args, **kwargs)
+
+                module.forward = deferred_forward
+                installed.append((module, had_instance_forward, previous))
+        except Exception:
+            self._restore_deferred_forwards(installed)
+            raise
+        return installed
+
+    @staticmethod
+    def _restore_deferred_forwards(
+        installed: list[tuple[nn.Module, bool, object]],
+    ) -> None:
+        for module, had_instance_forward, previous in reversed(installed):
+            if had_instance_forward:
+                module.forward = previous
+            else:
+                del module.forward
 
     @staticmethod
     def _restore_auxiliary_parameters(

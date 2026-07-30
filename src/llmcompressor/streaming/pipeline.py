@@ -202,6 +202,13 @@ def _prepare_loaded_tensor_for_save(
     )
 
 
+def _is_under_any(module_name: str, roots: Sequence[str]) -> bool:
+    return any(
+        module_name == root or module_name.startswith(f"{root}.")
+        for root in roots
+    )
+
+
 def _write_loaded_target(
     transaction,
     loaded,
@@ -209,13 +216,21 @@ def _write_loaded_target(
     source,
     *,
     pack_to_int8: bool,
+    exclude_modules: Sequence[str] = (),
 ) -> set[str]:
     written = set()
     formats = quantized_module_formats(
         loaded.model.named_modules(), prefix=target_name
     )
+    formats = {
+        name: value
+        for name, value in formats.items()
+        if not _is_under_any(name, exclude_modules)
+    }
     for name, tensor in loaded.state_tensors_under((target_name,)):
         owner_name = name.rpartition(".")[0]
+        if _is_under_any(owner_name, exclude_modules):
+            continue
         tensor = _prepare_loaded_tensor_for_save(
             loaded,
             name,
@@ -239,13 +254,26 @@ def _write_loaded_target(
     return written
 
 
-def _loaded_target_delta(loaded, target_name: str, *, pack_to_int8: bool):
+def _loaded_target_delta(
+    loaded,
+    target_name: str,
+    *,
+    pack_to_int8: bool,
+    exclude_modules: Sequence[str] = (),
+):
     formats = quantized_module_formats(
         loaded.model.named_modules(), prefix=target_name
     )
+    formats = {
+        name: value
+        for name, value in formats.items()
+        if not _is_under_any(name, exclude_modules)
+    }
     tensors = {}
     owned_cpu_tensors = set()
     for name, tensor in loaded.state_tensors_under((target_name,)):
+        if _is_under_any(name.rpartition(".")[0], exclude_modules):
+            continue
         prepared = _prepare_loaded_tensor_for_save(
             loaded,
             name,
@@ -269,6 +297,7 @@ def _write_loaded_target_direct(
     shard_id: str,
     *,
     pack_to_int8: bool = True,
+    exclude_modules: Sequence[str] = (),
 ) -> set[str]:
     """Write one target and release all device tensor references before returning."""
 
@@ -276,6 +305,7 @@ def _write_loaded_target_direct(
         loaded,
         target_name,
         pack_to_int8=pack_to_int8,
+        exclude_modules=exclude_modules,
     )
     try:
         if tensors:
@@ -288,6 +318,85 @@ def _write_loaded_target_direct(
         return written
     finally:
         tensors.clear()
+
+
+def _resident_subgraph_modules(subgraph, model, deferred_modules):
+    excluded = {
+        id(module)
+        for name in deferred_modules
+        for module in model.get_submodule(name).modules()
+    }
+    return tuple(
+        module
+        for module in subgraph.submodules(model)
+        if id(module) not in excluded
+    )
+
+
+def _modifier_update(modules: Sequence[torch.nn.Module]) -> None:
+    LifecycleCallbacks.sequential_epoch_end(list(modules))
+    for module in modules:
+        if is_module_quantized(module):
+            freeze_module_quantization(module)
+
+
+def _compress_modules(modules: Sequence[torch.nn.Module]) -> None:
+    for module in modules:
+        if is_module_quantized(module):
+            set_quantization_scale_dtype(module)
+            compress_module(module)
+
+
+def _validate_deferred_recipe(recipe: Recipe) -> None:
+    supported = {"IMatrixGatherer", "QuantizationModifier"}
+    unsupported = sorted(
+        type(modifier).__name__
+        for modifier in recipe.modifiers
+        if type(modifier).__name__ not in supported
+    )
+    if unsupported:
+        raise ValueError(
+            "Deferred streaming modules currently support RTN with optional "
+            f"iMatrix only; unsupported modifiers: {unsupported}"
+        )
+
+
+def _write_deferred_modules(
+    *,
+    transaction,
+    loaded,
+    adapter: TracedBoundaryAdapter,
+    source,
+    device: torch.device,
+    target_dtype: torch.dtype,
+    pack_to_int8: bool,
+) -> set[str]:
+    written = set()
+    total = len(loaded.deferred_module_names)
+    for index, module_name in enumerate(loaded.deferred_module_names, start=1):
+        if index == 1 or index % 64 == 0 or index == total:
+            streaming_logger.info(
+                f"deferred weights | progress={index}/{total} | "
+                f"module={module_name!r}"
+            )
+        with adapter.weight_session.loaded_module(
+            module_name,
+            device=device,
+            dtype=target_dtype,
+        ) as module:
+            modules = tuple(module.modules())
+            _modifier_update(modules)
+            _compress_modules(modules)
+            written.update(
+                _write_loaded_target(
+                    transaction,
+                    loaded,
+                    module_name,
+                    source,
+                    pack_to_int8=pack_to_int8,
+                )
+            )
+    return written
 
 
 def _write_remaining_direct_shards(
@@ -641,6 +750,18 @@ def run_subgraph_streaming_pipeline(
                                 dtype=target_dtype,
                                 label=f"{next_label} | load weights",
                             )
+                    deferred_modules = loaded.deferred_module_names
+                    if deferred_modules and transaction_writer is None:
+                        raise ValueError(
+                            "Deferred streaming modules require "
+                            "checkpoint_progress=True so their quantized tensors "
+                            "can be written incrementally"
+                        )
+                    if deferred_modules:
+                        _validate_deferred_recipe(recipe)
+                    resident_modules = _resident_subgraph_modules(
+                        subgraph, adapter.model, deferred_modules
+                    )
                     # Match the ordinary sequential calibration pipeline: model
                     # execution is inference-only. Besides avoiding autograd
                     # storage, this is required by models such as DeepSeek-V4
@@ -669,12 +790,7 @@ def run_subgraph_streaming_pipeline(
                         f"{target_label} | modifier update",
                         target_device,
                     ):
-                        LifecycleCallbacks.sequential_epoch_end(
-                            subgraph.submodules(adapter.model)
-                        )
-                        for module in subgraph.submodules(adapter.model):
-                            if is_module_quantized(module):
-                                freeze_module_quantization(module)
+                        _modifier_update(resident_modules)
                     with _stage_logger(
                         adapter.model,
                         f"{target_label} | activation propagation",
@@ -721,10 +837,7 @@ def run_subgraph_streaming_pipeline(
                         f"{target_label} | compress weights",
                         target_device,
                     ):
-                        for module in subgraph.submodules(adapter.model):
-                            if is_module_quantized(module):
-                                set_quantization_scale_dtype(module)
-                                compress_module(module)
+                        _compress_modules(resident_modules)
                     with _stage_logger(
                         adapter.model,
                         f"{target_label} | queue checkpoint",
@@ -749,6 +862,18 @@ def run_subgraph_streaming_pipeline(
                                         loaded,
                                         target_name,
                                         source,
+                                        pack_to_int8=pack_to_int8,
+                                        exclude_modules=deferred_modules,
+                                    )
+                                )
+                                written.update(
+                                    _write_deferred_modules(
+                                        transaction=transaction,
+                                        loaded=loaded,
+                                        adapter=adapter,
+                                        source=source,
+                                        device=target_device,
+                                        target_dtype=target_dtype,
                                         pack_to_int8=pack_to_int8,
                                     )
                                 )

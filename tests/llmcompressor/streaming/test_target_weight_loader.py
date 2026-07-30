@@ -11,6 +11,7 @@ from transformers import LlamaConfig, LlamaForCausalLM
 
 from llmcompressor.streaming import (
     KimiK3WeightMaterializer,
+    KimiK3WeightSource,
     SafetensorsWeightSource,
     TargetWeightLoader,
     build_meta_model,
@@ -57,6 +58,37 @@ class KdaModel(nn.Module):
         self.layer = nn.Module()
         self.layer.self_attn = nn.Module()
         self.layer.self_attn.A_log = nn.Parameter(torch.empty(num_heads))
+
+
+class DeferredLinear(nn.Linear):
+    def forward(self, inputs):
+        assert not self.weight.is_meta
+        return super().forward(inputs)
+
+
+class DeferredExpert(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.w1 = DeferredLinear(4, 4, bias=False)
+        self.w2 = DeferredLinear(4, 4, bias=False)
+        self.w3 = DeferredLinear(4, 4, bias=False)
+
+    def forward(self, inputs):
+        return self.w2(self.w1(inputs) + self.w3(inputs))
+
+
+class DeferredExpertModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.language_model = nn.Module()
+        self.language_model.model = nn.Module()
+        layer = nn.Module()
+        layer.gate = nn.Linear(4, 4, bias=False)
+        layer.block_sparse_moe = nn.Module()
+        layer.block_sparse_moe.experts = nn.ModuleList(
+            [DeferredExpert(), DeferredExpert()]
+        )
+        self.language_model.model.layers = nn.ModuleList([layer])
 
 
 def _write_checkpoint(model: nn.Module, path, *, overrides=None):
@@ -401,6 +433,62 @@ def test_kimi_k3_kda_a_log_uses_configured_head_count(tmp_path):
     with loader.loaded("layer", device=torch.device("cpu"), dtype=torch.float32):
         assert torch.equal(model.layer.self_attn.A_log, source[:96])
 
+    _assert_all_meta(model)
+
+
+def test_kimi_k3_routed_experts_load_only_when_invoked(tmp_path, monkeypatch):
+    path = tmp_path / "model.safetensors"
+    prefix = "language_model.model.layers.0"
+    values = {f"{prefix}.gate.weight": torch.eye(4)}
+    for expert_index in range(2):
+        for projection in ("w1", "w2", "w3"):
+            name = (
+                f"{prefix}.block_sparse_moe.experts.{expert_index}."
+                f"{projection}"
+            )
+            values[f"{name}.weight_packed"] = torch.full(
+                (4, 2), 0x22 + expert_index, dtype=torch.uint8
+            )
+            values[f"{name}.weight_scale"] = torch.full(
+                (4, 1), 127, dtype=torch.uint8
+            )
+    save_file(values, path)
+    source = KimiK3WeightSource(path)
+    loaded_names = []
+    original_iter = source.iter_tensor_groups
+
+    def recording_iter(groups, *, device):
+        groups = tuple(tuple(group) for group in groups)
+        loaded_names.extend(name for group in groups for name in group)
+        return original_iter(groups, device=device)
+
+    monkeypatch.setattr(source, "iter_tensor_groups", recording_iter)
+    model = build_meta_model(DeferredExpertModel)
+    materializer = KimiK3WeightMaterializer(fp4_block_size=4)
+    loader = TargetWeightLoader(model, source, materializer=materializer)
+    expert_prefix = f"{prefix}.block_sparse_moe.experts"
+    plan = loader.plan(prefix)
+
+    assert plan.deferred_modules == tuple(
+        f"{expert_prefix}.{expert_index}.{projection}"
+        for expert_index in range(2)
+        for projection in ("w1", "w2", "w3")
+    )
+    with loader.loaded(prefix, device=torch.device("cpu"), dtype=torch.float32):
+        layer = model.language_model.model.layers[0]
+        assert not layer.gate.weight.is_meta
+        assert all(
+            parameter.is_meta
+            for parameter in layer.block_sparse_moe.experts.parameters()
+        )
+        layer.block_sparse_moe.experts[0](torch.ones(1, 4))
+        assert all(
+            parameter.is_meta
+            for parameter in layer.block_sparse_moe.experts.parameters()
+        )
+
+    assert any(f"{expert_prefix}.0" in name for name in loaded_names)
+    assert not any(f"{expert_prefix}.1" in name for name in loaded_names)
     _assert_all_meta(model)
 
 
