@@ -232,7 +232,7 @@ class SubgraphWeightSession:
         registered_state = self._registered_state((module_name,))
         runtime_attributes = self._runtime_tensor_attributes((module_name,))
         try:
-            with self.loader.loaded(
+            with self.loader.loaded_deferred(
                 module_name,
                 device=torch.device(device),
                 dtype=dtype,

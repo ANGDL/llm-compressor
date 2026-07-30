@@ -17,6 +17,8 @@ from llmcompressor.streaming.materialization import (
     materialize_weights,
 )
 
+from .._logging import streaming_logger
+
 _ModelT = TypeVar("_ModelT", bound=nn.Module)
 
 
@@ -101,6 +103,27 @@ class PreparedTargetWeights:
         self.buffer_values.clear()
 
 
+@dataclass
+class _DeferredCacheEntry:
+    dtype: torch.dtype
+    parameter_values: dict[str, torch.Tensor]
+    buffer_values: dict[str, torch.Tensor]
+
+
+@dataclass
+class _DeferredWeightCache:
+    module_names: frozenset[str]
+    device: torch.device
+    entries: dict[str, _DeferredCacheEntry]
+    misses: int = 0
+
+    def close(self) -> None:
+        for entry in self.entries.values():
+            entry.parameter_values.clear()
+            entry.buffer_values.clear()
+        self.entries.clear()
+
+
 class TargetWeightLoader:
     """Materialize exactly one model target and restore it to meta on exit."""
 
@@ -115,6 +138,7 @@ class TargetWeightLoader:
         self.materializer = materializer or CastWeightMaterializer()
         self._source_names = frozenset(source.tensor_names())
         self._active_targets: set[str] = set()
+        self._deferred_cache_stack: list[_DeferredWeightCache] = []
 
     @contextmanager
     def loaded(
@@ -131,6 +155,84 @@ class TargetWeightLoader:
             target_name, allow_missing_state=allow_missing_state
         )
         prepared = self.materialize(plan, device=device, dtype=dtype)
+        with self.installed(prepared) as target:
+            yield target
+
+    @contextmanager
+    def loaded_deferred(
+        self,
+        target_name: str,
+        *,
+        device: torch.device,
+        dtype: torch.dtype = torch.bfloat16,
+        allow_missing_state: bool = False,
+    ) -> Iterator[nn.Module]:
+        """Load a deferred target through its active parent offload cache."""
+
+        cache = next(
+            (
+                candidate
+                for candidate in reversed(self._deferred_cache_stack)
+                if target_name in candidate.module_names
+            ),
+            None,
+        )
+        if cache is None:
+            with self.loaded(
+                target_name,
+                device=device,
+                dtype=dtype,
+                allow_missing_state=allow_missing_state,
+            ) as target:
+                yield target
+            return
+
+        plan = self.plan(
+            target_name, allow_missing_state=allow_missing_state
+        )
+        entry = cache.entries.get(target_name)
+        if entry is None:
+            prepared = self.materialize(plan, device=device, dtype=dtype)
+            entry = _DeferredCacheEntry(
+                dtype=dtype,
+                parameter_values={
+                    name: value.detach().to(device=cache.device, copy=True)
+                    for name, value in prepared.parameter_values.items()
+                },
+                buffer_values={
+                    name: value.detach().to(device=cache.device, copy=True)
+                    for name, value in prepared.buffer_values.items()
+                },
+            )
+            cache.entries[target_name] = entry
+            cache.misses += 1
+            total = len(cache.module_names)
+            if cache.misses == 1 or cache.misses % 64 == 0 or cache.misses == total:
+                streaming_logger.info(
+                    "deferred weights | cache fill | "
+                    f"progress={cache.misses}/{total} | module={target_name!r} | "
+                    f"offload_device={cache.device}"
+                )
+        else:
+            if entry.dtype != dtype:
+                raise ValueError(
+                    f"Deferred cache for {target_name!r} has dtype {entry.dtype}; "
+                    f"requested {dtype}"
+                )
+            prepared = PreparedTargetWeights(
+                plan=plan,
+                device=torch.device(device),
+                dtype=dtype,
+                parameter_values={
+                    name: value.to(device=device, copy=True)
+                    for name, value in entry.parameter_values.items()
+                },
+                buffer_values={
+                    name: value.to(device=device, copy=True)
+                    for name, value in entry.buffer_values.items()
+                },
+            )
+
         with self.installed(prepared) as target:
             yield target
 
@@ -292,7 +394,21 @@ class TargetWeightLoader:
         installed_buffers = []
         runtime_buffers = []
         deferred_forwards = []
+        deferred_cache = None
         try:
+            cache_device = self.materializer.deferred_cache_device()
+            if plan.deferred_modules and cache_device is not None:
+                deferred_cache = _DeferredWeightCache(
+                    module_names=frozenset(plan.deferred_modules),
+                    device=torch.device(cache_device),
+                    entries={},
+                )
+                self._deferred_cache_stack.append(deferred_cache)
+                streaming_logger.info(
+                    "deferred weights | cache ready | "
+                    f"modules={len(plan.deferred_modules)} | "
+                    f"offload_device={deferred_cache.device}"
+                )
             if plan.allow_missing_state:
                 auxiliary_parameters = self._materialize_missing_parameters(
                     target,
@@ -330,6 +446,11 @@ class TargetWeightLoader:
             yield target
         finally:
             self._restore_deferred_forwards(deferred_forwards)
+            if deferred_cache is not None:
+                active_cache = self._deferred_cache_stack.pop()
+                if active_cache is not deferred_cache:
+                    raise RuntimeError("Deferred weight cache stack is corrupted")
+                deferred_cache.close()
             self._restore_meta_parameters(target, installed_parameters)
             self._restore_meta_buffers(target, installed_buffers)
             self._restore_runtime_buffers(target, runtime_buffers)
@@ -416,7 +537,7 @@ class TargetWeightLoader:
                     _original_forward=original_forward,
                     **kwargs,
                 ):
-                    with self.loaded(
+                    with self.loaded_deferred(
                         _module_name,
                         device=device,
                         dtype=dtype,

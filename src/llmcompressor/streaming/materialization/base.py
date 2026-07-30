@@ -60,6 +60,16 @@ class WeightMaterializer(ABC):
         """
         return None
 
+    def deferred_cache_device(self) -> torch.device | None:
+        """Return the offload device used to cache decoded deferred weights.
+
+        A cache spans the lifetime of the resident parent target. This mirrors
+        ordinary oneshot's parameter offload cache: deferred weights are decoded
+        once, kept off the execution device between calls, and released when the
+        parent target is unloaded.
+        """
+        return None
+
     def create_source(self, checkpoint: str) -> CheckpointWeightSource:
         """Create the checkpoint view consumed by all streaming stages."""
         return SafetensorsWeightSource(checkpoint)
