@@ -6,7 +6,7 @@ import json
 import os
 import shutil
 import uuid
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -101,6 +101,32 @@ def _validate_transformers_config(path: Path) -> None:
         ) from error
 
 
+def _validate_quantized_module_weights(
+    weight_map: Mapping[str, str],
+    quantized_modules: Iterable[str],
+    module_formats: Mapping[str, str],
+) -> None:
+    for module_name in quantized_modules:
+        format_name = module_formats.get(module_name)
+        expected_weights = (
+            (f"{module_name}.weight",)
+            if format_name in {"int-quantized", "float-quantized"}
+            else (
+                f"{module_name}.weight_packed",
+                f"{module_name}.weight_compressed",
+            )
+        )
+        if not any(name in weight_map for name in expected_weights):
+            raise ValueError(
+                f"Quantized module {module_name!r} has no weight for format "
+                f"{format_name!r}"
+            )
+        if f"{module_name}.weight_scale" not in weight_map:
+            raise ValueError(
+                f"Quantized module {module_name!r} has no weight scale"
+            )
+
+
 def finalize_streaming_checkpoint(
     *,
     checkpoint: str | Path,
@@ -170,7 +196,10 @@ def finalize_streaming_checkpoint(
     )
     try:
         temporary.mkdir(parents=True, exist_ok=publish_in_place)
-        output_shards: dict[str, dict[str, tuple[int, ...]]] = {}
+        weight_map: dict[str, str] = {}
+        quantized_modules: set[str] = set()
+        module_formats: dict[str, str] = {}
+        omitted_tied_weights: dict[str, str] = {}
         total_size = 0
         sorted_shards = sorted(expected_shards)
         width = max(2, len(str(len(sorted_shards))))
@@ -199,7 +228,15 @@ def finalize_streaming_checkpoint(
                 raise ValueError(f"State tensor list disagrees with {shard_name!r}")
             if state.get("total_size") != shard_size:
                 raise ValueError(f"State total_size disagrees with {shard_name!r}")
-            output_shards[shard_name] = headers
+            quantized_modules.update(state.get("quantized_modules", ()))
+            module_formats.update(state.get("module_formats", {}))
+            omitted_tied_weights.update(state.get("omitted_tied_weights", {}))
+            for tensor_name in headers:
+                if tensor_name in weight_map:
+                    raise ValueError(
+                        f"Tensor {tensor_name!r} appears in multiple shards"
+                    )
+                weight_map[tensor_name] = shard_name
             total_size += shard_size
             if not publish_in_place:
                 destination = temporary / shard_name
@@ -208,39 +245,11 @@ def finalize_streaming_checkpoint(
                 except OSError:
                     shutil.copy2(shard, destination)
 
-        weight_map: dict[str, str] = {}
-        for shard_name, headers in output_shards.items():
-            for tensor_name in headers:
-                if tensor_name in weight_map:
-                    raise ValueError(
-                        f"Tensor {tensor_name!r} appears in multiple shards"
-                    )
-                weight_map[tensor_name] = shard_name
-        if set(weight_map) != {
-            name for headers in output_shards.values() for name in headers
-        }:
-            raise ValueError("Final weight map does not cover all output tensors")
-        quantized_modules = {
-            module
-            for shard_name in expected_shards
-            for module in json.loads(
-                (states_dir / f"{shard_name}.json").read_text(encoding="utf-8")
-            ).get("quantized_modules", [])
-        }
-        module_formats = {
-            module: format_name
-            for shard_name in expected_shards
-            for module, format_name in json.loads(
-                (states_dir / f"{shard_name}.json").read_text(encoding="utf-8")
-            ).get("module_formats", {}).items()
-        }
-        omitted_tied_weights = {
-            alias: canonical
-            for shard_name in expected_shards
-            for alias, canonical in json.loads(
-                (states_dir / f"{shard_name}.json").read_text(encoding="utf-8")
-            ).get("omitted_tied_weights", {}).items()
-        }
+        streaming_logger.info(
+            "finalize | validate model metadata | "
+            f"tensors={len(weight_map)} | "
+            f"quantized_modules={len(quantized_modules)}"
+        )
         for alias, canonical in omitted_tied_weights.items():
             if alias in weight_map:
                 raise ValueError(f"Omitted tied weight {alias!r} is still present")
@@ -251,28 +260,9 @@ def finalize_streaming_checkpoint(
                     f"Canonical tensor {canonical!r} for tied weight {alias!r} "
                     "is missing"
                 )
-        for module_name in quantized_modules:
-            names = {
-                name for name in weight_map if name.startswith(f"{module_name}.")
-            }
-            format_name = module_formats.get(module_name)
-            expected_weights = (
-                {f"{module_name}.weight"}
-                if format_name in {"int-quantized", "float-quantized"}
-                else {
-                    f"{module_name}.weight_packed",
-                    f"{module_name}.weight_compressed",
-                }
-            )
-            if names.isdisjoint(expected_weights):
-                raise ValueError(
-                    f"Quantized module {module_name!r} has no weight for format "
-                    f"{format_name!r}"
-                )
-            if f"{module_name}.weight_scale" not in names:
-                raise ValueError(
-                    f"Quantized module {module_name!r} has no weight scale"
-                )
+        _validate_quantized_module_weights(
+            weight_map, quantized_modules, module_formats
+        )
         for source_name in source_names:
             module_name, separator, tensor_name = source_name.rpartition(".")
             if (
@@ -287,6 +277,7 @@ def finalize_streaming_checkpoint(
                 raise ValueError(
                     f"Non-quantized source tensor {source_name!r} is missing"
                 )
+        streaming_logger.info("finalize | model metadata valid")
 
         index = {"metadata": {"total_size": total_size}, "weight_map": weight_map}
         _atomic_json(temporary / _INDEX_NAME, index)
