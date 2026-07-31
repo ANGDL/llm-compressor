@@ -5,7 +5,8 @@ from unittest.mock import patch
 
 import torch
 from torch import nn
-from transformers import PreTrainedModel
+from transformers import PreTrainedModel, PretrainedConfig
+from transformers.generation import GenerationMixin
 from transformers.utils import generic as transformers_generic
 from transformers.utils import import_utils
 from transformers.utils.output_capturing import OutputRecorder
@@ -45,6 +46,20 @@ def test_kimi_k3_transformers_tie_weights_compat():
     assert model.called
     assert patched_tie_weights is CheckpointModel.tie_weights
     assert patched_tie_weights is not original_tie_weights
+
+
+def test_kimi_k3_transformers_generation_mixin_compat():
+    class CheckpointModel(PreTrainedModel):
+        config_class = PretrainedConfig
+
+        def tie_weights(self):
+            pass
+
+    compatible = patch_kimi_k3_transformers_compat(CheckpointModel)
+
+    assert compatible is patch_kimi_k3_transformers_compat(CheckpointModel)
+    assert compatible is not CheckpointModel
+    assert issubclass(compatible, GenerationMixin)
 
 
 def test_kimi_k3_transformers_v5_remote_model_compat():

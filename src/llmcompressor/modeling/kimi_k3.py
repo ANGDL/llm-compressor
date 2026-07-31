@@ -9,6 +9,7 @@ from functools import wraps
 import torch
 import torch.nn.functional as F
 from transformers import PreTrainedModel
+from transformers.generation import GenerationMixin
 from transformers.utils import generic as transformers_generic
 from transformers.utils import import_utils
 
@@ -136,7 +137,29 @@ def _patch_kimi_k3_remote_model(model_class: type) -> None:
     linear_model_class.__init__ = compatible_linear_model_init
 
 
-def patch_kimi_k3_transformers_compat(model_class: type | None = None) -> None:
+def _with_generation_mixin(model_class: type) -> type:
+    """Return an AutoModel-compatible K3 class with generation methods."""
+    if not issubclass(model_class, PreTrainedModel) or issubclass(
+        model_class, GenerationMixin
+    ):
+        return model_class
+    compatible = model_class.__dict__.get("_kimi_k3_generation_compat_class")
+    if compatible is None:
+        compatible = type(
+            model_class.__name__,
+            (model_class, GenerationMixin),
+            {
+                "__doc__": model_class.__doc__,
+                "__module__": model_class.__module__,
+            },
+        )
+        model_class._kimi_k3_generation_compat_class = compatible
+    return compatible
+
+
+def patch_kimi_k3_transformers_compat(
+    model_class: type | None = None,
+) -> type | None:
     """Adapt K3 checkpoint code to the installed Transformers API."""
     _patch_transformers_v5_for_checkpoint_code()
     _patch_flash_attn_varlen_func()
@@ -149,23 +172,24 @@ def patch_kimi_k3_transformers_compat(model_class: type | None = None) -> None:
         transformers_generic.OutputRecorder = OutputRecorder
 
     if model_class is None:
-        return
+        return None
 
     _patch_kimi_k3_remote_model(model_class)
 
     tie_weights = model_class.tie_weights
-    if "recompute_mapping" in inspect.signature(tie_weights).parameters or getattr(
-        tie_weights, "_kimi_k3_compat_patched", False
+    if not (
+        "recompute_mapping" in inspect.signature(tie_weights).parameters
+        or getattr(tie_weights, "_kimi_k3_compat_patched", False)
     ):
-        return
 
-    def compatible_tie_weights(self, *args, **kwargs):
-        # K3's override takes no arguments and delegates to language_model. New
-        # Transformers versions pass their tied-weight bookkeeping arguments.
-        return tie_weights(self)
+        def compatible_tie_weights(self, *args, **kwargs):
+            # K3's override takes no arguments and delegates to language_model. New
+            # Transformers versions pass their tied-weight bookkeeping arguments.
+            return tie_weights(self)
 
-    compatible_tie_weights._kimi_k3_compat_patched = True
-    model_class.tie_weights = compatible_tie_weights
+        compatible_tie_weights._kimi_k3_compat_patched = True
+        model_class.tie_weights = compatible_tie_weights
+    return _with_generation_mixin(model_class)
 
 
 @MoECalibrationModule.register("KimiSparseMoeBlock")

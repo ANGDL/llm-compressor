@@ -443,7 +443,7 @@ def test_pretrained_streaming_overwrites_output_only_when_requested(tmp_path):
     assert not (tmp_path / "work" / "replaced-output").exists()
 
 
-def test_normal_mode_replaces_incompatible_run_metadata(tmp_path):
+def test_normal_mode_replaces_incompatible_metadata_then_cleans_work(tmp_path):
     config = Qwen3Config(
         vocab_size=32,
         hidden_size=8,
@@ -474,10 +474,8 @@ def test_normal_mode_replaces_incompatible_run_metadata(tmp_path):
         target_dtype=torch.float32,
     )
 
-    manifest = ArtifactStore(work / "artifacts").load_manifest()
     assert (output / "FINALIZED").is_file()
-    assert manifest.calibration.dataset_fingerprint == "current-dataset"
-    assert manifest.sequential.targets == ("model.layers.0",)
+    assert not work.exists()
 
 
 def test_checkpoint_progress_rejects_incompatible_run_metadata(tmp_path):
@@ -587,7 +585,7 @@ def test_finalize_only_publishes_completed_direct_writer_shards(
     assert (output / "FINALIZED").is_file()
     assert list(output.glob("model-static-*.safetensors"))
     assert not run_pipeline.called
-    assert not (work / "publish").exists()
+    assert not work.exists()
 
 
 def test_checkpoint_progress_persists_boundaries_and_prefetches(tmp_path, monkeypatch):
