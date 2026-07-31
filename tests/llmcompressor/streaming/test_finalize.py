@@ -13,6 +13,7 @@ from llmcompressor.streaming import (
     finalize_streaming_checkpoint,
     quantize_streaming,
 )
+from llmcompressor.streaming.finalize import _validate_quantized_module_weights
 from tests.llmcompressor.streaming.test_quantize import prepare, scheme
 
 
@@ -57,6 +58,40 @@ def test_finalize_builds_index_config_and_preserves_auxiliary_files(tmp_path):
     for name, shard_name in index["weight_map"].items():
         with safe_open(output / shard_name, framework="pt", device="cpu") as file:
             assert name in file.keys()
+
+
+def test_quantized_module_validation_uses_direct_key_lookup():
+    class MembershipOnly:
+        def __init__(self, names):
+            self.names = set(names)
+            self.lookups = 0
+
+        def __contains__(self, name):
+            self.lookups += 1
+            return name in self.names
+
+        def __iter__(self):
+            raise AssertionError("weight_map must not be scanned")
+
+    weight_map = MembershipOnly(
+        {
+            "int_layer.weight",
+            "int_layer.weight_scale",
+            "packed_layer.weight_packed",
+            "packed_layer.weight_scale",
+        }
+    )
+
+    _validate_quantized_module_weights(
+        weight_map,
+        ("int_layer", "packed_layer"),
+        {
+            "int_layer": "int-quantized",
+            "packed_layer": "pack-quantized",
+        },
+    )
+
+    assert weight_map.lookups == 4
 
 
 def test_finalize_rejects_incomplete_staging_without_publishing(tmp_path):
