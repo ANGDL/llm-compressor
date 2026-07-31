@@ -177,6 +177,13 @@ def test_direct_writer_publishes_final_shard_without_tensor_payloads(tmp_path):
     )
     assert not (tmp_path / "transactions").exists()
     assert not list(tmp_path.rglob("*.bin"))
+    assert writer.committed_metadata()[0]["tensor_names"] == [
+        "layers.0.weight"
+    ]
+    with pytest.raises(ArtifactCompatibilityError, match="different run"):
+        DirectSafetensorsWriter(
+            tmp_path, run_fingerprint="run-b"
+        ).committed_metadata()
 
 
 def test_async_direct_writer_returns_before_disk_write_finishes(tmp_path):

@@ -473,6 +473,7 @@ streaming_oneshot(
     checkpoint_progress=False,
     async_save=True,
     pack_to_int8=True,
+    finalize_only=False,
 )
 ```
 
@@ -489,6 +490,12 @@ At most one output snapshot may be pending.
 The advanced boundary-mode API remains available for adapters that provide an
 explicit meta-model factory, target order, calibration boundaries, and exact
 schemes. It follows the same single-device execution and CPU-prefetch contract.
+
+`finalize_only=True` is a pretrained normal-mode recovery operation. It traces
+the same target plan and rebuilds the same run identity, but does not initialize
+modifiers or execute any target. It validates every completed shard under
+`work_dir/publish` against that run identity, writes any still-missing static
+model tensors, and then publishes the checkpoint.
 
 ## Tracing and boundaries
 
@@ -628,6 +635,12 @@ parameter is installed and the target can execute, or the target remains meta.
 Missing checkpoint state may allocate auxiliary tensors, but parameters with a
 materialized source must never receive duplicate placeholder storage.
 
+After parameters and persistent buffers are installed, their model registrations
+become the sole owners of the materialized storage. The prepared-target maps must
+drop their tensor references immediately. Otherwise replacing a BF16 parameter
+during compression leaves the original storage alive until target unload, causing
+the complete BF16 and compressed target to overlap on the execution device.
+
 Pinned staging and asynchronous H2D may be added later, but a bounded pinned
 buffer is required. Pinning an entire large MoE target is not acceptable.
 
@@ -711,6 +724,8 @@ The normal path uses `checkpoint_progress=False`:
 
 - activation boundaries remain in CPU memory and are consumed batch by batch;
 - each target is written once as a final safetensors shard;
+- immutable run metadata is replaced at startup because normal mode never resumes
+  calibration state from `work_dir/artifacts`;
 - finalization adds the index, config, recipe, and auxiliary files;
 - `work_dir/publish` is renamed to `output_dir` on the same filesystem.
 
@@ -719,6 +734,20 @@ for crash recovery. It has higher disk and I/O cost and must remain opt-in. CPU
 next-target prefetch remains enabled because preparing immutable weights does not
 change the durable transaction boundary. Asynchronous direct saving remains
 disabled in recovery mode because recovery uses the transaction writer instead.
+
+Recovery-mode manifests are strict resume records: a changed source, recipe,
+dataset, target plan, or materializer is rejected. Normal-mode manifests are
+replaceable publication metadata and are written before target execution. They
+must not be regenerated after modifier finalization because modifier lifecycle
+state is mutable and is not part of the immutable run identity.
+
+If normal-mode quantization completed but final publication failed,
+`finalize_only=True` preserves `work_dir/publish`, replaces stale normal-mode
+metadata, verifies every target shard's stored run fingerprint, supplies static
+tensors if the original run failed before that phase, and retries final
+publication without requantizing. The caller must use the same model, dataset
+fingerprint, recipe, target dtype, materializer, and packing option as the
+completed run.
 
 `pack_to_int8=True` packs W4A8 `int-quantized` weights before every writer path.
 No unpacked INT4 checkpoint may be written as an intermediate normal-run output.

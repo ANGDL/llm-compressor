@@ -25,6 +25,10 @@ Example::
         --text-dataset-split train_sft \
         --output-dir /Users/ang/models/K3-WNA8
 
+If quantization completes but publication fails, repeat the same command with
+``--finalize-only``. Existing target shards are fingerprint-checked and reused;
+missing static tensors are copied without rerunning quantization.
+
 The K3 remote model code requires its normal runtime dependencies (including
 ``tiktoken``, ``einops``, ``fla-core``, ``flash-attn`` and ``torchvision``).
 This repository does not need the full 96-shard checkpoint for the static MXFP4
@@ -438,6 +442,11 @@ def main() -> None:
     parser.add_argument("--output-dir", "--output_dir", type=Path, required=True)
     parser.add_argument("--work-dir", "--work_dir", type=Path, default=None)
     parser.add_argument(
+        "--finalize-only",
+        action="store_true",
+        help="Publish completed work-dir shards without rerunning quantization.",
+    )
+    parser.add_argument(
         "--moe-calibrate-all-experts",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -517,6 +526,7 @@ def main() -> None:
         # K3 downstream readers expect packed INT4 tensors in the output.
         pack_to_int8=True,
         overwrite_output=True,
+        finalize_only=args.finalize_only,
     )
     processor.save_pretrained(result)
     print(
