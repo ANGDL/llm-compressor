@@ -9,6 +9,7 @@ import pytest
 import torch
 from safetensors import safe_open
 from torch.utils.data import DataLoader
+from transformers import AutoModelForCausalLM
 
 from llmcompressor.modifiers.quantization import QuantizationModifier
 from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
@@ -41,7 +42,7 @@ def test_tiny_kimi_k3_streaming_wna8_end_to_end(tmp_path):
         create_tiny_checkpoint(source, checkpoint)
         config = KIMI_K3_WNA8._register_k3_model(checkpoint)
         expert_pattern, expert_targets = KIMI_K3_WNA8._expert_targets_from_index(
-            checkpoint
+            checkpoint, config
         )
         other_pattern, other_targets = KIMI_K3_WNA8._other_targets_from_index(
             checkpoint, expert_targets
@@ -105,11 +106,15 @@ def test_tiny_kimi_k3_streaming_wna8_end_to_end(tmp_path):
         )
 
     assert (output / "FINALIZED").is_file()
+    assert not (tmp_path / "work").exists()
     output_config = json.loads((output / "config.json").read_text())
     weight_map = json.loads((output / "model.safetensors.index.json").read_text())[
         "weight_map"
     ]
     groups = output_config["quantization_config"]["config_groups"]
+    assert groups["routed_experts_w4a8"]["targets"] == [
+        KIMI_K3_WNA8._EXPERT_TARGET_PATTERN
+    ]
     for name, bits in (("routed_experts_w4a8", 4), ("other_linear_w8a8", 8)):
         scheme = groups[name]
         assert scheme["weights"]["num_bits"] == bits
@@ -134,3 +139,10 @@ def test_tiny_kimi_k3_streaming_wna8_end_to_end(tmp_path):
     tail_name = "language_model.model.output_attn_res_proj.weight"
     assert _load_output_tensor(output, weight_map, tail_name).dtype == torch.float32
     assert tail_name.removesuffix(".weight") + ".weight_scale" not in weight_map
+
+    with kda_import_stubs():
+        loaded = AutoModelForCausalLM.from_pretrained(
+            output, local_files_only=True, dtype=torch.float32
+        ).eval()
+    assert loaded.can_generate()
+    assert callable(loaded.generate)

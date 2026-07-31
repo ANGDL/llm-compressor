@@ -229,7 +229,7 @@ def create_tiny_checkpoint(source: Path, output: Path, seed: int = 42) -> Path:
             str(output),
             local_files_only=True,
         )
-        patch_kimi_k3_transformers_compat(model_class)
+        model_class = patch_kimi_k3_transformers_compat(model_class)
         torch.manual_seed(seed)
         model = model_class(config).eval()
 

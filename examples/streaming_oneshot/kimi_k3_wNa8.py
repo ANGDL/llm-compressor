@@ -61,7 +61,12 @@ from llmcompressor.modeling.kimi_k3 import patch_kimi_k3_transformers_compat
 from llmcompressor.modifiers.quantization import QuantizationModifier
 from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
 from llmcompressor.streaming import KimiK3WeightMaterializer, streaming_oneshot
+from llmcompressor.utils import ImatrixFallbackStats
 
+_EXPERT_TARGET_PATTERN = (
+    r"re:^language_model\.model\.layers\.[0-9]+"
+    r"\.block_sparse_moe\.experts\.[0-9]+\.w[123]$"
+)
 _EXPERT_TARGET = re.compile(
     r"^language_model\.model\.layers\.(\d+)\.block_sparse_moe\.experts\."
     r"(\d+)\.(w[123])$"
@@ -262,8 +267,10 @@ def _index_weight_map(model_id: Path) -> dict[str, str]:
     return weight_map
 
 
-def _expert_targets_from_index(model_id: Path) -> tuple[str, set[str]]:
-    """Build a compact regex from the exact native MXFP4 expert key set."""
+def _expert_targets_from_index(
+    model_id: Path, config: Any
+) -> tuple[str, set[str]]:
+    """Validate native MXFP4 expert keys and return a structural target regex."""
     weight_map = _index_weight_map(model_id)
     all_scale_keys = {key for key in weight_map if key.endswith(".weight_scale")}
     scale_keys = {
@@ -281,25 +288,62 @@ def _expert_targets_from_index(model_id: Path) -> tuple[str, set[str]]:
         )
 
     targets = {key.removesuffix(".weight_scale") for key in scale_keys}
-    packed_keys = {
+    all_packed_targets = {
         key.removesuffix(".weight_packed")
         for key in weight_map
         if key.endswith(".weight_packed")
     }
-    missing_packed = targets - packed_keys
-    if missing_packed:
+    packed_targets = {
+        name for name in all_packed_targets if _EXPERT_TARGET.fullmatch(name)
+    }
+    unexpected_packed = all_packed_targets - packed_targets
+    if unexpected_packed:
         raise ValueError(
-            "Kimi K3 index has expert scales without packed weights: "
-            f"{sorted(missing_packed)[:3]}"
+            "Kimi K3 index contains weight_packed tensors outside routed experts: "
+            f"{sorted(unexpected_packed)[:3]}"
         )
-    invalid = [name for name in targets if not _EXPERT_TARGET.fullmatch(name)]
-    if invalid:
-        raise ValueError(f"Unexpected K3 expert target names: {invalid[:3]}")
+    if targets != packed_targets:
+        missing_packed = sorted(targets - packed_targets)
+        missing_scale = sorted(packed_targets - targets)
+        raise ValueError(
+            "Kimi K3 expert weight_scale/weight_packed targets differ: "
+            f"missing_packed={missing_packed[:3]}, "
+            f"missing_scale={missing_scale[:3]}"
+        )
 
     matches = [_EXPERT_TARGET.fullmatch(name) for name in targets]
-    layers = sorted({int(match.group(1)) for match in matches})
-    experts = sorted({int(match.group(2)) for match in matches})
+    layers = {int(match.group(1)) for match in matches}
+    experts = {int(match.group(2)) for match in matches}
     projections = {match.group(3) for match in matches}
+
+    text_config = getattr(config, "text_config", config)
+    num_hidden_layers = int(text_config.num_hidden_layers)
+    first_moe_layer = int(text_config.first_k_dense_replace)
+    moe_layer_freq = int(getattr(text_config, "moe_layer_freq", 1))
+    num_experts = int(text_config.num_experts)
+    if moe_layer_freq <= 0 or num_experts <= 0:
+        raise ValueError(
+            "Kimi K3 num_experts and moe_layer_freq must be positive; "
+            f"got num_experts={num_experts}, moe_layer_freq={moe_layer_freq}"
+        )
+    expected_layers = {
+        layer
+        for layer in range(num_hidden_layers)
+        if layer >= first_moe_layer and layer % moe_layer_freq == 0
+    }
+    if layers != expected_layers:
+        raise ValueError(
+            "Kimi K3 expert layers disagree with text_config: "
+            f"actual={sorted(layers)}, expected={sorted(expected_layers)}"
+        )
+    expected_experts = set(range(num_experts))
+    if experts != expected_experts:
+        raise ValueError(
+            "Kimi K3 expert indices disagree with text_config: "
+            f"actual_count={len(experts)}, expected_count={num_experts}, "
+            f"missing={sorted(expected_experts - experts)[:3]}, "
+            f"unexpected={sorted(experts - expected_experts)[:3]}"
+        )
     if projections != {"w1", "w2", "w3"}:
         raise ValueError(f"Kimi K3 expert projections are incomplete: {projections}")
     expected_count = len(layers) * len(experts) * len(projections)
@@ -309,16 +353,7 @@ def _expert_targets_from_index(model_id: Path) -> tuple[str, set[str]]:
             f"layer/expert/projection set: {len(targets)} != {expected_count}"
         )
 
-    layer_pattern = "|".join(map(str, layers))
-    expert_pattern = "|".join(map(str, experts))
-    pattern = (
-        r"re:^language_model\.model\.layers\.(?:"
-        + layer_pattern
-        + r")\.block_sparse_moe\.experts\.(?:"
-        + expert_pattern
-        + r")\.w[123]$"
-    )
-    return pattern, targets
+    return _EXPERT_TARGET_PATTERN, targets
 
 
 def _other_targets_from_index(
@@ -357,7 +392,7 @@ def _register_k3_model(model_id: Path):
     model_class = get_class_from_dynamic_module(
         model_ref, str(model_id), local_files_only=True
     )
-    patch_kimi_k3_transformers_compat(model_class)
+    model_class = patch_kimi_k3_transformers_compat(model_class)
     try:
         AutoConfig.register(config.model_type, type(config))
     except ValueError:
@@ -458,7 +493,7 @@ def main() -> None:
 
     model_id = args.model_id.expanduser().resolve()
     config = _register_k3_model(model_id)
-    expert_pattern, expert_targets = _expert_targets_from_index(model_id)
+    expert_pattern, expert_targets = _expert_targets_from_index(model_id, config)
     other_pattern, other_targets = _other_targets_from_index(model_id, expert_targets)
 
     processor = AutoProcessor.from_pretrained(
@@ -505,29 +540,30 @@ def main() -> None:
         QuantizationModifier(config_groups=config_groups, ignore=ignores),
     ]
 
-    result = streaming_oneshot(
-        model=model_id,
-        model_config=config,
-        dataset=calibration_dataloader,
-        tokenizer=processor,
-        recipe=recipe,
-        output_dir=args.output_dir,
-        work_dir=args.work_dir,
-        num_calibration_samples=args.num_calibration_samples,
-        max_seq_length=args.max_sequence_length,
-        batch_size=args.batch_size,
-        shuffle_calibration_samples=False,
-        moe_calibrate_all_experts=args.moe_calibrate_all_experts,
-        materializer=KimiK3WeightMaterializer(
-            kda_num_heads=_kda_num_heads(config)
-        ),
-        # Keep adjacent boundaries in memory and publish final shards only.
-        checkpoint_progress=False,
-        # K3 downstream readers expect packed INT4 tensors in the output.
-        pack_to_int8=True,
-        overwrite_output=True,
-        finalize_only=args.finalize_only,
-    )
+    with ImatrixFallbackStats():
+        result = streaming_oneshot(
+            model=model_id,
+            model_config=config,
+            dataset=calibration_dataloader,
+            tokenizer=processor,
+            recipe=recipe,
+            output_dir=args.output_dir,
+            work_dir=args.work_dir,
+            num_calibration_samples=args.num_calibration_samples,
+            max_seq_length=args.max_sequence_length,
+            batch_size=args.batch_size,
+            shuffle_calibration_samples=False,
+            moe_calibrate_all_experts=args.moe_calibrate_all_experts,
+            materializer=KimiK3WeightMaterializer(
+                kda_num_heads=_kda_num_heads(config)
+            ),
+            # Keep adjacent boundaries in memory and publish final shards only.
+            checkpoint_progress=False,
+            # K3 downstream readers expect packed INT4 tensors in the output.
+            pack_to_int8=True,
+            overwrite_output=True,
+            finalize_only=args.finalize_only,
+        )
     processor.save_pretrained(result)
     print(
         f"Saved Kimi K3 WNA8 checkpoint to {result} "

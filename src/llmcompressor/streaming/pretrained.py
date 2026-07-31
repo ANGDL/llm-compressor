@@ -26,7 +26,9 @@ from llmcompressor.modeling.offset_norm import norm_calibration_context
 from llmcompressor.modifiers.gptq import GPTQModifier
 from llmcompressor.modifiers.quantization import QuantizationModifier
 from llmcompressor.recipe import Recipe
+from llmcompressor.utils.pytorch.module import infer_sequential_targets
 
+from ._logging import streaming_logger
 from .artifacts import fingerprint_json
 from .finalize import finalize_streaming_checkpoint
 from .loading import build_meta_model
@@ -40,6 +42,8 @@ from .pipeline import (
 from .tracing import trace_streaming_boundaries
 
 __all__ = ["streaming_oneshot_from_pretrained"]
+
+_OWNED_WORK_DIR_ENTRIES = ("artifacts", "boundaries", "publish", "staging")
 
 
 def _recipe_quantizer(recipe: Recipe):
@@ -108,6 +112,67 @@ def _exact_schemes(
     if not schemes:
         raise ValueError("Recipe does not match any Linear modules")
     return schemes
+
+
+def _is_module_or_descendant(name: str, ancestor: str) -> bool:
+    return name == ancestor or name.startswith(f"{ancestor}.")
+
+
+def _quantized_sequential_targets(
+    model: nn.Module,
+    schemes: dict[str, QuantizationScheme],
+) -> tuple[str, ...]:
+    """Select no-split ancestors that contain an exact quantization target."""
+    patterns = infer_sequential_targets(model)
+    matched_names = {
+        name for name, _ in match_named_modules(model, patterns)
+    }
+    relevant = {
+        name
+        for name in matched_names
+        if any(_is_module_or_descendant(scheme_name, name) for scheme_name in schemes)
+    }
+
+    selected = []
+    for name, _ in model.named_modules():
+        if name not in relevant:
+            continue
+        if any(_is_module_or_descendant(name, ancestor) for ancestor in selected):
+            continue
+        selected.append(name)
+
+    missing = [
+        name
+        for name in schemes
+        if not any(_is_module_or_descendant(name, target) for target in selected)
+    ]
+    if missing:
+        raise ValueError(
+            "Recipe matches modules outside the inferred sequential targets: "
+            f"{sorted(missing)}"
+        )
+    return tuple(selected)
+
+
+def _cleanup_successful_work_dir(work: Path) -> None:
+    """Remove framework-owned recovery data after a successful publication."""
+    for name in _OWNED_WORK_DIR_ENTRIES:
+        path = work / name
+        try:
+            if path.is_symlink() or path.is_file():
+                path.unlink()
+            elif path.is_dir():
+                shutil.rmtree(path)
+        except OSError as error:
+            streaming_logger.warning(
+                "finalize | work cleanup incomplete | "
+                f"path={path} | error={error}"
+            )
+    try:
+        work.rmdir()
+    except OSError:
+        # Preserve the root when it contains files not owned by streaming PTQ.
+        pass
 
 
 def _dataset_fingerprint(
@@ -202,13 +267,7 @@ def streaming_oneshot_from_pretrained(
         raise ValueError(
             "output_dir must not be inside work_dir; use sibling directories"
         )
-    work.mkdir(parents=True, exist_ok=True)
     output.parent.mkdir(parents=True, exist_ok=True)
-    if not checkpoint_progress and work.stat().st_dev != output.parent.stat().st_dev:
-        raise OSError(
-            "work_dir and output_dir must be on the same filesystem for "
-            "copy-free publication"
-        )
     if (
         output.exists()
         and (output / "FINALIZED").is_file()
@@ -219,6 +278,12 @@ def streaming_oneshot_from_pretrained(
         raise FileExistsError(
             f"Refusing to overwrite existing output: {output}. Pass "
             "overwrite_output=True to replace it."
+        )
+    work.mkdir(parents=True, exist_ok=True)
+    if not checkpoint_progress and work.stat().st_dev != output.parent.stat().st_dev:
+        raise OSError(
+            "work_dir and output_dir must be on the same filesystem for "
+            "copy-free publication"
         )
     publish = work / "publish"
     if finalize_only and checkpoint_progress:
@@ -305,14 +370,13 @@ def streaming_oneshot_from_pretrained(
                 calibrate_all_experts=moe_calibrate_all_experts,
             )
         )
+        sequential_targets = _quantized_sequential_targets(meta_model, schemes)
         adapter = trace_streaming_boundaries(
             model=meta_model,
             source=materializer.create_source(str(checkpoint)),
             sample_batch=sample_batch,
-            sequential_targets=tuple(
-                getattr(meta_model, "_no_split_modules", ())
-                or getattr(config, "_no_split_modules", ())
-            ),
+            sequential_targets=sequential_targets,
+            target_names=sequential_targets,
             materializer=materializer,
             device=device,
             dtype=target_dtype,
@@ -386,7 +450,7 @@ def streaming_oneshot_from_pretrained(
                 )
             )
         qconfig = build_quantization_config(quantizer.resolved_config)
-        return finalize_streaming_checkpoint(
+        result = finalize_streaming_checkpoint(
             checkpoint=checkpoint,
             artifact_dir=artifact_dir,
             staging_dir=staging_dir,
@@ -400,3 +464,6 @@ def streaming_oneshot_from_pretrained(
             recipe_yaml=parsed_recipe.yaml(),
             expected_run_fingerprint=run_fingerprint,
         )
+        if not checkpoint_progress:
+            _cleanup_successful_work_dir(work)
+        return result

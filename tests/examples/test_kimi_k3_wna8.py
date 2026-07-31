@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import importlib.util
+import json
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -19,6 +21,33 @@ class _FakeDataset(list):
     def shuffle(self, seed):
         self.shuffle_seed = seed
         return self
+
+
+def _tiny_text_config(num_experts=2):
+    return SimpleNamespace(
+        text_config=SimpleNamespace(
+            first_k_dense_replace=1,
+            moe_layer_freq=1,
+            num_experts=num_experts,
+            num_hidden_layers=2,
+        )
+    )
+
+
+def _write_expert_index(model_dir, *, include_all_packed=True):
+    weight_map = {}
+    for expert in range(2):
+        for projection in ("w1", "w2", "w3"):
+            prefix = (
+                "language_model.model.layers.1.block_sparse_moe.experts."
+                f"{expert}.{projection}"
+            )
+            weight_map[f"{prefix}.weight_scale"] = "model.safetensors"
+            if include_all_packed or (expert, projection) != (1, "w3"):
+                weight_map[f"{prefix}.weight_packed"] = "model.safetensors"
+    (model_dir / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": weight_map}), encoding="utf-8"
+    )
 
 
 def test_calibration_datasets_use_independent_splits(monkeypatch):
@@ -74,6 +103,38 @@ def test_kda_num_heads_comes_from_text_config():
     )
 
     assert KIMI_K3_WNA8._kda_num_heads(config) == 96
+
+
+def test_expert_targets_validate_exact_index_but_emit_structural_regex(tmp_path):
+    _write_expert_index(tmp_path)
+
+    pattern, targets = KIMI_K3_WNA8._expert_targets_from_index(
+        tmp_path, _tiny_text_config()
+    )
+
+    assert pattern == KIMI_K3_WNA8._EXPERT_TARGET_PATTERN
+    assert len(pattern) < 150
+    compiled = re.compile(pattern.removeprefix("re:"))
+    assert len(targets) == 6
+    assert all(compiled.fullmatch(target) for target in targets)
+
+
+def test_expert_targets_reject_scale_without_packed_weight(tmp_path):
+    _write_expert_index(tmp_path, include_all_packed=False)
+
+    with pytest.raises(ValueError, match="weight_scale/weight_packed targets differ"):
+        KIMI_K3_WNA8._expert_targets_from_index(
+            tmp_path, _tiny_text_config()
+        )
+
+
+def test_expert_targets_reject_config_index_mismatch(tmp_path):
+    _write_expert_index(tmp_path)
+
+    with pytest.raises(ValueError, match="expert indices disagree"):
+        KIMI_K3_WNA8._expert_targets_from_index(
+            tmp_path, _tiny_text_config(num_experts=3)
+        )
 
 
 @pytest.mark.parametrize("samples", [0, 3])

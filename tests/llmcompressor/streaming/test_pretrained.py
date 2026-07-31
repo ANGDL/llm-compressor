@@ -23,8 +23,33 @@ from llmcompressor.streaming import (
     DeepSeekV4WeightMaterializer,
     streaming_oneshot,
 )
-from llmcompressor.streaming.pretrained import _recipe_quantizer
+from llmcompressor.streaming.pretrained import (
+    _cleanup_successful_work_dir,
+    _quantized_sequential_targets,
+    _recipe_quantizer,
+)
 from llmcompressor.streaming.tracing import trace_streaming_boundaries
+
+
+class _VisionBlock(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.proj = torch.nn.Linear(2, 2)
+
+
+class _DecoderLayer(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.proj = torch.nn.Linear(2, 2)
+
+
+class _MultimodalModel(torch.nn.Module):
+    _no_split_modules = ["_VisionBlock", "_DecoderLayer", "Linear"]
+
+    def __init__(self):
+        super().__init__()
+        self.vision_tower = torch.nn.ModuleList([_VisionBlock()])
+        self.layers = torch.nn.ModuleList([_DecoderLayer(), _DecoderLayer()])
 
 
 def _write_raw_deepseek_v4_checkpoint(checkpoint):
@@ -108,6 +133,34 @@ def test_pretrained_explains_autoround_output_adapter_requirement():
         _recipe_quantizer(recipe)
 
 
+def test_sequential_targets_only_cover_quantized_model_branches():
+    model = _MultimodalModel()
+    schemes = {
+        "layers.0.proj": Mock(),
+        "layers.1.proj": Mock(),
+    }
+
+    assert _quantized_sequential_targets(model, schemes) == (
+        "layers.0",
+        "layers.1",
+    )
+
+
+def test_successful_work_cleanup_preserves_unknown_files(tmp_path):
+    work = tmp_path / "work"
+    for name in ("artifacts", "boundaries", "publish", "staging"):
+        directory = work / name
+        directory.mkdir(parents=True)
+        (directory / "owned").write_text("owned")
+    unknown = work / "user-note.txt"
+    unknown.write_text("keep")
+
+    _cleanup_successful_work_dir(work)
+
+    assert unknown.read_text() == "keep"
+    assert sorted(path.name for path in work.iterdir()) == ["user-note.txt"]
+
+
 def test_qwen3_pretrained_mode_hides_boundary_construction(tmp_path, monkeypatch):
     config = Qwen3Config(
         vocab_size=32,
@@ -138,6 +191,11 @@ def test_qwen3_pretrained_mode_hides_boundary_construction(tmp_path, monkeypatch
         "llmcompressor.streaming.pretrained.trace_streaming_boundaries",
         trace_boundaries,
     )
+    int4_packer = Mock(side_effect=AssertionError("W8A8 must not use INT4 packing"))
+    monkeypatch.setattr(
+        "llmcompressor.streaming.output.pack_int4_to_int8_cpu_snapshot",
+        int4_packer,
+    )
     output = streaming_oneshot(
         model=checkpoint,
         dataset=dataset,
@@ -164,6 +222,12 @@ def test_qwen3_pretrained_mode_hides_boundary_construction(tmp_path, monkeypatch
         in trace_boundaries.call_args.kwargs["tracing_ignore"]
     )
     assert trace_boundaries.call_args.kwargs["model"].training is False
+    assert trace_boundaries.call_args.kwargs["sequential_targets"] == (
+        "model.layers.0",
+        "model.layers.1",
+    )
+    assert not (tmp_path / "work").exists()
+    int4_packer.assert_not_called()
     assert '"lm_head.weight"' not in (
         output / "model.safetensors.index.json"
     ).read_text()

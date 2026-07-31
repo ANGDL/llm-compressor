@@ -727,7 +727,10 @@ The normal path uses `checkpoint_progress=False`:
 - immutable run metadata is replaced at startup because normal mode never resumes
   calibration state from `work_dir/artifacts`;
 - finalization adds the index, config, recipe, and auxiliary files;
-- `work_dir/publish` is renamed to `output_dir` on the same filesystem.
+- `work_dir/publish` is renamed to `output_dir` on the same filesystem;
+- after successful publication, framework-owned `artifacts`, `boundaries`,
+  `publish`, and `staging` entries are removed. The work root is removed only
+  when empty, so unrelated caller files are preserved.
 
 `checkpoint_progress=True` persists target transactions and boundary snapshots
 for crash recovery. It has higher disk and I/O cost and must remain opt-in. CPU
@@ -748,6 +751,11 @@ tensors if the original run failed before that phase, and retries final
 publication without requantizing. The caller must use the same model, dataset
 fingerprint, recipe, target dtype, materializer, and packing option as the
 completed run.
+
+Any failure before or during publication retains the work directory for
+diagnosis and `finalize_only` recovery. A successful `finalize_only` retry uses
+the same cleanup rule as a successful normal run. Recovery mode with
+`checkpoint_progress=True` keeps its explicit durable progress state.
 
 `pack_to_int8=True` packs W4A8 `int-quantized` weights before every writer path.
 No unpacked INT4 checkpoint may be written as an intermediate normal-run output.
