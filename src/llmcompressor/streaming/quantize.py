@@ -240,7 +240,7 @@ def quantize_streaming(
     for alias, canonical in tied_weights.items():
         if alias not in source_names or canonical not in source_names:
             continue
-        tied_values = source.load_tensors([alias, canonical], device=device)
+        tied_values = source.load_tensors_cpu([alias, canonical])
         if torch.equal(tied_values[alias], tied_values[canonical]):
             omitted_tied_weights[alias] = canonical
         del tied_values
@@ -274,13 +274,12 @@ def quantize_streaming(
                         name, source.metadata(name)
                     )
                     requested = [name, *dependency_names]
-                    raw_values = source.load_tensors(requested, device=device)
-                    weight = materializer.materialize(
+                    raw_values = source.load_tensors_cpu(requested)
+                    weight = materializer.materialize_cpu(
                         name,
                         raw_values,
                         target_dtype=target_dtype,
-                        device=device,
-                    )
+                    ).to(device)
                     metadata = source.metadata(name)
                     expected_shape = materializer.logical_shape(name, metadata)
                     if (
@@ -329,20 +328,19 @@ def quantize_streaming(
                     del module, weight, raw_values
                     continue
 
-                raw_values = source.load_tensors([name], device=device)
+                raw_values = source.load_tensors_cpu([name])
                 value = raw_values[name]
                 dependency_names = materializer.dependencies(
                     name, source.metadata(name)
                 )
                 if dependency_names:
                     raw_values.update(
-                        source.load_tensors(dependency_names, device=device)
+                        source.load_tensors_cpu(dependency_names)
                     )
-                    value = materializer.materialize(
+                    value = materializer.materialize_cpu(
                         name,
                         raw_values,
                         target_dtype=target_dtype,
-                        device=device,
                     )
                 transaction.write_tensor(name, value, output_shard=output_name)
                 del raw_values, value

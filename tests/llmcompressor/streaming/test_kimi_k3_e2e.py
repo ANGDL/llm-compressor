@@ -99,7 +99,7 @@ def test_tiny_kimi_k3_streaming_wna8_end_to_end(tmp_path):
                 kda_num_heads=KIMI_K3_WNA8._kda_num_heads(config)
             ),
             target_dtype=torch.float32,
-            checkpoint_progress=True,
+            checkpoint_progress=False,
             pack_to_int8=True,
             overwrite_output=True,
         )

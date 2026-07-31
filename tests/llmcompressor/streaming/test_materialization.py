@@ -26,27 +26,22 @@ class ScaledIntMaterializer(WeightMaterializer):
     ) -> list[str]:
         return [tensor_name.replace(".weight", ".scale")]
 
-    def materialize(
+    def materialize_cpu(
         self,
         tensor_name: str,
         tensors: Mapping[str, torch.Tensor],
         *,
         target_dtype: torch.dtype,
-        device: torch.device,
     ) -> torch.Tensor:
         scale_name = tensor_name.replace(".weight", ".scale")
-        return (tensors[tensor_name] * tensors[scale_name]).to(
-            device=device, dtype=target_dtype
-        )
+        return (tensors[tensor_name] * tensors[scale_name]).to(dtype=target_dtype)
 
 
 class InvalidMaterializer(WeightMaterializer):
     def __init__(self, result):
         self.result = result
 
-    def materialize(
-        self, tensor_name, tensors, *, target_dtype, device
-    ) -> torch.Tensor:
+    def materialize_cpu(self, tensor_name, tensors, *, target_dtype) -> torch.Tensor:
         return self.result
 
 
@@ -54,14 +49,13 @@ class RawLifetimeMaterializer(ScaledIntMaterializer):
     def __init__(self):
         self.previous_raw = []
 
-    def materialize(self, tensor_name, tensors, *, target_dtype, device):
+    def materialize_cpu(self, tensor_name, tensors, *, target_dtype):
         assert all(reference() is None for reference in self.previous_raw)
         self.previous_raw = [weakref.ref(value) for value in tensors.values()]
-        return super().materialize(
+        return super().materialize_cpu(
             tensor_name,
             tensors,
             target_dtype=target_dtype,
-            device=device,
         )
 
 
@@ -98,15 +92,16 @@ def test_default_materializer_casts_supported_floats(tmp_path, source_dtype):
     path = tmp_path / "model.safetensors"
     save_file({"weight": torch.ones(2, 3, dtype=source_dtype)}, path)
     source = SafetensorsWeightSource(path)
+    materializer = CastWeightMaterializer()
 
     result = materialize_weights(
         source,
         ["weight"],
-        CastWeightMaterializer(),
+        materializer,
         target_dtype=torch.bfloat16,
-        device=torch.device("cpu"),
     )
 
+    assert not hasattr(materializer, "materialize")
     assert result["weight"].dtype == torch.bfloat16
     assert result["weight"].device.type == "cpu"
 
@@ -119,7 +114,6 @@ def test_custom_materializer_loads_declared_dependency(sharded_checkpoint):
         ["layer1.weight"],
         ScaledIntMaterializer(),
         target_dtype=torch.bfloat16,
-        device=torch.device("cpu"),
     )
 
     expected = torch.arange(6, dtype=torch.bfloat16).reshape(2, 3) * 0.5
@@ -144,7 +138,6 @@ def test_materializer_releases_each_raw_group_before_loading_next(tmp_path):
         ["layer0.weight", "layer1.weight"],
         materializer,
         target_dtype=torch.bfloat16,
-        device=torch.device("cpu"),
     )
 
     assert set(result) == {"layer0.weight", "layer1.weight"}
@@ -157,14 +150,13 @@ def test_materializer_supports_legacy_source_without_group_iterator(
 
     class LegacySource:
         metadata = source.metadata
-        load_tensors = source.load_tensors
+        load_tensors_cpu = source.load_tensors_cpu
 
     result = materialize_weights(
         LegacySource(),
         ["layer1.weight"],
         ScaledIntMaterializer(),
         target_dtype=torch.bfloat16,
-        device=torch.device("cpu"),
     )
 
     assert result["layer1.weight"].dtype == torch.bfloat16
@@ -186,7 +178,6 @@ def test_large_materialization_reports_debug_progress(tmp_path, monkeypatch):
         [f"layer{index}.weight" for index in range(65)],
         CastWeightMaterializer(),
         target_dtype=torch.bfloat16,
-        device=torch.device("cpu"),
     )
 
     assert len(result) == 65
@@ -212,21 +203,20 @@ def test_materializer_reads_tensors_in_physical_storage_order(tmp_path, monkeypa
         key=lambda name: source.metadata(name).storage_index,
     )
     observed = []
-    original_iter = source.iter_tensor_groups
+    original_iter = source.iter_tensor_groups_cpu
 
-    def recording_iter(groups, *, device):
+    def recording_iter(groups):
         groups = tuple(tuple(group) for group in groups)
         observed.extend(group[0] for group in groups)
-        return original_iter(groups, device=device)
+        return original_iter(groups)
 
-    monkeypatch.setattr(source, "iter_tensor_groups", recording_iter)
+    monkeypatch.setattr(source, "iter_tensor_groups_cpu", recording_iter)
 
     materialize_weights(
         source,
         requested,
         CastWeightMaterializer(),
         target_dtype=torch.bfloat16,
-        device=torch.device("cpu"),
     )
 
     assert observed == expected
@@ -241,7 +231,6 @@ def test_missing_materializer_dependency_reports_name(sharded_checkpoint):
             ["layer0.weight"],
             ScaledIntMaterializer(),
             target_dtype=torch.bfloat16,
-            device=torch.device("cpu"),
         )
 
 
@@ -254,7 +243,6 @@ def test_default_materializer_rejects_integer_source(sharded_checkpoint):
             ["layer1.weight"],
             CastWeightMaterializer(),
             target_dtype=torch.bfloat16,
-            device=torch.device("cpu"),
         )
 
 
@@ -277,7 +265,6 @@ def test_rejects_invalid_materializer_output(
             ["layer0.weight"],
             InvalidMaterializer(result),
             target_dtype=torch.float32,
-            device=torch.device("cpu"),
         )
 
 
@@ -305,11 +292,10 @@ def test_deepseek_v4_materializer_unpacks_fp4_blocks(tmp_path):
     packed = torch.tensor([[0x01, 0x29], [-0x6D, -0x0C]], dtype=torch.int8)
     scale = torch.full((2, 1), 127, dtype=torch.uint8)
 
-    result = materializer.materialize(
+    result = materializer.materialize_cpu(
         name,
         {name: packed, "model.layers.0.ffn.experts.0.w1.scale": scale},
         target_dtype=torch.bfloat16,
-        device=torch.device("cpu"),
     )
 
     assert materializer.logical_shape(name, metadata) == (2, 4)
@@ -320,6 +306,16 @@ def test_deepseek_v4_materializer_unpacks_fp4_blocks(tmp_path):
             dtype=torch.bfloat16,
         ),
     )
+
+
+def test_deepseek_v4_materializer_decodes_ue8m0_endpoints():
+    decoded = DeepSeekV4WeightMaterializer._decode_e8m0(
+        torch.tensor([0, 127, 255], dtype=torch.uint8)
+    )
+
+    assert decoded[0].item() == 0.0
+    assert decoded[1].item() == 1.0
+    assert torch.isinf(decoded[2])
 
 
 def test_kimi_k3_source_maps_packed_expert_to_logical_weight(tmp_path):
@@ -347,7 +343,6 @@ def test_kimi_k3_source_maps_packed_expert_to_logical_weight(tmp_path):
         [logical_name],
         KimiK3WeightMaterializer(fp4_block_size=4),
         target_dtype=torch.bfloat16,
-        device=torch.device("cpu"),
     )[logical_name]
 
     assert torch.equal(
@@ -359,12 +354,40 @@ def test_kimi_k3_source_maps_packed_expert_to_logical_weight(tmp_path):
     )
 
 
+@pytest.mark.skipif(
+    not hasattr(torch, "float8_e8m0fnu"), reason="PyTorch has no E8M0 dtype"
+)
+def test_kimi_k3_source_normalizes_native_e8m0_scale_to_bytes(tmp_path):
+    path = tmp_path / "model.safetensors"
+    raw_name = (
+        "language_model.model.layers.1.block_sparse_moe.experts.0.w1.weight_packed"
+    )
+    scale_name = raw_name.removesuffix("_packed") + "_scale"
+    scale = torch.tensor([127, 128], dtype=torch.uint8).view(
+        torch.float8_e8m0fnu
+    )
+    save_file(
+        {
+            raw_name: torch.tensor([[0x01, 0x29]], dtype=torch.uint8),
+            scale_name: scale.reshape(1, 2),
+        },
+        path,
+    )
+    source = KimiK3WeightSource(path)
+    logical_name = raw_name.removesuffix("_packed")
+
+    values = source.load_tensors_cpu([logical_name, scale_name])
+
+    assert values[scale_name].dtype == torch.uint8
+    assert values[scale_name].tolist() == [[127, 128]]
+
+
 def test_kimi_k3_materializer_rejects_mismatched_scale_shape(tmp_path):
     materializer = KimiK3WeightMaterializer(fp4_block_size=4)
     name = "language_model.model.layers.1.block_sparse_moe.experts.0.w1.weight"
 
     with pytest.raises(ValueError, match="scale shape"):
-        materializer.materialize(
+        materializer.materialize_cpu(
             name,
             {
                 name: torch.zeros((2, 2), dtype=torch.uint8),
@@ -373,7 +396,6 @@ def test_kimi_k3_materializer_rejects_mismatched_scale_shape(tmp_path):
                 ),
             },
             target_dtype=torch.bfloat16,
-            device=torch.device("cpu"),
         )
 
 
@@ -398,17 +420,16 @@ def test_kimi_k3_materializer_kda_a_log_configuration_and_shape(tmp_path):
     )
     source = torch.arange(128, dtype=torch.float32)
 
-    result = materializer.materialize(
+    result = materializer.materialize_cpu(
         name,
         {name: source},
         target_dtype=torch.bfloat16,
-        device=torch.device("cpu"),
     )
 
     assert materializer.configuration()["kda_num_heads"] == 96
     assert (
         materializer.configuration()["routed_expert_loading"]
-        == "deferred-per-expert-cpu-cache"
+        == "resident-decoder-layer"
     )
     assert materializer.logical_shape(name, metadata) == (96,)
     assert torch.equal(result, source[:96].to(torch.bfloat16))

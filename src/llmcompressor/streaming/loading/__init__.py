@@ -1,5 +1,6 @@
 """Temporary materialization of one module in an otherwise meta model."""
 
+from .host_memory import HostMemoryBudget, HostMemoryError, HostMemoryReservation
 from .prefetch import SubgraphPrefetcher
 from .session import (
     LoadedSubgraph,
@@ -16,6 +17,9 @@ from .target import (
 
 __all__ = [
     "LoadedSubgraph",
+    "HostMemoryBudget",
+    "HostMemoryError",
+    "HostMemoryReservation",
     "PreparedSubgraphWeights",
     "PreparedTargetWeights",
     "SubgraphLoadPlan",

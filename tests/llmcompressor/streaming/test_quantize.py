@@ -258,7 +258,7 @@ def test_missing_statistics_fails_before_loading_weights(tmp_path, monkeypatch):
         raise AssertionError("weights must not be loaded")
 
     monkeypatch.setattr(
-        "llmcompressor.streaming.quantize.SafetensorsWeightSource.load_tensors",
+        "llmcompressor.streaming.quantize.SafetensorsWeightSource.load_tensors_cpu",
         fail_load,
     )
     with pytest.raises(RuntimeError, match="gptq_hessian"):

@@ -20,6 +20,7 @@ from llmcompressor.modifiers.quantization.calibration import (
 from llmcompressor.modifiers.utils.hooks import HooksMixin
 from llmcompressor.recipe import Recipe
 from llmcompressor.utils.helpers import DisableQuantization
+from llmcompressor.utils.int4_packing import DEFAULT_INT4_PACKING_WORKSPACE_BYTES
 from llmcompressor.utils.metric_logging import CompressionLogger
 
 from ._logging import streaming_logger
@@ -43,11 +44,12 @@ from .checkpoint import (
     DirectSafetensorsWriter,
     StreamingCheckpointWriter,
 )
-from .loading import SubgraphPrefetcher
+from .loading import HostMemoryBudget, SubgraphPrefetcher
 from .materialization import WeightMaterializer, materialize_weights
 from .output import (
     prepare_quantized_tensor_for_save,
     quantized_module_formats,
+    quantized_tensor_bytes_for_save,
 )
 from .tied_weights import infer_transformers_tied_weights
 from .tracing import TracedBoundaryAdapter
@@ -86,34 +88,6 @@ def _stage_logger(
 def _target_label(index: int, total: int, target: str) -> str:
     width = max(2, len(str(total)))
     return f"[{index + 1:0{width}d}/{total:0{width}d}] {target}"
-
-
-def _resolve_pipeline_devices(
-    device: torch.device,
-    pipeline_devices: Sequence[torch.device | str] | None,
-) -> tuple[torch.device, ...]:
-    primary = torch.device(device)
-    if pipeline_devices is None:
-        return (primary,)
-    devices = tuple(torch.device(value) for value in pipeline_devices)
-    if not devices:
-        raise ValueError("pipeline_devices must not be empty")
-    if devices[0] != primary:
-        raise ValueError(
-            f"pipeline_devices must start with the primary device {primary}"
-        )
-    if len(devices) > 2:
-        raise ValueError("The first asynchronous pipeline supports two GPUs")
-    if len(set(devices)) != len(devices):
-        raise ValueError("pipeline_devices must be distinct")
-    if len(devices) == 2 and any(
-        value.type != "cuda" or value.index is None for value in devices
-    ):
-        raise ValueError(
-            "Multi-device streaming requires explicit CUDA devices such as "
-            "['cuda:0', 'cuda:1']"
-        )
-    return devices
 
 
 def _output_shard(source, tensor_name: str, owner_name: str) -> str:
@@ -290,6 +264,43 @@ def _loaded_target_delta(
     return tensors, formats, written, owned_cpu_tensors
 
 
+def _estimate_loaded_target_snapshot_bytes(
+    loaded,
+    target_name: str,
+    *,
+    pack_to_int8: bool,
+    exclude_modules: Sequence[str] = (),
+) -> int:
+    formats = quantized_module_formats(
+        loaded.model.named_modules(), prefix=target_name
+    )
+    total = 0
+    workspace = 0
+    for name, tensor in loaded.state_tensors_under((target_name,)):
+        owner_name, _, local_name = name.rpartition(".")
+        if _is_under_any(owner_name, exclude_modules):
+            continue
+        format_name = formats.get(owner_name)
+        if local_name == "weight" and format_name is not None:
+            module = loaded.model.get_submodule(owner_name)
+            output_bytes = quantized_tensor_bytes_for_save(
+                name,
+                tensor,
+                module.quantization_scheme,
+                format_name=format_name,
+                pack_to_int8=pack_to_int8,
+            )
+            total += output_bytes
+            if tensor.device.type == "cpu" and output_bytes < tensor.nbytes:
+                workspace = max(
+                    workspace,
+                    min(DEFAULT_INT4_PACKING_WORKSPACE_BYTES, 2 * output_bytes),
+                )
+        else:
+            total += tensor.numel() * tensor.element_size()
+    return total + workspace
+
+
 def _write_loaded_target_direct(
     writer: DirectSafetensorsWriter,
     loaded,
@@ -298,39 +309,47 @@ def _write_loaded_target_direct(
     *,
     pack_to_int8: bool = True,
     exclude_modules: Sequence[str] = (),
+    host_budget: HostMemoryBudget | None = None,
 ) -> set[str]:
     """Write one target and release all device tensor references before returning."""
 
-    tensors, formats, written, owned_cpu_tensors = _loaded_target_delta(
-        loaded,
-        target_name,
-        pack_to_int8=pack_to_int8,
-        exclude_modules=exclude_modules,
-    )
+    tensors = {}
+    reservation = None
     try:
-        if tensors:
-            writer.write_shard(
-                shard_id,
-                tensors,
-                quantized_modules=formats,
-                owned_cpu_tensors=owned_cpu_tensors,
+        estimate = getattr(writer, "estimate_snapshot_bytes", None)
+        if host_budget is not None and callable(estimate):
+            required = _estimate_loaded_target_snapshot_bytes(
+                loaded,
+                target_name,
+                pack_to_int8=pack_to_int8,
+                exclude_modules=exclude_modules,
             )
+            reservation = host_budget.reserve(
+                f"checkpoint shard {shard_id}", required
+            )
+        tensors, formats, written, owned_cpu_tensors = _loaded_target_delta(
+            loaded,
+            target_name,
+            pack_to_int8=pack_to_int8,
+            exclude_modules=exclude_modules,
+        )
+        if tensors:
+            writer_kwargs = {
+                "quantized_modules": formats,
+                "owned_cpu_tensors": owned_cpu_tensors,
+            }
+            if reservation is not None:
+                writer_kwargs["reservation"] = reservation
+            writer.write_shard(shard_id, tensors, **writer_kwargs)
+        elif reservation is not None:
+            reservation.close()
         return written
+    except Exception:
+        if reservation is not None:
+            reservation.close()
+        raise
     finally:
         tensors.clear()
-
-
-def _resident_subgraph_modules(subgraph, model, deferred_modules):
-    excluded = {
-        id(module)
-        for name in deferred_modules
-        for module in model.get_submodule(name).modules()
-    }
-    return tuple(
-        module
-        for module in subgraph.submodules(model)
-        if id(module) not in excluded
-    )
 
 
 def _modifier_update(modules: Sequence[torch.nn.Module]) -> None:
@@ -347,58 +366,6 @@ def _compress_modules(modules: Sequence[torch.nn.Module]) -> None:
             compress_module(module)
 
 
-def _validate_deferred_recipe(recipe: Recipe) -> None:
-    supported = {"IMatrixGatherer", "QuantizationModifier"}
-    unsupported = sorted(
-        type(modifier).__name__
-        for modifier in recipe.modifiers
-        if type(modifier).__name__ not in supported
-    )
-    if unsupported:
-        raise ValueError(
-            "Deferred streaming modules currently support RTN with optional "
-            f"iMatrix only; unsupported modifiers: {unsupported}"
-        )
-
-
-def _write_deferred_modules(
-    *,
-    transaction,
-    loaded,
-    adapter: TracedBoundaryAdapter,
-    source,
-    device: torch.device,
-    target_dtype: torch.dtype,
-    pack_to_int8: bool,
-) -> set[str]:
-    written = set()
-    total = len(loaded.deferred_module_names)
-    for index, module_name in enumerate(loaded.deferred_module_names, start=1):
-        if index == 1 or index % 64 == 0 or index == total:
-            streaming_logger.info(
-                f"deferred weights | progress={index}/{total} | "
-                f"module={module_name!r}"
-            )
-        with adapter.weight_session.loaded_module(
-            module_name,
-            device=device,
-            dtype=target_dtype,
-        ) as module:
-            modules = tuple(module.modules())
-            _modifier_update(modules)
-            _compress_modules(modules)
-            written.update(
-                _write_loaded_target(
-                    transaction,
-                    loaded,
-                    module_name,
-                    source,
-                    pack_to_int8=pack_to_int8,
-                )
-            )
-    return written
-
-
 def _write_remaining_direct_shards(
     *,
     writer: DirectSafetensorsWriter,
@@ -407,6 +374,7 @@ def _write_remaining_direct_shards(
     target_dtype: torch.dtype,
     written: set[str],
     omitted: Mapping[str, str],
+    host_budget: HostMemoryBudget | None = None,
 ) -> None:
     """Copy non-subgraph tensors into bounded final static shards."""
 
@@ -420,11 +388,22 @@ def _write_remaining_direct_shards(
         nonlocal omitted_metadata, shard_index, tensor_bytes
         if not tensors:
             return
-        writer.write_shard(
-            f"static-{shard_index:05d}",
-            tensors,
-            omitted_tied_weights=omitted_metadata,
-        )
+        shard_id = f"static-{shard_index:05d}"
+        reservation = None
+        estimate = getattr(writer, "estimate_snapshot_bytes", None)
+        if host_budget is not None and callable(estimate):
+            reservation = host_budget.reserve(
+                f"checkpoint shard {shard_id}", estimate(tensors)
+            )
+        writer_kwargs = {"omitted_tied_weights": omitted_metadata}
+        if reservation is not None:
+            writer_kwargs["reservation"] = reservation
+        try:
+            writer.write_shard(shard_id, tensors, **writer_kwargs)
+        except Exception:
+            if reservation is not None:
+                reservation.close()
+            raise
         tensors.clear()
         omitted_metadata = {}
         shard_index += 1
@@ -442,12 +421,9 @@ def _write_remaining_direct_shards(
                 (name,),
                 materializer,
                 target_dtype=target_dtype,
-                device=torch.device("cpu"),
             )[name]
         else:
-            value = source.load_tensors(
-                (name,), device=torch.device("cpu")
-            )[name]
+            value = source.load_tensors_cpu((name,))[name]
         value_bytes = value.numel() * value.element_size()
         if tensors and tensor_bytes + value_bytes > max_shard_bytes:
             flush()
@@ -481,12 +457,9 @@ def _copy_remaining_tensors(
                 (name,),
                 materializer,
                 target_dtype=target_dtype,
-                device=torch.device("cpu"),
             )[name]
         else:
-            value = source.load_tensors(
-                (name,), device=torch.device("cpu")
-            )[name]
+            value = source.load_tensors_cpu((name,))[name]
         with writer.transaction(transaction_id) as transaction:
             transaction.write_tensor(
                 name, value, output_shard=metadata.shard.name
@@ -512,17 +485,15 @@ def run_subgraph_streaming_pipeline(
     max_seq_length: int | None,
     seed: int | None,
     checkpoint_progress: bool = False,
-    pipeline_devices: Sequence[torch.device | str] | None = None,
     async_save: bool = False,
     pack_to_int8: bool = True,
 ) -> tuple[Path, Path]:
     """Calibrate, modify, propagate, and persist one subgraph at a time."""
 
-    execution_devices = _resolve_pipeline_devices(device, pipeline_devices)
-    if checkpoint_progress and (len(execution_devices) > 1 or async_save):
+    device = torch.device(device)
+    if checkpoint_progress and async_save:
         raise ValueError(
-            "Asynchronous prefetch and saving are not supported with "
-            "checkpoint_progress=True"
+            "Asynchronous saving is not supported with checkpoint_progress=True"
         )
     work = Path(work_dir)
     artifact_dir = work / "artifacts"
@@ -556,12 +527,17 @@ def run_subgraph_streaming_pipeline(
     )
     direct_writer = direct_writer_base
     async_direct_writer = None
+    host_budget = HostMemoryBudget()
     boundaries: BoundaryActivationStore
     if checkpoint_progress:
-        boundaries = DiskBoundaryActivationStore(work / "boundaries")
+        boundaries = DiskBoundaryActivationStore(
+            work / "boundaries", host_budget=host_budget
+        )
     else:
         boundaries = InMemoryBoundaryActivationStore(
-            storage_device="cpu", deduplicate_tensors=True
+            storage_device="cpu",
+            deduplicate_tensors=True,
+            host_budget=host_budget,
         )
     source = adapter.weight_session.source
     written: set[str] = set()
@@ -617,36 +593,15 @@ def run_subgraph_streaming_pipeline(
             direct_writer = async_direct_writer
         prefetcher = (
             SubgraphPrefetcher(adapter.weight_session)
-            if len(execution_devices) > 1
+            if adapter.targets
             else None
         )
         pipeline_failed = True
         try:
-            if prefetcher is not None and adapter.targets:
-                first_name = adapter.targets[0]
-                first_device = execution_devices[0]
-                first_label = _target_label(0, len(adapter.targets), first_name)
-                with _stage_logger(
-                    adapter.model,
-                    f"{first_label} | plan weights",
-                    first_device,
-                ):
-                    first_plan = adapter.weight_session.plan(
-                        adapter.target_subgraphs[0]
-                    )
-                _reset_peak_memory(first_device)
-                prefetcher.submit(
-                    first_plan,
-                    device=first_device,
-                    dtype=target_dtype,
-                    label=f"{first_label} | load weights",
-                )
+            prefetch_pending = False
             for target_index, (target_name, subgraph) in enumerate(
                 zip(adapter.targets, adapter.target_subgraphs)
             ):
-                target_device = execution_devices[
-                    target_index % len(execution_devices)
-                ]
                 transaction_id = f"subgraph-{target_index:05d}"
                 if (
                     transaction_writer is not None
@@ -691,11 +646,10 @@ def run_subgraph_streaming_pipeline(
                 target_label = _target_label(
                     target_index, target_count, target_name
                 )
-                if prefetcher is None:
-                    _reset_peak_memory(target_device)
+                _reset_peak_memory(device)
                 streaming_logger.info(
                     f"{target_label} | start | "
-                    f"batches={len(batches)} | device={target_device}"
+                    f"batches={len(batches)} | device={device}"
                 )
                 target_started_at = perf_counter()
                 # A previous attempt can fail after publishing only part of the
@@ -705,62 +659,74 @@ def run_subgraph_streaming_pipeline(
                     boundaries.delete(target_index + 1)
                 weight_stack = ExitStack()
                 try:
-                    if prefetcher is None:
+                    if not prefetch_pending:
                         with _stage_logger(
                             adapter.model,
-                            f"{target_label} | load weights",
-                            target_device,
+                            f"{target_label} | plan weights",
+                            device,
                         ):
-                            loaded = weight_stack.enter_context(
-                                adapter.weight_session.loaded(
-                                    subgraph,
-                                    device=target_device,
-                                    dtype=target_dtype,
-                                )
+                            plan = adapter.weight_session.plan(subgraph)
+                            required = adapter.weight_session.estimate_preparation(
+                                plan, dtype=target_dtype
+                            )
+                            reservation = host_budget.reserve(
+                                f"{target_label} weights", required
+                            )
+                        with _stage_logger(
+                            adapter.model,
+                            f"{target_label} | prepare weights",
+                            device,
+                        ):
+                            prepared = adapter.weight_session.prepare(
+                                plan,
+                                dtype=target_dtype,
+                                reservation=reservation,
                             )
                     else:
                         prepared = prefetcher.take()
-                        next_index = target_index + 1
-                        if next_index < target_count:
-                            next_name = adapter.targets[next_index]
-                            next_label = _target_label(
-                                next_index, target_count, next_name
-                            )
-                            next_device = execution_devices[
-                                next_index % len(execution_devices)
-                            ]
-                            with _stage_logger(
-                                adapter.model,
-                                f"{next_label} | plan weights",
-                                next_device,
-                            ):
-                                next_plan = adapter.weight_session.plan(
-                                    adapter.target_subgraphs[next_index]
-                                )
-                        else:
-                            next_plan = None
+                        prefetch_pending = False
+                    with _stage_logger(
+                        adapter.model,
+                        f"{target_label} | load weights",
+                        device,
+                    ):
+                        prepared.move_to(device)
                         loaded = weight_stack.enter_context(
                             adapter.weight_session.installed(prepared)
                         )
-                        if next_plan is not None:
-                            _reset_peak_memory(next_device)
-                            prefetcher.submit(
-                                next_plan,
-                                device=next_device,
-                                dtype=target_dtype,
-                                label=f"{next_label} | load weights",
-                            )
-                    deferred_modules = loaded.deferred_module_names
-                    if deferred_modules and transaction_writer is None:
-                        raise ValueError(
-                            "Deferred streaming modules require "
-                            "checkpoint_progress=True so their quantized tensors "
-                            "can be written incrementally"
+
+                    next_index = target_index + 1
+                    if prefetcher is not None and next_index < target_count:
+                        next_name = adapter.targets[next_index]
+                        next_label = _target_label(
+                            next_index, target_count, next_name
                         )
-                    if deferred_modules:
-                        _validate_deferred_recipe(recipe)
-                    resident_modules = _resident_subgraph_modules(
-                        subgraph, adapter.model, deferred_modules
+                        with _stage_logger(
+                            adapter.model,
+                            f"{next_label} | plan weights",
+                            device,
+                        ):
+                            next_plan = adapter.weight_session.plan(
+                                adapter.target_subgraphs[next_index]
+                            )
+                            next_required = (
+                                adapter.weight_session.estimate_preparation(
+                                    next_plan, dtype=target_dtype
+                                )
+                            )
+                            next_reservation = host_budget.reserve(
+                                f"{next_label} weights", next_required
+                            )
+                        prefetcher.submit(
+                            next_plan,
+                            dtype=target_dtype,
+                            reservation=next_reservation,
+                            label=f"{next_label} | prepare weights",
+                        )
+                        prefetch_pending = True
+
+                    resident_modules = tuple(
+                        subgraph.submodules(adapter.model)
                     )
                     # Match the ordinary sequential calibration pipeline: model
                     # execution is inference-only. Besides avoiding autograd
@@ -769,7 +735,7 @@ def run_subgraph_streaming_pipeline(
                     with _stage_logger(
                         adapter.model,
                         f"{target_label} | calibration",
-                        target_device,
+                        device,
                     ):
                         with DisableQuantization(adapter.model), torch.no_grad():
                             for batch_index in batches:
@@ -777,7 +743,7 @@ def run_subgraph_streaming_pipeline(
                                 value = boundaries.get(
                                     target_index,
                                     batch_index,
-                                    device=target_device,
+                                    device=device,
                                 )
                                 inputs = {
                                     name: value[name]
@@ -788,13 +754,13 @@ def run_subgraph_streaming_pipeline(
                     with _stage_logger(
                         adapter.model,
                         f"{target_label} | modifier update",
-                        target_device,
+                        device,
                     ):
                         _modifier_update(resident_modules)
                     with _stage_logger(
                         adapter.model,
                         f"{target_label} | activation propagation",
-                        target_device,
+                        device,
                     ):
                         # Match SequentialPipeline: propagation captures the
                         # modified full-precision output (or an algorithm's
@@ -809,7 +775,7 @@ def run_subgraph_streaming_pipeline(
                                 value = boundaries.get(
                                     target_index,
                                     batch_index,
-                                    device=target_device,
+                                    device=device,
                                 )
                                 inputs = {
                                     name: value[name]
@@ -824,7 +790,8 @@ def run_subgraph_streaming_pipeline(
                                         ]
                                     ].consumed_names:
                                         next_value.pop(consumed, None)
-                                    boundaries.put(
+                                    boundaries.commit_propagated_batch(
+                                        target_index,
                                         target_index + 1,
                                         batch_index,
                                         next_value,
@@ -835,13 +802,13 @@ def run_subgraph_streaming_pipeline(
                     with _stage_logger(
                         adapter.model,
                         f"{target_label} | compress weights",
-                        target_device,
+                        device,
                     ):
                         _compress_modules(resident_modules)
                     with _stage_logger(
                         adapter.model,
                         f"{target_label} | queue checkpoint",
-                        target_device,
+                        device,
                     ):
                         if transaction_writer is not None:
                             with transaction_writer.transaction(
@@ -863,18 +830,6 @@ def run_subgraph_streaming_pipeline(
                                         target_name,
                                         source,
                                         pack_to_int8=pack_to_int8,
-                                        exclude_modules=deferred_modules,
-                                    )
-                                )
-                                written.update(
-                                    _write_deferred_modules(
-                                        transaction=transaction,
-                                        loaded=loaded,
-                                        adapter=adapter,
-                                        source=source,
-                                        device=target_device,
-                                        target_dtype=target_dtype,
-                                        pack_to_int8=pack_to_int8,
                                     )
                                 )
                                 transaction.commit()
@@ -886,17 +841,18 @@ def run_subgraph_streaming_pipeline(
                                     target_name,
                                     transaction_id,
                                     pack_to_int8=pack_to_int8,
+                                    host_budget=host_budget,
                                 )
                             )
                 finally:
                     with _stage_logger(
                         adapter.model,
                         f"{target_label} | unload weights",
-                        target_device,
+                        device,
                     ):
                         weight_stack.close()
                         boundaries.delete(target_index)
-                        _empty_device_cache(target_device)
+                        _empty_device_cache(device)
                 streaming_logger.info(
                     f"{target_label} | complete | "
                     f"time={perf_counter() - target_started_at:.2f}s"
@@ -966,6 +922,7 @@ def run_subgraph_streaming_pipeline(
                     target_dtype=target_dtype,
                     written=written,
                     omitted=omitted,
+                    host_budget=host_budget,
                 )
             else:
                 _copy_remaining_tensors(

@@ -21,7 +21,7 @@ from .artifacts import (
     fingerprint_checkpoint,
     fingerprint_json,
 )
-from .loading import TargetWeightLoader, build_meta_model
+from .loading import SubgraphWeightSession, build_meta_model
 from .materialization import CastWeightMaterializer, WeightMaterializer
 from .statistics import (
     GPTQStatisticsCollector,
@@ -180,7 +180,7 @@ def collect_calibration_statistics(
 
     kwargs = dict(model_kwargs or {})
     model = execution_model or build_meta_model(model_factory, *model_args, **kwargs)
-    loader = TargetWeightLoader(model, source, materializer)
+    weight_session = SubgraphWeightSession(model, source, materializer)
     boundaries = boundary_store or DiskBoundaryActivationStore(
         store.root / "boundaries"
     )
@@ -212,7 +212,10 @@ def collect_calibration_statistics(
                 f"Missing calibration boundary {index}; cannot resume target "
                 f"{target_name!r}"
             )
-        with loader.loaded(target_name, device=device, dtype=target_dtype) as target:
+        with weight_session.loaded_modules(
+            (target_name,), device=device, dtype=target_dtype
+        ) as loaded:
+            target = loaded.modules[0]
             target._streaming_target_name = target_name
             modules = dict(make_modules(target, target_name))
             if not modules:

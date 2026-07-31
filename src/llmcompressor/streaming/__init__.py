@@ -31,6 +31,9 @@ from .checkpoint import (
 from .collect import collect_calibration_statistics
 from .finalize import finalize_streaming_checkpoint
 from .loading import (
+    HostMemoryBudget,
+    HostMemoryError,
+    HostMemoryReservation,
     LoadedSubgraph,
     SubgraphWeightSession,
     TargetWeightLoader,
@@ -68,6 +71,9 @@ __all__ = [
     "KimiK3WeightMaterializer",
     "KimiK3WeightSource",
     "GPTQStatisticsCollector",
+    "HostMemoryBudget",
+    "HostMemoryError",
+    "HostMemoryReservation",
     "IMatrixStatisticsCollector",
     "InMemoryBoundaryActivationStore",
     "MaterializerInfo",

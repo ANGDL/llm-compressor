@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Callable, Iterator, TypeVar
+from typing import Callable, TypeVar
 
 import torch
 from accelerate import init_empty_weights
@@ -17,7 +18,7 @@ from llmcompressor.streaming.materialization import (
     materialize_weights,
 )
 
-from .._logging import streaming_logger
+from .host_memory import HostMemoryBudget
 
 _ModelT = TypeVar("_ModelT", bound=nn.Module)
 
@@ -84,7 +85,6 @@ class TargetLoadPlan:
     runtime_buffer_groups: list[tuple[torch.Tensor, list[str]]]
     parameter_sources: dict[int, str]
     buffer_sources: dict[int, str]
-    deferred_modules: tuple[str, ...]
     allow_missing_state: bool
 
 
@@ -98,30 +98,17 @@ class PreparedTargetWeights:
     parameter_values: dict[str, torch.Tensor]
     buffer_values: dict[str, torch.Tensor]
 
+    @property
+    def nbytes(self) -> int:
+        return sum(
+            value.numel() * value.element_size()
+            for values in (self.parameter_values, self.buffer_values)
+            for value in values.values()
+        )
+
     def close(self) -> None:
         self.parameter_values.clear()
         self.buffer_values.clear()
-
-
-@dataclass
-class _DeferredCacheEntry:
-    dtype: torch.dtype
-    parameter_values: dict[str, torch.Tensor]
-    buffer_values: dict[str, torch.Tensor]
-
-
-@dataclass
-class _DeferredWeightCache:
-    module_names: frozenset[str]
-    device: torch.device
-    entries: dict[str, _DeferredCacheEntry]
-    misses: int = 0
-
-    def close(self) -> None:
-        for entry in self.entries.values():
-            entry.parameter_values.clear()
-            entry.buffer_values.clear()
-        self.entries.clear()
 
 
 class TargetWeightLoader:
@@ -138,7 +125,6 @@ class TargetWeightLoader:
         self.materializer = materializer or CastWeightMaterializer()
         self._source_names = frozenset(source.tensor_names())
         self._active_targets: set[str] = set()
-        self._deferred_cache_stack: list[_DeferredWeightCache] = []
 
     @contextmanager
     def loaded(
@@ -148,93 +134,31 @@ class TargetWeightLoader:
         device: torch.device,
         dtype: torch.dtype = torch.bfloat16,
         allow_missing_state: bool = False,
-    ) -> Iterator[nn.Module]:
-        """Yield a real target, then release all of its storage on any exit."""
+    ) -> Generator[nn.Module, None, None]:
+        """Yield a CPU-resident target, then release its storage on any exit."""
+
+        resolved_device = torch.device(device)
+        if resolved_device.type != "cpu":
+            raise ValueError(
+                "TargetWeightLoader.loaded() is CPU-only; move streaming weights "
+                "with PreparedSubgraphWeights.move_to()"
+            )
 
         plan = self.plan(
             target_name, allow_missing_state=allow_missing_state
         )
-        prepared = self.materialize(plan, device=device, dtype=dtype)
-        with self.installed(prepared) as target:
-            yield target
-
-    @contextmanager
-    def loaded_deferred(
-        self,
-        target_name: str,
-        *,
-        device: torch.device,
-        dtype: torch.dtype = torch.bfloat16,
-        allow_missing_state: bool = False,
-    ) -> Iterator[nn.Module]:
-        """Load a deferred target through its active parent offload cache."""
-
-        cache = next(
-            (
-                candidate
-                for candidate in reversed(self._deferred_cache_stack)
-                if target_name in candidate.module_names
-            ),
-            None,
+        prepared_bytes, workspace_bytes = self.estimate_preparation(
+            plan, dtype=dtype
         )
-        if cache is None:
-            with self.loaded(
-                target_name,
-                device=device,
-                dtype=dtype,
-                allow_missing_state=allow_missing_state,
-            ) as target:
+        with HostMemoryBudget().reserve(
+            f"target {target_name!r}", prepared_bytes + workspace_bytes
+        ) as reservation:
+            prepared = self.materialize_cpu(
+                plan, dtype=dtype, reservation=reservation
+            )
+            reservation.release_reserved(reservation.reserved_bytes)
+            with self.installed(prepared) as target:
                 yield target
-            return
-
-        plan = self.plan(
-            target_name, allow_missing_state=allow_missing_state
-        )
-        entry = cache.entries.get(target_name)
-        if entry is None:
-            prepared = self.materialize(plan, device=device, dtype=dtype)
-            entry = _DeferredCacheEntry(
-                dtype=dtype,
-                parameter_values={
-                    name: value.detach().to(device=cache.device, copy=True)
-                    for name, value in prepared.parameter_values.items()
-                },
-                buffer_values={
-                    name: value.detach().to(device=cache.device, copy=True)
-                    for name, value in prepared.buffer_values.items()
-                },
-            )
-            cache.entries[target_name] = entry
-            cache.misses += 1
-            total = len(cache.module_names)
-            if cache.misses == 1 or cache.misses % 64 == 0 or cache.misses == total:
-                streaming_logger.info(
-                    "deferred weights | cache fill | "
-                    f"progress={cache.misses}/{total} | module={target_name!r} | "
-                    f"offload_device={cache.device}"
-                )
-        else:
-            if entry.dtype != dtype:
-                raise ValueError(
-                    f"Deferred cache for {target_name!r} has dtype {entry.dtype}; "
-                    f"requested {dtype}"
-                )
-            prepared = PreparedTargetWeights(
-                plan=plan,
-                device=torch.device(device),
-                dtype=dtype,
-                parameter_values={
-                    name: value.to(device=device, copy=True)
-                    for name, value in entry.parameter_values.items()
-                },
-                buffer_values={
-                    name: value.to(device=device, copy=True)
-                    for name, value in entry.buffer_values.items()
-                },
-            )
-
-        with self.installed(prepared) as target:
-            yield target
 
     def plan(
         self,
@@ -270,16 +194,6 @@ class TargetWeightLoader:
             parameters=False,
             allow_missing=allow_missing_state,
         )
-        deferred_modules = self._deferred_modules(
-            target_name, parameter_sources
-        )
-        deferred_ids = {
-            identity
-            for identity, source_name in parameter_sources.items()
-            if self._is_deferred_source(source_name, deferred_modules)
-        }
-        for identity in deferred_ids:
-            del parameter_sources[identity]
         parameter_groups = [
             group
             for group in parameter_groups
@@ -298,74 +212,86 @@ class TargetWeightLoader:
             runtime_buffer_groups=runtime_buffer_groups,
             parameter_sources=parameter_sources,
             buffer_sources=buffer_sources,
-            deferred_modules=deferred_modules,
             allow_missing_state=allow_missing_state,
         )
 
-    def _deferred_modules(
-        self, target_name: str, sources: dict[int, str]
-    ) -> tuple[str, ...]:
-        modules = []
-        for source_name in sources.values():
-            metadata = self.source.metadata(source_name)
-            module_name = self.materializer.deferred_module(source_name, metadata)
-            if module_name is None or module_name == target_name:
-                continue
-            if not source_name.startswith(f"{module_name}."):
-                raise ValueError(
-                    f"Deferred module {module_name!r} does not own checkpoint "
-                    f"tensor {source_name!r}"
-                )
-            if target_name and not module_name.startswith(f"{target_name}."):
-                raise ValueError(
-                    f"Deferred module {module_name!r} does not belong to target "
-                    f"{target_name!r}"
-                )
-            modules.append(module_name)
-        return tuple(dict.fromkeys(modules))
+    def estimate_preparation(
+        self, plan: TargetLoadPlan, *, dtype: torch.dtype
+    ) -> tuple[int, int]:
+        """Return prepared bytes and reusable peak materialization workspace."""
+
+        prepared_bytes = 0
+        workspace_bytes = 0
+        for groups, sources in (
+            (plan.parameter_groups, plan.parameter_sources),
+            (plan.buffer_groups, plan.buffer_sources),
+        ):
+            for tensor, _aliases in groups:
+                source_name = sources[id(tensor)]
+                metadata = self.source.metadata(source_name)
+                output_dtype = dtype if tensor.dtype.is_floating_point else tensor.dtype
+                output_elements = 1
+                for dimension in self.materializer.logical_shape(
+                    source_name, metadata
+                ):
+                    output_elements *= dimension
+                prepared_bytes += output_elements * output_dtype.itemsize
+                if tensor.dtype.is_floating_point:
+                    raw_names = (
+                        source_name,
+                        *self.materializer.dependencies(source_name, metadata),
+                    )
+                    raw_bytes = sum(
+                        self._metadata_nbytes(self.source.metadata(name))
+                        for name in dict.fromkeys(raw_names)
+                    )
+                    workspace_bytes = max(
+                        workspace_bytes,
+                        raw_bytes
+                        + self.materializer.estimate_workspace_bytes(
+                            source_name, metadata, dtype
+                        ),
+                    )
+        return prepared_bytes, workspace_bytes
 
     @staticmethod
-    def _is_deferred_source(
-        source_name: str, deferred_modules: tuple[str, ...]
-    ) -> bool:
-        return any(
-            source_name == module_name
-            or source_name.startswith(f"{module_name}.")
-            for module_name in deferred_modules
-        )
+    def _metadata_nbytes(metadata) -> int:
+        elements = 1
+        for dimension in metadata.shape:
+            elements *= dimension
+        return elements * metadata.dtype.itemsize
 
-    def materialize(
+    def materialize_cpu(
         self,
         plan: TargetLoadPlan,
         *,
-        device: torch.device | str,
         dtype: torch.dtype = torch.bfloat16,
+        reservation=None,
     ) -> PreparedTargetWeights:
-        """Read and decode a plan without mutating the shared model."""
+        """Read and decode a plan on CPU without mutating the shared model."""
 
         if not dtype.is_floating_point:
             raise TypeError(f"Target computation dtype must be floating, got {dtype}")
 
-        device = torch.device(device)
         parameter_values = self._load_parameters(
             plan.parameter_sources,
             plan.parameter_groups,
             dtype=dtype,
-            device=device,
+            reservation=reservation,
         )
         try:
             buffer_values = self._load_buffers(
                 plan.buffer_sources,
                 plan.buffer_groups,
                 dtype=dtype,
-                device=device,
+                reservation=reservation,
             )
         except Exception:
             parameter_values.clear()
             raise
         return PreparedTargetWeights(
             plan=plan,
-            device=device,
+            device=torch.device("cpu"),
             dtype=dtype,
             parameter_values=parameter_values,
             buffer_values=buffer_values,
@@ -374,7 +300,7 @@ class TargetWeightLoader:
     @contextmanager
     def installed(
         self, prepared: PreparedTargetWeights
-    ) -> Iterator[nn.Module]:
+    ) -> Generator[nn.Module, None, None]:
         """Install prepared values on the main thread and restore meta state."""
 
         plan = prepared.plan
@@ -393,28 +319,19 @@ class TargetWeightLoader:
         installed_parameters = []
         installed_buffers = []
         runtime_buffers = []
-        deferred_forwards = []
-        deferred_cache = None
         try:
-            cache_device = self.materializer.deferred_cache_device()
-            if plan.deferred_modules and cache_device is not None:
-                deferred_cache = _DeferredWeightCache(
-                    module_names=frozenset(plan.deferred_modules),
-                    device=torch.device(cache_device),
-                    entries={},
-                )
-                self._deferred_cache_stack.append(deferred_cache)
-                streaming_logger.info(
-                    "deferred weights | cache ready | "
-                    f"modules={len(plan.deferred_modules)} | "
-                    f"offload_device={deferred_cache.device}"
-                )
             if plan.allow_missing_state:
+                loaded_parameter_names = {
+                    alias
+                    for parameter, aliases in plan.parameter_groups
+                    if id(parameter) in plan.parameter_sources
+                    for alias in aliases
+                }
                 auxiliary_parameters = self._materialize_missing_parameters(
                     target,
                     device=prepared.device,
                     dtype=prepared.dtype,
-                    exclude_modules=self._relative_deferred_modules(plan),
+                    exclude_parameters=frozenset(loaded_parameter_names),
                 )
             installed_parameters = self._install_parameters(
                 target,
@@ -438,19 +355,8 @@ class TargetWeightLoader:
                 tensor.is_meta for tensor, _ in plan.runtime_buffer_groups
             ):
                 reinitialize()
-            deferred_forwards = self._install_deferred_forwards(
-                plan.deferred_modules,
-                device=prepared.device,
-                dtype=prepared.dtype,
-            )
             yield target
         finally:
-            self._restore_deferred_forwards(deferred_forwards)
-            if deferred_cache is not None:
-                active_cache = self._deferred_cache_stack.pop()
-                if active_cache is not deferred_cache:
-                    raise RuntimeError("Deferred weight cache stack is corrupted")
-                deferred_cache.close()
             self._restore_meta_parameters(target, installed_parameters)
             self._restore_meta_buffers(target, installed_buffers)
             self._restore_runtime_buffers(target, runtime_buffers)
@@ -483,16 +389,13 @@ class TargetWeightLoader:
         *,
         device: torch.device,
         dtype: torch.dtype,
-        exclude_modules: tuple[str, ...] = (),
+        exclude_parameters: frozenset[str] = frozenset(),
     ) -> list[tuple[str, nn.Parameter]]:
         installed = []
         for name, parameter in target.named_parameters(
             recurse=True, remove_duplicate=False
         ):
-            if any(
-                name == module_name or name.startswith(f"{module_name}.")
-                for module_name in exclude_modules
-            ):
+            if name in exclude_parameters:
                 continue
             if not parameter.is_meta:
                 continue
@@ -506,61 +409,6 @@ class TargetWeightLoader:
             )
             installed.append((name, parameter))
         return installed
-
-    @staticmethod
-    def _relative_deferred_modules(plan: TargetLoadPlan) -> tuple[str, ...]:
-        prefix = f"{plan.name}." if plan.name else ""
-        return tuple(
-            name.removeprefix(prefix) for name in plan.deferred_modules
-        )
-
-    def _install_deferred_forwards(
-        self,
-        module_names: tuple[str, ...],
-        *,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> list[tuple[nn.Module, bool, object]]:
-        # This is the checkpoint-backed equivalent of compressed-tensors'
-        # OffloadCache forward wrapper used by ordinary oneshot.
-        installed = []
-        try:
-            for module_name in module_names:
-                module = self.model.get_submodule(module_name)
-                had_instance_forward = "forward" in module.__dict__
-                previous = module.__dict__.get("forward")
-                original_forward = module.forward
-
-                def deferred_forward(
-                    *args,
-                    _module_name=module_name,
-                    _original_forward=original_forward,
-                    **kwargs,
-                ):
-                    with self.loaded_deferred(
-                        _module_name,
-                        device=device,
-                        dtype=dtype,
-                        allow_missing_state=True,
-                    ):
-                        return _original_forward(*args, **kwargs)
-
-                module.forward = deferred_forward
-                installed.append((module, had_instance_forward, previous))
-        except Exception:
-            self._restore_deferred_forwards(installed)
-            raise
-        return installed
-
-    @staticmethod
-    def _restore_deferred_forwards(
-        installed: list[tuple[nn.Module, bool, object]],
-    ) -> None:
-        for module, had_instance_forward, previous in reversed(installed):
-            if had_instance_forward:
-                module.forward = previous
-            else:
-                del module.forward
 
     @staticmethod
     def _restore_auxiliary_parameters(
@@ -730,7 +578,7 @@ class TargetWeightLoader:
         groups: list[tuple[torch.Tensor, list[str]]],
         *,
         dtype: torch.dtype,
-        device: torch.device,
+        reservation=None,
     ) -> dict[str, torch.Tensor]:
         floating = []
         non_floating = []
@@ -745,9 +593,17 @@ class TargetWeightLoader:
             floating,
             self.materializer,
             target_dtype=dtype,
-            device=device,
+            reservation=reservation,
         )
-        values.update(self.source.load_tensors(non_floating, device=device))
+        raw_values = self.source.load_tensors_cpu(non_floating)
+        if reservation is not None:
+            reservation.commit(
+                sum(
+                    value.numel() * value.element_size()
+                    for value in raw_values.values()
+                )
+            )
+        values.update(raw_values)
         for tensor, _ in groups:
             source_name = sources[id(tensor)]
             value = values[source_name]
@@ -765,7 +621,7 @@ class TargetWeightLoader:
         groups: list[tuple[torch.Tensor, list[str]]],
         *,
         dtype: torch.dtype,
-        device: torch.device,
+        reservation=None,
     ) -> dict[str, torch.Tensor]:
         floating = []
         non_floating = []
@@ -780,9 +636,17 @@ class TargetWeightLoader:
             floating,
             self.materializer,
             target_dtype=dtype,
-            device=device,
+            reservation=reservation,
         )
-        values.update(self.source.load_tensors(non_floating, device=device))
+        raw_values = self.source.load_tensors_cpu(non_floating)
+        if reservation is not None:
+            reservation.commit(
+                sum(
+                    value.numel() * value.element_size()
+                    for value in raw_values.values()
+                )
+            )
+        values.update(raw_values)
         for tensor, _ in groups:
             source_name = sources[id(tensor)]
             expected_dtype = dtype if tensor.dtype.is_floating_point else tensor.dtype

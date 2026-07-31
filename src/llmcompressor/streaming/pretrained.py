@@ -179,7 +179,6 @@ def streaming_oneshot_from_pretrained(
     validate_config: bool,
     checkpoint_progress: bool,
     overwrite_output: bool,
-    pipeline_devices: Sequence[torch.device | str] | None,
     async_save: bool,
     pack_to_int8: bool,
 ) -> Path:
@@ -342,7 +341,6 @@ def streaming_oneshot_from_pretrained(
             max_seq_length=max_seq_length,
             seed=seed,
             checkpoint_progress=checkpoint_progress,
-            pipeline_devices=pipeline_devices,
             async_save=async_save,
             pack_to_int8=pack_to_int8,
         )
