@@ -15,7 +15,7 @@ from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from safetensors import safe_open
@@ -24,6 +24,9 @@ from safetensors.torch import save_file
 from llmcompressor.streaming.artifacts import ArtifactCompatibilityError
 
 from .._logging import streaming_logger
+
+if TYPE_CHECKING:
+    from llmcompressor.streaming.loading.host_memory import HostMemoryReservation
 
 __all__ = [
     "AsyncDirectSafetensorsWriter",
@@ -644,20 +647,31 @@ class AsyncDirectSafetensorsWriter(AbstractContextManager):
         values: Mapping[str, torch.Tensor],
         quantized_modules: Mapping[str, str],
         omitted_tied_weights: Mapping[str, str],
+        reservation: HostMemoryReservation | None,
     ) -> Path:
-        started_at = perf_counter()
-        streaming_logger.info(f"save | shard={shard_id} | started")
-        output = self.writer.write_shard(
-            shard_id,
-            values,
-            quantized_modules=quantized_modules,
-            omitted_tied_weights=omitted_tied_weights,
+        try:
+            started_at = perf_counter()
+            streaming_logger.info(f"save | shard={shard_id} | started")
+            output = self.writer.write_shard(
+                shard_id,
+                values,
+                quantized_modules=quantized_modules,
+                omitted_tied_weights=omitted_tied_weights,
+            )
+            streaming_logger.info(
+                f"save | shard={shard_id} | complete | "
+                f"time={perf_counter() - started_at:.2f}s"
+            )
+            return output
+        finally:
+            if reservation is not None:
+                reservation.close()
+
+    @staticmethod
+    def estimate_snapshot_bytes(tensors: Mapping[str, torch.Tensor]) -> int:
+        return sum(
+            tensor.numel() * tensor.element_size() for tensor in tensors.values()
         )
-        streaming_logger.info(
-            f"save | shard={shard_id} | complete | "
-            f"time={perf_counter() - started_at:.2f}s"
-        )
-        return output
 
     def write_shard(
         self,
@@ -667,6 +681,7 @@ class AsyncDirectSafetensorsWriter(AbstractContextManager):
         quantized_modules: Mapping[str, str] | None = None,
         omitted_tied_weights: Mapping[str, str] | None = None,
         owned_cpu_tensors: Collection[str] = (),
+        reservation: HostMemoryReservation | None = None,
     ) -> Path:
         """Snapshot a shard on CPU and enqueue its durable write.
 
@@ -675,22 +690,42 @@ class AsyncDirectSafetensorsWriter(AbstractContextManager):
         this method returns.
         """
 
-        self.poll()
-        while len(self._pending) >= self.max_pending:
-            self._wait_oldest()
-        values = _cpu_snapshot(
-            tensors,
-            clone_cpu=True,
-            owned_cpu_tensors=owned_cpu_tensors,
-        )
+        try:
+            self.poll()
+            while len(self._pending) >= self.max_pending:
+                self._wait_oldest()
+        except Exception:
+            if reservation is not None:
+                reservation.close()
+            raise
+        try:
+            values = _cpu_snapshot(
+                tensors,
+                clone_cpu=True,
+                owned_cpu_tensors=owned_cpu_tensors,
+            )
+            if reservation is not None:
+                reservation.commit(self.estimate_snapshot_bytes(values))
+                reservation.release_reserved(reservation.reserved_bytes)
+        except Exception:
+            if reservation is not None:
+                reservation.close()
+            raise
         output = self.writer.shards_dir / f"model-{shard_id}.safetensors"
-        future = self._executor.submit(
-            self._write,
-            shard_id,
-            values,
-            dict(quantized_modules or {}),
-            dict(omitted_tied_weights or {}),
-        )
+        try:
+            future = self._executor.submit(
+                self._write,
+                shard_id,
+                values,
+                dict(quantized_modules or {}),
+                dict(omitted_tied_weights or {}),
+                reservation,
+            )
+        except Exception:
+            values.clear()
+            if reservation is not None:
+                reservation.close()
+            raise
         self._pending.append((shard_id, future))
         streaming_logger.info(f"save | shard={shard_id} | queued")
         return output

@@ -60,25 +60,25 @@ class KdaModel(nn.Module):
         self.layer.self_attn.A_log = nn.Parameter(torch.empty(num_heads))
 
 
-class DeferredLinear(nn.Linear):
+class ResidentLinear(nn.Linear):
     def forward(self, inputs):
         assert not self.weight.is_meta
         return super().forward(inputs)
 
 
-class DeferredExpert(nn.Module):
+class ResidentExpert(nn.Module):
     def __init__(self):
         super().__init__()
-        self.w1 = DeferredLinear(4, 4, bias=False)
-        self.w2 = DeferredLinear(4, 4, bias=False)
-        self.w3 = DeferredLinear(4, 4, bias=False)
+        self.w1 = ResidentLinear(4, 4, bias=False)
+        self.w2 = ResidentLinear(4, 4, bias=False)
+        self.w3 = ResidentLinear(4, 4, bias=False)
 
     def forward(self, inputs):
         return self.w2(self.w1(inputs) + self.w3(inputs))
 
 
-class DeferredExpertModel(nn.Module):
-    def __init__(self):
+class ResidentExpertModel(nn.Module):
+    def __init__(self, expert_count: int = 2):
         super().__init__()
         self.language_model = nn.Module()
         self.language_model.model = nn.Module()
@@ -86,7 +86,7 @@ class DeferredExpertModel(nn.Module):
         layer.gate = nn.Linear(4, 4, bias=False)
         layer.block_sparse_moe = nn.Module()
         layer.block_sparse_moe.experts = nn.ModuleList(
-            [DeferredExpert(), DeferredExpert()]
+            [ResidentExpert() for _ in range(expert_count)]
         )
         self.language_model.model.layers = nn.ModuleList([layer])
 
@@ -189,6 +189,18 @@ def test_loads_one_target_for_forward_then_restores_meta(tiny_checkpoint):
     assert next(model.layers[0].parameters()).dtype == torch.float32
 
 
+def test_target_loader_rejects_accelerator_transfer(tiny_checkpoint):
+    _, path = tiny_checkpoint
+    model = build_meta_model(TinyModel)
+    loader = TargetWeightLoader(model, SafetensorsWeightSource(path))
+
+    with pytest.raises(ValueError, match="PreparedSubgraphWeights.move_to"):
+        with loader.loaded("layers.0", device=torch.device("cuda")):
+            pass
+
+    _assert_all_meta(model)
+
+
 def test_prepare_does_not_mutate_model_before_install(tiny_checkpoint):
     reference, path = tiny_checkpoint
     model = build_meta_model(TinyModel)
@@ -196,7 +208,7 @@ def test_prepare_does_not_mutate_model_before_install(tiny_checkpoint):
     original = model.layers[0].proj.weight
 
     plan = loader.plan("layers.0")
-    prepared = loader.materialize(plan, device="cpu", dtype=torch.float32)
+    prepared = loader.materialize_cpu(plan, dtype=torch.float32)
 
     assert model.layers[0].proj.weight is original
     _assert_all_meta(model)
@@ -268,8 +280,8 @@ def test_install_rejects_stale_prepared_plan(tiny_checkpoint):
     _, path = tiny_checkpoint
     model = build_meta_model(TinyModel)
     loader = TargetWeightLoader(model, SafetensorsWeightSource(path))
-    prepared = loader.materialize(
-        loader.plan("layers.0"), device="cpu", dtype=torch.float32
+    prepared = loader.materialize_cpu(
+        loader.plan("layers.0"), dtype=torch.float32
     )
     model.layers[0].proj.weight = nn.Parameter(
         torch.empty_like(model.layers[0].proj.weight, device="meta")
@@ -351,14 +363,14 @@ def test_tied_parameters_load_once_and_remain_tied(tmp_path, monkeypatch):
     model = build_meta_model(TiedTarget)
     source = SafetensorsWeightSource(path)
     loaded_names = []
-    original_iter = source.iter_tensor_groups
+    original_iter = source.iter_tensor_groups_cpu
 
-    def recording_iter(groups, *, device):
+    def recording_iter(groups):
         groups = tuple(tuple(group) for group in groups)
         loaded_names.extend(name for group in groups for name in group)
-        return original_iter(groups, device=device)
+        return original_iter(groups)
 
-    monkeypatch.setattr(source, "iter_tensor_groups", recording_iter)
+    monkeypatch.setattr(source, "iter_tensor_groups_cpu", recording_iter)
     loader = TargetWeightLoader(model, source)
 
     with loader.loaded("", device=torch.device("cpu"), dtype=torch.float32):
@@ -436,7 +448,7 @@ def test_kimi_k3_kda_a_log_uses_configured_head_count(tmp_path):
     _assert_all_meta(model)
 
 
-def test_kimi_k3_routed_experts_load_only_when_invoked(tmp_path, monkeypatch):
+def test_kimi_k3_routed_experts_reside_with_complete_parent(tmp_path):
     path = tmp_path / "model.safetensors"
     prefix = "language_model.model.layers.0"
     values = {f"{prefix}.gate.weight": torch.eye(4)}
@@ -453,44 +465,96 @@ def test_kimi_k3_routed_experts_load_only_when_invoked(tmp_path, monkeypatch):
                 (4, 1), 127, dtype=torch.uint8
             )
     save_file(values, path)
-    source = KimiK3WeightSource(path)
-    loaded_names = []
-    original_iter = source.iter_tensor_groups
+    model = build_meta_model(ResidentExpertModel)
+    loader = TargetWeightLoader(
+        model,
+        KimiK3WeightSource(path),
+        materializer=KimiK3WeightMaterializer(fp4_block_size=4),
+    )
 
-    def recording_iter(groups, *, device):
-        groups = tuple(tuple(group) for group in groups)
-        loaded_names.extend(name for group in groups for name in group)
-        return original_iter(groups, device=device)
+    with loader.loaded(
+        prefix,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        allow_missing_state=True,
+    ):
+        layer = model.language_model.model.layers[0]
+        assert all(
+            not parameter.is_meta
+            for parameter in layer.block_sparse_moe.experts.parameters()
+        )
 
-    monkeypatch.setattr(source, "iter_tensor_groups", recording_iter)
-    model = build_meta_model(DeferredExpertModel)
-    materializer = KimiK3WeightMaterializer(fp4_block_size=4)
-    loader = TargetWeightLoader(model, source, materializer=materializer)
-    expert_prefix = f"{prefix}.block_sparse_moe.experts"
+    _assert_all_meta(model)
+
+
+def test_kimi_k3_plan_includes_all_896_routed_experts(tmp_path):
+    path = tmp_path / "model.safetensors"
+    prefix = "language_model.model.layers.0"
+    values = {f"{prefix}.gate.weight": torch.eye(4)}
+    for expert_index in range(896):
+        for projection in ("w1", "w2", "w3"):
+            name = (
+                f"{prefix}.block_sparse_moe.experts.{expert_index}."
+                f"{projection}"
+            )
+            values[f"{name}.weight_packed"] = torch.full(
+                (4, 2), 0x22, dtype=torch.uint8
+            )
+            values[f"{name}.weight_scale"] = torch.full(
+                (4, 1), 127, dtype=torch.uint8
+            )
+    save_file(values, path)
+    model = build_meta_model(ResidentExpertModel, expert_count=896)
+    loader = TargetWeightLoader(
+        model,
+        KimiK3WeightSource(path),
+        materializer=KimiK3WeightMaterializer(fp4_block_size=4),
+    )
+
     plan = loader.plan(prefix)
 
-    assert plan.deferred_modules == tuple(
-        f"{expert_prefix}.{expert_index}" for expert_index in range(2)
-    )
+    assert len(plan.parameter_sources) == 1 + 896 * 3
     with loader.loaded(prefix, device=torch.device("cpu"), dtype=torch.float32):
-        layer = model.language_model.model.layers[0]
-        assert not layer.gate.weight.is_meta
-        assert all(
-            parameter.is_meta
-            for parameter in layer.block_sparse_moe.experts.parameters()
-        )
-        layer.block_sparse_moe.experts[0](torch.ones(1, 4))
-        layer.block_sparse_moe.experts[0](torch.ones(1, 4))
-        assert all(
-            parameter.is_meta
-            for parameter in layer.block_sparse_moe.experts.parameters()
-        )
+        experts = model.language_model.model.layers[0].block_sparse_moe.experts
+        assert len(experts) == 896
+        assert all(not expert.w1.weight.is_meta for expert in experts)
 
-    assert any(f"{expert_prefix}.0" in name for name in loaded_names)
-    assert not any(f"{expert_prefix}.1" in name for name in loaded_names)
-    expert_loads = [name for name in loaded_names if name.startswith(expert_prefix)]
-    assert len(expert_loads) == 6
     _assert_all_meta(model)
+
+
+def test_missing_state_does_not_allocate_placeholders_for_loaded_parameters(
+    tmp_path, monkeypatch
+):
+    class PartialModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.loaded = nn.Linear(4, 3, bias=False)
+            self.missing = nn.Linear(4, 5, bias=False)
+
+    path = tmp_path / "model.safetensors"
+    save_file({"loaded.weight": torch.ones(3, 4)}, path)
+    model = build_meta_model(PartialModel)
+    loader = TargetWeightLoader(model, SafetensorsWeightSource(path))
+    original_zeros = torch.zeros
+    allocated_shapes = []
+
+    def recording_zeros(*args, **kwargs):
+        shape = args[0] if args else kwargs["size"]
+        allocated_shapes.append(tuple(shape))
+        return original_zeros(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "zeros", recording_zeros)
+
+    with loader.loaded(
+        "",
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        allow_missing_state=True,
+    ):
+        assert torch.equal(model.loaded.weight, torch.ones(3, 4))
+        assert torch.equal(model.missing.weight, original_zeros(5, 4))
+
+    assert allocated_shapes == [(5, 4)]
 
 
 def test_rejects_fused_checkpoint_tensor_with_clear_error(tmp_path):

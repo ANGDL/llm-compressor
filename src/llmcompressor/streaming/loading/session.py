@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Generator, Iterable, Iterator, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from typing import Any
@@ -14,13 +14,14 @@ from llmcompressor.pipelines.sequential.helpers import Subgraph
 from llmcompressor.streaming.checkpoint import CheckpointWeightSource
 from llmcompressor.streaming.materialization import WeightMaterializer
 
+from .host_memory import HostMemoryBudget, HostMemoryReservation
 from .target import (
     PreparedTargetWeights,
     TargetLoadPlan,
     TargetWeightLoader,
 )
 
-__all__ = ["LoadedSubgraph", "SubgraphWeightSession"]
+__all__ = ["LoadedSubgraph", "PreparedSubgraphWeights", "SubgraphWeightSession"]
 
 
 def _contains(parent: str, child: str) -> bool:
@@ -45,7 +46,6 @@ class LoadedSubgraph:
 
     model: nn.Module
     module_names: tuple[str, ...]
-    deferred_module_names: tuple[str, ...] = ()
 
     @property
     def modules(self) -> tuple[nn.Module, ...]:
@@ -116,11 +116,54 @@ class PreparedSubgraphWeights:
     model: nn.Module
     plan: SubgraphLoadPlan
     targets: list[PreparedTargetWeights]
+    reservation: HostMemoryReservation | None = None
+    _device: torch.device = torch.device("cpu")
+
+    @property
+    def device(self) -> torch.device:
+        return self._device
+
+    @property
+    def nbytes(self) -> int:
+        return sum(target.nbytes for target in self.targets)
+
+    def move_to(self, device: torch.device | str) -> PreparedSubgraphWeights:
+        """Move the complete aggregate, releasing CPU ownership incrementally."""
+
+        resolved = torch.device(device)
+        if resolved.type == "meta":
+            raise ValueError("Prepared weights cannot move to the meta device")
+        if self._device.type != "cpu":
+            raise RuntimeError(f"Prepared weights are already on {self._device}")
+        if resolved.type == "cpu":
+            return self
+
+        try:
+            for target in self.targets:
+                for values in (target.parameter_values, target.buffer_values):
+                    for name, value in tuple(values.items()):
+                        size = value.numel() * value.element_size()
+                        values[name] = value.to(device=resolved)
+                        del value
+                        if self.reservation is not None:
+                            self.reservation.release_committed(size)
+                target.device = resolved
+            self._device = resolved
+            if self.reservation is not None:
+                self.reservation.close()
+                self.reservation = None
+            return self
+        except Exception:
+            self.close()
+            raise
 
     def close(self) -> None:
         for target in self.targets:
             target.close()
         self.targets.clear()
+        if self.reservation is not None:
+            self.reservation.close()
+            self.reservation = None
 
 
 class SubgraphWeightSession:
@@ -209,39 +252,67 @@ class SubgraphWeightSession:
         dtype: torch.dtype = torch.bfloat16,
         include_modules: Sequence[str] = (),
         exclude_modules: Sequence[str] = (),
-    ) -> Iterator[LoadedSubgraph]:
+    ) -> Generator[LoadedSubgraph, None, None]:
         plan = self.plan(
             subgraph,
             include_modules=include_modules,
             exclude_modules=exclude_modules,
         )
-        prepared = self.prepare(plan, device=device, dtype=dtype)
-        with self.installed(prepared) as loaded:
+        with self.loaded_plan(plan, device=device, dtype=dtype) as loaded:
             yield loaded
 
     @contextmanager
-    def loaded_module(
+    def loaded_modules(
         self,
-        module_name: str,
+        module_names: Sequence[str],
         *,
         device: torch.device | str,
         dtype: torch.dtype = torch.bfloat16,
-    ) -> Iterator[nn.Module]:
-        """Load one deferred module and fully restore modifier mutations."""
+        allow_missing_state: bool = False,
+    ) -> Generator[LoadedSubgraph, None, None]:
+        """Load an explicit module aggregate through the streaming H2D boundary."""
 
-        registered_state = self._registered_state((module_name,))
-        runtime_attributes = self._runtime_tensor_attributes((module_name,))
-        try:
-            with self.loader.loaded_deferred(
-                module_name,
-                device=torch.device(device),
-                dtype=dtype,
-                allow_missing_state=True,
-            ) as module:
-                yield module
-        finally:
-            self._restore_registered_state(registered_state)
-            self._restore_runtime_tensor_attributes(runtime_attributes)
+        plan = self.plan_modules(
+            module_names, allow_missing_state=allow_missing_state
+        )
+        with self.loaded_plan(plan, device=device, dtype=dtype) as loaded:
+            yield loaded
+
+    @contextmanager
+    def loaded_plan(
+        self,
+        plan: SubgraphLoadPlan,
+        *,
+        device: torch.device | str,
+        dtype: torch.dtype = torch.bfloat16,
+    ) -> Generator[LoadedSubgraph, None, None]:
+        """Prepare, transfer, and install one complete subgraph aggregate."""
+
+        required = self.estimate_preparation(plan, dtype=dtype)
+        reservation = HostMemoryBudget().reserve(
+            f"subgraph {plan.module_names}", required
+        )
+        prepared = self.prepare(plan, dtype=dtype, reservation=reservation)
+        prepared.move_to(device)
+        with self.installed(prepared) as loaded:
+            yield loaded
+
+    def plan_modules(
+        self,
+        module_names: Sequence[str],
+        *,
+        allow_missing_state: bool = False,
+    ) -> SubgraphLoadPlan:
+        """Resolve an explicit ordered module aggregate without reading weights."""
+
+        roots = _minimal_roots(module_names)
+        return SubgraphLoadPlan(
+            module_names=roots,
+            targets=tuple(
+                self.loader.plan(name, allow_missing_state=allow_missing_state)
+                for name in roots
+            ),
+        )
 
     def plan(
         self,
@@ -257,41 +328,66 @@ class SubgraphWeightSession:
             include_modules=include_modules,
             exclude_modules=exclude_modules,
         )
-        return SubgraphLoadPlan(
-            module_names=module_names,
-            targets=tuple(
-                self.loader.plan(name, allow_missing_state=True)
-                for name in module_names
-            ),
+        return self.plan_modules(
+            module_names,
+            allow_missing_state=True,
         )
+
+    def estimate_preparation(
+        self, plan: SubgraphLoadPlan, *, dtype: torch.dtype
+    ) -> int:
+        prepared_bytes = 0
+        workspace_bytes = 0
+        for target in plan.targets:
+            target_bytes, target_workspace = self.loader.estimate_preparation(
+                target, dtype=dtype
+            )
+            prepared_bytes += target_bytes
+            workspace_bytes = max(workspace_bytes, target_workspace)
+        return prepared_bytes + workspace_bytes
 
     def prepare(
         self,
         plan: SubgraphLoadPlan,
         *,
-        device: torch.device | str,
         dtype: torch.dtype = torch.bfloat16,
+        reservation: HostMemoryReservation,
     ) -> PreparedSubgraphWeights:
-        """Materialize a plan without mutating the shared model."""
+        """Materialize a plan on CPU without mutating the shared model."""
 
         prepared = []
         try:
             for target in plan.targets:
                 prepared.append(
-                    self.loader.materialize(target, device=device, dtype=dtype)
+                    self.loader.materialize_cpu(
+                        target, dtype=dtype, reservation=reservation
+                    )
                 )
         except Exception:
             for target in prepared:
                 target.close()
+            reservation.close()
             raise
-        return PreparedSubgraphWeights(self.model, plan, prepared)
+        try:
+            reservation.release_reserved(reservation.reserved_bytes)
+        except Exception:
+            for target in prepared:
+                target.close()
+            reservation.close()
+            raise
+        return PreparedSubgraphWeights(
+            self.model, plan, prepared, reservation=reservation
+        )
 
     @contextmanager
     def installed(
         self, prepared: PreparedSubgraphWeights
-    ) -> Iterator[LoadedSubgraph]:
+    ) -> Generator[LoadedSubgraph, None, None]:
         """Install prepared weights and restore the model on context exit."""
 
+        if any(target.device != prepared.device for target in prepared.targets):
+            prepared.close()
+            raise ValueError("Prepared subgraph tensors must share one device")
         module_names = prepared.plan.module_names
         registered_state = self._registered_state(module_names)
         runtime_attributes = self._runtime_tensor_attributes(module_names)
@@ -313,18 +409,7 @@ class SubgraphWeightSession:
             )
             if callable(reinitialize):
                 reinitialize()
-            deferred_module_names = tuple(
-                dict.fromkeys(
-                    name
-                    for target in prepared.plan.targets
-                    for name in target.deferred_modules
-                )
-            )
-            yield LoadedSubgraph(
-                self.model,
-                module_names,
-                deferred_module_names=deferred_module_names,
-            )
+            yield LoadedSubgraph(self.model, module_names)
 
     def _runtime_tensor_attributes(
         self, module_names: Sequence[str]

@@ -19,8 +19,47 @@ from llmcompressor.utils.int4_packing import pack_int4_to_int8_cpu_snapshot
 __all__ = [
     "build_quantization_config",
     "prepare_quantized_tensor_for_save",
+    "quantized_tensor_bytes_for_save",
     "quantized_module_formats",
 ]
+
+
+def _uses_int4_packing(
+    name: str,
+    scheme: QuantizationScheme,
+    *,
+    format_name: str,
+    pack_to_int8: bool,
+) -> bool:
+    weights = scheme.weights
+    return (
+        pack_to_int8
+        and name.endswith(".weight")
+        and format_name == CompressionFormat.int_quantized.value
+        and weights is not None
+        and weights.num_bits == 4
+        and weights.type == QuantizationType.INT.value
+    )
+
+
+def quantized_tensor_bytes_for_save(
+    name: str,
+    tensor: Tensor,
+    scheme: QuantizationScheme,
+    *,
+    format_name: str,
+    pack_to_int8: bool,
+) -> int:
+    """Estimate final CPU snapshot bytes without allocating the snapshot."""
+
+    if _uses_int4_packing(
+        name,
+        scheme,
+        format_name=format_name,
+        pack_to_int8=pack_to_int8,
+    ):
+        return tensor.numel() // 2
+    return tensor.numel() * tensor.element_size()
 
 
 def prepare_quantized_tensor_for_save(
@@ -37,14 +76,11 @@ def prepare_quantized_tensor_for_save(
     results cannot accumulate in accelerator memory while a target is saved.
     """
 
-    if not pack_to_int8 or not name.endswith(".weight"):
-        return tensor
-    weights = scheme.weights
-    if (
-        format_name != CompressionFormat.int_quantized.value
-        or weights is None
-        or weights.num_bits != 4
-        or weights.type != QuantizationType.INT.value
+    if not _uses_int4_packing(
+        name,
+        scheme,
+        format_name=format_name,
+        pack_to_int8=pack_to_int8,
     ):
         return tensor
     return pack_int4_to_int8_cpu_snapshot(tensor)

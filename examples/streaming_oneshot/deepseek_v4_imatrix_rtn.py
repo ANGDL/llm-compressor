@@ -200,12 +200,6 @@ def main() -> None:
         help="Persist boundaries and transactions for crash recovery.",
     )
     parser.add_argument(
-        "--pipeline-devices",
-        nargs=2,
-        metavar=("PRIMARY", "PREFETCH"),
-        help="Alternate subgraphs across two CUDA devices, for example cuda:0 cuda:1.",
-    )
-    parser.add_argument(
         "--async-save",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -253,10 +247,6 @@ def main() -> None:
             moe_calibrate_all_experts=args.moe_calibrate_all_experts,
             materializer=DeepSeekV4WeightMaterializer(),
             checkpoint_progress=args.checkpoint_progress,
-            device=(
-                args.pipeline_devices[0] if args.pipeline_devices else None
-            ),
-            pipeline_devices=args.pipeline_devices,
             async_save=args.async_save,
             overwrite_output=True,
         )

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Generator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from itertools import chain
@@ -209,7 +209,9 @@ class TracedBoundaryAdapter:
         return tuple(candidates)
 
     @contextmanager
-    def _detect_prefix_dependency_calls(self, candidates: Sequence[str]):
+    def _detect_prefix_dependency_calls(
+        self, candidates: Sequence[str]
+    ) -> Generator[None, None, None]:
         handles = []
 
         def hook(module_name: str, module: nn.Module, _args):

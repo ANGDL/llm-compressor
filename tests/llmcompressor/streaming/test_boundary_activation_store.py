@@ -5,6 +5,7 @@ import torch
 
 from llmcompressor.streaming import (
     DiskBoundaryActivationStore,
+    HostMemoryBudget,
     InMemoryBoundaryActivationStore,
 )
 
@@ -121,6 +122,58 @@ def test_delete_removes_consumed_boundary_only(store):
         store.get(1, 0)
 
 
+def test_commit_propagated_batch_consumes_only_matching_input(store):
+    store.put(0, 0, {"hidden_states": torch.tensor([0])})
+    store.put(0, 1, {"hidden_states": torch.tensor([1])})
+
+    store.commit_propagated_batch(
+        0, 1, 0, {"hidden_states": torch.tensor([10])}
+    )
+
+    assert not store.contains(0, 0)
+    assert store.contains(0, 1)
+    assert store.contains(1, 0)
+
+
+def test_failed_propagated_snapshot_retains_input_batch(store, monkeypatch):
+    store.put(0, 0, {"hidden_states": torch.tensor([0])})
+
+    def fail_put(*_args, **_kwargs):
+        raise RuntimeError("snapshot failed")
+
+    monkeypatch.setattr(store, "put", fail_put)
+    with pytest.raises(RuntimeError, match="snapshot failed"):
+        store.commit_propagated_batch(
+            0, 1, 0, {"hidden_states": torch.tensor([10])}
+        )
+
+    assert store.contains(0, 0)
+
+
+def test_memory_store_rejects_complete_non_cpu_boundaries():
+    with pytest.raises(ValueError, match="stored on CPU"):
+        InMemoryBoundaryActivationStore("meta")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_cross_device_boundary_read_does_not_clone_after_copy(monkeypatch):
+    store = InMemoryBoundaryActivationStore()
+    store.put(0, 0, {"hidden_states": torch.ones(4)})
+    original_clone = torch.Tensor.clone
+    clone_calls = 0
+
+    def recording_clone(self, *args, **kwargs):
+        nonlocal clone_calls
+        clone_calls += 1
+        return original_clone(self, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "clone", recording_clone)
+    loaded = store.get(0, 0, device="cuda")
+
+    assert loaded["hidden_states"].device.type == "cuda"
+    assert clone_calls == 0
+
+
 @pytest.mark.parametrize(
     "bad_value",
     [
@@ -218,3 +271,17 @@ def test_memory_store_deduplicates_equal_boundary_tensors():
     assert store.tensor_bytes() == mask.untyped_storage().nbytes()
     loaded = store.get(0, 0)
     assert loaded["mask_0"].data_ptr() == loaded["mask_1"].data_ptr()
+
+
+def test_memory_budget_counts_distinct_overlapping_views():
+    budget = HostMemoryBudget(
+        safety_reserve_bytes=0,
+        system_available=lambda: 1 << 20,
+        cgroup_available=lambda: None,
+    )
+    store = InMemoryBoundaryActivationStore(host_budget=budget)
+    source = torch.arange(8, dtype=torch.float32)
+
+    store.put(0, 0, {"left": source[:6], "right": source[2:]})
+
+    assert store.tensor_bytes() == 2 * 6 * source.element_size()

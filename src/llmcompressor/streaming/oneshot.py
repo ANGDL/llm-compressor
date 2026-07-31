@@ -206,7 +206,6 @@ def streaming_oneshot(
     validate_config: bool = True,
     checkpoint_progress: bool = False,
     overwrite_output: bool = False,
-    pipeline_devices: Sequence[torch.device | str] | None = None,
     async_save: bool = False,
     pack_to_int8: bool = True,
 ) -> Path:
@@ -257,15 +256,12 @@ def streaming_oneshot(
             validate_config=validate_config,
             checkpoint_progress=checkpoint_progress,
             overwrite_output=overwrite_output,
-            pipeline_devices=pipeline_devices,
             async_save=async_save,
             pack_to_int8=pack_to_int8,
         )
 
-    if pipeline_devices is not None or async_save:
-        raise ValueError(
-            "pipeline_devices and async_save currently require pretrained mode"
-        )
+    if async_save:
+        raise ValueError("async_save currently requires pretrained mode")
 
     required = {
         "model_factory": model_factory,

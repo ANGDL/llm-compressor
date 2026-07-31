@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 
 import pytest
 import torch
@@ -21,9 +22,13 @@ from llmcompressor.modifiers.transform import AWQModifier, SmoothQuantModifier
 from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
 from llmcompressor.pipelines.sequential.helpers import Subgraph
 from llmcompressor.streaming import streaming_oneshot
+from llmcompressor.streaming.loading import (
+    SubgraphPrefetcher,
+    SubgraphWeightSession,
+)
+from llmcompressor.streaming.output import prepare_quantized_tensor_for_save
 from llmcompressor.streaming.pipeline import (
     _empty_device_cache,
-    _resolve_pipeline_devices,
     _stage_logger,
     _write_loaded_target_direct,
 )
@@ -93,7 +98,7 @@ def test_direct_target_write_does_not_retain_tensor(tmp_path):
     assert references[0]() is None
 
 
-def test_direct_target_write_packs_w4a8_before_writer_snapshot():
+def test_direct_target_write_reserves_before_w4a8_cpu_snapshot(monkeypatch):
     class Loaded:
         model = torch.nn.Module()
         model.layer = torch.nn.Linear(4, 2, bias=False)
@@ -119,20 +124,54 @@ def test_direct_target_write_packs_w4a8_before_writer_snapshot():
             )
 
     class Writer:
+        @staticmethod
+        def estimate_snapshot_bytes(tensors):
+            return sum(tensor.nbytes for tensor in tensors.values())
+
         def write_shard(self, _shard_id, tensors, **kwargs):
             assert tensors["layer.weight"].device.type == "cpu"
             assert kwargs["owned_cpu_tensors"] == {"layer.weight"}
+            assert kwargs["reservation"] is reservation
             captured.update(
                 {name: value.clone() for name, value in tensors.items()}
             )
             assert kwargs["quantized_modules"] == {"layer": "int-quantized"}
 
+    class Reservation:
+        def close(self):
+            pass
+
+    class Budget:
+        def reserve(self, owner, required):
+            assert owner == "checkpoint shard target-0"
+            assert required == 12
+            events.append("reserve")
+            return reservation
+
     captured = {}
+    events = []
+    reservation = Reservation()
+    original_prepare = prepare_quantized_tensor_for_save
+
+    def record_prepare(*args, **kwargs):
+        assert events == ["reserve"]
+        events.append("pack")
+        return original_prepare(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "llmcompressor.streaming.pipeline.prepare_quantized_tensor_for_save",
+        record_prepare,
+    )
     written = _write_loaded_target_direct(
-        Writer(), Loaded(), "layer", "target-0"
+        Writer(),
+        Loaded(),
+        "layer",
+        "target-0",
+        host_budget=Budget(),
     )
 
     assert written == {"layer.weight"}
+    assert events == ["reserve", "pack"]
     assert captured["layer.weight"].shape == (2, 2)
     assert captured["layer.weight"].tolist() == [[-8, 112], [33, 67]]
 
@@ -217,19 +256,6 @@ def test_stage_logger_only_monitors_execution_device():
     assert _stage_logger(model, "cpu-stage", torch.device("cpu")).device_ids == ()
 
 
-def test_pipeline_devices_require_primary_then_one_explicit_cuda_device():
-    assert _resolve_pipeline_devices(
-        torch.device("cuda:0"), ["cuda:0", "cuda:1"]
-    ) == (torch.device("cuda:0"), torch.device("cuda:1"))
-
-    with pytest.raises(ValueError, match="start with"):
-        _resolve_pipeline_devices(
-            torch.device("cuda:0"), ["cuda:1", "cuda:0"]
-        )
-    with pytest.raises(ValueError, match="explicit CUDA"):
-        _resolve_pipeline_devices(torch.device("cpu"), ["cpu", "mps:0"])
-
-
 def test_pretrained_streaming_writes_each_subgraph_as_final_shard(
     tmp_path, monkeypatch
 ):
@@ -265,6 +291,24 @@ def test_pretrained_streaming_writes_each_subgraph_as_final_shard(
             AssertionError("default streaming path must not assemble shards")
         ),
     )
+    active_installation = False
+    installed_devices = []
+    original_installed = SubgraphWeightSession.installed
+
+    @contextmanager
+    def record_installation(session, prepared):
+        nonlocal active_installation
+        assert not active_installation
+        with original_installed(session, prepared) as loaded:
+            active_installation = True
+            try:
+                if loaded.module_names:
+                    installed_devices.append(prepared.device)
+                yield loaded
+            finally:
+                active_installation = False
+
+    monkeypatch.setattr(SubgraphWeightSession, "installed", record_installation)
     output = streaming_oneshot(
         model=checkpoint,
         dataset=dataset,
@@ -307,6 +351,8 @@ def test_pretrained_streaming_writes_each_subgraph_as_final_shard(
     assert not (tmp_path / "work" / "boundaries").exists()
     assert not staging.exists()
     assert not (tmp_path / "work" / "publish").exists()
+    assert installed_devices
+    assert set(installed_devices) == {torch.device("cpu")}
 
     resumed = streaming_oneshot(
         model=checkpoint,
@@ -370,7 +416,7 @@ def test_pretrained_streaming_overwrites_output_only_when_requested(tmp_path):
     assert not (tmp_path / "work" / "replaced-output").exists()
 
 
-def test_checkpoint_progress_persists_subgraph_boundaries(tmp_path):
+def test_checkpoint_progress_persists_boundaries_and_prefetches(tmp_path, monkeypatch):
     config = Qwen3Config(
         vocab_size=32,
         hidden_size=8,
@@ -386,6 +432,14 @@ def test_checkpoint_progress_persists_subgraph_boundaries(tmp_path):
     Qwen3ForCausalLM(config).save_pretrained(
         checkpoint, safe_serialization=True
     )
+    submitted = []
+    original_submit = SubgraphPrefetcher.submit
+
+    def record_submit(prefetcher, plan, **kwargs):
+        submitted.append(plan.module_names)
+        return original_submit(prefetcher, plan, **kwargs)
+
+    monkeypatch.setattr(SubgraphPrefetcher, "submit", record_submit)
 
     streaming_oneshot(
         model=checkpoint,
@@ -400,6 +454,7 @@ def test_checkpoint_progress_persists_subgraph_boundaries(tmp_path):
         checkpoint_progress=True,
     )
 
+    assert submitted
     transaction = (
         tmp_path / "work/staging/transactions/subgraph-00000/metadata.json"
     )

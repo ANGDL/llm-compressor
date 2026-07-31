@@ -9,9 +9,15 @@ import uuid
 from abc import ABC, abstractmethod
 from dataclasses import fields, is_dataclass
 from pathlib import Path
-from typing import Any, Iterator
+from typing import TYPE_CHECKING, Any, Iterator
 
 import torch
+
+if TYPE_CHECKING:
+    from llmcompressor.streaming.loading.host_memory import (
+        HostMemoryBudget,
+        HostMemoryReservation,
+    )
 
 _PRIMITIVE_TYPES = (type(None), bool, int, float, str, bytes)
 _KV_CACHE_NAMES = {
@@ -48,7 +54,10 @@ def _snapshot(
         identity = id(value)
         if identity in memo:
             return memo[identity]
-        snapshot = value.detach().to(device=device).clone()
+        detached = value.detach()
+        snapshot = detached.to(device=device)
+        if snapshot.device == detached.device:
+            snapshot = snapshot.clone()
         if content_candidates is not None:
             signature = (snapshot.dtype, tuple(snapshot.shape))
             for candidate in content_candidates.get(signature, ()):
@@ -139,7 +148,8 @@ def _move(
         memo = memo if memo is not None else {}
         identity = id(value)
         if identity not in memo:
-            memo[identity] = value.to(device=device).clone()
+            moved = value.to(device=device)
+            memo[identity] = moved.clone() if moved.device == value.device else moved
         return memo[identity]
     if isinstance(value, _PRIMITIVE_TYPES):
         return value
@@ -162,12 +172,11 @@ def _move(
 def _tensor_bytes(value: Any, seen: set[int] | None = None) -> int:
     seen = seen if seen is not None else set()
     if isinstance(value, torch.Tensor):
-        storage = value.untyped_storage()
-        identity = id(storage)
+        identity = id(value)
         if identity in seen:
             return 0
         seen.add(identity)
-        return storage.nbytes()
+        return value.numel() * value.element_size()
     if is_dataclass(value) and not isinstance(value, type):
         return sum(
             _tensor_bytes(getattr(value, field.name), seen)
@@ -205,6 +214,24 @@ class BoundaryActivationStore(ABC):
     def contains(self, boundary: int, batch: int) -> bool:
         """Return whether a complete batch is available."""
 
+    @abstractmethod
+    def _delete_batch(self, boundary: int, batch: int) -> None:
+        """Delete one committed batch after its replacement is durable."""
+
+    def commit_propagated_batch(
+        self,
+        source_boundary: int,
+        destination_boundary: int,
+        batch: int,
+        value: Any,
+    ) -> None:
+        """Commit a CPU destination before consuming its matching source batch."""
+
+        if source_boundary == destination_boundary:
+            raise ValueError("Propagation boundaries must be distinct")
+        self.put(destination_boundary, batch, value)
+        self._delete_batch(source_boundary, batch)
+
     def iter_boundary(
         self, boundary: int, *, device: torch.device | str = "cpu"
     ) -> Iterator[tuple[int, Any]]:
@@ -220,23 +247,49 @@ class InMemoryBoundaryActivationStore(BoundaryActivationStore):
         storage_device: torch.device | str = "cpu",
         *,
         deduplicate_tensors: bool = False,
+        host_budget: HostMemoryBudget | None = None,
     ):
         self.storage_device = torch.device(storage_device)
-        if self.storage_device.type == "meta":
-            raise ValueError("Boundary activations cannot be stored on meta")
+        if self.storage_device.type != "cpu":
+            raise ValueError("Complete activation boundaries must be stored on CPU")
         self.deduplicate_tensors = deduplicate_tensors
+        self.host_budget = host_budget
         self._boundaries: dict[int, dict[int, Any]] = {}
+        self._reservations: dict[
+            int, dict[int, HostMemoryReservation]
+        ] = {}
 
     def put(self, boundary: int, batch: int, value: Any) -> None:
         _check_index(boundary, "boundary")
         _check_index(batch, "batch")
-        snapshot = _snapshot(
-            value,
-            self.storage_device,
-            memo={},
-            content_candidates={} if self.deduplicate_tensors else None,
+        reservation = (
+            self.host_budget.reserve(
+                f"activation boundary {boundary} batch {batch}",
+                _tensor_bytes(value),
+            )
+            if self.host_budget is not None
+            else None
         )
+        try:
+            snapshot = _snapshot(
+                value,
+                self.storage_device,
+                memo={},
+                content_candidates={} if self.deduplicate_tensors else None,
+            )
+            if reservation is not None:
+                reservation.commit(_tensor_bytes(snapshot))
+                reservation.release_reserved(reservation.reserved_bytes)
+        except Exception:
+            if reservation is not None:
+                reservation.close()
+            raise
+        previous = self._reservations.get(boundary, {}).pop(batch, None)
         self._boundaries.setdefault(boundary, {})[batch] = snapshot
+        if reservation is not None:
+            self._reservations.setdefault(boundary, {})[batch] = reservation
+        if previous is not None:
+            previous.close()
 
     def get(
         self, boundary: int, batch: int, *, device: torch.device | str = "cpu"
@@ -258,11 +311,30 @@ class InMemoryBoundaryActivationStore(BoundaryActivationStore):
     def delete(self, boundary: int) -> None:
         _check_index(boundary, "boundary")
         self._boundaries.pop(boundary, None)
+        for reservation in self._reservations.pop(boundary, {}).values():
+            reservation.close()
 
     def contains(self, boundary: int, batch: int) -> bool:
         _check_index(boundary, "boundary")
         _check_index(batch, "batch")
         return batch in self._boundaries.get(boundary, {})
+
+    def _delete_batch(self, boundary: int, batch: int) -> None:
+        _check_index(boundary, "boundary")
+        _check_index(batch, "batch")
+        batches = self._boundaries.get(boundary)
+        if batches is None:
+            return
+        batches.pop(batch, None)
+        if not batches:
+            self._boundaries.pop(boundary, None)
+        reservations = self._reservations.get(boundary)
+        if reservations is not None:
+            reservation = reservations.pop(batch, None)
+            if reservation is not None:
+                reservation.close()
+            if not reservations:
+                self._reservations.pop(boundary, None)
 
     def tensor_bytes(self) -> int:
         return sum(
@@ -279,9 +351,15 @@ class DiskBoundaryActivationStore(BoundaryActivationStore):
     run directory because PyTorch serialization may reconstruct dataclass objects.
     """
 
-    def __init__(self, root: str | Path):
+    def __init__(
+        self,
+        root: str | Path,
+        *,
+        host_budget: HostMemoryBudget | None = None,
+    ):
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
+        self.host_budget = host_budget
 
     def _boundary_dir(self, boundary: int) -> Path:
         _check_index(boundary, "boundary")
@@ -294,9 +372,20 @@ class DiskBoundaryActivationStore(BoundaryActivationStore):
     def put(self, boundary: int, batch: int, value: Any) -> None:
         path = self._batch_path(boundary, batch)
         path.parent.mkdir(parents=True, exist_ok=True)
-        snapshot = _snapshot(value, torch.device("cpu"))
+        reservation = (
+            self.host_budget.reserve(
+                f"activation boundary {boundary} batch {batch}",
+                _tensor_bytes(value),
+            )
+            if self.host_budget is not None
+            else None
+        )
         temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
         try:
+            snapshot = _snapshot(value, torch.device("cpu"))
+            if reservation is not None:
+                reservation.commit(_tensor_bytes(snapshot))
+                reservation.release_reserved(reservation.reserved_bytes)
             torch.save(snapshot, temporary)
             with temporary.open("rb") as file:
                 os.fsync(file.fileno())
@@ -304,6 +393,8 @@ class DiskBoundaryActivationStore(BoundaryActivationStore):
             self._sync_directory(path.parent)
         finally:
             temporary.unlink(missing_ok=True)
+            if reservation is not None:
+                reservation.close()
 
     def get(
         self, boundary: int, batch: int, *, device: torch.device | str = "cpu"
@@ -338,6 +429,16 @@ class DiskBoundaryActivationStore(BoundaryActivationStore):
 
     def contains(self, boundary: int, batch: int) -> bool:
         return self._batch_path(boundary, batch).is_file()
+
+    def _delete_batch(self, boundary: int, batch: int) -> None:
+        path = self._batch_path(boundary, batch)
+        path.unlink(missing_ok=True)
+        directory = path.parent
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
+        self._sync_directory(self.root)
 
     def disk_bytes(self) -> int:
         return sum(

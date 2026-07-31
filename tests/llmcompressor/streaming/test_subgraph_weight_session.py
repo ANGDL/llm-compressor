@@ -8,6 +8,7 @@ from torch.fx import Graph
 
 from llmcompressor.pipelines.sequential.helpers import Subgraph
 from llmcompressor.streaming import (
+    HostMemoryBudget,
     SafetensorsWeightSource,
     SubgraphWeightSession,
     build_meta_model,
@@ -134,14 +135,92 @@ def test_prepares_subgraph_without_installing_it(tmp_path):
     subgraph = subgraph_for("layers.0")
 
     plan = session.plan(subgraph)
-    prepared = session.prepare(plan, device="cpu", dtype=torch.float32)
+    required = session.estimate_preparation(plan, dtype=torch.float32)
+    reservation = HostMemoryBudget(
+        safety_reserve_bytes=0,
+        system_available=lambda: 1 << 30,
+        cgroup_available=lambda: None,
+    ).reserve("test", required)
+    prepared = session.prepare(
+        plan, dtype=torch.float32, reservation=reservation
+    )
 
     assert_all_meta(model)
+    committed_bytes = reservation.committed_bytes
+    assert committed_bytes > 0
+    prepared.move_to("cpu")
+    assert reservation.committed_bytes == committed_bytes
+    assert not reservation.closed
     with session.installed(prepared) as loaded:
         assert loaded.module_names == ("layers.0",)
         assert not next(model.layers[0].parameters()).is_meta
 
+    assert reservation.closed
     assert_all_meta(model)
+
+
+def test_prepared_move_closes_all_storage_after_partial_failure(
+    tmp_path, monkeypatch
+):
+    reference = SessionModel()
+    checkpoint = checkpoint_for(reference, tmp_path)
+    model = build_meta_model(SessionModel)
+    session = SubgraphWeightSession(
+        model, SafetensorsWeightSource(checkpoint)
+    )
+    plan = session.plan(subgraph_for("layers.0"))
+    required = session.estimate_preparation(plan, dtype=torch.float32)
+    reservation = HostMemoryBudget(
+        safety_reserve_bytes=0,
+        system_available=lambda: 1 << 30,
+        cgroup_available=lambda: None,
+    ).reserve("test", required)
+    prepared = session.prepare(
+        plan, dtype=torch.float32, reservation=reservation
+    )
+    calls = 0
+
+    def fail_second_move(tensor, *args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("copy failed")
+        return tensor.clone()
+
+    monkeypatch.setattr(torch.Tensor, "to", fail_second_move)
+    with pytest.raises(RuntimeError, match="copy failed"):
+        prepared.move_to("cuda")
+
+    assert not prepared.targets
+    assert reservation.closed
+    assert_all_meta(model)
+
+
+def test_host_memory_failure_precedes_checkpoint_reads(tmp_path, monkeypatch):
+    reference = SessionModel()
+    checkpoint = checkpoint_for(reference, tmp_path)
+    model = build_meta_model(SessionModel)
+    source = SafetensorsWeightSource(checkpoint)
+    session = SubgraphWeightSession(model, source)
+    plan = session.plan(subgraph_for("layers.0"))
+    required = session.estimate_preparation(plan, dtype=torch.float32)
+    reads = 0
+
+    def record_read(_names):
+        nonlocal reads
+        reads += 1
+        raise AssertionError("checkpoint read must not start")
+
+    monkeypatch.setattr(source, "load_tensors_cpu", record_read)
+    budget = HostMemoryBudget(
+        safety_reserve_bytes=0,
+        system_available=lambda: required - 1,
+        cgroup_available=lambda: None,
+    )
+
+    with pytest.raises(MemoryError, match="Insufficient host memory"):
+        budget.reserve("next target", required)
+    assert reads == 0
 
 
 def test_merges_modifier_working_set_across_checkpoint_shards(tmp_path, monkeypatch):
@@ -150,14 +229,14 @@ def test_merges_modifier_working_set_across_checkpoint_shards(tmp_path, monkeypa
     model = build_meta_model(SessionModel)
     source = SafetensorsWeightSource(checkpoint)
     requests = []
-    original_iter = source.iter_tensor_groups
+    original_iter = source.iter_tensor_groups_cpu
 
-    def recording_iter(groups, *, device):
+    def recording_iter(groups):
         groups = tuple(tuple(group) for group in groups)
         requests.extend(groups)
-        return original_iter(groups, device=device)
+        return original_iter(groups)
 
-    monkeypatch.setattr(source, "iter_tensor_groups", recording_iter)
+    monkeypatch.setattr(source, "iter_tensor_groups_cpu", recording_iter)
     session = SubgraphWeightSession(model, source)
     subgraph = subgraph_for("layers.0")
 

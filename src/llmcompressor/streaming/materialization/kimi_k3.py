@@ -69,7 +69,7 @@ class KimiK3WeightSource(CheckpointWeightSource):
             raise KeyError(f"Unknown Kimi K3 tensor {name!r}") from error
         return replace(self._source.metadata(raw_name), name=name)
 
-    def load_tensors(self, names, *, device: torch.device) -> dict[str, torch.Tensor]:
+    def load_tensors_cpu(self, names) -> dict[str, torch.Tensor]:
         requested = list(dict.fromkeys(names))
         raw_names = []
         for name in requested:
@@ -77,12 +77,13 @@ class KimiK3WeightSource(CheckpointWeightSource):
                 raw_names.append(self._logical_to_raw[name])
             except KeyError as error:
                 raise KeyError(f"Unknown Kimi K3 tensor {name!r}") from error
-        raw_values = self._source.load_tensors(raw_names, device=device)
-        return {name: raw_values[self._logical_to_raw[name]] for name in requested}
+        raw_values = self._source.load_tensors_cpu(raw_names)
+        return {
+            name: self._normalize_scale(raw_values[self._logical_to_raw[name]])
+            for name in requested
+        }
 
-    def iter_tensor_groups(
-        self, groups, *, device: torch.device
-    ) -> Iterator[dict[str, torch.Tensor]]:
+    def iter_tensor_groups_cpu(self, groups) -> Iterator[dict[str, torch.Tensor]]:
         logical_groups = [tuple(dict.fromkeys(group)) for group in groups]
         raw_groups = []
         for group in logical_groups:
@@ -94,12 +95,18 @@ class KimiK3WeightSource(CheckpointWeightSource):
         for logical, raw, raw_values in zip(
             logical_groups,
             raw_groups,
-            self._source.iter_tensor_groups(raw_groups, device=device),
+            self._source.iter_tensor_groups_cpu(raw_groups),
         ):
             yield {
-                logical_name: raw_values[raw_name]
+                logical_name: self._normalize_scale(raw_values[raw_name])
                 for logical_name, raw_name in zip(logical, raw)
             }
+
+    @staticmethod
+    def _normalize_scale(value: torch.Tensor) -> torch.Tensor:
+        if value.dtype == getattr(torch, "float8_e8m0fnu", None):
+            return value.view(torch.uint8)
+        return value
 
 
 class KimiK3WeightMaterializer(WeightMaterializer):
@@ -151,7 +158,7 @@ class KimiK3WeightMaterializer(WeightMaterializer):
             "key_layout": "kimi-k3-weight-packed-weight-scale",
             "fp4_layout": "e2m1-low-nibble-first",
             "scale_layout": "ue8m0",
-            "routed_expert_loading": "deferred-per-expert-cpu-cache",
+            "routed_expert_loading": "resident-decoder-layer",
         }
 
     def create_source(self, checkpoint: str) -> CheckpointWeightSource:
@@ -187,25 +194,6 @@ class KimiK3WeightMaterializer(WeightMaterializer):
         if self._is_packed_expert(tensor_name, metadata):
             return [f"{tensor_name.removesuffix('.weight')}{_SCALE_SUFFIX}"]
         return []
-
-    def deferred_module(
-        self, tensor_name: str, metadata: TensorMetadata
-    ) -> str | None:
-        if not self._is_packed_expert(tensor_name, metadata):
-            return None
-        projection_name = tensor_name.removesuffix(".weight")
-        expert_name, _, projection = projection_name.rpartition(".")
-        if projection not in {"w1", "w2", "w3"}:
-            raise ValueError(
-                f"Unsupported Kimi K3 expert projection {projection_name!r}"
-            )
-        return expert_name
-
-    def deferred_cache_device(self) -> torch.device:
-        # K3's routed experts are decoded from MXFP4 once per decoder layer,
-        # then onloaded one expert at a time just like ordinary oneshot's CPU
-        # OffloadCache. Keeping the decoded cache off CUDA bounds GPU residency.
-        return torch.device("cpu")
 
     def logical_shape(
         self, tensor_name: str, metadata: TensorMetadata
@@ -266,15 +254,14 @@ class KimiK3WeightMaterializer(WeightMaterializer):
         ]
         return unpacked * expanded_scale
 
-    def materialize(
+    def materialize_cpu(
         self,
         tensor_name: str,
         tensors: Mapping[str, torch.Tensor],
         *,
         target_dtype: torch.dtype,
-        device: torch.device,
     ) -> torch.Tensor:
-        weight = tensors[tensor_name].to(device)
+        weight = tensors[tensor_name]
         if self._is_kda_a_log(tensor_name):
             self._validate_kda_a_log_shape(tuple(weight.shape))
             result = weight[: self.kda_num_heads]
@@ -285,7 +272,7 @@ class KimiK3WeightMaterializer(WeightMaterializer):
         ):
             scale_name = f"{tensor_name.removesuffix('.weight')}{_SCALE_SUFFIX}"
             try:
-                scale = tensors[scale_name].to(device)
+                scale = tensors[scale_name]
             except KeyError as error:
                 raise KeyError(f"Missing Kimi K3 MXFP4 scale {scale_name!r}") from error
             result = self._dequantize_fp4(weight, scale)
@@ -295,4 +282,14 @@ class KimiK3WeightMaterializer(WeightMaterializer):
             raise TypeError(
                 f"Unsupported Kimi K3 source dtype {weight.dtype} for {tensor_name!r}"
             )
-        return result.to(device=device, dtype=target_dtype)
+        return result.to(dtype=target_dtype)
+
+    def estimate_workspace_bytes(
+        self, tensor_name, metadata, target_dtype
+    ) -> int:
+        if self._is_packed_expert(tensor_name, metadata):
+            elements = 1
+            for dimension in self.logical_shape(tensor_name, metadata):
+                elements *= dimension
+            return 4 * elements * torch.float32.itemsize
+        return 0

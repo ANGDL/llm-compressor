@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import AbstractContextManager, nullcontext
+from contextlib import AbstractContextManager
+from time import perf_counter
 
 import torch
 
-from llmcompressor.utils.metric_logging import CompressionLogger
-
 from .._logging import streaming_logger
+from .host_memory import HostMemoryReservation
 from .session import (
     PreparedSubgraphWeights,
     SubgraphLoadPlan,
@@ -30,57 +30,49 @@ class SubgraphPrefetcher(AbstractContextManager):
         ] | None = None
         self._closed = False
 
-    @staticmethod
-    def _device_ids(device: torch.device) -> tuple[int, ...]:
-        if device.type != "cuda":
-            return ()
-        if device.index is None:
-            raise ValueError("CUDA prefetch devices must include an explicit index")
-        return (device.index,)
-
     def _prepare(
         self,
         label: str,
         plan: SubgraphLoadPlan,
-        device: torch.device,
         dtype: torch.dtype,
+        reservation: HostMemoryReservation,
     ) -> PreparedSubgraphWeights:
-        device_context = (
-            torch.cuda.device(device) if device.type == "cuda" else nullcontext()
+        started_at = perf_counter()
+        streaming_logger.info(f"{label} | started | device=cpu")
+        prepared = self.session.prepare(
+            plan, dtype=dtype, reservation=reservation
         )
-        with device_context:
-            metrics = CompressionLogger(
-                self.session.model, device_ids=self._device_ids(device)
-            )
-            metrics.set_results(
-                name="streaming",
-                summary=f"{label} | device={device}",
-            )
-            with metrics:
-                return self.session.prepare(plan, device=device, dtype=dtype)
+        streaming_logger.info(
+            f"{label} | complete | device=cpu | "
+            f"time={perf_counter() - started_at:.2f}s"
+        )
+        return prepared
 
     def submit(
         self,
         plan: SubgraphLoadPlan,
         *,
-        device: torch.device | str,
         dtype: torch.dtype,
+        reservation: HostMemoryReservation,
         label: str,
     ) -> None:
         """Schedule one plan after the previous result has been consumed."""
 
         if self._closed:
+            reservation.close()
             raise RuntimeError("Subgraph prefetcher is closed")
         if self._pending is not None:
+            reservation.close()
             raise RuntimeError("A subgraph prefetch is already pending")
-        resolved = torch.device(device)
-        self._pending = (
-            label,
-            self._executor.submit(
-                self._prepare, label, plan, resolved, dtype
-            ),
-        )
-        streaming_logger.info(f"{label} | queued | device={resolved}")
+        try:
+            future = self._executor.submit(
+                self._prepare, label, plan, dtype, reservation
+            )
+        except Exception:
+            reservation.close()
+            raise
+        self._pending = (label, future)
+        streaming_logger.info(f"{label} | queued | device=cpu")
 
     def take(self) -> PreparedSubgraphWeights:
         """Wait for and transfer ownership of the pending prepared weights."""

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from time import perf_counter
-from typing import Any, Iterable, Mapping
+from typing import TYPE_CHECKING, Any, Iterable, Mapping
 
 import torch
 
@@ -17,7 +17,11 @@ from llmcompressor.streaming.checkpoint import (
 
 from .._logging import streaming_logger
 
+if TYPE_CHECKING:
+    from llmcompressor.streaming.loading.host_memory import HostMemoryReservation
+
 _PROGRESS_INTERVAL = 64
+
 
 class WeightMaterializer(ABC):
     """Decode a logical floating-point weight and declare its dependencies."""
@@ -48,27 +52,15 @@ class WeightMaterializer(ABC):
         """Return the decoded tensor shape exposed to the model."""
         return metadata.shape
 
-    def deferred_module(
-        self, tensor_name: str, metadata: TensorMetadata
-    ) -> str | None:
-        """Return a module that should be materialized only when invoked.
+    def estimate_workspace_bytes(
+        self,
+        tensor_name: str,
+        metadata: TensorMetadata,
+        target_dtype: torch.dtype,
+    ) -> int:
+        """Return additional peak CPU workspace beyond inputs and output."""
 
-        The returned name must own ``tensor_name``. Parent target loads omit all
-        state under that module, while loading the deferred module itself remains
-        eager. This keeps unusually large conditional branches, such as routed
-        experts, outside the resident target working set.
-        """
-        return None
-
-    def deferred_cache_device(self) -> torch.device | None:
-        """Return the offload device used to cache decoded deferred weights.
-
-        A cache spans the lifetime of the resident parent target. This mirrors
-        ordinary oneshot's parameter offload cache: deferred weights are decoded
-        once, kept off the execution device between calls, and released when the
-        parent target is unloaded.
-        """
-        return None
+        return 0
 
     def create_source(self, checkpoint: str) -> CheckpointWeightSource:
         """Create the checkpoint view consumed by all streaming stages."""
@@ -85,15 +77,14 @@ class WeightMaterializer(ABC):
         return config
 
     @abstractmethod
-    def materialize(
+    def materialize_cpu(
         self,
         tensor_name: str,
         tensors: Mapping[str, torch.Tensor],
         *,
         target_dtype: torch.dtype,
-        device: torch.device,
     ) -> torch.Tensor:
-        """Return one logical weight in the requested dtype and device."""
+        """Return one logical weight in the requested dtype on CPU."""
 
 
 def materialize_weights(
@@ -102,11 +93,10 @@ def materialize_weights(
     materializer: WeightMaterializer,
     *,
     target_dtype: torch.dtype,
-    device: torch.device,
+    reservation: HostMemoryReservation | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Load requested weights and dependencies, then validate decoded results."""
+    """Load and decode requested weights on CPU in physical storage order."""
 
-    device = torch.device(device)
     requested = list(dict.fromkeys(names))
     metadata = {name: source.metadata(name) for name in requested}
     requests = []
@@ -126,12 +116,12 @@ def materialize_weights(
     tensor_groups = [group for _, group, _ in requests]
 
     results = {}
-    iter_groups = getattr(source, "iter_tensor_groups", None)
+    iter_groups = getattr(source, "iter_tensor_groups_cpu", None)
     raw_groups = (
-        iter_groups(tensor_groups, device=device)
+        iter_groups(tensor_groups)
         if callable(iter_groups)
         else (
-            source.load_tensors(group, device=device) for group in tensor_groups
+            source.load_tensors_cpu(group) for group in tensor_groups
         )
     )
     raw_groups = iter(raw_groups)
@@ -139,7 +129,7 @@ def materialize_weights(
     started_at = perf_counter()
     if total >= _PROGRESS_INTERVAL:
         streaming_logger.info(
-            f"weights | materialize | tensors={total} | device={device}"
+            f"weights | materialize | tensors={total} | device=cpu"
         )
     for index, (name, _, _) in enumerate(requests, start=1):
         if total >= _PROGRESS_INTERVAL and (index - 1) % _PROGRESS_INTERVAL == 0:
@@ -158,8 +148,14 @@ def materialize_weights(
             raise RuntimeError(
                 "Checkpoint source returned fewer tensor groups than requested"
             ) from error
-        tensor = materializer.materialize(
-            name, raw_tensors, target_dtype=target_dtype, device=device
+        raw_bytes = sum(
+            value.numel() * value.element_size()
+            for value in raw_tensors.values()
+        )
+        if reservation is not None:
+            reservation.commit(raw_bytes)
+        tensor = materializer.materialize_cpu(
+            name, raw_tensors, target_dtype=target_dtype
         )
         if not isinstance(tensor, torch.Tensor):
             raise TypeError(f"Materializer returned a non-tensor for {name!r}")
@@ -178,12 +174,17 @@ def materialize_weights(
                 f"Materializer returned shape {tuple(tensor.shape)} for {name!r}; "
                 f"expected {expected_shape}"
             )
-        if tensor.device != device:
+        if tensor.device.type != "cpu":
             raise ValueError(
                 f"Materializer returned device {tensor.device} for {name!r}; "
-                f"expected {device}"
+                "expected cpu"
             )
+        if reservation is not None:
+            reservation.commit(tensor.numel() * tensor.element_size())
         results[name] = tensor
+        del raw_tensors
+        if reservation is not None:
+            reservation.uncommit(raw_bytes)
         if total >= _PROGRESS_INTERVAL and (
             index % _PROGRESS_INTERVAL == 0 or index == total
         ):

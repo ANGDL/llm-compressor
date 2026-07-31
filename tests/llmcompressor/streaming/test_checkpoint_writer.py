@@ -9,6 +9,7 @@ from safetensors import safe_open
 
 from llmcompressor.streaming import (
     ArtifactCompatibilityError,
+    HostMemoryBudget,
     StreamingCheckpointWriter,
 )
 from llmcompressor.streaming.checkpoint import (
@@ -270,6 +271,32 @@ def test_async_direct_writer_propagates_background_failure(tmp_path):
 
     with pytest.raises(RuntimeError, match="subgraph-00000"):
         writer.close()
+
+
+def test_async_writer_releases_snapshot_reservation_after_failure(tmp_path):
+    direct = DirectSafetensorsWriter(tmp_path, run_fingerprint="run-a")
+    direct.write_shard = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        OSError("disk full")
+    )
+    writer = AsyncDirectSafetensorsWriter(direct)
+    budget = HostMemoryBudget(
+        safety_reserve_bytes=0,
+        system_available=lambda: 1 << 20,
+        cgroup_available=lambda: None,
+    )
+    source = torch.ones(4)
+    reservation = budget.reserve(
+        "snapshot", writer.estimate_snapshot_bytes({"weight": source})
+    )
+
+    writer.write_shard(
+        "subgraph-00000", {"weight": source}, reservation=reservation
+    )
+    with pytest.raises(RuntimeError, match="subgraph-00000"):
+        writer.close()
+
+    assert reservation.closed
+    assert budget.effective_available_bytes() == 1 << 20
 
 
 def test_direct_writer_publishes_state_only_after_header_validation(
