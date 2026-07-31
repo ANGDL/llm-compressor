@@ -8,7 +8,7 @@ optional durable recovery path.
 
 Example::
 
-    python examples/streaming_oneshot/deepseek_v4_imatrix_rtn.py \
+    python examples/streaming_oneshot/deepseek_v4_wNa8.py \
         --model-id /Users/ang/models/DeepSeek-V4-Pro-Tiny-bf16 \
         --dataset-id /Users/ang/Downloads/llm-demo/datasets/ultrachat_200k \
         --quant-mode w4a8 \
