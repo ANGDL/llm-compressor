@@ -1,5 +1,5 @@
-from dataclasses import replace
 import json
+from dataclasses import replace
 
 import pytest
 import torch
@@ -123,6 +123,26 @@ def test_initialize_is_idempotent_and_rejects_changed_manifest(initialized_store
     )
     with pytest.raises(ArtifactCompatibilityError, match="recipe"):
         store.initialize(changed, normalized_recipe=recipe, targets=targets)
+
+
+def test_initialize_can_replace_non_resumable_run_metadata(initialized_store):
+    store, manifest, _ = initialized_store
+    changed = replace(
+        manifest, recipe=replace(manifest.recipe, normalized_sha256="0" * 64)
+    )
+    recipe = {"QuantizationModifier": {"scheme": "W8A8"}}
+    targets = ["model.layers.1"]
+
+    store.initialize(
+        changed,
+        normalized_recipe=recipe,
+        targets=targets,
+        replace_existing=True,
+    )
+
+    assert store.load_manifest() == changed
+    assert json.loads((store.root / "recipe.json").read_text()) == recipe
+    assert json.loads((store.root / "targets.json").read_text()) == targets
 
 
 def test_initialize_rejects_changed_recipe_payload(initialized_store):

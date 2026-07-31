@@ -83,6 +83,28 @@ def test_finalize_rejects_incomplete_staging_without_publishing(tmp_path):
     assert not list(tmp_path.glob(".output.*.tmp"))
 
 
+def test_finalize_rejects_staging_from_a_different_run(tmp_path):
+    checkpoint, artifacts, _, _ = prepare(tmp_path)
+    staging = tmp_path / "staging"
+    quantize_streaming(
+        checkpoint=checkpoint,
+        artifact_dir=artifacts,
+        staging_dir=staging,
+        schemes={"layers.0": scheme()},
+        target_dtype=torch.float32,
+    )
+
+    with pytest.raises(ValueError, match="belongs to a different run"):
+        finalize_streaming_checkpoint(
+            checkpoint=checkpoint,
+            artifact_dir=artifacts,
+            staging_dir=staging,
+            output_dir=tmp_path / "output",
+            expected_run_fingerprint="different-run",
+            validate_config=False,
+        )
+
+
 def test_finalize_refuses_existing_or_source_output(tmp_path):
     checkpoint, artifacts, _, _ = prepare(tmp_path)
     staging = tmp_path / "staging"

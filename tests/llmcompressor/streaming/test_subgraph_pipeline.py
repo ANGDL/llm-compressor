@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from contextlib import contextmanager
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -21,7 +22,13 @@ from llmcompressor.modifiers.quantization import QuantizationModifier
 from llmcompressor.modifiers.transform import AWQModifier, SmoothQuantModifier
 from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
 from llmcompressor.pipelines.sequential.helpers import Subgraph
-from llmcompressor.streaming import streaming_oneshot
+from llmcompressor.recipe import Recipe
+from llmcompressor.streaming import (
+    ArtifactCompatibilityError,
+    ArtifactStore,
+    CastWeightMaterializer,
+    streaming_oneshot,
+)
 from llmcompressor.streaming.loading import (
     SubgraphPrefetcher,
     SubgraphWeightSession,
@@ -29,6 +36,7 @@ from llmcompressor.streaming.loading import (
 from llmcompressor.streaming.output import prepare_quantized_tensor_for_save
 from llmcompressor.streaming.pipeline import (
     _empty_device_cache,
+    _initialize_run,
     _stage_logger,
     _write_loaded_target_direct,
 )
@@ -72,6 +80,25 @@ def _imatrix_recipe():
             ignore=["lm_head"],
         ),
     ]
+
+
+def _seed_incompatible_run_metadata(
+    checkpoint, work_dir, *, replace_existing=False
+):
+    _initialize_run(
+        checkpoint=checkpoint,
+        artifact_dir=work_dir / "artifacts",
+        recipe=Recipe.create_instance(_imatrix_recipe()),
+        dataset_fingerprint="stale-dataset",
+        targets=("stale.target",),
+        materializer=CastWeightMaterializer(),
+        target_dtype=torch.float32,
+        num_samples=7,
+        max_seq_length=17,
+        seed=11,
+        pack_to_int8=False,
+        replace_existing=replace_existing,
+    )
 
 
 def test_direct_target_write_does_not_retain_tensor(tmp_path):
@@ -414,6 +441,153 @@ def test_pretrained_streaming_overwrites_output_only_when_requested(tmp_path):
     assert not (output / "old-file").exists()
     assert not (tmp_path / "work" / "publish").exists()
     assert not (tmp_path / "work" / "replaced-output").exists()
+
+
+def test_normal_mode_replaces_incompatible_run_metadata(tmp_path):
+    config = Qwen3Config(
+        vocab_size=32,
+        hidden_size=8,
+        intermediate_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=4,
+        max_position_embeddings=32,
+        tie_word_embeddings=True,
+    )
+    checkpoint = tmp_path / "checkpoint"
+    Qwen3ForCausalLM(config).save_pretrained(
+        checkpoint, safe_serialization=True
+    )
+    work = tmp_path / "work"
+    _seed_incompatible_run_metadata(checkpoint, work)
+
+    output = streaming_oneshot(
+        model=checkpoint,
+        dataset=_calibration_data(),
+        dataset_fingerprint="current-dataset",
+        recipe=_imatrix_recipe(),
+        output_dir=tmp_path / "output",
+        work_dir=work,
+        num_calibration_samples=1,
+        max_seq_length=4,
+        target_dtype=torch.float32,
+    )
+
+    manifest = ArtifactStore(work / "artifacts").load_manifest()
+    assert (output / "FINALIZED").is_file()
+    assert manifest.calibration.dataset_fingerprint == "current-dataset"
+    assert manifest.sequential.targets == ("model.layers.0",)
+
+
+def test_checkpoint_progress_rejects_incompatible_run_metadata(tmp_path):
+    config = Qwen3Config(
+        vocab_size=32,
+        hidden_size=8,
+        intermediate_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=4,
+        max_position_embeddings=32,
+        tie_word_embeddings=True,
+    )
+    checkpoint = tmp_path / "checkpoint"
+    Qwen3ForCausalLM(config).save_pretrained(
+        checkpoint, safe_serialization=True
+    )
+    work = tmp_path / "work"
+    _seed_incompatible_run_metadata(checkpoint, work)
+
+    with pytest.raises(ArtifactCompatibilityError, match="changed sections"):
+        streaming_oneshot(
+            model=checkpoint,
+            dataset=_calibration_data(),
+            dataset_fingerprint="current-dataset",
+            recipe=_imatrix_recipe(),
+            output_dir=tmp_path / "output",
+            work_dir=work,
+            num_calibration_samples=1,
+            max_seq_length=4,
+            target_dtype=torch.float32,
+            checkpoint_progress=True,
+        )
+
+
+def test_finalize_only_publishes_completed_direct_writer_shards(
+    tmp_path, monkeypatch
+):
+    from llmcompressor.streaming.finalize import finalize_streaming_checkpoint
+
+    config = Qwen3Config(
+        vocab_size=32,
+        hidden_size=8,
+        intermediate_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=4,
+        max_position_embeddings=32,
+        tie_word_embeddings=True,
+    )
+    checkpoint = tmp_path / "checkpoint"
+    Qwen3ForCausalLM(config).save_pretrained(
+        checkpoint, safe_serialization=True
+    )
+    work = tmp_path / "work"
+    output = tmp_path / "output"
+    kwargs = {
+        "model": checkpoint,
+        "dataset_fingerprint": "current-dataset",
+        "recipe": _imatrix_recipe(),
+        "output_dir": output,
+        "work_dir": work,
+        "num_calibration_samples": 1,
+        "max_seq_length": 4,
+        "target_dtype": torch.float32,
+    }
+
+    def fail_finalize(**_kwargs):
+        raise RuntimeError("injected finalization failure")
+
+    monkeypatch.setattr(
+        "llmcompressor.streaming.pretrained.finalize_streaming_checkpoint",
+        fail_finalize,
+    )
+    with pytest.raises(RuntimeError, match="injected finalization failure"):
+        streaming_oneshot(dataset=_calibration_data(), **kwargs)
+    assert (work / "publish/.streaming-state").is_dir()
+    for shard in (work / "publish").glob("model-static-*.safetensors"):
+        shard.unlink()
+    for state in (work / "publish/.streaming-state").glob(
+        "model-static-*.safetensors.json"
+    ):
+        state.unlink()
+    assert not list((work / "publish").glob("model-static-*.safetensors"))
+
+    _seed_incompatible_run_metadata(
+        checkpoint, work, replace_existing=True
+    )
+    run_pipeline = Mock(side_effect=AssertionError("pipeline must not run"))
+    monkeypatch.setattr(
+        "llmcompressor.streaming.pretrained.run_subgraph_streaming_pipeline",
+        run_pipeline,
+    )
+    monkeypatch.setattr(
+        "llmcompressor.streaming.pretrained.finalize_streaming_checkpoint",
+        finalize_streaming_checkpoint,
+    )
+
+    recovery_kwargs = {**kwargs, "recipe": _imatrix_recipe()}
+    result = streaming_oneshot(
+        dataset=_calibration_data(), finalize_only=True, **recovery_kwargs
+    )
+
+    assert result == output
+    assert (output / "FINALIZED").is_file()
+    assert list(output.glob("model-static-*.safetensors"))
+    assert not run_pipeline.called
+    assert not (work / "publish").exists()
 
 
 def test_checkpoint_progress_persists_boundaries_and_prefetches(tmp_path, monkeypatch):

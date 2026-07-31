@@ -549,6 +549,26 @@ class DirectSafetensorsWriter:
         self.shards_dir.mkdir(parents=True, exist_ok=True)
         self.states_dir.mkdir(parents=True, exist_ok=True)
 
+    def committed_metadata(self) -> list[dict[str, Any]]:
+        """Return complete shard states belonging to this run."""
+
+        states = []
+        for state_path in sorted(self.states_dir.glob("*.json")):
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            shard_name = state_path.name.removesuffix(".json")
+            if state.get("run_fingerprint") != self.run_fingerprint:
+                raise ArtifactCompatibilityError(
+                    f"Direct shard {shard_name!r} belongs to a different run"
+                )
+            if (
+                state.get("completed") is not True
+                or state.get("output_shard") != shard_name
+                or not (self.shards_dir / shard_name).is_file()
+            ):
+                raise RuntimeError(f"Direct shard {shard_name!r} is incomplete")
+            states.append(state)
+        return states
+
     def write_shard(
         self,
         shard_id: str,

@@ -119,7 +119,7 @@ def _initialize_run(
     max_seq_length: int | None,
     seed: int | None,
     pack_to_int8: bool,
-    persist: bool = True,
+    replace_existing: bool = False,
 ) -> str:
     normalized_recipe = recipe.model_dump(mode="json")
     source_info = fingerprint_checkpoint(checkpoint)
@@ -148,10 +148,12 @@ def _initialize_run(
         materializer=materializer.manifest_info(target_dtype=target_dtype),
         software=SoftwareInfo.from_versions({"torch": torch.__version__}),
     )
-    if persist:
-        ArtifactStore(artifact_dir).initialize(
-            manifest, normalized_recipe=normalized_recipe, targets=targets
-        )
+    ArtifactStore(artifact_dir).initialize(
+        manifest,
+        normalized_recipe=normalized_recipe,
+        targets=targets,
+        replace_existing=replace_existing,
+    )
     return run_fingerprint
 
 
@@ -375,13 +377,14 @@ def _write_remaining_direct_shards(
     written: set[str],
     omitted: Mapping[str, str],
     host_budget: HostMemoryBudget | None = None,
+    start_shard_index: int = 0,
 ) -> None:
     """Copy non-subgraph tensors into bounded final static shards."""
 
     omitted_metadata = dict(omitted)
     tensors: dict[str, torch.Tensor] = {}
     tensor_bytes = 0
-    shard_index = 0
+    shard_index = start_shard_index
     max_shard_bytes = 256 * 1024 * 1024
 
     def flush() -> None:
@@ -431,6 +434,75 @@ def _write_remaining_direct_shards(
         tensor_bytes += value_bytes
         written.add(name)
     flush()
+
+
+def _complete_direct_writer_staging(
+    *,
+    adapter: TracedBoundaryAdapter,
+    checkpoint: str | Path,
+    publish_dir: Path,
+    materializer: WeightMaterializer,
+    target_dtype: torch.dtype,
+    run_fingerprint: str,
+) -> None:
+    """Validate completed targets and append only missing static tensors."""
+
+    writer = DirectSafetensorsWriter(
+        publish_dir, run_fingerprint=run_fingerprint
+    )
+    states = writer.committed_metadata()
+    required_target_shards = {
+        f"model-subgraph-{index:05d}.safetensors"
+        for index in range(len(adapter.targets))
+    }
+    available_target_shards = {
+        state["output_shard"]
+        for state in states
+        if state["output_shard"].startswith("model-subgraph-")
+    }
+    if available_target_shards != required_target_shards:
+        raise RuntimeError(
+            "Direct-writer staging does not contain every completed target: "
+            f"expected={len(required_target_shards)}, "
+            f"actual={len(available_target_shards)}"
+        )
+
+    written = {
+        name for state in states for name in state.get("tensor_names", ())
+    }
+    static_indices = []
+    for state in states:
+        shard_name = state["output_shard"]
+        if shard_name.startswith("model-static-"):
+            index = shard_name.removeprefix("model-static-").removesuffix(
+                ".safetensors"
+            )
+            try:
+                static_indices.append(int(index))
+            except ValueError as error:
+                raise RuntimeError(
+                    f"Invalid static shard name: {shard_name}"
+                ) from error
+
+    source = adapter.weight_session.source
+    source_names = set(source.tensor_names())
+    omitted = {
+        alias: canonical
+        for alias, canonical in infer_transformers_tied_weights(
+            checkpoint
+        ).items()
+        if alias in source_names and canonical in source_names
+    }
+    _write_remaining_direct_shards(
+        writer=writer,
+        source=source,
+        materializer=materializer,
+        target_dtype=target_dtype,
+        written=written,
+        omitted=omitted,
+        host_budget=HostMemoryBudget(),
+        start_shard_index=max(static_indices, default=-1) + 1,
+    )
 
 
 def _copy_remaining_tensors(
@@ -487,7 +559,7 @@ def run_subgraph_streaming_pipeline(
     checkpoint_progress: bool = False,
     async_save: bool = False,
     pack_to_int8: bool = True,
-) -> tuple[Path, Path]:
+) -> tuple[Path, Path, str]:
     """Calibrate, modify, propagate, and persist one subgraph at a time."""
 
     device = torch.device(device)
@@ -511,7 +583,7 @@ def run_subgraph_streaming_pipeline(
         max_seq_length=max_seq_length,
         seed=seed,
         pack_to_int8=pack_to_int8,
-        persist=checkpoint_progress,
+        replace_existing=not checkpoint_progress,
     )
     transaction_writer = (
         StreamingCheckpointWriter(staging_dir, run_fingerprint=run_fingerprint)
@@ -885,21 +957,6 @@ def run_subgraph_streaming_pipeline(
                         "Asynchronous checkpoint writer failed while unwinding"
                     )
 
-    if direct_writer is not None:
-        _initialize_run(
-            checkpoint=checkpoint,
-            artifact_dir=artifact_dir,
-            recipe=recipe,
-            dataset_fingerprint=dataset_fingerprint,
-            targets=adapter.targets,
-            materializer=materializer,
-            target_dtype=target_dtype,
-            num_samples=num_samples,
-            max_seq_length=max_seq_length,
-            seed=seed,
-            pack_to_int8=pack_to_int8,
-        )
-
     source_names = set(source.tensor_names())
     omitted = {
         alias: canonical
@@ -946,4 +1003,5 @@ def run_subgraph_streaming_pipeline(
                     "Asynchronous checkpoint writer failed while unwinding"
                 )
     streaming_logger.info("complete")
-    return artifact_dir, staging_dir if checkpoint_progress else publish_dir
+    output_staging = staging_dir if checkpoint_progress else publish_dir
+    return artifact_dir, output_staging, run_fingerprint

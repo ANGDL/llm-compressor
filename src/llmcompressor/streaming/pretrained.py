@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import shutil
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from contextlib import ExitStack
 from copy import deepcopy
 from pathlib import Path
@@ -32,7 +32,11 @@ from .finalize import finalize_streaming_checkpoint
 from .loading import build_meta_model
 from .materialization import CastWeightMaterializer, WeightMaterializer
 from .output import build_quantization_config
-from .pipeline import run_subgraph_streaming_pipeline
+from .pipeline import (
+    _complete_direct_writer_staging,
+    _initialize_run,
+    run_subgraph_streaming_pipeline,
+)
 from .tracing import trace_streaming_boundaries
 
 __all__ = ["streaming_oneshot_from_pretrained"]
@@ -181,6 +185,7 @@ def streaming_oneshot_from_pretrained(
     overwrite_output: bool,
     async_save: bool,
     pack_to_int8: bool,
+    finalize_only: bool = False,
 ) -> Path:
     """Run traced streaming PTQ with an oneshot-like model/dataset interface."""
     checkpoint = Path(model).expanduser()
@@ -216,8 +221,10 @@ def streaming_oneshot_from_pretrained(
             "overwrite_output=True to replace it."
         )
     publish = work / "publish"
-    if not checkpoint_progress and publish.exists():
-        shutil.rmtree(publish)
+    if finalize_only and checkpoint_progress:
+        raise ValueError(
+            "finalize_only is only supported for checkpoint_progress=False"
+        )
     if not checkpoint.is_dir():
         raise ValueError("Pretrained streaming mode requires a local model directory")
     config = model_config or AutoConfig.from_pretrained(
@@ -327,23 +334,57 @@ def streaming_oneshot_from_pretrained(
                 f"{missing}"
             )
 
-        artifact_dir, staging_dir = run_subgraph_streaming_pipeline(
-            adapter=adapter,
-            checkpoint=checkpoint,
-            work_dir=work_dir,
-            calibration_batches=dataloader,
-            recipe=parsed_recipe,
-            dataset_fingerprint=fingerprint,
-            materializer=materializer,
-            device=device,
-            target_dtype=target_dtype,
-            num_samples=num_calibration_samples,
-            max_seq_length=max_seq_length,
-            seed=seed,
-            checkpoint_progress=checkpoint_progress,
-            async_save=async_save,
-            pack_to_int8=pack_to_int8,
-        )
+        if finalize_only:
+            if not publish.is_dir():
+                raise FileNotFoundError(
+                    f"No completed direct-writer staging directory: {publish}"
+                )
+            artifact_dir = work / "artifacts"
+            staging_dir = publish
+            run_fingerprint = _initialize_run(
+                checkpoint=checkpoint,
+                artifact_dir=artifact_dir,
+                recipe=parsed_recipe,
+                dataset_fingerprint=fingerprint,
+                targets=adapter.targets,
+                materializer=materializer,
+                target_dtype=target_dtype,
+                num_samples=num_calibration_samples,
+                max_seq_length=max_seq_length,
+                seed=seed,
+                pack_to_int8=pack_to_int8,
+                replace_existing=True,
+            )
+            _complete_direct_writer_staging(
+                adapter=adapter,
+                checkpoint=checkpoint,
+                publish_dir=publish,
+                materializer=materializer,
+                target_dtype=target_dtype,
+                run_fingerprint=run_fingerprint,
+            )
+        else:
+            if not checkpoint_progress and publish.exists():
+                shutil.rmtree(publish)
+            artifact_dir, staging_dir, run_fingerprint = (
+                run_subgraph_streaming_pipeline(
+                    adapter=adapter,
+                    checkpoint=checkpoint,
+                    work_dir=work_dir,
+                    calibration_batches=dataloader,
+                    recipe=parsed_recipe,
+                    dataset_fingerprint=fingerprint,
+                    materializer=materializer,
+                    device=device,
+                    target_dtype=target_dtype,
+                    num_samples=num_calibration_samples,
+                    max_seq_length=max_seq_length,
+                    seed=seed,
+                    checkpoint_progress=checkpoint_progress,
+                    async_save=async_save,
+                    pack_to_int8=pack_to_int8,
+                )
+            )
         qconfig = build_quantization_config(quantizer.resolved_config)
         return finalize_streaming_checkpoint(
             checkpoint=checkpoint,
@@ -357,4 +398,5 @@ def streaming_oneshot_from_pretrained(
             publish_in_place=not checkpoint_progress,
             overwrite_output=overwrite_output,
             recipe_yaml=parsed_recipe.yaml(),
+            expected_run_fingerprint=run_fingerprint,
         )

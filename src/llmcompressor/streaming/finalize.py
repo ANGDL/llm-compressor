@@ -115,6 +115,7 @@ def finalize_streaming_checkpoint(
     publish_in_place: bool = False,
     overwrite_output: bool = False,
     recipe_yaml: str | None = None,
+    expected_run_fingerprint: str | None = None,
 ) -> Path:
     """Publish complete staging shards as a standard indexed checkpoint."""
     source_dir = Path(checkpoint).expanduser().resolve()
@@ -186,6 +187,13 @@ def finalize_streaming_checkpoint(
             state = json.loads(state_path.read_text(encoding="utf-8"))
             if state.get("completed") is not True:
                 raise RuntimeError(f"Staging shard {shard_name!r} is not complete")
+            if (
+                expected_run_fingerprint is not None
+                and state.get("run_fingerprint") != expected_run_fingerprint
+            ):
+                raise ValueError(
+                    f"Staging shard {shard_name!r} belongs to a different run"
+                )
             headers, shard_size = _read_shard_headers(shard)
             if state.get("tensor_names") != sorted(headers):
                 raise ValueError(f"State tensor list disagrees with {shard_name!r}")

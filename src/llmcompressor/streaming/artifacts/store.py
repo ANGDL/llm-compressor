@@ -82,10 +82,11 @@ class ArtifactStore:
         *,
         normalized_recipe: Mapping[str, Any] | Sequence[Any],
         targets: Sequence[str],
+        replace_existing: bool = False,
     ) -> None:
-        """Create a store or validate that an existing store can be resumed."""
+        """Create a store, replace run metadata, or validate a resumable store."""
 
-        if self.manifest_path.exists():
+        if self.manifest_path.exists() and not replace_existing:
             validate_manifest_compatibility(self.load_manifest(), manifest)
             if _read_json(self.root / RECIPE_FILE) != normalized_recipe:
                 raise ValueError("Stored normalized recipe content does not match")

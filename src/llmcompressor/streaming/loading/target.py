@@ -106,9 +106,14 @@ class PreparedTargetWeights:
             for value in values.values()
         )
 
-    def close(self) -> None:
+    def release_values(self) -> None:
+        """Drop preparation-owned references after installation transfers ownership."""
+
         self.parameter_values.clear()
         self.buffer_values.clear()
+
+    def close(self) -> None:
+        self.release_values()
 
 
 class TargetWeightLoader:
@@ -345,6 +350,10 @@ class TargetWeightLoader:
                 plan.buffer_sources,
                 prepared.buffer_values,
             )
+            # Parameters and persistent buffers now own the materialized storage.
+            # Keeping the preparation dictionaries alive would retain replaced
+            # full-precision weights during compression.
+            prepared.release_values()
             runtime_buffers = self._move_runtime_buffers(
                 target, plan.runtime_buffer_groups, prepared.device
             )

@@ -210,9 +210,14 @@ def test_prepare_does_not_mutate_model_before_install(tiny_checkpoint):
     plan = loader.plan("layers.0")
     prepared = loader.materialize_cpu(plan, dtype=torch.float32)
 
+    assert prepared.parameter_values
+    assert prepared.buffer_values
     assert model.layers[0].proj.weight is original
     _assert_all_meta(model)
     with loader.installed(prepared):
+        assert not prepared.parameter_values
+        assert not prepared.buffer_values
+        assert prepared.nbytes == 0
         assert not model.layers[0].proj.weight.is_meta
         assert torch.equal(
             model.layers[0].proj.weight, reference.layers[0].proj.weight

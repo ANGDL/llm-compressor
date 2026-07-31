@@ -208,6 +208,7 @@ def streaming_oneshot(
     overwrite_output: bool = False,
     async_save: bool = False,
     pack_to_int8: bool = True,
+    finalize_only: bool = False,
 ) -> Path:
     """Run resumable streaming PTQ.
 
@@ -219,6 +220,9 @@ def streaming_oneshot(
     By default, INT4 weights using the ``int-quantized`` W4A8 layout are packed
     two values per INT8 immediately before checkpoint I/O. Set
     ``pack_to_int8=False`` to retain the legacy unpacked layout.
+
+    Set ``finalize_only=True`` to validate and publish completed direct-writer
+    shards after a previous normal-mode run failed during finalization.
     """
     device = resolve_execution_device(device)
     if work_dir is None:
@@ -258,10 +262,13 @@ def streaming_oneshot(
             overwrite_output=overwrite_output,
             async_save=async_save,
             pack_to_int8=pack_to_int8,
+            finalize_only=finalize_only,
         )
 
     if async_save:
         raise ValueError("async_save currently requires pretrained mode")
+    if finalize_only:
+        raise ValueError("finalize_only currently requires pretrained mode")
 
     required = {
         "model_factory": model_factory,
