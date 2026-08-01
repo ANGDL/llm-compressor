@@ -12,6 +12,7 @@ Example::
         --model-id /Users/ang/models/DeepSeek-V4-Pro-Tiny-bf16 \
         --dataset-id /Users/ang/Downloads/llm-demo/datasets/ultrachat_200k \
         --quant-mode w4a8 \
+        --pack-to-int8 \
         --output-dir /Users/ang/models/DeepSeek-V4-Pro-Tiny-w4a8
 """
 
@@ -211,6 +212,12 @@ def main() -> None:
         default=False,
         help="Collect iMatrix statistics for every routed expert.",
     )
+    parser.add_argument(
+        "--pack-to-int8",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Pack INT4 weights into INT8 storage in the output checkpoint.",
+    )
     args = parser.parse_args()
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_id, local_files_only=True)
@@ -248,6 +255,7 @@ def main() -> None:
             materializer=DeepSeekV4WeightMaterializer(),
             checkpoint_progress=args.checkpoint_progress,
             async_save=args.async_save,
+            pack_to_int8=args.pack_to_int8,
             overwrite_output=True,
         )
     tokenizer.save_pretrained(result)
