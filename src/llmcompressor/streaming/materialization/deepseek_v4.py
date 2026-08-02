@@ -26,6 +26,14 @@ def _raw_to_logical(name: str) -> str:
     return f"model.{name}"
 
 
+def _logical_to_raw(name: str) -> str:
+    return (
+        name.removeprefix("model.")
+        .replace(".weight_scale", ".scale")
+        .replace("lm_head.", "head.")
+    )
+
+
 class DeepSeekV4WeightSource(CheckpointWeightSource):
     """Expose raw DeepSeek-V4 keys as native Transformers model keys."""
 
@@ -115,28 +123,37 @@ class DeepSeekV4WeightMaterializer(WeightMaterializer):
         *,
         fp8_block_size: tuple[int, int] = (128, 128),
         fp4_block_size: int = 32,
+        save_raw_checkpoint_format: bool = False,
     ):
         if min(fp8_block_size) <= 0 or fp4_block_size <= 0:
             raise ValueError("DeepSeek-V4 block sizes must be positive")
         self.fp8_block_size = tuple(fp8_block_size)
         self.fp4_block_size = fp4_block_size
+        self.save_raw_checkpoint_format = save_raw_checkpoint_format
 
     def configuration(self) -> Mapping[str, Any]:
         return {
             "fp8_block_size": self.fp8_block_size,
             "fp4_block_size": self.fp4_block_size,
             "key_layout": "deepseek-v4-raw",
+            "save_raw_checkpoint_format": self.save_raw_checkpoint_format,
         }
 
     def create_source(self, checkpoint: str) -> CheckpointWeightSource:
         return DeepSeekV4WeightSource(checkpoint)
 
     def output_config_updates(self) -> Mapping[str, Any]:
-        return {
-            "architectures": ["DeepseekV4NativeForCausalLM"],
-            "model_type": "deepseek_v4_native",
-            "torch_dtype": "bfloat16",
-        }
+        return {"torch_dtype": "bfloat16"}
+
+    def output_tensor_name(self, tensor_name: str) -> str:
+        if not self.save_raw_checkpoint_format:
+            return tensor_name
+        return _logical_to_raw(tensor_name)
+
+    def output_weight_scale_name(self, output_module_name: str) -> str:
+        if self.save_raw_checkpoint_format:
+            return f"{output_module_name}.scale"
+        return super().output_weight_scale_name(output_module_name)
 
     def dependencies(
         self, tensor_name: str, metadata: TensorMetadata

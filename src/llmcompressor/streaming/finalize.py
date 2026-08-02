@@ -105,7 +105,9 @@ def _validate_quantized_module_weights(
     weight_map: Mapping[str, str],
     quantized_modules: Iterable[str],
     module_formats: Mapping[str, str],
+    materializer: WeightMaterializer | None = None,
 ) -> None:
+    materializer = materializer or CastWeightMaterializer()
     for module_name in quantized_modules:
         format_name = module_formats.get(module_name)
         expected_weights = (
@@ -121,9 +123,11 @@ def _validate_quantized_module_weights(
                 f"Quantized module {module_name!r} has no weight for format "
                 f"{format_name!r}"
             )
-        if f"{module_name}.weight_scale" not in weight_map:
+        weight_scale_name = materializer.output_weight_scale_name(module_name)
+        if weight_scale_name not in weight_map:
             raise ValueError(
-                f"Quantized module {module_name!r} has no weight scale"
+                f"Quantized module {module_name!r} has no weight scale "
+                f"{weight_scale_name!r}"
             )
 
 
@@ -171,6 +175,15 @@ def finalize_streaming_checkpoint(
     materializer = materializer or CastWeightMaterializer()
     source = materializer.create_source(str(source_dir))
     source_names = set(source.tensor_names())
+    output_source_names = {}
+    for source_name in source_names:
+        output_name = materializer.output_tensor_name(source_name)
+        previous = output_source_names.setdefault(output_name, source_name)
+        if previous != source_name:
+            raise ValueError(
+                "Materializer output tensor names are not unique: "
+                f"{previous!r} and {source_name!r} both map to {output_name!r}"
+            )
     shards_dir = staging if publish_in_place else staging / "shards"
     states_dir = (
         staging / ".streaming-state"
@@ -253,7 +266,7 @@ def finalize_streaming_checkpoint(
         for alias, canonical in omitted_tied_weights.items():
             if alias in weight_map:
                 raise ValueError(f"Omitted tied weight {alias!r} is still present")
-            if alias not in source_names:
+            if alias not in output_source_names:
                 raise ValueError(f"Unknown omitted tied weight {alias!r}")
             if canonical not in weight_map:
                 raise ValueError(
@@ -261,21 +274,21 @@ def finalize_streaming_checkpoint(
                     "is missing"
                 )
         _validate_quantized_module_weights(
-            weight_map, quantized_modules, module_formats
+            weight_map, quantized_modules, module_formats, materializer
         )
         for source_name in source_names:
             module_name, separator, tensor_name = source_name.rpartition(".")
-            if (
-                separator
-                and tensor_name == "weight"
-                and module_name in quantized_modules
-            ):
-                continue
-            if source_name not in weight_map:
-                if source_name in omitted_tied_weights:
+            output_name = materializer.output_tensor_name(source_name)
+            if separator and tensor_name == "weight":
+                output_module_name = materializer.output_module_name(module_name)
+                if output_module_name in quantized_modules:
+                    continue
+            if output_name not in weight_map:
+                if output_name in omitted_tied_weights:
                     continue
                 raise ValueError(
-                    f"Non-quantized source tensor {source_name!r} is missing"
+                    "Non-quantized source tensor is missing from output: "
+                    f"{source_name!r} -> {output_name!r}"
                 )
         streaming_logger.info("finalize | model metadata valid")
 

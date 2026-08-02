@@ -70,6 +70,24 @@ class WeightMaterializer(ABC):
         """Return config fields required to reload the materialized output."""
         return {}
 
+    def output_tensor_name(self, tensor_name: str) -> str:
+        """Map an internal logical tensor name to its serialized name."""
+        return tensor_name
+
+    def output_module_name(self, module_name: str) -> str:
+        """Map an internal logical module name to its serialized name."""
+        output_weight = self.output_tensor_name(f"{module_name}.weight")
+        if not output_weight.endswith(".weight"):
+            raise ValueError(
+                "Materializer output tensor mapping must preserve the '.weight' "
+                f"suffix for module names: {module_name!r} -> {output_weight!r}"
+            )
+        return output_weight.removesuffix(".weight")
+
+    def output_weight_scale_name(self, output_module_name: str) -> str:
+        """Return the serialized weight-scale name for an output module."""
+        return f"{output_module_name}.weight_scale"
+
     def transform_output_config(
         self, config: Mapping[str, Any]
     ) -> Mapping[str, Any]:

@@ -4,7 +4,8 @@ The source checkpoint may be the native FP8+FP4 format or an ordinary BF16
 checkpoint. ``DeepSeekV4WeightMaterializer`` decodes the former on demand and
 casts both formats to BF16 while one traced subgraph is resident. Calibration
 boundaries remain in memory by default; ``--checkpoint-progress`` enables the
-optional durable recovery path.
+optional durable recovery path. Output uses the raw DeepSeek checkpoint naming
+expected by SGLang and vLLM unless ``--no-save-raw-checkpoint-format`` is set.
 
 Example::
 
@@ -218,6 +219,12 @@ def main() -> None:
         default=True,
         help="Pack INT4 weights into INT8 storage in the output checkpoint.",
     )
+    parser.add_argument(
+        "--save-raw-checkpoint-format",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use raw DeepSeek tensor names required by SGLang and vLLM.",
+    )
     args = parser.parse_args()
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_id, local_files_only=True)
@@ -252,7 +259,9 @@ def main() -> None:
             max_seq_length=args.max_sequence_length,
             batch_size=args.batch_size,
             moe_calibrate_all_experts=args.moe_calibrate_all_experts,
-            materializer=DeepSeekV4WeightMaterializer(),
+            materializer=DeepSeekV4WeightMaterializer(
+                save_raw_checkpoint_format=args.save_raw_checkpoint_format
+            ),
             checkpoint_progress=args.checkpoint_progress,
             async_save=args.async_save,
             pack_to_int8=args.pack_to_int8,
