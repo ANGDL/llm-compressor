@@ -106,6 +106,26 @@ def _output_shard(source, tensor_name: str, owner_name: str) -> str:
     raise KeyError(f"Cannot assign output shard for tensor {tensor_name!r}")
 
 
+def _serialized_tensor_name(
+    materializer: WeightMaterializer | None, tensor_name: str
+) -> str:
+    return (
+        tensor_name
+        if materializer is None
+        else materializer.output_tensor_name(tensor_name)
+    )
+
+
+def _serialized_module_name(
+    materializer: WeightMaterializer | None, module_name: str
+) -> str:
+    return (
+        module_name
+        if materializer is None
+        else materializer.output_module_name(module_name)
+    )
+
+
 def _initialize_run(
     *,
     checkpoint: str | Path,
@@ -190,6 +210,7 @@ def _write_loaded_target(
     loaded,
     target_name: str,
     source,
+    materializer: WeightMaterializer,
     *,
     pack_to_int8: bool,
     exclude_modules: Sequence[str] = (),
@@ -214,15 +235,18 @@ def _write_loaded_target(
             formats,
             pack_to_int8=pack_to_int8,
         )
+        output_name = materializer.output_tensor_name(name)
         transaction.write_tensor(
-            name,
+            output_name,
             tensor,
             output_shard=_output_shard(source, name, owner_name),
         )
         written.add(name)
 
     for module_name, format_name in formats.items():
-        transaction.mark_quantized(module_name, format_name)
+        transaction.mark_quantized(
+            materializer.output_module_name(module_name), format_name
+        )
         # Compression formats such as pack-quantized replace the source weight
         # with weight_packed/weight_shape. Mark the original source tensor as
         # consumed so the fallback copier cannot reintroduce a second raw weight.
@@ -233,6 +257,7 @@ def _write_loaded_target(
 def _loaded_target_delta(
     loaded,
     target_name: str,
+    materializer: WeightMaterializer | None = None,
     *,
     pack_to_int8: bool,
     exclude_modules: Sequence[str] = (),
@@ -246,6 +271,7 @@ def _loaded_target_delta(
         if not _is_under_any(name, exclude_modules)
     }
     tensors = {}
+    written = set()
     owned_cpu_tensors = set()
     for name, tensor in loaded.state_tensors_under((target_name,)):
         if _is_under_any(name.rpartition(".")[0], exclude_modules):
@@ -257,13 +283,20 @@ def _loaded_target_delta(
             formats,
             pack_to_int8=pack_to_int8,
         )
-        tensors[name] = prepared
+        output_name = _serialized_tensor_name(materializer, name)
+        if output_name in tensors:
+            raise ValueError(f"Duplicate serialized tensor name {output_name!r}")
+        tensors[output_name] = prepared
+        written.add(name)
         if prepared is not tensor and prepared.device.type == "cpu":
-            owned_cpu_tensors.add(name)
-    written = set(tensors)
+            owned_cpu_tensors.add(output_name)
+    output_formats = {
+        _serialized_module_name(materializer, name): format_name
+        for name, format_name in formats.items()
+    }
     for module_name in formats:
         written.add(f"{module_name}.weight")
-    return tensors, formats, written, owned_cpu_tensors
+    return tensors, output_formats, written, owned_cpu_tensors
 
 
 def _estimate_loaded_target_snapshot_bytes(
@@ -308,6 +341,7 @@ def _write_loaded_target_direct(
     loaded,
     target_name: str,
     shard_id: str,
+    materializer: WeightMaterializer | None = None,
     *,
     pack_to_int8: bool = True,
     exclude_modules: Sequence[str] = (),
@@ -332,6 +366,7 @@ def _write_loaded_target_direct(
         tensors, formats, written, owned_cpu_tensors = _loaded_target_delta(
             loaded,
             target_name,
+            materializer,
             pack_to_int8=pack_to_int8,
             exclude_modules=exclude_modules,
         )
@@ -381,7 +416,12 @@ def _write_remaining_direct_shards(
 ) -> None:
     """Copy non-subgraph tensors into bounded final static shards."""
 
-    omitted_metadata = dict(omitted)
+    omitted_metadata = {
+        materializer.output_tensor_name(alias): materializer.output_tensor_name(
+            canonical
+        )
+        for alias, canonical in omitted.items()
+    }
     tensors: dict[str, torch.Tensor] = {}
     tensor_bytes = 0
     shard_index = start_shard_index
@@ -430,7 +470,10 @@ def _write_remaining_direct_shards(
         value_bytes = value.numel() * value.element_size()
         if tensors and tensor_bytes + value_bytes > max_shard_bytes:
             flush()
-        tensors[name] = value
+        output_name = materializer.output_tensor_name(name)
+        if output_name in tensors:
+            raise ValueError(f"Duplicate serialized tensor name {output_name!r}")
+        tensors[output_name] = value
         tensor_bytes += value_bytes
         written.add(name)
     flush()
@@ -534,10 +577,15 @@ def _copy_remaining_tensors(
             value = source.load_tensors_cpu((name,))[name]
         with writer.transaction(transaction_id) as transaction:
             transaction.write_tensor(
-                name, value, output_shard=metadata.shard.name
+                materializer.output_tensor_name(name),
+                value,
+                output_shard=metadata.shard.name,
             )
             for alias, canonical in omitted.items():
-                transaction.omit_tied_weight(alias, canonical)
+                transaction.omit_tied_weight(
+                    materializer.output_tensor_name(alias),
+                    materializer.output_tensor_name(canonical),
+                )
             transaction.commit()
         del value
 
@@ -901,6 +949,7 @@ def run_subgraph_streaming_pipeline(
                                         loaded,
                                         target_name,
                                         source,
+                                        materializer,
                                         pack_to_int8=pack_to_int8,
                                     )
                                 )
@@ -912,6 +961,7 @@ def run_subgraph_streaming_pipeline(
                                     loaded,
                                     target_name,
                                     transaction_id,
+                                    materializer,
                                     pack_to_int8=pack_to_int8,
                                     host_budget=host_budget,
                                 )

@@ -289,7 +289,13 @@ def test_pretrained_boundary_tracing_is_not_model_specific(
     assert (output / "FINALIZED").is_file()
 
 
-def test_deepseek_v4_preserves_input_ids_and_collects_all_experts(tmp_path):
+@pytest.mark.parametrize(
+    ("save_raw_checkpoint_format", "checkpoint_progress"),
+    [(False, False), (True, False), (True, True)],
+)
+def test_deepseek_v4_preserves_input_ids_and_collects_all_experts(
+    tmp_path, save_raw_checkpoint_format, checkpoint_progress
+):
     from llmcompressor.modeling.deepseekv4.config import ModelConfig
     from llmcompressor.modeling.deepseekv4.model import (
         DeepseekV4NativeForCausalLM,
@@ -321,7 +327,8 @@ def test_deepseek_v4_preserves_input_ids_and_collects_all_experts(tmp_path):
         compress_ratios=[0, 0],
     )
     checkpoint = tmp_path / "checkpoint"
-    DeepseekV4NativeForCausalLM(config).save_pretrained(
+    source_model = DeepseekV4NativeForCausalLM(config)
+    source_model.save_pretrained(
         checkpoint, safe_serialization=True
     )
     _write_raw_deepseek_v4_checkpoint(checkpoint)
@@ -355,8 +362,11 @@ def test_deepseek_v4_preserves_input_ids_and_collects_all_experts(tmp_path):
         max_seq_length=4,
         target_dtype=torch.float32,
         materializer=DeepSeekV4WeightMaterializer(
-            fp8_block_size=(128, 128), fp4_block_size=32
+            fp8_block_size=(128, 128),
+            fp4_block_size=32,
+            save_raw_checkpoint_format=save_raw_checkpoint_format,
         ),
+        checkpoint_progress=checkpoint_progress,
     )
 
     assert (output / "FINALIZED").is_file()
@@ -365,11 +375,36 @@ def test_deepseek_v4_preserves_input_ids_and_collects_all_experts(tmp_path):
             "target-*"
         )
     )
-    assert not (tmp_path / "work" / "staging").exists()
-    assert (output / "model-subgraph-00000.safetensors").is_file()
-    assert (output / "model-subgraph-00001.safetensors").is_file()
-    loaded = AutoModelForCausalLM.from_pretrained(
-        output, local_files_only=True, dtype=torch.float32
+    if checkpoint_progress:
+        assert (tmp_path / "work" / "staging").is_dir()
+        assert list(output.glob("*.safetensors"))
+    else:
+        assert not (tmp_path / "work" / "staging").exists()
+        for index in range(2):
+            assert (
+                output / f"model-subgraph-{index:05d}.safetensors"
+            ).is_file()
+    output_config = json.loads((output / "config.json").read_text())
+    assert output_config["architectures"] == ["DeepseekV4ForCausalLM"]
+    assert output_config["model_type"] == "deepseek_v4"
+    if save_raw_checkpoint_format:
+        weight_map = json.loads(
+            (output / "model.safetensors.index.json").read_text()
+        )["weight_map"]
+        assert "mtp.0.ffn.experts.0.w1.weight" in weight_map
+        assert "mtp.0.ffn.experts.0.w1.scale" in weight_map
+        assert "mtp.0.ffn.shared_experts.w1.weight" in weight_map
+        assert "mtp.0.ffn.shared_experts.w1.scale" in weight_map
+        assert "head.weight" in weight_map
+        assert not any(name.startswith("model.mtp.") for name in weight_map)
+        assert "model.lm_head.weight" not in weight_map
+        return
+
+    loaded = DeepseekV4NativeForCausalLM.from_pretrained(
+        output,
+        config=ModelConfig.from_pretrained(output),
+        local_files_only=True,
+        dtype=torch.float32,
     ).eval()
     quantized = loaded.model.layers[0].attn.wq_a
     assert quantized.weight.dtype == torch.int8

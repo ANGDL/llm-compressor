@@ -318,6 +318,42 @@ def test_deepseek_v4_materializer_decodes_ue8m0_endpoints():
     assert torch.isinf(decoded[2])
 
 
+@pytest.mark.parametrize("mtp_index", [0, 1, 2])
+def test_deepseek_v4_materializer_raw_output_names_match_sglang_contract(
+    mtp_index,
+):
+    materializer = DeepSeekV4WeightMaterializer(
+        save_raw_checkpoint_format=True
+    )
+
+    assert materializer.output_tensor_name(
+        f"model.mtp.{mtp_index}.ffn.experts.7.w1.weight"
+    ) == f"mtp.{mtp_index}.ffn.experts.7.w1.weight"
+    assert materializer.output_tensor_name(
+        f"model.mtp.{mtp_index}.ffn.shared_experts.w2.weight_scale"
+    ) == f"mtp.{mtp_index}.ffn.shared_experts.w2.scale"
+    assert materializer.output_tensor_name(
+        f"model.mtp.{mtp_index}.lm_head.weight"
+    ) == f"mtp.{mtp_index}.head.weight"
+    assert materializer.output_module_name(
+        f"model.mtp.{mtp_index}.ffn.experts.7.w1"
+    ) == f"mtp.{mtp_index}.ffn.experts.7.w1"
+    assert materializer.output_weight_scale_name(
+        f"mtp.{mtp_index}.ffn.experts.7.w1"
+    ) == f"mtp.{mtp_index}.ffn.experts.7.w1.scale"
+
+
+@pytest.mark.parametrize("save_raw_checkpoint_format", [False, True])
+def test_deepseek_v4_materializer_preserves_source_model_identity(
+    save_raw_checkpoint_format,
+):
+    updates = DeepSeekV4WeightMaterializer(
+        save_raw_checkpoint_format=save_raw_checkpoint_format
+    ).output_config_updates()
+
+    assert updates == {"torch_dtype": "bfloat16"}
+
+
 def test_kimi_k3_source_maps_packed_expert_to_logical_weight(tmp_path):
     path = tmp_path / "model.safetensors"
     raw_name = (

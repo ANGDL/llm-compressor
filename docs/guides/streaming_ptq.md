@@ -656,6 +656,8 @@ the selected execution dtype. It must:
   tensor metadata before source reads begin;
 - release raw dependency tensors after each materialized result;
 - provide stable configuration data for artifact compatibility;
+- map logical model tensor names to their serialized checkpoint names before
+  every writer snapshot when a runtime requires a model-native key layout;
 - avoid retaining global tensor or checkpoint-header caches.
 
 The generic safetensors source uses the native safetensors loader for supported
@@ -674,6 +676,14 @@ the vLLM-compatible UE8M0 conversion:
 This conversion is not equivalent to blindly casting every native E8M0 value to
 FP32 at endpoint encodings. The conversion remains model-format logic; the
 manual `_read_e8m0` file reader and its `lru_cache` do not.
+
+DeepSeek-V4 calibration uses `model.*` logical names internally. Raw output mode
+maps them back to the SGLang/vLLM checkpoint contract before writing each shard:
+it removes the leading `model.`, maps `lm_head` to `head`, and maps
+`weight_scale` to `scale`. Non-raw output mode keeps the internal logical names.
+Both layouts preserve the source BF16 checkpoint's `architectures` and
+`model_type`. Output-name mapping is part of the materializer fingerprint, so
+the two layouts cannot share resume artifacts.
 
 ## MoE targets
 

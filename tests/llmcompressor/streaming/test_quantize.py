@@ -22,6 +22,7 @@ from llmcompressor.modifiers.quantization.calibration import (
 )
 from llmcompressor.streaming import (
     ArtifactCompatibilityError,
+    CastWeightMaterializer,
     collect_calibration_statistics,
     quantize_streaming,
 )
@@ -57,7 +58,9 @@ def w4a8_scheme(*, observer=None):
     return value
 
 
-def prepare(tmp_path, *, algorithms=("gptq", "imatrix")):
+def prepare(
+    tmp_path, *, algorithms=("gptq", "imatrix"), materializer=None
+):
     torch.manual_seed(8)
     model = TwoLayer()
     checkpoint = tmp_path / "checkpoint"
@@ -105,6 +108,7 @@ def prepare(tmp_path, *, algorithms=("gptq", "imatrix")):
         dataset_fingerprint="c" * 64,
         algorithms=algorithms,
         target_dtype=torch.float32,
+        materializer=materializer,
     )
     return checkpoint, artifacts, model, inputs
 
@@ -197,6 +201,34 @@ def test_w4a8_is_packed_before_transaction_payload_is_written(tmp_path):
     )
     assert weight_record["shape"] == [4, 2]
     assert weight_record["size"] == 8
+
+
+def test_output_tensor_names_are_mapped_before_low_level_writes(tmp_path):
+    class PrefixMaterializer(CastWeightMaterializer):
+        def output_tensor_name(self, tensor_name: str) -> str:
+            return f"serialized.{tensor_name}"
+
+    materializer = PrefixMaterializer()
+    checkpoint, artifacts, _, _ = prepare(
+        tmp_path, materializer=materializer
+    )
+    output = quantize_streaming(
+        checkpoint=checkpoint,
+        artifact_dir=artifacts,
+        staging_dir=tmp_path / "staging",
+        schemes={"layers.0": scheme()},
+        materializer=materializer,
+        target_dtype=torch.float32,
+    )
+
+    first = read_shard(
+        output / "shards/model-00001-of-00002.safetensors"
+    )
+    assert "serialized.layers.0.weight_packed" in first
+    assert "serialized.layers.0.weight_scale" in first
+    assert "serialized.layers.0.weight_shape" in first
+    assert "serialized.layers.0.bias" in first
+    assert not any(name.startswith("layers.") for name in first)
 
 
 def test_imatrix_and_resume_skip_completed_shard(tmp_path, monkeypatch):

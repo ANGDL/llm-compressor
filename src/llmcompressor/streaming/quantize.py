@@ -317,12 +317,12 @@ def quantize_streaming(
                             pack_to_int8=pack_to_int8,
                         )
                         transaction.write_tensor(
-                            module_tensor_name,
+                            materializer.output_tensor_name(module_tensor_name),
                             output_value,
                             output_shard=output_name,
                         )
                     transaction.mark_quantized(
-                        module_name,
+                        materializer.output_module_name(module_name),
                         format_name,
                     )
                     del module, weight, raw_values
@@ -342,11 +342,18 @@ def quantize_streaming(
                         raw_values,
                         target_dtype=target_dtype,
                     )
-                transaction.write_tensor(name, value, output_shard=output_name)
+                transaction.write_tensor(
+                    materializer.output_tensor_name(name),
+                    value,
+                    output_shard=output_name,
+                )
                 del raw_values, value
 
             for alias, canonical in omitted_tied_weights.items():
-                transaction.omit_tied_weight(alias, canonical)
+                transaction.omit_tied_weight(
+                    materializer.output_tensor_name(alias),
+                    materializer.output_tensor_name(canonical),
+                )
             transaction.commit()
         logger.info(f"streaming quantize: committed shard {output_name}")
 
