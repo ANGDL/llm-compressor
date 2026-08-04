@@ -955,38 +955,45 @@ def run_subgraph_streaming_pipeline(
                         device,
                     ):
                         _modifier_update(resident_modules)
-                    with _stage_logger(
-                        adapter.model,
-                        f"{target_label} | activation propagation",
-                        device,
-                    ):
-                        # Match SequentialPipeline: propagation captures the
-                        # modified full-precision output (or an algorithm's
-                        # in-place weight update), without adding fake-quant
-                        # QDQ to every quantized module.
-                        with (
-                            HooksMixin.disable_hooks(),
-                            DisableQuantization(adapter.model),
-                            torch.no_grad(),
+                    # The propagation pass exists only to feed the next target's
+                    # boundary. The final target has no successor, so skipping it
+                    # avoids an extra full forward over the last (often large)
+                    # subgraph without changing any compressed weight: the weight
+                    # update already ran in the modifier update above, and this
+                    # pass runs with hooks and quantization disabled.
+                    if target_index + 1 < len(adapter.targets):
+                        with _stage_logger(
+                            adapter.model,
+                            f"{target_label} | activation propagation",
+                            device,
                         ):
-                            for batch_index in batches:
-                                value = boundaries.get(
-                                    target_index,
-                                    batch_index,
-                                    device=device,
-                                )
-                                inputs = {
-                                    name: value[name]
-                                    for name in subgraph.input_names
-                                }
-                                output = subgraph.forward(adapter.model, **inputs)
-                                if target_index + 1 < len(adapter.targets):
+                            # Match SequentialPipeline: propagation captures the
+                            # modified full-precision output (or an algorithm's
+                            # in-place weight update), without adding fake-quant
+                            # QDQ to every quantized module.
+                            consumed_names = adapter.plan.subgraphs[
+                                adapter.plan.target_subgraph_indices[target_index]
+                            ].consumed_names
+                            with (
+                                HooksMixin.disable_hooks(),
+                                DisableQuantization(adapter.model),
+                                torch.no_grad(),
+                            ):
+                                for batch_index in batches:
+                                    value = boundaries.get(
+                                        target_index,
+                                        batch_index,
+                                        device=device,
+                                    )
+                                    inputs = {
+                                        name: value[name]
+                                        for name in subgraph.input_names
+                                    }
+                                    output = subgraph.forward(
+                                        adapter.model, **inputs
+                                    )
                                     next_value = {**value, **output}
-                                    for consumed in adapter.plan.subgraphs[
-                                        adapter.plan.target_subgraph_indices[
-                                            target_index
-                                        ]
-                                    ].consumed_names:
+                                    for consumed in consumed_names:
                                         next_value.pop(consumed, None)
                                     boundaries.commit_propagated_batch(
                                         target_index,
@@ -1005,8 +1012,7 @@ def run_subgraph_streaming_pipeline(
                                             ],
                                             value=next_value,
                                         )
-                                    del next_value
-                                del inputs, output, value
+                                    del next_value, inputs, output, value
 
                     with _stage_logger(
                         adapter.model,
