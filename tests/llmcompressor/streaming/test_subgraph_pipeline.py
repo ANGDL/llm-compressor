@@ -29,12 +29,15 @@ from llmcompressor.streaming import (
     CastWeightMaterializer,
     streaming_oneshot,
 )
+from llmcompressor.streaming._logging import streaming_logger
 from llmcompressor.streaming.loading import (
     SubgraphPrefetcher,
     SubgraphWeightSession,
 )
 from llmcompressor.streaming.output import prepare_quantized_tensor_for_save
 from llmcompressor.streaming.pipeline import (
+    _debug_boundary,
+    _debug_value_summary,
     _empty_device_cache,
     _initialize_run,
     _stage_logger,
@@ -281,6 +284,48 @@ def test_stage_logger_only_monitors_execution_device():
         3,
     )
     assert _stage_logger(model, "cpu-stage", torch.device("cpu")).device_ids == ()
+
+
+def test_debug_value_summary_reports_zero_and_nonfinite_tensors():
+    summary = _debug_value_summary(
+        {
+            "zeros": torch.zeros(2, 3),
+            "empty": torch.empty(0),
+            "nonfinite": torch.tensor([1.0, float("nan")]),
+            "tokens": torch.tensor([[1, 2]]),
+        }
+    )
+
+    assert summary["zeros"]["all_zero"] is True
+    assert summary["zeros"]["finite"] is True
+    assert summary["zeros"]["abs_max"] == 0.0
+    assert summary["empty"]["empty"] is True
+    assert "all_zero" not in summary["empty"]
+    assert summary["nonfinite"]["finite"] is False
+    assert summary["tokens"]["all_zero"] is False
+
+
+def test_debug_boundary_identifies_producer_and_consumer():
+    records = []
+    sink = streaming_logger.add(
+        lambda message: records.append(message.record["message"]), level="DEBUG"
+    )
+    try:
+        _debug_boundary(
+            "propagated",
+            boundary=2,
+            batch=0,
+            producer="model.layers.1",
+            consumer="model.mtp.0",
+            value={"hidden": torch.ones(1, 2, 3)},
+        )
+    finally:
+        streaming_logger.remove(sink)
+
+    assert len(records) == 1
+    assert "producer=model.layers.1" in records[0]
+    assert "consumer=model.mtp.0" in records[0]
+    assert "'all_zero': False" in records[0]
 
 
 def test_pretrained_streaming_writes_each_subgraph_as_final_shard(

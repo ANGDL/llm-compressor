@@ -29,6 +29,7 @@ from llmcompressor.streaming.pretrained import (
     _recipe_quantizer,
 )
 from llmcompressor.streaming.tracing import trace_streaming_boundaries
+from llmcompressor.utils import ImatrixFallbackStats
 
 
 class _VisionBlock(torch.nn.Module):
@@ -52,7 +53,7 @@ class _MultimodalModel(torch.nn.Module):
         self.layers = torch.nn.ModuleList([_DecoderLayer(), _DecoderLayer()])
 
 
-def _write_raw_deepseek_v4_checkpoint(checkpoint):
+def _write_raw_deepseek_v4_checkpoint(checkpoint, *, omit_names=()):
     """Convert one tiny native shard to raw keys with one FP8+E8M0 weight."""
     tensors = load_file(checkpoint / "model.safetensors")
     encoded_name = "model.layers.0.attn.wq_a.weight"
@@ -63,6 +64,8 @@ def _write_raw_deepseek_v4_checkpoint(checkpoint):
         torch.int64: "I64",
     }
     for name, tensor in tensors.items():
+        if name in omit_names:
+            continue
         raw_name = name.removeprefix("model.")
         if raw_name.startswith("lm_head."):
             raw_name = f"head.{raw_name.removeprefix('lm_head.')}"
@@ -123,6 +126,36 @@ def _write_raw_deepseek_v4_checkpoint(checkpoint):
     config["model_type"] = "deepseek_v4"
     config["architectures"] = ["DeepseekV4ForCausalLM"]
     config_path.write_text(json.dumps(config))
+
+
+def _tiny_deepseek_v4_config():
+    from llmcompressor.modeling.deepseekv4.config import ModelConfig
+
+    return ModelConfig(
+        vocab_size=32,
+        hidden_size=16,
+        moe_intermediate_size=8,
+        num_hidden_layers=1,
+        num_hash_layers=1,
+        num_nextn_predict_layers=1,
+        num_attention_heads=2,
+        n_routed_experts=2,
+        n_shared_experts=1,
+        num_experts_per_tok=1,
+        q_lora_rank=8,
+        head_dim=8,
+        qk_rope_head_dim=2,
+        o_groups=2,
+        o_lora_rank=4,
+        sliding_window=4,
+        max_position_embeddings=16,
+        max_seq_len=16,
+        index_n_heads=2,
+        index_head_dim=4,
+        index_topk=2,
+        hc_mult=2,
+        compress_ratios=[0, 0],
+    )
 
 
 def test_pretrained_explains_autoround_output_adapter_requirement():
@@ -301,31 +334,7 @@ def test_deepseek_v4_preserves_input_ids_and_collects_all_experts(
         DeepseekV4NativeForCausalLM,
     )
 
-    config = ModelConfig(
-        vocab_size=32,
-        hidden_size=16,
-        moe_intermediate_size=8,
-        num_hidden_layers=1,
-        num_hash_layers=1,
-        num_nextn_predict_layers=1,
-        num_attention_heads=2,
-        n_routed_experts=2,
-        n_shared_experts=1,
-        num_experts_per_tok=1,
-        q_lora_rank=8,
-        head_dim=8,
-        qk_rope_head_dim=2,
-        o_groups=2,
-        o_lora_rank=4,
-        sliding_window=4,
-        max_position_embeddings=16,
-        max_seq_len=16,
-        index_n_heads=2,
-        index_head_dim=4,
-        index_topk=2,
-        hc_mult=2,
-        compress_ratios=[0, 0],
-    )
+    config = _tiny_deepseek_v4_config()
     checkpoint = tmp_path / "checkpoint"
     source_model = DeepseekV4NativeForCausalLM(config)
     source_model.save_pretrained(
@@ -342,32 +351,39 @@ def test_deepseek_v4_preserves_input_ids_and_collects_all_experts(
         batch_size=1,
     )
 
-    output = streaming_oneshot(
-        model=checkpoint,
-        model_config=ModelConfig.from_pretrained(checkpoint),
-        dataset=dataset,
-        dataset_fingerprint="c" * 64,
-        recipe=[
-            IMatrixGatherer(ignore=["model.lm_head"]),
-            QuantizationModifier(
-                scheme="W8A8",
-                targets=["Linear"],
-                weight_observer="imatrix_mse",
-                ignore=["model.lm_head"],
+    stats = ImatrixFallbackStats()
+    stats.install_hooks()
+    with stats:
+        output = streaming_oneshot(
+            model=checkpoint,
+            model_config=ModelConfig.from_pretrained(checkpoint),
+            dataset=dataset,
+            dataset_fingerprint="c" * 64,
+            recipe=[
+                IMatrixGatherer(ignore=["model.lm_head"]),
+                QuantizationModifier(
+                    scheme="W8A8",
+                    targets=["Linear"],
+                    weight_observer="imatrix_mse",
+                    ignore=["model.lm_head"],
+                ),
+            ],
+            output_dir=tmp_path / "output",
+            work_dir=tmp_path / "work",
+            num_calibration_samples=1,
+            max_seq_length=4,
+            target_dtype=torch.float32,
+            materializer=DeepSeekV4WeightMaterializer(
+                fp8_block_size=(128, 128),
+                fp4_block_size=32,
+                save_raw_checkpoint_format=save_raw_checkpoint_format,
             ),
-        ],
-        output_dir=tmp_path / "output",
-        work_dir=tmp_path / "work",
-        num_calibration_samples=1,
-        max_seq_length=4,
-        target_dtype=torch.float32,
-        materializer=DeepSeekV4WeightMaterializer(
-            fp8_block_size=(128, 128),
-            fp4_block_size=32,
-            save_raw_checkpoint_format=save_raw_checkpoint_format,
-        ),
-        checkpoint_progress=checkpoint_progress,
-    )
+            checkpoint_progress=checkpoint_progress,
+        )
+
+    assert not {
+        name for name in stats.all_zero_counter if name.startswith("model.mtp.0")
+    }
 
     assert (output / "FINALIZED").is_file()
     assert not list(
@@ -406,9 +422,56 @@ def test_deepseek_v4_preserves_input_ids_and_collects_all_experts(
         local_files_only=True,
         dtype=torch.float32,
     ).eval()
+    assert torch.equal(loaded.model.embed.weight, source_model.model.embed.weight)
+    assert loaded.model.mtp[0].embed.weight is loaded.model.embed.weight
     quantized = loaded.model.layers[0].attn.wq_a
     assert quantized.weight.dtype == torch.int8
     assert hasattr(quantized, "weight_scale")
     with torch.no_grad():
         logits = loaded(input_ids=torch.tensor([[1, 2, 3, 4]])).logits
     assert torch.isfinite(logits).all()
+
+
+def test_deepseek_v4_missing_mtp_norms_fail_before_calibration(tmp_path):
+    from llmcompressor.modeling.deepseekv4.model import (
+        DeepseekV4NativeForCausalLM,
+    )
+
+    config = _tiny_deepseek_v4_config()
+    checkpoint = tmp_path / "checkpoint"
+    DeepseekV4NativeForCausalLM(config).save_pretrained(
+        checkpoint, safe_serialization=True
+    )
+    _write_raw_deepseek_v4_checkpoint(
+        checkpoint,
+        omit_names={
+            "model.mtp.0.enorm.weight",
+            "model.mtp.0.hnorm.weight",
+        },
+    )
+    dataset = DataLoader(
+        [{"input_ids": torch.tensor([1, 2, 3, 4])}], batch_size=1
+    )
+
+    with pytest.raises(KeyError, match="model.mtp.0.(enorm|hnorm).weight"):
+        streaming_oneshot(
+            model=checkpoint,
+            model_config=config,
+            dataset=dataset,
+            dataset_fingerprint="m" * 64,
+            recipe=[
+                IMatrixGatherer(ignore=["model.lm_head"]),
+                QuantizationModifier(
+                    scheme="W8A8",
+                    targets=["Linear"],
+                    weight_observer="imatrix_mse",
+                    ignore=["model.lm_head"],
+                ),
+            ],
+            output_dir=tmp_path / "output",
+            work_dir=tmp_path / "work",
+            num_calibration_samples=1,
+            max_seq_length=4,
+            target_dtype=torch.float32,
+            materializer=DeepSeekV4WeightMaterializer(),
+        )
