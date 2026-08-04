@@ -50,6 +50,12 @@ def _dtype_size(dtype_name: str) -> int:
         "I64": torch.int64,
         "U8": torch.uint8,
     }
+    for _name, _dtype in (
+        ("F8_E4M3", "float8_e4m3fn"),
+        ("F8_E5M2", "float8_e5m2"),
+    ):
+        if hasattr(torch, _dtype):
+            names[_name] = getattr(torch, _dtype)
     try:
         return torch.empty((), dtype=names[dtype_name]).element_size()
     except KeyError as error:
