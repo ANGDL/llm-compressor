@@ -11,6 +11,7 @@ import torch
 from accelerate import init_empty_weights
 from torch import nn
 
+from llmcompressor.streaming._logging import streaming_logger
 from llmcompressor.streaming.checkpoint import CheckpointWeightSource
 from llmcompressor.streaming.materialization import (
     CastWeightMaterializer,
@@ -129,7 +130,34 @@ class TargetWeightLoader:
         self.source = source
         self.materializer = materializer or CastWeightMaterializer()
         self._source_names = frozenset(source.tensor_names())
+        # Parameters and persistent buffers present when the meta model is
+        # built are checkpoint-backed state.  Modifiers may add qparams later;
+        # those are the only state that may legitimately be absent from the
+        # source and initialized during installation.
+        self._initial_state_names = frozenset(model.state_dict().keys())
         self._active_targets: set[str] = set()
+        expanded_ties = getattr(model, "get_expanded_tied_weights_keys", None)
+        declared_ties = (
+            expanded_ties()
+            if callable(expanded_ties)
+            else getattr(model, "_tied_weights_keys", None)
+        )
+        self._tied_weight_sources = (
+            {
+                str(alias): str(canonical)
+                for alias, canonical in declared_ties.items()
+            }
+            if isinstance(declared_ties, dict)
+            else {}
+        )
+        streaming_logger.debug(
+            "weights | loader initialized | source_tensors={} | "
+            "initial_state={} | tied_aliases={} | materializer={}",
+            len(self._source_names),
+            len(self._initial_state_names),
+            len(self._tied_weight_sources),
+            type(self.materializer).__name__,
+        )
 
     @contextmanager
     def loaded(
@@ -187,6 +215,8 @@ class TargetWeightLoader:
         self._validate_meta(parameter_groups, "parameter")
         self._validate_meta(buffer_groups, "buffer")
 
+        parameter_group_count = len(parameter_groups)
+        buffer_group_count = len(buffer_groups)
         parameter_sources = self._resolve_sources(
             target_name,
             parameter_groups,
@@ -209,6 +239,18 @@ class TargetWeightLoader:
         ]
         self._validate_shapes(parameter_sources, parameter_groups)
         self._validate_shapes(buffer_sources, buffer_groups)
+        streaming_logger.debug(
+            "weights | plan | target={} | source_parameters={}/{} | "
+            "source_buffers={}/{} | auxiliary_parameters={} | "
+            "runtime_buffers={}",
+            target_name or "<root>",
+            len(parameter_sources),
+            parameter_group_count,
+            len(buffer_sources),
+            buffer_group_count,
+            parameter_group_count - len(parameter_sources),
+            len(runtime_buffer_groups),
+        )
         return TargetLoadPlan(
             name=target_name,
             target=target,
@@ -294,13 +336,21 @@ class TargetWeightLoader:
         except Exception:
             parameter_values.clear()
             raise
-        return PreparedTargetWeights(
+        prepared = PreparedTargetWeights(
             plan=plan,
             device=torch.device("cpu"),
             dtype=dtype,
             parameter_values=parameter_values,
             buffer_values=buffer_values,
         )
+        streaming_logger.opt(lazy=True).debug(
+            "weights | materialized | target={} | tensors={} | bytes={} | "
+            "device=cpu",
+            lambda: plan.name or "<root>",
+            lambda: len(parameter_values) + len(buffer_values),
+            lambda: prepared.nbytes,
+        )
+        return prepared
 
     @contextmanager
     def installed(
@@ -338,6 +388,21 @@ class TargetWeightLoader:
                     dtype=prepared.dtype,
                     exclude_parameters=frozenset(loaded_parameter_names),
                 )
+            if auxiliary_parameters:
+                streaming_logger.opt(lazy=True).debug(
+                    "weights | auxiliary parameters initialized | target={} | "
+                    "count={} | names={}",
+                    lambda: plan.name or "<root>",
+                    lambda: len(auxiliary_parameters),
+                    lambda: [
+                        name for name, _ in auxiliary_parameters[:8]
+                    ]
+                    + (
+                        [f"... {len(auxiliary_parameters) - 8} more"]
+                        if len(auxiliary_parameters) > 8
+                        else []
+                    ),
+                )
             installed_parameters = self._install_parameters(
                 target,
                 plan.parameter_groups,
@@ -364,6 +429,15 @@ class TargetWeightLoader:
                 tensor.is_meta for tensor, _ in plan.runtime_buffer_groups
             ):
                 reinitialize()
+            streaming_logger.debug(
+                "weights | installed | target={} | parameters={} | buffers={} | "
+                "runtime_buffers={} | device={}",
+                plan.name or "<root>",
+                len(installed_parameters),
+                len(installed_buffers),
+                len(runtime_buffers),
+                prepared.device,
+            )
             yield target
         finally:
             self._restore_meta_parameters(target, installed_parameters)
@@ -372,6 +446,10 @@ class TargetWeightLoader:
             self._restore_auxiliary_parameters(target, auxiliary_parameters)
             prepared.close()
             self._active_targets.remove(plan.name)
+            streaming_logger.debug(
+                "weights | restored meta state | target={}",
+                plan.name or "<root>",
+            )
 
     @staticmethod
     def _validate_plan_is_current(plan: TargetLoadPlan) -> None:
@@ -404,9 +482,7 @@ class TargetWeightLoader:
         for name, parameter in target.named_parameters(
             recurse=True, remove_duplicate=False
         ):
-            if name in exclude_parameters:
-                continue
-            if not parameter.is_meta:
+            if name in exclude_parameters or not parameter.is_meta:
                 continue
             owner, local_name = _owner_and_name(target, name)
             value_dtype = (
@@ -527,6 +603,12 @@ class TargetWeightLoader:
         global_aliases = None
         for tensor, aliases in groups:
             candidates = [_join_name(target_name, alias) for alias in aliases]
+            candidates.extend(
+                self._tied_weight_sources[name]
+                for name in tuple(candidates)
+                if name in self._tied_weight_sources
+            )
+            candidates = list(dict.fromkeys(candidates))
             matches = [
                 name for name in candidates if name in self._source_names
             ]
@@ -541,12 +623,35 @@ class TargetWeightLoader:
                     name for name in candidates if name in self._source_names
                 ]
             if not matches:
+                missing_checkpoint_state = [
+                    name for name in candidates if name in self._initial_state_names
+                ]
+                if missing_checkpoint_state:
+                    raise KeyError(
+                        "Checkpoint is missing model state "
+                        f"{missing_checkpoint_state}. A source-backed parameter "
+                        "cannot be initialized implicitly. Check the checkpoint "
+                        "key mapping and model configuration. Fused or renamed "
+                        "checkpoint tensors require an explicit materializer "
+                        "mapping."
+                    )
                 if allow_missing:
                     continue
                 raise KeyError(
                     "No checkpoint tensor matches model tensor aliases "
                     f"{candidates}. Fused or renamed checkpoint tensors require a "
                     "custom mapping and are not supported by TargetWeightLoader."
+                )
+            if (
+                candidates[0] not in self._source_names
+                and matches[0] != candidates[0]
+            ):
+                streaming_logger.debug(
+                    "weights | alias resolved | target={} | aliases={} | "
+                    "source={}",
+                    target_name or "<root>",
+                    aliases,
+                    matches[0],
                 )
             resolved[id(tensor)] = matches[0]
         return resolved

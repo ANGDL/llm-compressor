@@ -90,6 +90,62 @@ def _target_label(index: int, total: int, target: str) -> str:
     return f"[{index + 1:0{width}d}/{total:0{width}d}] {target}"
 
 
+def _debug_tensor_summary(tensor: torch.Tensor) -> dict[str, Any]:
+    numel = tensor.numel()
+    summary: dict[str, Any] = {
+        "shape": tuple(tensor.shape),
+        "dtype": str(tensor.dtype),
+        "device": str(tensor.device),
+        "numel": numel,
+    }
+    if tensor.is_meta:
+        summary["meta"] = True
+        return summary
+    if numel == 0:
+        summary["empty"] = True
+        return summary
+    detached = tensor.detach()
+    summary["all_zero"] = bool(torch.count_nonzero(detached).item() == 0)
+    if detached.dtype.is_floating_point:
+        summary["finite"] = bool(torch.isfinite(detached).all().item())
+        summary["abs_max"] = float(detached.float().abs().amax().item())
+    return summary
+
+
+def _debug_value_summary(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return _debug_tensor_summary(value)
+    if isinstance(value, Mapping):
+        return {
+            str(name): _debug_value_summary(item)
+            for name, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_debug_value_summary(item) for item in value]
+    return type(value).__name__
+
+
+def _debug_boundary(
+    stage: str,
+    *,
+    boundary: int,
+    batch: int,
+    producer: str,
+    consumer: str,
+    value: Any,
+) -> None:
+    streaming_logger.opt(lazy=True).debug(
+        "boundary | {stage} | index={boundary} | batch={batch} | "
+        "producer={producer} | consumer={consumer} | values={values}",
+        stage=lambda: stage,
+        boundary=lambda: boundary,
+        batch=lambda: batch,
+        producer=lambda: producer,
+        consumer=lambda: consumer,
+        values=lambda: _debug_value_summary(value),
+    )
+
+
 def _output_shard(source, tensor_name: str, owner_name: str) -> str:
     available = set(source.tensor_names())
     if tensor_name in available:
@@ -684,6 +740,15 @@ def run_subgraph_streaming_pipeline(
                 adapter.calibration_boundaries(calibration_batches)
             ):
                 boundaries.put(0, batch_index, boundary)
+                if batch_index == 0:
+                    _debug_boundary(
+                        "initial",
+                        boundary=0,
+                        batch=batch_index,
+                        producer="<dataset>",
+                        consumer=adapter.targets[0],
+                        value=boundary,
+                    )
         streaming_logger.info(
             "setup | initial boundary ready | "
             f"batches={len(boundaries.batch_indices(0))}"
@@ -869,6 +934,19 @@ def run_subgraph_streaming_pipeline(
                                     name: value[name]
                                     for name in subgraph.input_names
                                 }
+                                if batch_index == batches[0]:
+                                    _debug_boundary(
+                                        "calibration input",
+                                        boundary=target_index,
+                                        batch=batch_index,
+                                        producer=(
+                                            adapter.targets[target_index - 1]
+                                            if target_index
+                                            else "<dataset>"
+                                        ),
+                                        consumer=target_name,
+                                        value=inputs,
+                                    )
                                 subgraph.forward(adapter.model, **inputs)
                                 del inputs, value
                     with _stage_logger(
@@ -916,6 +994,17 @@ def run_subgraph_streaming_pipeline(
                                         batch_index,
                                         next_value,
                                     )
+                                    if batch_index == batches[0]:
+                                        _debug_boundary(
+                                            "propagated",
+                                            boundary=target_index + 1,
+                                            batch=batch_index,
+                                            producer=target_name,
+                                            consumer=adapter.targets[
+                                                target_index + 1
+                                            ],
+                                            value=next_value,
+                                        )
                                     del next_value
                                 del inputs, output, value
 

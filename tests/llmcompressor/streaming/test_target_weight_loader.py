@@ -281,6 +281,32 @@ def test_plan_scans_global_aliases_once_for_omitted_tied_weight(
     assert scans == 1
 
 
+def test_plan_uses_declared_tied_weight_source_without_shared_identity(tmp_path):
+    class DeclaredTiedModel(nn.Module):
+        _tied_weights_keys = {"alias.weight": "canonical.weight"}
+
+        def __init__(self):
+            super().__init__()
+            self.canonical = nn.Linear(4, 4, bias=False)
+            self.alias = nn.Linear(4, 4, bias=False)
+
+    reference = DeclaredTiedModel()
+    path = tmp_path / "model.safetensors"
+    save_file(
+        {"canonical.weight": reference.canonical.weight.detach().clone()}, path
+    )
+    model = build_meta_model(DeclaredTiedModel)
+    loader = TargetWeightLoader(model, SafetensorsWeightSource(path))
+
+    plan = loader.plan("alias")
+
+    assert set(plan.parameter_sources.values()) == {"canonical.weight"}
+    with loader.loaded("alias", device=torch.device("cpu"), dtype=torch.float32):
+        assert torch.equal(model.alias.weight, reference.canonical.weight)
+
+    _assert_all_meta(model)
+
+
 def test_install_rejects_stale_prepared_plan(tiny_checkpoint):
     _, path = tiny_checkpoint
     model = build_meta_model(TinyModel)
@@ -527,9 +553,7 @@ def test_kimi_k3_plan_includes_all_896_routed_experts(tmp_path):
     _assert_all_meta(model)
 
 
-def test_missing_state_does_not_allocate_placeholders_for_loaded_parameters(
-    tmp_path, monkeypatch
-):
+def test_missing_source_state_is_not_initialized_as_a_placeholder(tmp_path):
     class PartialModel(nn.Module):
         def __init__(self):
             super().__init__()
@@ -540,26 +564,10 @@ def test_missing_state_does_not_allocate_placeholders_for_loaded_parameters(
     save_file({"loaded.weight": torch.ones(3, 4)}, path)
     model = build_meta_model(PartialModel)
     loader = TargetWeightLoader(model, SafetensorsWeightSource(path))
-    original_zeros = torch.zeros
-    allocated_shapes = []
+    with pytest.raises(KeyError, match="missing model state"):
+        loader.plan("", allow_missing_state=True)
 
-    def recording_zeros(*args, **kwargs):
-        shape = args[0] if args else kwargs["size"]
-        allocated_shapes.append(tuple(shape))
-        return original_zeros(*args, **kwargs)
-
-    monkeypatch.setattr(torch, "zeros", recording_zeros)
-
-    with loader.loaded(
-        "",
-        device=torch.device("cpu"),
-        dtype=torch.float32,
-        allow_missing_state=True,
-    ):
-        assert torch.equal(model.loaded.weight, torch.ones(3, 4))
-        assert torch.equal(model.missing.weight, original_zeros(5, 4))
-
-    assert allocated_shapes == [(5, 4)]
+    _assert_all_meta(model)
 
 
 def test_rejects_fused_checkpoint_tensor_with_clear_error(tmp_path):
