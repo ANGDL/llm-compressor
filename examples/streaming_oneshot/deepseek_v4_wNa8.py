@@ -217,7 +217,11 @@ def main() -> None:
         "--moe-calibrate-all-experts",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="Collect iMatrix statistics for every routed expert.",
+        help=(
+            "Send all tokens through every main-model expert. DSpark draft "
+            "layers always cover every expert because their short fixed block "
+            "cannot provide complete routing coverage."
+        ),
     )
     parser.add_argument(
         "--pack-to-int8",

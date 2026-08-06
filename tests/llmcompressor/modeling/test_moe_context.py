@@ -2,8 +2,48 @@ import torch
 from compressed_tensors.offload import disable_onloading
 from compressed_tensors.quantization import QuantizationMetadata
 
+from llmcompressor.modeling.moe_context import (
+    MoECalibrationModule,
+    moe_calibration_context,
+)
 from tests.e2e.e2e_utils import run_oneshot_single
 from tests.testing_utils import BaseTestConfig, requires_gpu
+
+
+class _TestMoE(torch.nn.Module):
+    def __init__(self, *, requires_all_experts: bool):
+        super().__init__()
+        self.requires_all_experts_for_calibration = requires_all_experts
+
+
+@MoECalibrationModule.register("_TestMoE")
+class _TestCalibrationMoE(MoECalibrationModule):
+    def __init__(self, original, config, calibrate_all_experts=True):
+        super().__init__()
+        self.calibrate_all_experts = calibrate_all_experts
+
+    def restore(self, original):
+        return original
+
+
+class _TestMoEModel(torch.nn.Module):
+    config = object()
+
+    def __init__(self):
+        super().__init__()
+        self.optional = _TestMoE(requires_all_experts=False)
+        self.required = _TestMoE(requires_all_experts=True)
+
+
+def test_module_can_require_all_experts_when_global_policy_is_disabled():
+    model = _TestMoEModel()
+
+    with moe_calibration_context(model, calibrate_all_experts=False):
+        assert not model.optional.calibrate_all_experts
+        assert model.required.calibrate_all_experts
+
+    assert isinstance(model.optional, _TestMoE)
+    assert isinstance(model.required, _TestMoE)
 
 
 @requires_gpu(1)

@@ -168,7 +168,7 @@ def _tiny_deepseek_v4_dspark_config():
         num_hash_layers=3,
         num_nextn_predict_layers=1,
         num_attention_heads=2,
-        n_routed_experts=2,
+        n_routed_experts=8,
         n_shared_experts=1,
         num_experts_per_tok=1,
         q_lora_rank=8,
@@ -510,6 +510,79 @@ def test_deepseek_v4_missing_mtp_norms_fail_before_calibration(tmp_path):
         )
 
 
+def test_deepseek_v4_dspark_forward_teacher_forces_valid_seed_and_context():
+    from llmcompressor.modeling.deepseekv4.model_dspark import (
+        DeepseekV4DSparkForCausalLM,
+    )
+
+    config = _tiny_deepseek_v4_dspark_config()
+    model = DeepseekV4DSparkForCausalLM(config).eval()
+    target_outputs = {layer_id: [] for layer_id in config.dspark_target_layer_ids}
+    projected_contexts = []
+    context_masks = []
+    draft_ids = []
+    handles = []
+
+    def capture_target(layer_id):
+        def hook(_module, _args, output):
+            target_outputs[layer_id].append(output[0].mean(dim=2).detach())
+
+        return hook
+
+    for layer_id in config.dspark_target_layer_ids:
+        handles.append(
+            model.model.layers[layer_id].register_forward_hook(
+                capture_target(layer_id)
+            )
+        )
+    handles.append(
+        model.model.mtp[0].main_proj.register_forward_pre_hook(
+            lambda _module, args: projected_contexts.append(args[0].detach())
+        )
+    )
+    handles.append(
+        model.model.mtp[0].attn.register_forward_pre_hook(
+            lambda _module, args: context_masks.append(args[2].detach())
+        )
+    )
+    handles.append(
+        model.model.mtp[0].ffn.register_forward_pre_hook(
+            lambda _module, args: draft_ids.append(args[1].detach())
+        )
+    )
+
+    try:
+        with torch.no_grad():
+            unpadded = model(
+                input_ids=torch.tensor([[1, 2, 3, 4]]),
+                attention_mask=torch.ones((1, 4), dtype=torch.long),
+            ).logits
+            padded = model(
+                input_ids=torch.tensor([[1, 2, 3, 4, 7, 7]]),
+                attention_mask=torch.tensor([[1, 1, 1, 1, 0, 0]]),
+            ).logits
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    expected_context = torch.cat(
+        [
+            target_outputs[layer_id][0][:, [0, 0, 1, 2]]
+            for layer_id in config.dspark_target_layer_ids
+        ],
+        dim=-1,
+    )
+    assert torch.equal(draft_ids[0], torch.tensor([[4, 31, 31]]))
+    assert torch.equal(draft_ids[1], draft_ids[0])
+    assert torch.equal(
+        context_masks[0], torch.tensor([[False, True, True, True]])
+    )
+    assert torch.equal(context_masks[1], context_masks[0])
+    assert torch.allclose(projected_contexts[0], expected_context)
+    assert torch.allclose(projected_contexts[1], projected_contexts[0])
+    assert torch.allclose(padded[:, :4], unpadded)
+
+
 def test_deepseek_v4_0731_dspark_streaming_checkpoint_contract(tmp_path):
     from llmcompressor.modeling.deepseekv4.model_dspark import (
         DeepseekV4DSparkForCausalLM,
@@ -523,10 +596,9 @@ def test_deepseek_v4_0731_dspark_streaming_checkpoint_contract(tmp_path):
     dataset = DataLoader(
         [
             {
-                # Prefill uses full-sequence indices before updating the
-                # sliding-window cache, so exercise seq_len > window_size.
-                "input_ids": torch.tensor([1, 2, 3, 4, 5, 6]),
-                "attention_mask": torch.ones(6, dtype=torch.long),
+                # Exercise the same right padding used by calibration datasets.
+                "input_ids": torch.tensor([1, 2, 3, 4, 0, 0]),
+                "attention_mask": torch.tensor([1, 1, 1, 1, 0, 0]),
             }
         ],
         batch_size=1,
@@ -557,6 +629,7 @@ def test_deepseek_v4_0731_dspark_streaming_checkpoint_contract(tmp_path):
             work_dir=tmp_path / "work",
             num_calibration_samples=1,
             max_seq_length=6,
+            moe_calibrate_all_experts=False,
             target_dtype=torch.float32,
             materializer=DeepSeekV4WeightMaterializer(
                 fp8_block_size=(128, 128),

@@ -45,6 +45,11 @@ class MoECalibrationModule(ABC, torch.nn.Module, RegistryMixin):
        (self, original, config, calibrate_all_experts=True)
     2. Set `is_permanent` to indicate if module should stay in calibration form
     3. Optionally implement `restore()` if is_permanent=False
+
+    Source MoE modules may set ``requires_all_experts_for_calibration=True``
+    when sparse routing cannot provide representative data for every expert.
+    This per-module correctness requirement takes precedence over the caller's
+    global ``calibrate_all_experts=False`` optimization.
     """
 
     is_permanent: bool = False
@@ -102,15 +107,22 @@ def moe_calibration_context(
     for name, module in model.named_modules():
         class_name = module.__class__.__name__
         if _is_registered(class_name, MoECalibrationModule):
-            modules_to_replace.append((name, class_name))
+            requires_all_experts = bool(
+                getattr(module, "requires_all_experts_for_calibration", False)
+            )
+            modules_to_replace.append(
+                (name, class_name, requires_all_experts)
+            )
 
     # Step 2: Replace modules with progress bar
     if modules_to_replace:
+        required_count = sum(required for _, _, required in modules_to_replace)
         logger.info(
             f"Found {len(modules_to_replace)} MoE modules to replace; "
-            f"calibrate_all_experts={calibrate_all_experts}"
+            f"calibrate_all_experts={calibrate_all_experts}; "
+            f"module_overrides={required_count}"
         )
-        for name, class_name in tqdm(
+        for name, class_name, requires_all_experts in tqdm(
             modules_to_replace, desc="Replacing MoE modules for calibration"
         ):
             module = model.get_submodule(name)
@@ -118,7 +130,9 @@ def moe_calibration_context(
                 class_name,
                 original=module,
                 config=model.config,
-                calibrate_all_experts=calibrate_all_experts,
+                calibrate_all_experts=(
+                    calibrate_all_experts or requires_all_experts
+                ),
             )
             # Apply the same offloading settings as the original module
             _apply_offloading_to_replacement(module, replacement)
