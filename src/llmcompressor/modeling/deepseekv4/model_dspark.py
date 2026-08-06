@@ -93,6 +93,7 @@ def _apply_rotary_4d(
 def _dense_dspark_attention(
     q: torch.Tensor,
     kv: torch.Tensor,
+    kv_mask: torch.Tensor,
     attn_sink: torch.Tensor,
     softmax_scale: float,
 ) -> torch.Tensor:
@@ -106,8 +107,11 @@ def _dense_dspark_attention(
 
     scores = torch.einsum("bshd,btd->bsht", q.float(), kv.float())
     scores = scores * softmax_scale
+    mask = ~kv_mask[:, None, None, :].bool()
+    scores = scores.masked_fill(mask, float("-inf"))
     scores_max = scores.amax(dim=-1, keepdim=True).clamp(min=-1e30)
     exp_scores = torch.exp(scores - scores_max)
+    exp_scores = exp_scores.masked_fill(mask, 0.0)
     exp_scores_bf16 = exp_scores.bfloat16()
     output = torch.einsum(
         "bsht,btd->bshd", exp_scores_bf16.float(), kv.float()
@@ -236,7 +240,12 @@ class DSparkAttention(TraceFriendlyAttention):
             persistent=False,
         )
 
-    def forward(self, x: torch.Tensor, main_x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        main_x: torch.Tensor,
+        main_mask: torch.Tensor,
+    ) -> torch.Tensor:
         block_size = x.shape[1]
         context_positions = self.freqs_cis[: main_x.shape[1]]
         draft_positions = self.draft_offsets + main_x.shape[1]
@@ -256,9 +265,17 @@ class DSparkAttention(TraceFriendlyAttention):
         kv = self.kv_norm(self.wkv(x))
         _apply_rotary_3d(kv[..., -self.rope_head_dim :], draft_freqs)
         context = main_kv[:, -self.window_size :]
+        context_mask = main_mask[:, -self.window_size :]
         output = _dense_dspark_attention(
             q,
             torch.cat((context, kv), dim=1),
+            torch.cat(
+                (
+                    context_mask,
+                    torch.ones_like(x[..., 0], dtype=torch.bool),
+                ),
+                dim=1,
+            ),
             self.attn_sink,
             self.softmax_scale,
         )
@@ -288,6 +305,10 @@ class DSparkBlock(Block):
     def __init__(self, layer_id: int, args: ModelConfig):
         super().__init__(layer_id, args)
         self.attn = DSparkAttention(layer_id, args)
+        # Each calibration sample contains only one short draft block. Sparse
+        # routing cannot guarantee coverage of all DSpark experts, so the MoE
+        # calibration adapter must observe every expert explicitly.
+        self.ffn.requires_all_experts_for_calibration = True
         self.stage_id = layer_id - args.n_layers
         self.block_size = args.dspark_block_size
         self.noise_token_id = args.dspark_noise_token_id
@@ -314,34 +335,71 @@ class DSparkBlock(Block):
                 self.hc_head_scale = nn.Parameter(torch.empty(1))
 
     def forward_embed(
-        self, main_hidden: torch.Tensor, input_embeds: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self,
+        main_hidden: torch.Tensor,
+        input_embeds: torch.Tensor,
+        main_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         main_x = self.main_norm(self.main_proj(main_hidden))
         x = input_embeds
         x = x.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
-        return x, main_x
+        return x, main_x, main_mask
 
     def forward(
         self,
         x: torch.Tensor | tuple[torch.Tensor, ...],
         input_ids: Optional[torch.Tensor],
         main_x: Optional[torch.Tensor] = None,
+        main_mask: Optional[torch.Tensor] = None,
         embedding_weight: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        attention_mask: Optional[torch.Tensor] = None,
+        seed_positions: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor | tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+    ]:
         if self.stage_id == 0:
-            if input_ids is None or embedding_weight is None:
+            if (
+                input_ids is None
+                or embedding_weight is None
+                or seed_positions is None
+            ):
                 raise ValueError(
-                    "The first DSpark block requires input ids and embedding"
+                    "The first DSpark block requires input ids, seed positions, "
+                    "and embedding"
                 )
             if not isinstance(x, tuple):
                 raise TypeError("The first DSpark block requires target hidden states")
-            first = input_ids[:, -1:]
-            noise = first[:, :1].expand(-1, self.block_size - 1) * 0
-            draft_ids = torch.cat((first, noise + self.noise_token_id), dim=1)
+            if attention_mask is None:
+                attention_mask = torch.ones_like(input_ids)
+            context_positions = seed_positions[:, None] - self.attn.window_size
+            context_positions = context_positions + torch.arange(
+                self.attn.window_size, device=input_ids.device
+            )[None, :]
+            context_indices = context_positions.clamp(min=0)
+            main_mask = attention_mask.gather(1, context_indices).bool()
+            main_mask = main_mask & (context_positions >= 0)
+            context_indices = context_indices[..., None]
+            context_hiddens = tuple(
+                hidden.gather(1, context_indices.expand(-1, -1, hidden.shape[-1]))
+                for hidden in x
+            )
+            # Teacher forcing substitutes the calibration sequence's true token
+            # for the sampled main-model output used by reference inference.
+            draft_seed_ids = input_ids.gather(1, seed_positions[:, None])
+            noise = draft_seed_ids.expand(-1, self.block_size - 1) * 0
+            draft_ids = torch.cat(
+                (draft_seed_ids, noise + self.noise_token_id), dim=1
+            )
             input_embeds = F.embedding(draft_ids, embedding_weight)
-            x, main_x = self.forward_embed(torch.cat(x, dim=-1), input_embeds)
+            x, main_x, main_mask = self.forward_embed(
+                torch.cat(context_hiddens, dim=-1), input_embeds, main_mask
+            )
             input_ids = draft_ids
-        elif main_x is None or not isinstance(x, torch.Tensor):
+        elif (
+            main_x is None
+            or main_mask is None
+            or not isinstance(x, torch.Tensor)
+        ):
             raise ValueError("DSpark decoder blocks require hidden and context states")
 
         residual = x
@@ -349,7 +407,7 @@ class DSparkBlock(Block):
             x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
         )
         x = self.attn_norm(x)
-        x = self.attn(x, main_x)
+        x = self.attn(x, main_x, main_mask)
         x = self.hc_post(x, residual, post, comb)
 
         residual = x
@@ -360,7 +418,7 @@ class DSparkBlock(Block):
         x = self.ffn(x, input_ids)
         x = self.hc_post(x, residual, post, comb)
         if self.stage_id == 0:
-            return x, main_x, input_ids
+            return x, main_x, main_mask, input_ids
         return x
 
 
@@ -377,6 +435,23 @@ class DSparkConfidenceHead(nn.Module):
         self.proj = Linear(input_dim, 1, bias=False)
 
 
+class DSparkInputAdapter(nn.Module):
+    """Normalize padded inputs before crossing sequential layer boundaries."""
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids)
+        positions = torch.arange(input_ids.shape[1], device=input_ids.device)
+        valid_positions = torch.where(
+            attention_mask.bool(), positions[None, :], -1
+        )
+        return attention_mask, valid_positions.amax(dim=1).clamp(min=0)
+
+
 class DSparkTransformer(nn.Module):
     def __init__(self, args: ModelConfig):
         super().__init__()
@@ -384,6 +459,7 @@ class DSparkTransformer(nn.Module):
             raise ValueError("DSparkTransformer requires dspark_block_size > 0")
         self.max_seq_len = args.max_seq_len
         self.hc_mult = args.hc_mult
+        self.input_adapter = DSparkInputAdapter()
         self._config_target_layer_ids = tuple(args.dspark_target_layer_ids)
         invalid_targets = set(self._config_target_layer_ids) - set(
             range(args.n_layers)
@@ -413,7 +489,14 @@ class DSparkTransformer(nn.Module):
             self.hc_head_base = nn.Parameter(torch.empty(args.hc_mult))
             self.hc_head_scale = nn.Parameter(torch.empty(1))
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        attention_mask, seed_positions = self.input_adapter(
+            input_ids, attention_mask
+        )
         hidden_states = self.embed(input_ids)
         hidden_states = hidden_states.unsqueeze(2).repeat(
             1, 1, self.hc_mult, 1
@@ -427,13 +510,15 @@ class DSparkTransformer(nn.Module):
                 hidden_states, 0, input_ids, main_hiddens
             )
 
-        x, main_x, draft_ids = self.mtp[0](
+        x, main_x, main_mask, draft_ids = self.mtp[0](
             main_hiddens,
             input_ids,
             embedding_weight=self.embed.weight,
+            attention_mask=attention_mask,
+            seed_positions=seed_positions,
         )
         for layer in self.mtp[1:]:
-            x = layer(x, draft_ids, main_x)
+            x = layer(x, draft_ids, main_x, main_mask)
         dependency = torch.zeros_like(x[..., :1]).sum()
         logits = self.lm_head(
             hidden_states + dependency,
@@ -495,13 +580,14 @@ class DeepseekV4DSparkForCausalLM(
     def forward(
         self,
         input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
         labels: torch.LongTensor | None = None,
         logits_to_keep: int | torch.Tensor = 0,
         **kwargs: Unpack[TransformersKwargs],
     ) -> CausalLMOutputWithPast:
         if input_ids is None:
             raise ValueError("DeepSeek-V4 DSpark requires input_ids")
-        logits = self.model(input_ids=input_ids)
+        logits = self.model(input_ids=input_ids, attention_mask=attention_mask)
         if isinstance(logits_to_keep, int) and logits_to_keep > 0:
             logits = logits[:, -logits_to_keep:]
         elif isinstance(logits_to_keep, torch.Tensor):
