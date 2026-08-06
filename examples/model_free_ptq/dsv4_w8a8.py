@@ -4,7 +4,8 @@ Convert DeepSeek-V4-Flash (FP4 + FP8 mixed) -> INT8 per-channel.
 Source checkpoint layout (DeepSeek native naming, verified from the HF release):
   - FP8 weights : F8_E4M3 weight + F8_E8M0 block-128x128 scale
                   (attn wq_a/wq_b/wkv/wo_b, ffn.shared_experts.w*,
-                   mtp.* counterparts, mtp.e_proj/h_proj, attn.indexer.wq_b)
+                   mtp.* counterparts, mtp.e_proj/h_proj/main_proj,
+                   attn.indexer.wq_b)
   - FP4 experts : packed e2m1 stored as int8 (2 nibbles/byte) + F8_E8M0
                   block-32 scale; logical in_dim = 2 * stored in_dim
                   (layers/mtp ffn.experts.N.w1/w2/w3)
@@ -19,7 +20,8 @@ KLX w8a8_int8 / w4a8 loaders):
     per-output-channel scale named "<name>.scale" of shape [out_features, 1].
   - wo_a is dequantized to BF16 and kept BF16 (DSV4 loader's manual einsum path
     consumes BF16 wo_a; it is NOT quantized in the reference INT8 model).
-  - Everything else is copied through byte-for-byte (dtype preserved).
+  - DSpark markov/confidence heads and everything else are copied through
+    byte-for-byte (dtype preserved).
 
 INT8 here is *per-channel*, not block-wise.
 
@@ -230,6 +232,7 @@ _FP8_INT8_PROJ_SUFFIXES = (
     ".ffn.shared_experts.w3.weight",
     ".e_proj.weight",  # mtp.<k>.e_proj.weight (MTP embedding projector)
     ".h_proj.weight",  # mtp.<k>.h_proj.weight (MTP hidden projector)
+    ".main_proj.weight",  # mtp.0.main_proj.weight (0731 DSpark projector)
 )
 
 # FP8 e4m3 weights that are dequantized to BF16 and left BF16 (not quantized).
@@ -403,7 +406,11 @@ def _write_int8_config(output_dir: str):
             }
         },
         "format": "int-quantized",
-        "ignore": ["lm_head"],
+        "ignore": [
+            "lm_head",
+            "re:.*confidence_head\\.proj$",
+            "re:.*markov_head\\.(markov_w1|markov_w2)$",
+        ],
         "quant_method": "compressed-tensors",
     }
     with open(config_path, "w", encoding="utf-8") as f:
@@ -529,7 +536,10 @@ def main():
 
     print("Convert DeepSeek-V4-Flash FP4+FP8 -> per-channel INT8")
     print("  experts (FP4 e2m1)            -> INT8 per-channel weight + .scale")
-    print("  attn/shared/e_proj/h_proj(FP8)-> INT8 per-channel weight + .scale")
+    print(
+        "  attn/shared/e_proj/h_proj/main_proj(FP8)-> "
+        "INT8 per-channel weight + .scale"
+    )
     print("  wo_a (FP8)                    -> BF16 (kept, not quantized)")
     print("  norms/gate/embed/head/hc/...  -> copied unchanged")
     print(f"  source: {input_dir}")
