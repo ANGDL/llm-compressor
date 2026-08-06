@@ -226,6 +226,7 @@ def streaming_oneshot_from_pretrained(
     *,
     model: str | Path,
     model_config: Any,
+    model_factory: Callable[..., nn.Module] | None = None,
     dataset: Any,
     recipe: Any,
     output_dir: str | Path,
@@ -318,8 +319,9 @@ def streaming_oneshot_from_pretrained(
         if type(modifier).__name__ == "IMatrixGatherer":
             modifier.attach_by_initialize = False
     quantizer = _recipe_quantizer(parsed_recipe)
+    factory = model_factory or AutoModelForCausalLM.from_config
     meta_model = build_meta_model(
-        AutoModelForCausalLM.from_config,
+        factory,
         config,
         keep_nonpersistent_buffers=True,
     )

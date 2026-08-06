@@ -122,6 +122,7 @@ def _ignores() -> list[str]:
         r"re:.*attn\.indexer\.compressor\.wgate$",
         r"re:.*attn\.indexer\.compressor\.wkv$",
         r"re:.*attn\.indexer\.weights_proj$",
+        r"re:.*confidence_head\.proj$",
     ]
     return ignores
 
@@ -148,7 +149,7 @@ def _int_scheme(num_bits: int) -> QuantizationScheme:
     )
 
 
-def _schemes(quant_mode: str):
+def _schemes(quant_mode: str, *, dspark: bool = False):
     ignores = _ignores()
     if quant_mode == "w8a8":
         scheme = preset_name_to_scheme("W8A8", ["Linear"])
@@ -164,12 +165,17 @@ def _schemes(quant_mode: str):
         experts = _int_scheme(4)
         experts.targets = [r"re:.*ffn\.experts\.\d+\.(w1|w2|w3)$"]
         other = _int_scheme(8)
-        other.targets = [
+        other_targets = [
             r"re:.*attn\.(wq_a|wq_b|wkv|wo_a|wo_b)$",
             r"re:.*attn\.indexer\.wq_b$",
             r"re:.*ffn\.shared_experts\.(w1|w2|w3)$",
-            r"re:.*mtp\.\d+\.(e_proj|h_proj)$",
         ]
+        other_targets.append(
+            r"re:.*mtp\.0\.main_proj$"
+            if dspark
+            else r"re:.*mtp\.\d+\.(e_proj|h_proj)$"
+        )
+        other.targets = other_targets
         return {"experts_w4a8": experts, "other_w8a8": other}, ignores
     raise ValueError(f"Unknown quantization mode: {quant_mode}")
 
@@ -230,13 +236,23 @@ def main() -> None:
     tokenizer = AutoTokenizer.from_pretrained(args.model_id, local_files_only=True)
     config = ModelConfig.from_pretrained(args.model_id)
     config.max_batch_size = args.batch_size
-    config.max_seq_len = args.max_sequence_length
+    is_dspark = config.is_dspark
+    config.max_seq_len = args.max_sequence_length + (
+        config.dspark_block_size if is_dspark else 0
+    )
+    model_factory = None
+    if is_dspark:
+        from llmcompressor.modeling.deepseekv4.model_dspark import (
+            DeepseekV4DSparkForCausalLM,
+        )
+
+        model_factory = DeepseekV4DSparkForCausalLM
     dataset = load_calibration_dataset(
         args.dataset_id,
         args.dataset_split,
         args.num_calibration_samples,
     )
-    config_groups, ignores = _schemes(args.quant_mode)
+    config_groups, ignores = _schemes(args.quant_mode, dspark=is_dspark)
     recipe = [
         IMatrixGatherer(ignore=ignores),
         QuantizationModifier(
@@ -250,6 +266,7 @@ def main() -> None:
         result = streaming_oneshot(
             model=args.model_id,
             model_config=config,
+            model_factory=model_factory,
             dataset=dataset,
             tokenizer=tokenizer,
             recipe=recipe,

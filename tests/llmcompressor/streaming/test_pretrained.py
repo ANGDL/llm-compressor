@@ -9,7 +9,6 @@ import torch
 from safetensors.torch import load_file
 from torch.utils.data import DataLoader
 from transformers import (
-    AutoModelForCausalLM,
     LlamaConfig,
     LlamaForCausalLM,
     Qwen3Config,
@@ -155,6 +154,40 @@ def _tiny_deepseek_v4_config():
         index_topk=2,
         hc_mult=2,
         compress_ratios=[0, 0],
+    )
+
+
+def _tiny_deepseek_v4_dspark_config():
+    from llmcompressor.modeling.deepseekv4.config import ModelConfig
+
+    return ModelConfig(
+        vocab_size=32,
+        hidden_size=16,
+        moe_intermediate_size=8,
+        num_hidden_layers=3,
+        num_hash_layers=3,
+        num_nextn_predict_layers=1,
+        num_attention_heads=2,
+        n_routed_experts=2,
+        n_shared_experts=1,
+        num_experts_per_tok=1,
+        q_lora_rank=8,
+        head_dim=8,
+        qk_rope_head_dim=2,
+        o_groups=2,
+        o_lora_rank=4,
+        sliding_window=4,
+        max_position_embeddings=16,
+        max_seq_len=16,
+        index_n_heads=2,
+        index_head_dim=4,
+        index_topk=2,
+        hc_mult=2,
+        compress_ratios=[0, 0, 0, 0, 0, 0],
+        dspark_block_size=3,
+        dspark_noise_token_id=31,
+        dspark_target_layer_ids=[0, 1, 2],
+        dspark_markov_rank=4,
     )
 
 
@@ -475,3 +508,80 @@ def test_deepseek_v4_missing_mtp_norms_fail_before_calibration(tmp_path):
             target_dtype=torch.float32,
             materializer=DeepSeekV4WeightMaterializer(),
         )
+
+
+def test_deepseek_v4_0731_dspark_streaming_checkpoint_contract(tmp_path):
+    from llmcompressor.modeling.deepseekv4.model_dspark import (
+        DeepseekV4DSparkForCausalLM,
+    )
+
+    config = _tiny_deepseek_v4_dspark_config()
+    checkpoint = tmp_path / "checkpoint"
+    source_model = DeepseekV4DSparkForCausalLM(config)
+    source_model.save_pretrained(checkpoint, safe_serialization=True)
+    _write_raw_deepseek_v4_checkpoint(checkpoint)
+    dataset = DataLoader(
+        [
+            {
+                "input_ids": torch.tensor([1, 2, 3, 4]),
+                "attention_mask": torch.ones(4, dtype=torch.long),
+            }
+        ],
+        batch_size=1,
+    )
+    ignored = [
+        "model.lm_head",
+        "model.mtp.2.confidence_head.proj",
+    ]
+    stats = ImatrixFallbackStats()
+    stats.install_hooks()
+    with stats:
+        output = streaming_oneshot(
+            model=checkpoint,
+            model_config=config,
+            model_factory=DeepseekV4DSparkForCausalLM,
+            dataset=dataset,
+            dataset_fingerprint="d" * 64,
+            recipe=[
+                IMatrixGatherer(ignore=ignored),
+                QuantizationModifier(
+                    scheme="W8A8",
+                    targets=["Linear"],
+                    weight_observer="imatrix_mse",
+                    ignore=ignored,
+                ),
+            ],
+            output_dir=tmp_path / "output",
+            work_dir=tmp_path / "work",
+            num_calibration_samples=1,
+            max_seq_length=4,
+            target_dtype=torch.float32,
+            materializer=DeepSeekV4WeightMaterializer(
+                fp8_block_size=(128, 128),
+                fp4_block_size=32,
+                save_raw_checkpoint_format=True,
+            ),
+        )
+
+    assert config.n_mtp_layers == 3
+    assert not {
+        name
+        for name in stats.all_zero_counter
+        if name.startswith("model.mtp.")
+    }
+    assert not {
+        name
+        for name in stats.no_importance_counter
+        if name.startswith("model.mtp.")
+    }
+    weight_map = json.loads(
+        (output / "model.safetensors.index.json").read_text()
+    )["weight_map"]
+    assert "mtp.0.main_proj.weight" in weight_map
+    assert "mtp.1.attn.wq_a.weight" in weight_map
+    assert "mtp.2.markov_head.markov_w1.weight" in weight_map
+    assert "mtp.2.confidence_head.proj.weight" in weight_map
+    assert not any("mtp.0.embed" in name for name in weight_map)
+    output_config = json.loads((output / "config.json").read_text())
+    assert output_config["architectures"] == ["DeepseekV4ForCausalLM"]
+    assert output_config["model_type"] == "deepseek_v4"
