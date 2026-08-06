@@ -3,14 +3,15 @@ Convert DeepSeek-V4-Flash (FP4 + FP8 mixed) -> W4A8
 (INT4 experts + INT8 projectors, per-channel symmetric).
 
 Based on ``convert_dsv4_to_w4a8.py`` (raw safetensors reader, FP4/FP8
-dequantization, INT4 packing, multi-GPU shard fan-out) adapted for the base
-DeepSeek-V4-Flash checkpoint (which has ``mtp.e_proj``/``mtp.h_proj`` instead of
-the DSpark-only ``mtp.main_proj``).
+dequantization, INT4 packing, multi-GPU shard fan-out). The converter supports
+both the preview MTP layout (``mtp.e_proj``/``mtp.h_proj``) and the 0731 DSpark
+layout (``mtp.0.main_proj`` plus three MTP blocks).
 
 Source checkpoint layout (DeepSeek native naming):
   - FP8 weights : F8_E4M3 weight + F8_E8M0 block-128x128 scale
                   (attn wq_a/wq_b/wkv/wo_b, ffn.shared_experts.w*,
-                   mtp.* counterparts, mtp.e_proj/h_proj, attn.indexer.wq_b)
+                   mtp.* counterparts, mtp.e_proj/h_proj/main_proj,
+                   attn.indexer.wq_b)
   - FP4 experts : packed e2m1 stored as int8 (2 nibbles/byte) + F8_E8M0
                   block-32 scale; logical in_dim = 2 * stored in_dim
                   (layers/mtp ffn.experts.N.w1/w2/w3)
@@ -26,11 +27,13 @@ Target scheme (compatible with the KLX ``w4a8_int4`` loader — see
     by 7 (``process_weights_after_loading``), so we store ``abs_max / 8``
     with the quantized range clamped to [-8, 7] (matches the GLM/KiMi
     w4a8 convention).
-  - Attn / shared / e_proj / h_proj (FP8) -> per-channel symmetric INT8 weight
-    (torch.int8) with F32 per-output-channel scale named ``<name>.scale``.
+  - Attn / shared / e_proj / h_proj / main_proj (FP8) -> per-channel symmetric
+    INT8 weight (torch.int8) with F32 per-output-channel scale named
+    ``<name>.scale``.
     The W8A8 loader pre-multiplies by 127, so we store ``abs_max / 127``.
   - wo_a (FP8)                       -> BF16 (kept, not quantized; the DSV4
     loader's manual einsum path consumes BF16 wo_a).
+  - DSpark markov/confidence heads   -> copied through byte-for-byte.
   - Everything else                  -> copied through byte-for-byte.
 
 Runtime W4A8_W8_PATTERN:
@@ -296,6 +299,7 @@ _FP8_INT8_PROJ_SUFFIXES = (
     ".ffn.shared_experts.w3.weight",
     ".e_proj.weight",  # mtp.<k>.e_proj.weight (MTP embedding projector)
     ".h_proj.weight",  # mtp.<k>.h_proj.weight (MTP hidden projector)
+    ".main_proj.weight",  # mtp.0.main_proj.weight (0731 DSpark projector)
 )
 
 # FP8 e4m3 weights that are dequantized to BF16 and left BF16 (not quantized).
@@ -427,7 +431,7 @@ def _write_w4a8_config(output_dir: str):
 
     Two config groups:
       - group_0: INT8 per-channel weight + INT8 dynamic per-token activation
-        for attention/shared/e_proj/h_proj projectors.
+        for attention/shared/e_proj/h_proj/main_proj projectors.
       - group_1: INT4 per-channel weight + INT8 dynamic per-token activation
         for MoE experts.
     """
@@ -497,7 +501,11 @@ def _write_w4a8_config(output_dir: str):
             },
         },
         "format": "int-quantized",
-        "ignore": ["lm_head"],
+        "ignore": [
+            "lm_head",
+            "re:.*confidence_head\\.proj$",
+            "re:.*markov_head\\.(markov_w1|markov_w2)$",
+        ],
         "quant_method": "compressed-tensors",
     }
     with open(config_path, "w", encoding="utf-8") as f:
@@ -618,7 +626,10 @@ def main():
 
     print("Convert DeepSeek-V4-Flash FP4+FP8 -> W4A8 (INT4 experts + INT8 projectors)")
     print("  experts (FP4 e2m1)            -> INT4 per-channel packed + .scale")
-    print("  attn/shared/e_proj/h_proj(FP8)-> INT8 per-channel weight + .scale")
+    print(
+        "  attn/shared/e_proj/h_proj/main_proj(FP8)-> "
+        "INT8 per-channel weight + .scale"
+    )
     print("  wo_a (FP8)                    -> BF16 (kept, not quantized)")
     print("  norms/gate/embed/head/hc/...  -> copied unchanged")
     print(f"  source: {input_dir}")
