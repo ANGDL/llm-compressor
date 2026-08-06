@@ -523,8 +523,10 @@ def test_deepseek_v4_0731_dspark_streaming_checkpoint_contract(tmp_path):
     dataset = DataLoader(
         [
             {
-                "input_ids": torch.tensor([1, 2, 3, 4]),
-                "attention_mask": torch.ones(4, dtype=torch.long),
+                # Prefill uses full-sequence indices before updating the
+                # sliding-window cache, so exercise seq_len > window_size.
+                "input_ids": torch.tensor([1, 2, 3, 4, 5, 6]),
+                "attention_mask": torch.ones(6, dtype=torch.long),
             }
         ],
         batch_size=1,
@@ -554,7 +556,7 @@ def test_deepseek_v4_0731_dspark_streaming_checkpoint_contract(tmp_path):
             output_dir=tmp_path / "output",
             work_dir=tmp_path / "work",
             num_calibration_samples=1,
-            max_seq_length=4,
+            max_seq_length=6,
             target_dtype=torch.float32,
             materializer=DeepSeekV4WeightMaterializer(
                 fp8_block_size=(128, 128),

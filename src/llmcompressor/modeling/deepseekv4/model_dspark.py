@@ -54,7 +54,9 @@ def _window_topk_idxs(
         )
     else:
         base = torch.arange(seqlen).unsqueeze(1)
-        matrix = (base - window_size + 1).clamp(0) + torch.arange(window_size)
+        matrix = (base - window_size + 1).clamp(0) + torch.arange(
+            min(seqlen, window_size)
+        )
         matrix = torch.where(matrix > base, -1, matrix)
     return matrix.unsqueeze(0).expand(bsz, -1, -1)
 
@@ -154,7 +156,6 @@ class TraceFriendlyAttention(Attention):
         if start_pos == 0:
             if seqlen <= self.window_size:
                 kv_cache[:bsz, :seqlen] = kv.float()
-                window_kv = kv
             else:
                 cutoff = seqlen % self.window_size
                 left, right = kv[:, -self.window_size :].float().split(
@@ -162,12 +163,11 @@ class TraceFriendlyAttention(Attention):
                 )
                 kv_cache[:bsz, cutoff : self.window_size] = left
                 kv_cache[:bsz, :cutoff] = right
-                window_kv = kv_cache[:bsz]
             if self.compress_ratio:
                 compressed = self.compressor(x, start_pos)
                 attn_kv = torch.cat((kv, compressed), dim=1)
             else:
-                attn_kv = window_kv
+                attn_kv = kv
         else:
             kv_cache[:bsz, start_pos % self.window_size] = kv[:, 0].float()
             if self.compress_ratio:
