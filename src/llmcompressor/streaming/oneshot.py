@@ -238,6 +238,7 @@ def streaming_oneshot(
         return streaming_oneshot_from_pretrained(
             model=model,
             model_config=model_config,
+            model_factory=model_factory,
             dataset=dataset,
             recipe=recipe,
             output_dir=output_dir,

@@ -75,6 +75,11 @@ class ModelConfig(PretrainedConfig):
         torch_dtype: str = "bfloat16",
         compress_rope_theta: float = 160000.0,
         compress_ratios: Optional[list[int]] = None,
+        temperature: float = 1.0,
+        dspark_block_size: int = 0,
+        dspark_noise_token_id: int = 0,
+        dspark_target_layer_ids: Optional[list[int]] = None,
+        dspark_markov_rank: int = 256,
         quantization_config: Optional[dict] = None,
         **kwargs,
     ):
@@ -135,6 +140,11 @@ class ModelConfig(PretrainedConfig):
         self.torch_dtype = torch_dtype
         self.compress_rope_theta = compress_rope_theta
         self.compress_ratios = compress_ratios
+        self.temperature = temperature
+        self.dspark_block_size = dspark_block_size
+        self.dspark_noise_token_id = dspark_noise_token_id
+        self.dspark_target_layer_ids = list(dspark_target_layer_ids or [])
+        self.dspark_markov_rank = dspark_markov_rank
         # Raw DeepSeek FP4/FP8 metadata must not trigger Transformers' generic
         # pre-quantized loader. Checkpoints produced by llm-compressor, however,
         # need their compressed config preserved so weight_scale/zero_point
@@ -172,7 +182,19 @@ class ModelConfig(PretrainedConfig):
 
     @property
     def n_mtp_layers(self) -> int:
+        if self.is_dspark:
+            num_layers = len(self.compress_ratios or ()) - self.n_layers
+            if num_layers <= 0:
+                raise ValueError(
+                    "DSpark requires one trailing compress_ratios entry per "
+                    "mtp layer"
+                )
+            return num_layers
         return self.num_nextn_predict_layers
+
+    @property
+    def is_dspark(self) -> bool:
+        return bool(self.dspark_block_size)
 
     @property
     def n_heads(self) -> int:
