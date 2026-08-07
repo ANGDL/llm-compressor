@@ -296,7 +296,7 @@ class QuantizationMixin(HooksMixin):
         )
 
         for module in model.modules():
-            if not is_attention_module(module):
+            if not is_cached_attention_module(module):
                 continue
 
             module.quantization_scheme = scheme
