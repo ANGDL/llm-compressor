@@ -88,13 +88,24 @@ def test_k3_multimodal_message_uses_image_field():
     assert "image_url" not in image_part
 
 
-def test_k3_model_level_output_residual_stays_outside_decoder_targets():
-    assert KIMI_K3_WNA8._OTHER_LINEAR_RE.fullmatch(
-        "language_model.model.layers.1.self_attention_res_proj"
-    )
-    assert not KIMI_K3_WNA8._OTHER_LINEAR_RE.fullmatch(
-        "language_model.model.output_attn_res_proj"
-    )
+@pytest.mark.parametrize(
+    "module_name",
+    [
+        "language_model.model.layers.1.self_attention_res_proj",
+        "language_model.model.layers.1.mlp_res_proj",
+        (
+            "language_model.model.layers.1.block_sparse_moe."
+            "routed_expert_down_proj"
+        ),
+        (
+            "language_model.model.layers.1.block_sparse_moe."
+            "routed_expert_up_proj"
+        ),
+        "language_model.model.output_attn_res_proj",
+    ],
+)
+def test_k3_residual_and_latent_expert_projections_stay_unquantized(module_name):
+    assert not KIMI_K3_WNA8._OTHER_LINEAR_RE.fullmatch(module_name)
 
 
 def test_kda_num_heads_comes_from_text_config():

@@ -11,9 +11,9 @@ The recipe is deliberately fixed to IMatrixGatherer + QuantizationModifier
 (RTN).  Activation and weight quantization are symmetric; weights are static
 per-channel and activations are dynamic per-token.  ``pack_to_int8=True`` is
 also fixed because K3's downstream compressed-tensors/vLLM loaders consume the
-packed INT4 layout.  The model-level ``output_attn_res_proj`` remains in its
-source dtype because K3 invokes it inside an autowrapped method after the
-decoder loop; all decoder-layer residual projections remain INT8 targets.
+packed INT4 layout.  Decoder residual projections, the model-level
+``output_attn_res_proj``, and latent routed-expert projections remain in their
+source dtype to match the K3 W4A8 checkpoint layout.
 
 Example::
 
@@ -89,10 +89,6 @@ _OTHER_LINEAR_SUFFIXES = (
     "gate_proj",
     "up_proj",
     "down_proj",
-    "routed_expert_down_proj",
-    "routed_expert_up_proj",
-    "self_attention_res_proj",
-    "mlp_res_proj",
 )
 _OTHER_LINEAR_RE = re.compile(
     r"^language_model\.model\.(?:.*\.)?(?:"
