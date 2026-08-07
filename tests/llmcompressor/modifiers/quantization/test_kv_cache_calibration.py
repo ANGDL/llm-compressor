@@ -145,7 +145,9 @@ def test_kv_cache_channel_strategy_is_supported_for_attention_quantization():
 
     modifier.initialize_quantization(model)
 
-    attn_modules = [m for _, m in model.named_modules() if is_attention_module(m)]
+    attn_modules = [
+        m for _, m in model.named_modules() if is_cached_attention_module(m)
+    ]
     assert len(attn_modules) == 2
 
     for module in attn_modules:
