@@ -107,7 +107,9 @@ class IntermediatesCache:
         return cls(batch_intermediates, offload_device)
 
     def fetch(
-        self, batch_index: int, input_names: list[str] | None = None
+        self,
+        batch_index: int,
+        input_names: list[str] | None = None,
     ) -> dict[str, Any]:
         """
         Fetch values belonging to a batch
@@ -123,6 +125,51 @@ class IntermediatesCache:
             for key, subgraph_input in intermediates.items()
             if input_names is None or key in input_names
         }
+
+    def pin_memory(
+        self,
+        batch_index: int,
+        input_names: list[str] | None = None,
+    ) -> None:
+        """
+        Pin CPU tensors in-place for a batch so that subsequent onloads can use
+        non-blocking H2D transfers. Only tensors matching the given keys are
+        pinned; other entries in the batch are left untouched.
+
+        :param batch_index: index of batch whose values should be pinned
+        :param input_names: list of keys whose values should be pinned
+        """
+        if not accelerator_is_available() or torch.mps.is_available():
+            return
+
+        intermediates = self.batch_intermediates[batch_index]
+
+        for key, intermediate in intermediates.items():
+            if input_names is None or key in input_names:
+                self._pin_intermediate(intermediate)
+
+    @classmethod
+    def _pin_intermediate(cls, intermediate: IntermediateValue) -> None:
+        """
+        Recursively pin memory on CPU tensors within an IntermediateValue
+
+        :param intermediate: intermediate value whose tensors should be pinned
+        """
+        value = intermediate.value
+
+        match value:
+            case torch.Tensor():
+                if value.device.type == "cpu" and not value.is_pinned():
+                    intermediate.value = value.pin_memory()
+            case list() | tuple():
+                for v in value:
+                    cls._pin_intermediate(v)
+            case dict():
+                for v in value.values():
+                    cls._pin_intermediate(v)
+            case _ if is_dataclass(value):
+                for field in fields(value):
+                    cls._pin_intermediate(getattr(value, field.name))
 
     def update(self, batch_index: int, values: dict[str, Any]):
         """
@@ -210,9 +257,9 @@ class IntermediatesCache:
         Overlaps onload from offload_device with consumption of the current batch,
         which can reduce wall-clock time when offloading to CPU.
 
-        When CUDA is available, uses non_blocking transfers (requires pinned CPU
-        tensors, set up by _offload_value) and synchronises via CUDA events so the
-        main stream waits for each H2D copy before running GPU kernels on the data.
+        When the accelerator exposes streams, each batch is pinned immediately before
+        its non-blocking transfer. This avoids pinning the entire cache up front while
+        retaining overlap for callers that explicitly enable prefetching.
 
         Yields the same fetched batch dicts as :meth:`iter`; only the timing
         of onloads differs.
@@ -225,14 +272,29 @@ class IntermediatesCache:
         # separate stream from the main thread's compute stream. Without this,
         # both threads default to the null stream (stream 0) which serializes
         # all operations and prevents any overlap.
-        h2d_stream = torch.Stream() if torch.accelerator.is_available() else None
+        backend = (
+            getattr(torch, current_accelerator_type(), None)
+            if accelerator_is_available()
+            else None
+        )
+        stream_type = getattr(backend, "Stream", None)
+        event_type = getattr(backend, "Event", None)
+        current_stream = getattr(backend, "current_stream", None)
+        h2d_stream = (
+            stream_type()
+            if stream_type is not None
+            and event_type is not None
+            and current_stream is not None
+            else None
+        )
 
         def _fetch_and_record(batch_index):
             event = None
             if h2d_stream is not None:
+                self.pin_memory(batch_index, input_names)
                 with h2d_stream:
                     data = self.fetch(batch_index, input_names)
-                event = torch.Event()
+                event = event_type()
                 event.record(h2d_stream)
             else:
                 data = self.fetch(batch_index, input_names)
@@ -252,7 +314,7 @@ class IntermediatesCache:
                 # Make the main CUDA stream wait for the background H2D copy
                 # before any GPU kernel consumes the prefetched tensors
                 if event is not None:
-                    torch.accelerator.current_stream().wait_event(event)
+                    current_stream().wait_event(event)
                 yield current
 
     def __iter__(self) -> Generator[Any, None, None]:
@@ -327,14 +389,6 @@ class IntermediatesCache:
                         # move to offload if no hit
                         offloaded = value.to(device=offload_device)
                         if offloaded is not value:  # avoid circular ref
-                            # pin CPU tensors so onload can use non_blocking DMA
-                            if (
-                                torch.device(offload_device).type == "cpu"
-                                and accelerator_is_available()
-                                and not offloaded.is_pinned()
-                                and not torch.mps.is_available()  # pinning not supported on MPS
-                            ):
-                                offloaded = offloaded.pin_memory()
                             cls.offload_values[value] = offloaded
 
                 return IntermediateValue(

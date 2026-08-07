@@ -85,6 +85,7 @@ def model_free_ptq(
     )
     resolved_devices = _resolve_devices(device)
     validate_safetensors_index(model_files, scheme)
+    os.makedirs(save_directory, exist_ok=True)
 
     # copy non-safetensors files (configs, tokenizers, etc.)
     for file_path, resolved_path in model_files.items():
