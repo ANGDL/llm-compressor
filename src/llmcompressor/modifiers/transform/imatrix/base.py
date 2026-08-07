@@ -1,141 +1,34 @@
-from compressed_tensors.quantization import QuantizationArgs
-from compressed_tensors.utils import match_named_modules
+from loguru import logger
 from pydantic import Field
 
-from llmcompressor.core import Event, State
+from llmcompressor.core import State
 from llmcompressor.modifiers import Modifier
-from llmcompressor.observers.base import Observer
 
 __all__ = ["IMatrixGatherer"]
 
 
 class IMatrixGatherer(Modifier):
+    """Compatibility wrapper for legacy two-modifier iMatrix recipes.
+
+    ``imatrix_mse`` observers now collect activation importance directly while the
+    quantization modifier calibrates. This modifier intentionally performs no hook
+    registration, but remains importable so existing recipes continue to load.
+
+    The legacy fields are retained because they may be present in serialized recipes.
     """
-    Lifecycle trigger for iMatrix importance collection.
 
-    Triggers a calibration pass so that ``IMatrixMSEObserver`` can collect
-    E[x²] via its ``attach()`` hook.  Does **not** quantize weights — the
-    actual quantization is done by the subsequent
-    ``QuantizationModifier`` / ``GPTQModifier``.
-
-    The observer's ``detach()`` method leaves raw ``_imatrix_sum`` and
-    ``_imatrix_count`` on the module for the next quantization pass
-    observer to pick up via ``attach()``.
-
-    Example recipe::
-
-        recipe:
-          - IMatrixGatherer:
-              ignore: ["lm_head"]
-          - QuantizationModifier:
-              config_groups:
-                group_0:
-                  targets: ["Linear"]
-                  weights:
-                    observer: imatrix_mse
-
-    Or composed with GPTQ::
-
-        recipe:
-          - IMatrixGatherer:
-              ignore: ["lm_head"]
-          - GPTQModifier:
-              config_groups:
-                group_0:
-                  targets: ["Linear"]
-                  weights:
-                    observer: imatrix_mse
-
-    .. note::
-        Auto-prepend (inserting the gatherer automatically when
-        ``imatrix_mse`` is detected in a recipe) is planned for a
-        follow-up PR.
-
-    :param targets: module types to instrument (default: ``["Linear"]``)
-    :param ignore: layer name patterns to skip (default: ``["lm_head"]``)
-    :param weight_observer: observer to attach during calibration.
-        Must be ``"imatrix_mse"`` (default).
-    """
+    requires_calibration_data: bool = True
 
     targets: str | list[str] = Field(default_factory=lambda: ["Linear"])
     ignore: list[str] = Field(default_factory=lambda: ["lm_head"])
     weight_observer: str = "imatrix_mse"
-    attach_by_initialize: bool = Field(
-        default=True,
-        description=(
-            "When True, observers attach (register hooks and create module buffers) "
-            "during on_initialize. When False, attachment is deferred — the downstream "
-            "QuantizationModifier/GPTQModifier creates the hooks and buffers, and "
-            "IMatrixGatherer syncs accumulated data to the observer during "
-            "SEQUENTIAL_EPOCH_END (after forward passes have run). Set to False when "
-            "using pipeline='sequential' to avoid double-attach conflicts."
-        ),
-    )
-
-    # ------------------------------------------------------------------ #
-    #  Lifecycle
-    # ------------------------------------------------------------------ #
+    attach_by_initialize: bool = True
 
     def on_initialize(self, state: State, **kwargs) -> bool:
-        """
-        Attach iMatrix observers to target modules for E[x²] collection
-        """
-        self._resolved_targets = (
-            self.targets if isinstance(self.targets, list) else [self.targets]
+        logger.warning(
+            "IMatrixGatherer is deprecated and no longer registers hooks. "
+            "Configure weights.observer='imatrix_mse' on the quantization "
+            "modifier instead.",
+            log_once=True,
         )
-
-        # Minimal QuantizationArgs — only used to instantiate the observer,
-        # no quantization config is applied to the model.
-        observer_args = QuantizationArgs(observer=self.weight_observer)
-
-        for _, module in match_named_modules(
-            state.model, self._resolved_targets, self.ignore
-        ):
-            observer = Observer.load_from_registry(
-                self.weight_observer,
-                base_name="weight",
-                args=observer_args,
-            )
-            module.register_module("weight_observer", observer)
-            if self.attach_by_initialize:
-                observer.attach(module)
-
-        return True
-
-    def on_sequential_epoch_end(self, state: State, event: Event, **kwargs):
-        if self.attach_by_initialize:
-            return
-        parents = kwargs.get("modules", [])
-        modules = {
-            m
-            for parent in parents
-            for m in parent.modules()
-            if hasattr(m, "weight_observer")
-        }
-        for module in modules:
-            observer = getattr(module, "weight_observer", None)
-            if observer is not None and hasattr(module, "_imatrix_sum"):
-                observer._imatrix_sum = module._imatrix_sum
-                observer._imatrix_count = module._imatrix_count
-
-    def on_calibration_end(self, state: State, event: Event, **kwargs):
-        for _, module in match_named_modules(
-            state.model, self._resolved_targets, self.ignore
-        ):
-            observer = getattr(module, "weight_observer", None)
-            if observer is not None and hasattr(observer, "detach"):
-                observer.detach(module)
-                delattr(module, "weight_observer")
-
-    def on_finalize(self, state: State, **kwargs) -> bool:
-        """
-        Clean up any remaining accumulators so they don't end up in the checkpoint
-        """
-        for _, module in match_named_modules(
-            state.model, self._resolved_targets, self.ignore
-        ):
-            for attr in ("_imatrix_sum", "_imatrix_count"):
-                if hasattr(module, attr):
-                    delattr(module, attr)
-
         return True

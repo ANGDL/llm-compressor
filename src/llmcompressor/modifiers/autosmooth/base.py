@@ -179,6 +179,8 @@ class AutoSmoothModifier(Modifier):
         arbitrary_types_allowed=True, extra="forbid"
     )
 
+    requires_calibration_data: bool = True
+
     # User-provided vars
     mappings: list[AWQMapping] | None = None
     ignore: list[str] = []
