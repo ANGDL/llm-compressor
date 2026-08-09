@@ -182,6 +182,18 @@ def _serialized_module_name(
     )
 
 
+def _normalized_recipe_payload(recipe: Recipe) -> dict[str, Any]:
+    payload = recipe.model_dump(mode="json", exclude={"modifiers"})
+    payload["modifiers"] = [
+        {
+            "type": type(modifier).__name__,
+            "arguments": modifier.model_dump(mode="json"),
+        }
+        for modifier in recipe.modifiers
+    ]
+    return payload
+
+
 def _initialize_run(
     *,
     checkpoint: str | Path,
@@ -197,7 +209,7 @@ def _initialize_run(
     pack_to_int8: bool,
     replace_existing: bool = False,
 ) -> str:
-    normalized_recipe = recipe.model_dump(mode="json")
+    normalized_recipe = _normalized_recipe_payload(recipe)
     source_info = fingerprint_checkpoint(checkpoint)
     run_fingerprint = fingerprint_json(
         {
