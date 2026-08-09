@@ -23,6 +23,7 @@ Example::
         --dataset-split test \
         --text-dataset-id HuggingFaceH4/ultrachat_200k \
         --text-dataset-split train_sft \
+        --use-float32-scale-dtype \
         --output-dir /Users/ang/models/K3-WNA8
 
 If quantization completes but publication fails, repeat the same command with
@@ -417,7 +418,11 @@ def _kda_num_heads(config: Any) -> int:
     return num_heads
 
 
-def _int_scheme(num_bits: int, targets: list[str]) -> QuantizationScheme:
+def _int_scheme(
+    num_bits: int,
+    targets: list[str],
+    scale_dtype: torch.dtype | None = None,
+) -> QuantizationScheme:
     return QuantizationScheme(
         targets=targets,
         weights=QuantizationArgs(
@@ -427,6 +432,7 @@ def _int_scheme(num_bits: int, targets: list[str]) -> QuantizationScheme:
             symmetric=True,
             dynamic=False,
             observer="imatrix_mse",
+            scale_dtype=scale_dtype,
         ),
         input_activations=QuantizationArgs(
             num_bits=8,
@@ -483,6 +489,12 @@ def main() -> None:
         default=False,
         help="Collect iMatrix statistics for every K3 routed expert.",
     )
+    parser.add_argument(
+        "--use-float32-scale-dtype",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use float32 for weight scale tensors instead of bfloat16.",
+    )
     args = parser.parse_args()
     if args.batch_size != 1:
         parser.error("Kimi K3 multimodal calibration requires --batch-size 1")
@@ -527,9 +539,10 @@ def main() -> None:
         r"re:.*\.embed_tokens$",
         r"re:.*\.lm_head$",
     ]
+    scale_dtype = torch.float32 if args.use_float32_scale_dtype else None
     config_groups = {
-        "routed_experts_w4a8": _int_scheme(4, [expert_pattern]),
-        "other_linear_w8a8": _int_scheme(8, [other_pattern]),
+        "routed_experts_w4a8": _int_scheme(4, [expert_pattern], scale_dtype),
+        "other_linear_w8a8": _int_scheme(8, [other_pattern], scale_dtype),
     }
     recipe = [
         IMatrixGatherer(ignore=ignores),

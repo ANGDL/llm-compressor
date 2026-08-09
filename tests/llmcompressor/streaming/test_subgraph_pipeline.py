@@ -25,7 +25,6 @@ from llmcompressor.pipelines.sequential.helpers import Subgraph
 from llmcompressor.recipe import Recipe
 from llmcompressor.streaming import (
     ArtifactCompatibilityError,
-    ArtifactStore,
     CastWeightMaterializer,
     streaming_oneshot,
 )
@@ -82,6 +81,30 @@ def _imatrix_recipe():
             weight_observer="imatrix_mse",
             ignore=["lm_head"],
         ),
+    ]
+
+
+def _imatrix_recipe_with_scale_dtype(scale_dtype: torch.dtype | None):
+    scheme = QuantizationScheme(
+        targets=["Linear"],
+        weights=QuantizationArgs(
+            num_bits=8,
+            type="int",
+            strategy="channel",
+            symmetric=True,
+            observer="imatrix_mse",
+            scale_dtype=scale_dtype,
+        ),
+        input_activations=QuantizationArgs(
+            num_bits=8,
+            type="int",
+            strategy="token",
+            dynamic=True,
+        ),
+    )
+    return [
+        IMatrixGatherer(ignore=["lm_head"], attach_by_initialize=False),
+        QuantizationModifier(config_groups={"group_0": scheme}, ignore=["lm_head"]),
     ]
 
 
@@ -582,7 +605,7 @@ def test_finalize_only_publishes_completed_direct_writer_shards(
     kwargs = {
         "model": checkpoint,
         "dataset_fingerprint": "current-dataset",
-        "recipe": _imatrix_recipe(),
+        "recipe": _imatrix_recipe_with_scale_dtype(None),
         "output_dir": output,
         "work_dir": work,
         "num_calibration_samples": 1,
@@ -621,7 +644,23 @@ def test_finalize_only_publishes_completed_direct_writer_shards(
         finalize_streaming_checkpoint,
     )
 
-    recovery_kwargs = {**kwargs, "recipe": _imatrix_recipe()}
+    incompatible_kwargs = {
+        **kwargs,
+        "recipe": _imatrix_recipe_with_scale_dtype(torch.float32),
+    }
+    with pytest.raises(
+        ArtifactCompatibilityError, match="belongs to a different run"
+    ):
+        streaming_oneshot(
+            dataset=_calibration_data(),
+            finalize_only=True,
+            **incompatible_kwargs,
+        )
+
+    recovery_kwargs = {
+        **kwargs,
+        "recipe": _imatrix_recipe_with_scale_dtype(None),
+    }
     result = streaming_oneshot(
         dataset=_calibration_data(), finalize_only=True, **recovery_kwargs
     )

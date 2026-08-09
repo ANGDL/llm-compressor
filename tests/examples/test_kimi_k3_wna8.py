@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 MODULE_PATH = (
     Path(__file__).parents[2] / "examples" / "streaming_oneshot" / "kimi_k3_wNa8.py"
@@ -114,6 +115,14 @@ def test_kda_num_heads_comes_from_text_config():
     )
 
     assert KIMI_K3_WNA8._kda_num_heads(config) == 96
+
+
+@pytest.mark.parametrize("scale_dtype", [None, torch.float32])
+def test_int_scheme_sets_only_weight_scale_dtype(scale_dtype):
+    scheme = KIMI_K3_WNA8._int_scheme(4, ["Linear"], scale_dtype)
+
+    assert scheme.weights.scale_dtype is scale_dtype
+    assert scheme.input_activations.scale_dtype is None
 
 
 def test_expert_targets_validate_exact_index_but_emit_structural_regex(tmp_path):
