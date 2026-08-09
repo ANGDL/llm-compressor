@@ -1,3 +1,4 @@
+import inspect
 from collections.abc import Iterator
 from copy import deepcopy
 from typing import Any
@@ -17,22 +18,40 @@ from compressed_tensors.quantization import (
     QuantizationArgs,
     QuantizationConfig,
     QuantizationScheme,
-    QuantizationStrategy,
     QuantizationStatus,
+    QuantizationStrategy,
     apply_quantization_config,
     disable_quantization,
     enable_quantization,
-    is_cached_attention_module,
     is_preset_scheme,
     preset_name_to_scheme,
 )
+
+try:
+    from compressed_tensors.quantization import is_cached_attention_module
+except ImportError:
+    # compressed-tensors <= 0.17.1 exposes the older predicate name.
+    from compressed_tensors.quantization import (
+        is_attention_module,
+    )
+
+    def is_cached_attention_module(module: torch.nn.Module) -> bool:
+        if not is_attention_module(module):
+            return False
+        try:
+            parameters = inspect.signature(module.forward).parameters
+        except (TypeError, ValueError):
+            return False
+        return "past_key_value" in parameters or "past_key_values" in parameters
+
+
 from compressed_tensors.quantization.lifecycle.initialize import (
     QuantizationMetadata,
     get_head_dim,
     get_num_attn_heads,
     get_num_kv_heads,
-    initialize_qparams,
     initialize_module_for_quantization,
+    initialize_qparams,
 )
 from compressed_tensors.quantization.utils import KV_CACHE_TARGETS
 from compressed_tensors.utils import match_named_modules
@@ -51,10 +70,10 @@ from llmcompressor.modifiers.quantization.calibration import (
     reset_quantization_status,
     set_quantization_scale_dtype,
 )
-from llmcompressor.modifiers.quantization.scale_dtype import validate_scale_dtype
 from llmcompressor.modifiers.quantization.group_size_validation import (
     validate_group_size_divisibility,
 )
+from llmcompressor.modifiers.quantization.scale_dtype import validate_scale_dtype
 from llmcompressor.modifiers.utils.hooks import HooksMixin
 from llmcompressor.observers import ACTIVATION_OBS, fuse_weight_observers
 from llmcompressor.utils import (
@@ -289,7 +308,7 @@ class QuantizationMixin(HooksMixin):
             weights=None,
             format=None,
         )
-        
+
         # Symmetric quantization should not materialize explicit zero-point buffers.
         force_zero_point = (
             status < QuantizationStatus.COMPRESSED and not kv_cache_scheme.symmetric
