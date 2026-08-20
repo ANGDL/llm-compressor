@@ -2,10 +2,11 @@
 
 The source checkpoint may be the native FP8+FP4 format or an ordinary BF16
 checkpoint. ``DeepSeekV4WeightMaterializer`` decodes the former on demand and
-casts both formats to BF16 while one traced subgraph is resident. Calibration
-boundaries remain in memory by default; ``--checkpoint-progress`` enables the
-optional durable recovery path. Output uses the raw DeepSeek checkpoint naming
-expected by SGLang and vLLM unless ``--no-save-raw-checkpoint-format`` is set.
+casts quantized execution weights to BF16 while one traced subgraph is resident;
+ordinary checkpoint state keeps its source dtype. Calibration boundaries remain
+in memory by default; ``--checkpoint-progress`` enables the optional durable
+recovery path. Output uses the raw DeepSeek checkpoint naming expected by
+SGLang and vLLM unless ``--no-save-raw-checkpoint-format`` is set.
 
 Example::
 
@@ -13,6 +14,8 @@ Example::
         --model-id /Users/ang/models/DeepSeek-V4-Pro-Tiny-bf16 \
         --dataset-id /Users/ang/Downloads/llm-demo/datasets/ultrachat_200k \
         --quant-mode w4a8 \
+        --reference-kernel \
+        /Users/ang/models/DeepSeek-V4-Flash-0731/inference/kernel.py \
         --pack-to-int8 \
         --output-dir /Users/ang/models/DeepSeek-V4-Pro-Tiny-w4a8
 """
@@ -20,6 +23,7 @@ Example::
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +53,22 @@ def positive_int(value: str) -> int:
     if parsed <= 0:
         raise argparse.ArgumentTypeError("value must be a positive integer")
     return parsed
+
+
+def _configure_reference_kernel(path: Path | None) -> None:
+    """Override the reference-kernel environment with the CLI-selected path."""
+    if path is None:
+        return
+    path = path.expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"Reference TileLang kernel does not exist: {path}")
+    os.environ["DEEPSEEK_V4_KERNEL_BACKEND"] = "reference"
+    os.environ["DEEPSEEK_V4_REFERENCE_KERNEL_PATH"] = str(path)
+    # The package is imported before argument parsing; clear the lazy loader so
+    # a stale path from the parent environment cannot override this argument.
+    from llmcompressor.modeling.deepseekv4.kernels import reset_kernel_backend_cache
+
+    reset_kernel_backend_cache()
 
 
 def _is_local_json(path: str) -> bool:
@@ -184,6 +204,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-id", type=Path, required=True)
     parser.add_argument(
+        "--reference-kernel",
+        type=Path,
+        default=None,
+        help=(
+            "Reference TileLang kernel.py. Selecting it enables the reference "
+            "backend and overrides DEEPSEEK_V4_REFERENCE_KERNEL_PATH."
+        ),
+    )
+    parser.add_argument(
         "--dataset-id",
         nargs="+",
         default=["HuggingFaceH4/ultrachat_200k"],
@@ -236,6 +265,7 @@ def main() -> None:
         help="Use raw DeepSeek tensor names required by SGLang and vLLM.",
     )
     args = parser.parse_args()
+    _configure_reference_kernel(args.reference_kernel)
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_id, local_files_only=True)
     config = ModelConfig.from_pretrained(args.model_id)

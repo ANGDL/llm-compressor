@@ -15,9 +15,38 @@ from llmcompressor.streaming.materialization import (
     DeepSeekV4WeightMaterializer,
     KimiK3WeightMaterializer,
     KimiK3WeightSource,
+    StreamingDTypePolicy,
     WeightMaterializer,
     materialize_weights,
 )
+
+
+def test_streaming_dtype_policy_preserves_control_state_by_default():
+    policy = StreamingDTypePolicy.for_quantized_modules(
+        torch.bfloat16, ("layer.proj",)
+    )
+
+    assert policy.resolve("layer.proj.weight", torch.float32) == torch.bfloat16
+    assert policy.resolve("layer.proj.bias", torch.float32) == torch.bfloat16
+    assert policy.resolve("layer.attn_sink", torch.float32) == torch.float32
+    assert policy.resolve("layer.norm.weight", torch.bfloat16) == torch.bfloat16
+    assert (
+        policy.resolve("layer.experts.weight", torch.int8)
+        == torch.bfloat16
+    )
+
+
+def test_streaming_dtype_policy_allows_model_adapter_override():
+    policy = StreamingDTypePolicy.for_quantized_modules(
+        torch.bfloat16,
+        ("layer.proj",),
+        overrides=((r".*\.attention_sink_bias", torch.float32),),
+    )
+
+    assert (
+        policy.resolve("layer.attention_sink_bias", torch.bfloat16)
+        == torch.float32
+    )
 
 
 class ScaledIntMaterializer(WeightMaterializer):
@@ -270,14 +299,25 @@ def test_rejects_invalid_materializer_output(
 
 def test_materializer_manifest_identity_is_stable_and_dtype_sensitive():
     materializer = CastWeightMaterializer()
+    policy = StreamingDTypePolicy.for_quantized_modules(
+        torch.bfloat16, ("layer.proj",)
+    )
 
     first = materializer.manifest_info(target_dtype=torch.bfloat16)
     second = materializer.manifest_info(target_dtype=torch.bfloat16)
     fp32 = materializer.manifest_info(target_dtype=torch.float32)
+    policy_first = materializer.manifest_info(
+        target_dtype=torch.bfloat16, dtype_policy=policy
+    )
+    policy_second = materializer.manifest_info(
+        target_dtype=torch.bfloat16, dtype_policy=policy
+    )
 
     assert first == second
     assert first.identifier.endswith("CastWeightMaterializer")
     assert first.config_sha256 != fp32.config_sha256
+    assert policy_first == policy_second
+    assert policy_first.config_sha256 != first.config_sha256
 
 
 def test_deepseek_v4_materializer_unpacks_fp4_blocks(tmp_path):

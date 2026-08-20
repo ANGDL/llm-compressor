@@ -100,6 +100,10 @@ def sparse_attention(
 ) -> torch.Tensor:
     module = _load_reference_kernel_module()
     if module is not None and _can_use_reference_kernels(q):
+        # The reference TileLang kernel declares this small bias as FP32. Keep
+        # that ABI stable even when a legacy or custom streaming dtype policy
+        # materializes ``attn_sink`` at the model computation dtype.
+        attn_sink = attn_sink.to(dtype=torch.float32)
         return module.sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale)
 
     bsz, seqlen, n_heads, head_dim = q.shape

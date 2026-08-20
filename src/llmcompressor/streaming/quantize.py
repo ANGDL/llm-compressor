@@ -38,10 +38,24 @@ from .checkpoint import (
 )
 from .materialization import (
     CastWeightMaterializer,
+    StreamingDTypePolicy,
     WeightMaterializer,
 )
 from .output import prepare_quantized_tensor_for_save
 from .tied_weights import infer_transformers_tied_weights
+
+
+def _materialization_dtype(
+    dtype_policy: StreamingDTypePolicy | None,
+    tensor_name: str,
+    source_dtype: torch.dtype,
+    target_dtype: torch.dtype,
+) -> torch.dtype:
+    if dtype_policy is None:
+        return target_dtype
+    return dtype_policy.resolve(
+        tensor_name, source_dtype, fallback_dtype=target_dtype
+    )
 
 __all__ = ["quantize_streaming"]
 
@@ -173,6 +187,7 @@ def quantize_streaming(
     schemes: Mapping[str, QuantizationScheme],
     use_gptq: bool = True,
     materializer: WeightMaterializer | None = None,
+    dtype_policy: StreamingDTypePolicy | None = None,
     device: torch.device | str = "cpu",
     target_dtype: torch.dtype = torch.bfloat16,
     blocksize: int = 128,
@@ -204,7 +219,9 @@ def quantize_streaming(
         raise ArtifactCompatibilityError(
             "Calibration artifacts belong to a different source checkpoint"
         )
-    if materializer.manifest_info(target_dtype=target_dtype) != manifest.materializer:
+    if materializer.manifest_info(
+        target_dtype=target_dtype, dtype_policy=dtype_policy
+    ) != manifest.materializer:
         raise ArtifactCompatibilityError(
             "Calibration artifacts were created with a different materializer "
             "or target dtype"
@@ -275,16 +292,22 @@ def quantize_streaming(
                     )
                     requested = [name, *dependency_names]
                     raw_values = source.load_tensors_cpu(requested)
+                    materialize_dtype = _materialization_dtype(
+                        dtype_policy,
+                        name,
+                        source.metadata(name).dtype,
+                        target_dtype,
+                    )
                     weight = materializer.materialize_cpu(
                         name,
                         raw_values,
-                        target_dtype=target_dtype,
+                        target_dtype=materialize_dtype,
                     ).to(device)
                     metadata = source.metadata(name)
                     expected_shape = materializer.logical_shape(name, metadata)
                     if (
                         not weight.dtype.is_floating_point
-                        or weight.dtype != target_dtype
+                        or weight.dtype != materialize_dtype
                         or tuple(weight.shape) != expected_shape
                         or weight.device != device
                     ):
@@ -340,7 +363,12 @@ def quantize_streaming(
                     value = materializer.materialize_cpu(
                         name,
                         raw_values,
-                        target_dtype=target_dtype,
+                        target_dtype=_materialization_dtype(
+                            dtype_policy,
+                            name,
+                            source.metadata(name).dtype,
+                            target_dtype,
+                        ),
                     )
                 transaction.write_tensor(
                     materializer.output_tensor_name(name),

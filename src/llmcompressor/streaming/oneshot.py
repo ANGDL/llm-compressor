@@ -19,7 +19,7 @@ from llmcompressor.utils.dev import resolve_execution_device
 
 from .collect import collect_calibration_statistics
 from .finalize import finalize_streaming_checkpoint
-from .materialization import WeightMaterializer
+from .materialization import StreamingDTypePolicy, WeightMaterializer
 from .output import build_quantization_config
 from .quantize import quantize_streaming
 
@@ -76,6 +76,7 @@ def _streaming_oneshot_from_boundaries(
     use_gptq: bool = True,
     device: torch.device | str | None = None,
     target_dtype: torch.dtype = torch.bfloat16,
+    dtype_policy: StreamingDTypePolicy | None = None,
     blocksize: int = 128,
     dampening_frac: float = 0.01,
     num_samples: int | None = None,
@@ -90,6 +91,9 @@ def _streaming_oneshot_from_boundaries(
     staging_dir = work / "staging"
     output = Path(output_dir)
     device = torch.device(device)
+    dtype_policy = dtype_policy or StreamingDTypePolicy.for_quantized_modules(
+        target_dtype, schemes
+    )
     if output.exists() and (output / "FINALIZED").is_file():
         logger.info(
             f"streaming finalize: resume hit, output already complete: {output}"
@@ -112,6 +116,7 @@ def _streaming_oneshot_from_boundaries(
         model_kwargs=model_kwargs,
         execution_model=execution_model,
         materializer=materializer,
+        dtype_policy=dtype_policy,
         target_module_selector=target_module_selector,
         forward_target=forward_target,
         algorithms=algorithms,
@@ -135,6 +140,7 @@ def _streaming_oneshot_from_boundaries(
         schemes=schemes,
         use_gptq=use_gptq,
         materializer=materializer,
+        dtype_policy=dtype_policy,
         device=device,
         target_dtype=target_dtype,
         blocksize=blocksize,
@@ -185,6 +191,7 @@ def streaming_oneshot(
     dataset_fingerprint: str | None = None,
     device: torch.device | str | None = None,
     target_dtype: torch.dtype = torch.bfloat16,
+    dtype_policy: StreamingDTypePolicy | None = None,
     # Advanced boundary-mode arguments. These keep the low-level API available
     # for model adapters while normal callers use ``model`` and ``dataset``.
     model_factory: Callable[..., nn.Module] | None = None,
@@ -254,6 +261,7 @@ def streaming_oneshot(
             dataset_fingerprint=dataset_fingerprint,
             device=device,
             target_dtype=target_dtype,
+            dtype_policy=dtype_policy,
             materializer=materializer,
             blocksize=blocksize,
             dampening_frac=dampening_frac,
@@ -303,6 +311,7 @@ def streaming_oneshot(
         use_gptq=use_gptq,
         device=device,
         target_dtype=target_dtype,
+        dtype_policy=dtype_policy,
         blocksize=blocksize,
         dampening_frac=dampening_frac,
         num_samples=num_calibration_samples,

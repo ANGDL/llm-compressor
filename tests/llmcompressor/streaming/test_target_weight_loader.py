@@ -13,6 +13,7 @@ from llmcompressor.streaming import (
     KimiK3WeightMaterializer,
     KimiK3WeightSource,
     SafetensorsWeightSource,
+    StreamingDTypePolicy,
     TargetWeightLoader,
     build_meta_model,
 )
@@ -187,6 +188,42 @@ def test_loads_one_target_for_forward_then_restores_meta(tiny_checkpoint):
     _assert_all_meta(model)
     assert reference_to_parameter() is None
     assert next(model.layers[0].parameters()).dtype == torch.float32
+
+
+def test_mixed_dtype_policy_preserves_non_quantized_fp32_state(tmp_path):
+    class MixedDTypeTarget(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = nn.Linear(4, 4)
+            self.attn_sink = nn.Parameter(torch.arange(4, dtype=torch.float32))
+            self.register_buffer(
+                "control_scale", torch.tensor(0.5, dtype=torch.float32)
+            )
+
+    reference = MixedDTypeTarget()
+    path = tmp_path / "mixed-dtype.safetensors"
+    _write_checkpoint(reference, path)
+    model = build_meta_model(MixedDTypeTarget)
+    policy = StreamingDTypePolicy.for_quantized_modules(
+        torch.bfloat16, ("proj",)
+    )
+    loader = TargetWeightLoader(
+        model,
+        SafetensorsWeightSource(path),
+        dtype_policy=policy,
+    )
+
+    with loader.loaded("", device=torch.device("cpu"), dtype=torch.bfloat16):
+        assert model.proj.weight.dtype == torch.bfloat16
+        assert model.proj.bias.dtype == torch.bfloat16
+        assert model.attn_sink.dtype == torch.float32
+        assert model.control_scale.dtype == torch.float32
+        assert (
+            model.proj(torch.ones(1, 4, dtype=torch.bfloat16)).dtype
+            == torch.bfloat16
+        )
+
+    _assert_all_meta(model)
 
 
 def test_target_loader_rejects_accelerator_transfer(tiny_checkpoint):

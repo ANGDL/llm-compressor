@@ -12,7 +12,10 @@ from torch import nn
 
 from llmcompressor.pipelines.sequential.helpers import Subgraph
 from llmcompressor.streaming.checkpoint import CheckpointWeightSource
-from llmcompressor.streaming.materialization import WeightMaterializer
+from llmcompressor.streaming.materialization import (
+    StreamingDTypePolicy,
+    WeightMaterializer,
+)
 
 from .host_memory import HostMemoryBudget, HostMemoryReservation
 from .target import (
@@ -180,14 +183,21 @@ class SubgraphWeightSession:
         model: nn.Module,
         source: CheckpointWeightSource,
         materializer: WeightMaterializer | None = None,
+        dtype_policy: StreamingDTypePolicy | None = None,
     ):
         self.model = model
         self.source = source
-        self.loader = TargetWeightLoader(model, source, materializer)
+        self.loader = TargetWeightLoader(
+            model, source, materializer, dtype_policy=dtype_policy
+        )
         self._source_names = set(source.tensor_names())
         self._checkpoint_modules = self._build_checkpoint_modules(
             self._source_names
         )
+
+    @property
+    def dtype_policy(self) -> StreamingDTypePolicy | None:
+        return self.loader.dtype_policy
 
     @staticmethod
     def _build_checkpoint_modules(source_names: Iterable[str]) -> frozenset[str]:
