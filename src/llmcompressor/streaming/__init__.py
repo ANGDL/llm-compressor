@@ -45,6 +45,7 @@ from .materialization import (
     DeepSeekV4WeightSource,
     KimiK3WeightMaterializer,
     KimiK3WeightSource,
+    StreamingDTypePolicy,
     WeightMaterializer,
     materialize_weights,
 )
@@ -84,6 +85,7 @@ __all__ = [
     "SourceCheckpointInfo",
     "SafetensorsWeightSource",
     "StreamingRunManifest",
+    "StreamingDTypePolicy",
     "StreamingCheckpointWriter",
     "StatisticsCollectorGroup",
     "TargetStatisticsMetadata",

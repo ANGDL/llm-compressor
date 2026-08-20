@@ -15,6 +15,7 @@ from llmcompressor.streaming._logging import streaming_logger
 from llmcompressor.streaming.checkpoint import CheckpointWeightSource
 from llmcompressor.streaming.materialization import (
     CastWeightMaterializer,
+    StreamingDTypePolicy,
     WeightMaterializer,
     materialize_weights,
 )
@@ -125,10 +126,12 @@ class TargetWeightLoader:
         model: nn.Module,
         source: CheckpointWeightSource,
         materializer: WeightMaterializer | None = None,
+        dtype_policy: StreamingDTypePolicy | None = None,
     ):
         self.model = model
         self.source = source
         self.materializer = materializer or CastWeightMaterializer()
+        self.dtype_policy = dtype_policy
         self._source_names = frozenset(source.tensor_names())
         # Parameters and persistent buffers present when the meta model is
         # built are checkpoint-backed state.  Modifiers may add qparams later;
@@ -276,7 +279,9 @@ class TargetWeightLoader:
             for tensor, _aliases in groups:
                 source_name = sources[id(tensor)]
                 metadata = self.source.metadata(source_name)
-                output_dtype = dtype if tensor.dtype.is_floating_point else tensor.dtype
+                output_dtype = self._resolved_dtype(
+                    sources[id(tensor)], metadata, dtype, tensor.dtype
+                )
                 output_elements = 1
                 for dimension in self.materializer.logical_shape(
                     source_name, metadata
@@ -296,7 +301,9 @@ class TargetWeightLoader:
                         workspace_bytes,
                         raw_bytes
                         + self.materializer.estimate_workspace_bytes(
-                            source_name, metadata, dtype
+                            source_name,
+                            metadata,
+                            output_dtype,
                         ),
                     )
         return prepared_bytes, workspace_bytes
@@ -708,6 +715,7 @@ class TargetWeightLoader:
             self.materializer,
             target_dtype=dtype,
             reservation=reservation,
+            dtype_policy=self.dtype_policy,
         )
         raw_values = self.source.load_tensors_cpu(non_floating)
         if reservation is not None:
@@ -721,7 +729,9 @@ class TargetWeightLoader:
         for tensor, _ in groups:
             source_name = sources[id(tensor)]
             value = values[source_name]
-            expected_dtype = dtype if tensor.dtype.is_floating_point else tensor.dtype
+            expected_dtype = self._resolved_dtype(
+                source_name, self.source.metadata(source_name), dtype, tensor.dtype
+            )
             if value.dtype != expected_dtype:
                 raise ValueError(
                     f"Buffer {source_name!r} has dtype {value.dtype}; "
@@ -751,6 +761,7 @@ class TargetWeightLoader:
             self.materializer,
             target_dtype=dtype,
             reservation=reservation,
+            dtype_policy=self.dtype_policy,
         )
         raw_values = self.source.load_tensors_cpu(non_floating)
         if reservation is not None:
@@ -763,13 +774,32 @@ class TargetWeightLoader:
         values.update(raw_values)
         for tensor, _ in groups:
             source_name = sources[id(tensor)]
-            expected_dtype = dtype if tensor.dtype.is_floating_point else tensor.dtype
+            expected_dtype = self._resolved_dtype(
+                source_name, self.source.metadata(source_name), dtype, tensor.dtype
+            )
             if values[source_name].dtype != expected_dtype:
                 raise ValueError(
                     f"Parameter {source_name!r} has dtype "
                     f"{values[source_name].dtype}; expected {expected_dtype}"
                 )
         return values
+
+    def _resolved_dtype(
+        self,
+        source_name: str,
+        metadata,
+        requested_dtype: torch.dtype,
+        declared_dtype: torch.dtype,
+    ) -> torch.dtype:
+        if not declared_dtype.is_floating_point:
+            return declared_dtype
+        if self.dtype_policy is None:
+            return requested_dtype
+        return self.dtype_policy.resolve(
+            source_name,
+            metadata.dtype,
+            fallback_dtype=requested_dtype,
+        )
 
     @staticmethod
     def _install_parameters(

@@ -16,6 +16,7 @@ from llmcompressor.streaming.checkpoint import (
 )
 
 from .._logging import streaming_logger
+from .dtype import StreamingDTypePolicy
 
 if TYPE_CHECKING:
     from llmcompressor.streaming.loading.host_memory import HostMemoryReservation
@@ -34,11 +35,18 @@ class WeightMaterializer(ABC):
     def configuration(self) -> Mapping[str, Any]:
         return {}
 
-    def manifest_info(self, *, target_dtype: torch.dtype) -> MaterializerInfo:
+    def manifest_info(
+        self,
+        *,
+        target_dtype: torch.dtype,
+        dtype_policy: StreamingDTypePolicy | None = None,
+    ) -> MaterializerInfo:
         configuration = {
             "configuration": self.configuration(),
             "target_dtype": str(target_dtype),
         }
+        if dtype_policy is not None:
+            configuration["dtype_policy"] = dtype_policy.configuration()
         return MaterializerInfo(self.identifier, fingerprint_json(configuration))
 
     def dependencies(
@@ -112,6 +120,7 @@ def materialize_weights(
     *,
     target_dtype: torch.dtype,
     reservation: HostMemoryReservation | None = None,
+    dtype_policy: StreamingDTypePolicy | None = None,
 ) -> dict[str, torch.Tensor]:
     """Load and decode requested weights on CPU in physical storage order."""
 
@@ -172,8 +181,17 @@ def materialize_weights(
         )
         if reservation is not None:
             reservation.commit(raw_bytes)
+        materialize_dtype = (
+            dtype_policy.resolve(
+                name,
+                metadata[name].dtype,
+                fallback_dtype=target_dtype,
+            )
+            if dtype_policy is not None
+            else target_dtype
+        )
         tensor = materializer.materialize_cpu(
-            name, raw_tensors, target_dtype=target_dtype
+            name, raw_tensors, target_dtype=materialize_dtype
         )
         if not isinstance(tensor, torch.Tensor):
             raise TypeError(f"Materializer returned a non-tensor for {name!r}")
@@ -181,10 +199,10 @@ def materialize_weights(
             raise TypeError(
                 f"Materializer returned non-floating dtype {tensor.dtype} for {name!r}"
             )
-        if tensor.dtype != target_dtype:
+        if tensor.dtype != materialize_dtype:
             raise ValueError(
                 f"Materializer returned dtype {tensor.dtype} for {name!r}; "
-                f"expected {target_dtype}"
+                f"expected {materialize_dtype}"
             )
         expected_shape = materializer.logical_shape(name, metadata[name])
         if tuple(tensor.shape) != expected_shape:

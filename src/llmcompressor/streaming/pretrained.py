@@ -32,7 +32,11 @@ from ._logging import streaming_logger
 from .artifacts import fingerprint_json
 from .finalize import finalize_streaming_checkpoint
 from .loading import build_meta_model
-from .materialization import CastWeightMaterializer, WeightMaterializer
+from .materialization import (
+    CastWeightMaterializer,
+    StreamingDTypePolicy,
+    WeightMaterializer,
+)
 from .output import build_quantization_config
 from .pipeline import (
     _complete_direct_writer_staging,
@@ -252,6 +256,7 @@ def streaming_oneshot_from_pretrained(
     async_save: bool,
     pack_to_int8: bool,
     finalize_only: bool = False,
+    dtype_policy: StreamingDTypePolicy | None = None,
 ) -> Path:
     """Run traced streaming PTQ with an oneshot-like model/dataset interface."""
     checkpoint = Path(model).expanduser()
@@ -327,6 +332,9 @@ def streaming_oneshot_from_pretrained(
     )
     meta_model.eval()
     schemes = _exact_schemes(meta_model, quantizer)
+    dtype_policy = dtype_policy or StreamingDTypePolicy.for_quantized_modules(
+        target_dtype, schemes
+    )
     uses_imatrix = any(
         scheme.weights is not None and scheme.weights.observer == "imatrix_mse"
         for scheme in schemes.values()
@@ -380,6 +388,7 @@ def streaming_oneshot_from_pretrained(
             sequential_targets=sequential_targets,
             target_names=sequential_targets,
             materializer=materializer,
+            dtype_policy=dtype_policy,
             device=device,
             dtype=target_dtype,
             tracing_ignore=dataset_args.tracing_ignore,
@@ -414,6 +423,7 @@ def streaming_oneshot_from_pretrained(
                 dataset_fingerprint=fingerprint,
                 targets=adapter.targets,
                 materializer=materializer,
+                dtype_policy=dtype_policy,
                 target_dtype=target_dtype,
                 num_samples=num_calibration_samples,
                 max_seq_length=max_seq_length,
@@ -426,6 +436,7 @@ def streaming_oneshot_from_pretrained(
                 checkpoint=checkpoint,
                 publish_dir=publish,
                 materializer=materializer,
+                dtype_policy=dtype_policy,
                 target_dtype=target_dtype,
                 run_fingerprint=run_fingerprint,
             )
@@ -441,6 +452,7 @@ def streaming_oneshot_from_pretrained(
                     recipe=parsed_recipe,
                     dataset_fingerprint=fingerprint,
                     materializer=materializer,
+                    dtype_policy=dtype_policy,
                     device=device,
                     target_dtype=target_dtype,
                     num_samples=num_calibration_samples,

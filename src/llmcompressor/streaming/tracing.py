@@ -26,7 +26,7 @@ from llmcompressor.utils.helpers import (
 
 from .checkpoint import CheckpointWeightSource
 from .loading import SubgraphWeightSession, TargetWeightLoader
-from .materialization import WeightMaterializer
+from .materialization import StreamingDTypePolicy, WeightMaterializer
 
 __all__ = ["TracedBoundaryAdapter", "trace_streaming_boundaries"]
 
@@ -283,6 +283,7 @@ def trace_streaming_boundaries(
     sequential_targets: Sequence[str] | str | None = None,
     target_names: Sequence[str] | None = None,
     materializer: WeightMaterializer | None = None,
+    dtype_policy: StreamingDTypePolicy | None = None,
     device: torch.device | str = "cpu",
     dtype: torch.dtype = torch.bfloat16,
     tracing_ignore: Sequence[str] = (),
@@ -310,8 +311,12 @@ def trace_streaming_boundaries(
         )
         target_subgraphs.append(target_subgraph)
 
-    loader = TargetWeightLoader(model, source, materializer)
-    weight_session = SubgraphWeightSession(model, source, materializer)
+    loader = TargetWeightLoader(
+        model, source, materializer, dtype_policy=dtype_policy
+    )
+    weight_session = SubgraphWeightSession(
+        model, source, materializer, dtype_policy=dtype_policy
+    )
 
     return TracedBoundaryAdapter(
         model=model,

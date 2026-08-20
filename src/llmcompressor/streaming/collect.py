@@ -22,7 +22,11 @@ from .artifacts import (
     fingerprint_json,
 )
 from .loading import SubgraphWeightSession, build_meta_model
-from .materialization import CastWeightMaterializer, WeightMaterializer
+from .materialization import (
+    CastWeightMaterializer,
+    StreamingDTypePolicy,
+    WeightMaterializer,
+)
 from .statistics import (
     GPTQStatisticsCollector,
     IMatrixStatisticsCollector,
@@ -118,6 +122,7 @@ def collect_calibration_statistics(
     model_kwargs: Mapping[str, Any] | None = None,
     execution_model: nn.Module | None = None,
     materializer: WeightMaterializer | None = None,
+    dtype_policy: StreamingDTypePolicy | None = None,
     target_module_selector: Callable[[nn.Module, str], Mapping[str, nn.Module]]
     | None = None,
     forward_target: Callable[[nn.Module, Any], Any] | None = None,
@@ -172,7 +177,9 @@ def collect_calibration_statistics(
             seed=seed,
         ),
         sequential=SequentialInfo(tuple(targets), calibration_mode=calibration_mode),
-        materializer=materializer.manifest_info(target_dtype=target_dtype),
+        materializer=materializer.manifest_info(
+            target_dtype=target_dtype, dtype_policy=dtype_policy
+        ),
         software=SoftwareInfo.from_versions({"torch": torch.__version__}),
     )
     store = ArtifactStore(artifact_dir)
@@ -180,7 +187,9 @@ def collect_calibration_statistics(
 
     kwargs = dict(model_kwargs or {})
     model = execution_model or build_meta_model(model_factory, *model_args, **kwargs)
-    weight_session = SubgraphWeightSession(model, source, materializer)
+    weight_session = SubgraphWeightSession(
+        model, source, materializer, dtype_policy=dtype_policy
+    )
     boundaries = boundary_store or DiskBoundaryActivationStore(
         store.root / "boundaries"
     )

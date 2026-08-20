@@ -45,7 +45,11 @@ from .checkpoint import (
     StreamingCheckpointWriter,
 )
 from .loading import HostMemoryBudget, SubgraphPrefetcher
-from .materialization import WeightMaterializer, materialize_weights
+from .materialization import (
+    StreamingDTypePolicy,
+    WeightMaterializer,
+    materialize_weights,
+)
 from .output import (
     prepare_quantized_tensor_for_save,
     quantized_module_formats,
@@ -207,6 +211,7 @@ def _initialize_run(
     max_seq_length: int | None,
     seed: int | None,
     pack_to_int8: bool,
+    dtype_policy: StreamingDTypePolicy | None = None,
     replace_existing: bool = False,
 ) -> str:
     normalized_recipe = _normalized_recipe_payload(recipe)
@@ -218,7 +223,7 @@ def _initialize_run(
             "dataset": dataset_fingerprint,
             "targets": targets,
             "materializer": materializer.manifest_info(
-                target_dtype=target_dtype
+                target_dtype=target_dtype, dtype_policy=dtype_policy
             ).config_sha256,
             "output": {"pack_to_int8": pack_to_int8},
         }
@@ -233,7 +238,9 @@ def _initialize_run(
             seed=seed,
         ),
         sequential=SequentialInfo(targets),
-        materializer=materializer.manifest_info(target_dtype=target_dtype),
+        materializer=materializer.manifest_info(
+            target_dtype=target_dtype, dtype_policy=dtype_policy
+        ),
         software=SoftwareInfo.from_versions({"torch": torch.__version__}),
     )
     ArtifactStore(artifact_dir).initialize(
@@ -476,6 +483,7 @@ def _write_remaining_direct_shards(
     writer: DirectSafetensorsWriter,
     source,
     materializer: WeightMaterializer,
+    dtype_policy: StreamingDTypePolicy | None,
     target_dtype: torch.dtype,
     written: set[str],
     omitted: Mapping[str, str],
@@ -532,6 +540,7 @@ def _write_remaining_direct_shards(
                 (name,),
                 materializer,
                 target_dtype=target_dtype,
+                dtype_policy=dtype_policy,
             )[name]
         else:
             value = source.load_tensors_cpu((name,))[name]
@@ -553,6 +562,7 @@ def _complete_direct_writer_staging(
     checkpoint: str | Path,
     publish_dir: Path,
     materializer: WeightMaterializer,
+    dtype_policy: StreamingDTypePolicy | None,
     target_dtype: torch.dtype,
     run_fingerprint: str,
 ) -> None:
@@ -609,6 +619,7 @@ def _complete_direct_writer_staging(
         source=source,
         materializer=materializer,
         target_dtype=target_dtype,
+        dtype_policy=dtype_policy,
         written=written,
         omitted=omitted,
         host_budget=HostMemoryBudget(),
@@ -621,6 +632,7 @@ def _copy_remaining_tensors(
     writer: StreamingCheckpointWriter,
     source,
     materializer: WeightMaterializer,
+    dtype_policy: StreamingDTypePolicy | None,
     target_dtype: torch.dtype,
     written: set[str],
     omitted: Mapping[str, str],
@@ -640,6 +652,7 @@ def _copy_remaining_tensors(
                 (name,),
                 materializer,
                 target_dtype=target_dtype,
+                dtype_policy=dtype_policy,
             )[name]
         else:
             value = source.load_tensors_cpu((name,))[name]
@@ -675,6 +688,7 @@ def run_subgraph_streaming_pipeline(
     checkpoint_progress: bool = False,
     async_save: bool = False,
     pack_to_int8: bool = True,
+    dtype_policy: StreamingDTypePolicy | None = None,
 ) -> tuple[Path, Path, str]:
     """Calibrate, modify, propagate, and persist one subgraph at a time."""
 
@@ -684,6 +698,7 @@ def run_subgraph_streaming_pipeline(
             "Asynchronous saving is not supported with checkpoint_progress=True"
         )
     work = Path(work_dir)
+    dtype_policy = dtype_policy or adapter.weight_session.dtype_policy
     artifact_dir = work / "artifacts"
     staging_dir = work / "staging"
     publish_dir = work / "publish"
@@ -694,6 +709,7 @@ def run_subgraph_streaming_pipeline(
         dataset_fingerprint=dataset_fingerprint,
         targets=adapter.targets,
         materializer=materializer,
+        dtype_policy=dtype_policy,
         target_dtype=target_dtype,
         num_samples=num_samples,
         max_seq_length=max_seq_length,
@@ -1134,6 +1150,7 @@ def run_subgraph_streaming_pipeline(
                     source=source,
                     materializer=materializer,
                     target_dtype=target_dtype,
+                    dtype_policy=dtype_policy,
                     written=written,
                     omitted=omitted,
                     host_budget=host_budget,
@@ -1144,6 +1161,7 @@ def run_subgraph_streaming_pipeline(
                     source=source,
                     materializer=materializer,
                     target_dtype=target_dtype,
+                    dtype_policy=dtype_policy,
                     written=written,
                     omitted=omitted,
                 )
