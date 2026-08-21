@@ -27,6 +27,7 @@ import os
 from pathlib import Path
 from typing import Any
 
+import torch
 from compressed_tensors.quantization import (
     QuantizationScheme,
     preset_name_to_scheme,
@@ -152,7 +153,10 @@ def _ignores(*, quantize_wo_a: bool = False) -> list[str]:
     return ignores
 
 
-def _int_scheme(num_bits: int) -> QuantizationScheme:
+def _int_scheme(
+    num_bits: int,
+    scale_dtype: torch.dtype | None = None,
+) -> QuantizationScheme:
     return QuantizationScheme(
         targets=["Linear"],
         weights=QuantizationArgs(
@@ -162,6 +166,7 @@ def _int_scheme(num_bits: int) -> QuantizationScheme:
             symmetric=True,
             dynamic=False,
             observer="imatrix_mse",
+            scale_dtype=scale_dtype,
         ),
         input_activations=QuantizationArgs(
             num_bits=8,
@@ -179,6 +184,7 @@ def _schemes(
     *,
     dspark: bool = False,
     quantize_wo_a: bool = False,
+    scale_dtype: torch.dtype | None = None,
 ):
     ignores = _ignores(quantize_wo_a=quantize_wo_a)
     if quant_mode == "w8a8":
@@ -186,13 +192,14 @@ def _schemes(
         if scheme.weights is None:
             raise RuntimeError("W8A8 preset is missing weight settings")
         scheme.weights.observer = "imatrix_mse"
+        scheme.weights.scale_dtype = scale_dtype
         return {"group_0": scheme}, ignores
     if quant_mode == "w4a8":
-        return {"group_0": _int_scheme(4)}, ignores
+        return {"group_0": _int_scheme(4, scale_dtype)}, ignores
     if quant_mode == "wna8":
-        experts = _int_scheme(4)
+        experts = _int_scheme(4, scale_dtype)
         experts.targets = [r"re:.*ffn\.experts\.\d+\.(w1|w2|w3)$"]
-        other = _int_scheme(8)
+        other = _int_scheme(8, scale_dtype)
         other_targets = [
             r"re:.*attn\.(wq_a|wq_b|wkv|wo_b)$",
             r"re:.*attn\.indexer\.wq_b$",
@@ -245,6 +252,12 @@ def main() -> None:
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Quantize attn.wo_a; wna8 always uses the INT8 scheme for it.",
+    )
+    parser.add_argument(
+        "--use-float32-scale-dtype",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use float32 for weight scale tensors instead of bfloat16.",
     )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--work-dir", type=Path, default=None)
@@ -308,6 +321,7 @@ def main() -> None:
         args.quant_mode,
         dspark=is_dspark,
         quantize_wo_a=args.quantize_wo_a,
+        scale_dtype=(torch.float32 if args.use_float32_scale_dtype else None),
     )
     recipe = [
         IMatrixGatherer(ignore=ignores),
