@@ -132,7 +132,10 @@ def load_calibration_dataset(
     return concatenate_datasets(parts)
 
 
-def _ignores() -> list[str]:
+_WO_A_PATTERN = r"re:.*attn\.wo_a$"
+
+
+def _ignores(*, quantize_wo_a: bool = False) -> list[str]:
     ignores = [
         "lm_head",
         r"re:.*embed$",
@@ -144,6 +147,8 @@ def _ignores() -> list[str]:
         r"re:.*attn\.indexer\.weights_proj$",
         r"re:.*confidence_head\.proj$",
     ]
+    if not quantize_wo_a:
+        ignores.append(_WO_A_PATTERN)
     return ignores
 
 
@@ -169,14 +174,17 @@ def _int_scheme(num_bits: int) -> QuantizationScheme:
     )
 
 
-def _schemes(quant_mode: str, *, dspark: bool = False):
-    ignores = _ignores()
+def _schemes(
+    quant_mode: str,
+    *,
+    dspark: bool = False,
+    quantize_wo_a: bool = False,
+):
+    ignores = _ignores(quantize_wo_a=quantize_wo_a)
     if quant_mode == "w8a8":
         scheme = preset_name_to_scheme("W8A8", ["Linear"])
         if scheme.weights is None:
             raise RuntimeError("W8A8 preset is missing weight settings")
-        # wo_a is grouped/block-diagonal and is excluded from the uniform preset.
-        ignores.append(r"re:.*attn\.wo_a$")
         scheme.weights.observer = "imatrix_mse"
         return {"group_0": scheme}, ignores
     if quant_mode == "w4a8":
@@ -186,10 +194,12 @@ def _schemes(quant_mode: str, *, dspark: bool = False):
         experts.targets = [r"re:.*ffn\.experts\.\d+\.(w1|w2|w3)$"]
         other = _int_scheme(8)
         other_targets = [
-            r"re:.*attn\.(wq_a|wq_b|wkv|wo_a|wo_b)$",
+            r"re:.*attn\.(wq_a|wq_b|wkv|wo_b)$",
             r"re:.*attn\.indexer\.wq_b$",
             r"re:.*ffn\.shared_experts\.(w1|w2|w3)$",
         ]
+        if quantize_wo_a:
+            other_targets.append(_WO_A_PATTERN)
         other_targets.append(
             r"re:.*mtp\.0\.main_proj$"
             if dspark
@@ -227,6 +237,14 @@ def main() -> None:
         choices=("w8a8", "wna8", "w4a8"),
         default="w8a8",
         help="Uniform W8A8, mixed W4A8 experts/W8A8 other, or uniform W4A8.",
+    )
+    parser.add_argument(
+        "--quantize-wo-a",
+        "--quantize_wo_a",
+        dest="quantize_wo_a",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Quantize attn.wo_a; wna8 always uses the INT8 scheme for it.",
     )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--work-dir", type=Path, default=None)
@@ -286,7 +304,11 @@ def main() -> None:
         args.dataset_split,
         args.num_calibration_samples,
     )
-    config_groups, ignores = _schemes(args.quant_mode, dspark=is_dspark)
+    config_groups, ignores = _schemes(
+        args.quant_mode,
+        dspark=is_dspark,
+        quantize_wo_a=args.quantize_wo_a,
+    )
     recipe = [
         IMatrixGatherer(ignore=ignores),
         QuantizationModifier(

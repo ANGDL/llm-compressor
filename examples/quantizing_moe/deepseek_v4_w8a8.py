@@ -98,6 +98,14 @@ parser.add_argument(
         "The wNa8 mode follows the original checkpoint precision: FP4→INT4, FP8→INT8."
     ),
 )
+parser.add_argument(
+    "--quantize-wo-a",
+    "--quantize_wo_a",
+    dest="quantize_wo_a",
+    action=argparse.BooleanOptionalAction,
+    default=False,
+    help="Quantize attn.wo_a; wNa8 always uses the INT8 scheme for it.",
+)
 parser.add_argument("--dataset_id", type=str, nargs="+",
                     default=["HuggingFaceH4/ultrachat_200k"],
                     help="HuggingFace dataset ID(s) or path(s) to local JSON/JSONL files. "
@@ -622,6 +630,7 @@ ds = ds.map(tokenize, remove_columns=ds.column_names)
 #   - attn.indexer.weights_proj: indexer weight projection
 #   - ffn.gate: MoE router
 #   - lm_head: output head
+_WO_A_PATTERN = r"re:.*attn\.wo_a$"
 ignores = [
     "lm_head",
     "re:.*embed$",
@@ -632,10 +641,8 @@ ignores = [
     "re:.*attn\\.indexer\\.compressor\\.wkv$",
     "re:.*attn\\.indexer\\.weights_proj$",
 ]
-if args.quant_mode == "w8a8":
-    # W8A8 uniform mode: wo_a is a grouped linear (block-diagonal), skip it
-    # to avoid issues with the uniform quantization scheme.
-    ignores.append("re:.*attn\\.wo_a$")
+if not args.quantize_wo_a:
+    ignores.append(_WO_A_PATTERN)
 
 # Configure the quantization algorithm to run.
 # Each quant_mode branch builds config_groups, applies observer settings,
@@ -692,13 +699,16 @@ elif args.quant_mode == "wNa8":
     )
 
     # INT8: attention projections, shared experts, MTP e_proj/h_proj (originally FP8)
+    other_targets = [
+        r"re:.*attn\.(wq_a|wq_b|wkv|wo_b)$",
+        r"re:.*attn\.indexer\.wq_b$",
+        r"re:.*ffn\.shared_experts\.(w1|w2|w3)$",
+        r"re:.*mtp\.\d+\.(e_proj|h_proj)$",
+    ]
+    if args.quantize_wo_a:
+        other_targets.append(_WO_A_PATTERN)
     other_w8_scheme = QuantizationScheme(
-        targets=[
-            r"re:.*attn\.(wq_a|wq_b|wkv|wo_a|wo_b)$",
-            r"re:.*attn\.indexer\.wq_b$",
-            r"re:.*ffn\.shared_experts\.(w1|w2|w3)$",
-            r"re:.*mtp\.\d+\.(e_proj|h_proj)$",
-        ],
+        targets=other_targets,
         weights=weights_args_8,
         input_activations=activations_args,
     )
