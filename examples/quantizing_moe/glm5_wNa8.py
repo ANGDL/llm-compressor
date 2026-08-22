@@ -2,6 +2,7 @@ import argparse
 import os
 from contextlib import contextmanager
 
+import torch
 from datasets import concatenate_datasets, load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -35,7 +36,8 @@ Usage example for quantizing GLM-5.1 with MoE layers to mixed W4/W8 + A8 using L
 python glm5_wNa8.py --model_id /ssd3/models/GLM-5.1/ --save_dir /ssd2/models/ --modifier RTN --observer imatrix_mse \
     --num_calibration_samples 512 --max_sequence_length 4096 \
     --dataset_id ./ultrachat_200k ./calibration_data.jsonl --dataset_split train_sft \
-    --indexer-ignore-mode indexer_all --dispatch_extra_memory_gb 10 --pipeline sequential
+    --indexer-ignore-mode indexer_all --dispatch_extra_memory_gb 10 --pipeline sequential \
+    --use-float32-scale-dtype
 3. 打包，确保输入路径正确
 python -m llmcompressor.utils.pack_int4_to_int8 \
     -i /ssd2/models/GLM-5.1-WNA8-IMatrix-RTN-unpacked/ \
@@ -125,6 +127,12 @@ parser.add_argument(
         "Default 4 keeps shared experts in the W4 group (with routed experts); "
         "use 8 to move them into the W8 group together with attention/MLP linears."
     ),
+)
+parser.add_argument(
+    "--use-float32-scale-dtype",
+    action=argparse.BooleanOptionalAction,
+    default=False,
+    help="Use float32 for weight scale tensors instead of bfloat16.",
 )
 parser.add_argument(
     "--pipeline",
@@ -276,6 +284,8 @@ ignores = [
 ]
 
 # ---- Quantization config: mixed experts int4 + other linear int8 ----
+scale_dtype = torch.float32 if args.use_float32_scale_dtype else None
+
 # Weights: 4-bit, channelwise, symmetric, static
 weights_args_4 = QuantizationArgs(
     num_bits=4,
@@ -283,6 +293,7 @@ weights_args_4 = QuantizationArgs(
     strategy=QuantizationStrategy.CHANNEL,
     symmetric=True,
     dynamic=False,
+    scale_dtype=scale_dtype,
 )
 
 # Weights: 8-bit, channelwise, symmetric, static
@@ -292,6 +303,7 @@ weights_args_8 = QuantizationArgs(
     strategy=QuantizationStrategy.CHANNEL,
     symmetric=True,
     dynamic=False,
+    scale_dtype=scale_dtype,
 )
 
 # Activations: 8-bit, per-token, asymmetric, dynamic
@@ -302,6 +314,7 @@ activations_args = QuantizationArgs(
     symmetric=True,
     dynamic=True,
     observer=None,
+    scale_dtype=torch.float32,
 )
 
 # Routed experts always use int4 weights; shared experts follow --shared-experts-bits.
