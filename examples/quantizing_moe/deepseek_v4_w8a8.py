@@ -20,6 +20,9 @@ from llmcompressor.modifiers.quantization import QuantizationModifier
 from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
 from llmcompressor.pipelines.basic import pipeline as basic_pipeline
 from llmcompressor.pipelines.data_free import pipeline as data_free_pipeline
+from llmcompressor.streaming.materialization.deepseek_v4 import (
+    DeepSeekV4WeightMaterializer,
+)
 from llmcompressor.utils import ImatrixFallbackStats
 from compressed_tensors.offload import get_device_map
 from compressed_tensors.offload.dispatch import dispatch_model as _dispatch_model
@@ -67,6 +70,13 @@ def positive_int(value: str) -> int:
     return parsed
 
 
+def nonnegative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("value must be non-negative")
+    return parsed
+
+
 parser = argparse.ArgumentParser()
 parser.add_argument("--model_id", type=str, default="/ssd4/models/DeepSeek-V4-Pro")
 parser.add_argument("--bf16_save_dir", type=str, default="/ssd3/models")
@@ -85,7 +95,55 @@ parser.add_argument(
     choices=["", "mse", "imatrix_mse"],
     help="Observer for weights quantization: empty(default), mse, or imatrix_mse.",
 )
-parser.add_argument("--modifier", type=str, default="GPTQ", choices=["GPTQ", "RTN"])
+parser.add_argument(
+    "--modifier",
+    type=str,
+    default="GPTQ",
+    choices=["GPTQ", "RTN", "AutoRound"],
+    help="Quantization algorithm to use: GPTQ, RTN, or AutoRound.",
+)
+parser.add_argument(
+    "--autoround-iters",
+    "--autoround_iters",
+    type=nonnegative_int,
+    default=200,
+    help="AutoRound tuning iterations per decoding layer.",
+)
+parser.add_argument(
+    "--autoround-batch-size",
+    "--autoround_batch_size",
+    type=positive_int,
+    default=8,
+    help="AutoRound tuning batch size.",
+)
+parser.add_argument(
+    "--autoround-lr",
+    "--autoround_lr",
+    type=float,
+    default=None,
+    help="AutoRound learning rate; omitted uses AutoRound's default.",
+)
+parser.add_argument(
+    "--autoround-device-ids",
+    "--autoround_device_ids",
+    type=str,
+    default=None,
+    help="AutoRound device map, for example '0,1' or 'auto'.",
+)
+parser.add_argument(
+    "--autoround-disable-torch-compile",
+    "--autoround_disable_torch_compile",
+    action=argparse.BooleanOptionalAction,
+    default=False,
+    help="Disable torch.compile inside AutoRound.",
+)
+parser.add_argument(
+    "--autoround-disable-opt-rtn",
+    "--autoround_disable_opt_rtn",
+    action=argparse.BooleanOptionalAction,
+    default=False,
+    help="Disable AutoRound's optional opt-Rtn path.",
+)
 parser.add_argument(
     "--quant_mode",
     type=str,
@@ -233,79 +291,10 @@ def maybe_skip_from_accelerate(skip_restore: bool):
 # DeepSeek V4 checkpoint uses mixed precision:
 #   - Attention & shared experts: FP8 (F8_E4M3 weight + F8_E8M0 scale, block [128,128])
 #   - Routed experts: FP4 (I8 packed weight + F8_E8M0 scale, fp4_block_size=32)
-# The standard `convert_checkpoint` API doesn't support F8_E8M0 scale format,
-# so we implement custom dequantization operating directly on safetensors files.
+# The standard `convert_checkpoint` API doesn't support F8_E8M0 scale format.
+# The reader below preserves raw dtypes and delegates dequantization to
+# `DeepSeekV4WeightMaterializer`, which is also used by streaming PTQ.
 # ===========================================================================
-
-FP4_TABLE = torch.tensor(
-    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-     0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
-    dtype=torch.float32,
-)
-
-
-def _e8m0_to_float(raw_bytes: bytes, shape: tuple) -> torch.Tensor:
-    """Convert F8_E8M0 raw bytes to float32 tensor. Each byte = 2^(byte - 127)."""
-    arr = np.frombuffer(raw_bytes, dtype=np.uint8).reshape(shape).copy()
-    return torch.from_numpy(arr).float().sub_(127).exp2_()
-
-
-def _e4m3_to_float(raw_bytes: bytes, shape: tuple) -> torch.Tensor:
-    """Convert F8_E4M3 raw bytes to float32 tensor via torch float8_e4m3fn."""
-    arr = np.frombuffer(raw_bytes, dtype=np.uint8).reshape(shape).copy()
-    t = torch.from_numpy(arr).view(torch.float8_e4m3fn)
-    return t.float()
-
-
-def _dequant_fp8_block(weight_bytes: bytes, weight_shape: tuple,
-                       scale_bytes: bytes, scale_shape: tuple,
-                       block_size: tuple = (128, 128)) -> torch.Tensor:
-    """Dequantize FP8 block-quantized weight to BF16."""
-    weight = _e4m3_to_float(weight_bytes, weight_shape)
-    scale = _e8m0_to_float(scale_bytes, scale_shape)
-
-    out_dim, in_dim = weight_shape
-    bh, bw = block_size
-    n_row_blocks = (out_dim + bh - 1) // bh
-    n_col_blocks = (in_dim + bw - 1) // bw
-
-    # Pad if needed
-    pad_h = n_row_blocks * bh - out_dim
-    pad_w = n_col_blocks * bw - in_dim
-    if pad_h > 0 or pad_w > 0:
-        weight = torch.nn.functional.pad(weight, (0, pad_w, 0, pad_h))
-
-    weight = weight.reshape(n_row_blocks, bh, n_col_blocks, bw).transpose(1, 2)
-    weight = weight * scale.unsqueeze(-1).unsqueeze(-1)
-    weight = weight.transpose(1, 2).reshape(n_row_blocks * bh, n_col_blocks * bw)
-
-    if pad_h > 0 or pad_w > 0:
-        weight = weight[:out_dim, :in_dim]
-
-    return weight.bfloat16()
-
-
-def _dequant_fp4(weight_bytes: bytes, weight_shape: tuple,
-                 scale_bytes: bytes, scale_shape: tuple,
-                 fp4_block_size: int = 32) -> torch.Tensor:
-    """Dequantize FP4 (e2m1fn packed as I8, 2 values per byte) weight to BF16."""
-    out_dim, packed_in_dim = weight_shape
-    in_dim = packed_in_dim * 2
-
-    # Read as uint8 to correctly extract nibbles regardless of sign interpretation
-    arr = np.frombuffer(weight_bytes, dtype=np.uint8).reshape(weight_shape).copy()
-    x = torch.from_numpy(arr)
-    low = x & 0x0F
-    high = (x >> 4) & 0x0F
-    x_fp4 = torch.stack([FP4_TABLE[low.long()], FP4_TABLE[high.long()]], dim=-1).flatten(1)
-
-    scale = _e8m0_to_float(scale_bytes, scale_shape)
-    # scale shape: [out_dim, in_dim / fp4_block_size]
-    # Repeat scale to match in_dim
-    scale = scale.unsqueeze(-1).expand(-1, -1, fp4_block_size).reshape(out_dim, in_dim)
-    result = x_fp4 * scale
-    return result.bfloat16()
-
 
 class SafetensorsReader:
     """Low-level reader for safetensors files that handles F8_E8M0/F8_E4M3/I8 dtypes."""
@@ -337,7 +326,7 @@ class SafetensorsReader:
         return self._f.read(end - start)
 
     def get_tensor(self, key: str) -> torch.Tensor:
-        """Read tensor, handling F8_E8M0, F8_E4M3, I8, BF16, F32 dtypes."""
+        """Read a tensor while preserving source dtypes for the materializer."""
         info = self.header[key]
         dtype_str = info["dtype"]
         shape = tuple(info["shape"])
@@ -350,9 +339,11 @@ class SafetensorsReader:
             arr = np.frombuffer(raw, dtype=np.float32).reshape(shape).copy()
             return torch.from_numpy(arr)
         elif dtype_str == "F8_E4M3":
-            return _e4m3_to_float(raw, shape).bfloat16()
+            arr = np.frombuffer(raw, dtype=np.uint8).reshape(shape).copy()
+            return torch.from_numpy(arr).view(torch.float8_e4m3fn)
         elif dtype_str == "F8_E8M0":
-            return _e8m0_to_float(raw, shape)
+            arr = np.frombuffer(raw, dtype=np.uint8).reshape(shape).copy()
+            return torch.from_numpy(arr)
         elif dtype_str in ("I8", "U8"):
             arr = np.frombuffer(raw, dtype=np.int8 if dtype_str == "I8" else np.uint8)
             return torch.from_numpy(arr.reshape(shape).copy())
@@ -441,12 +432,17 @@ def convert_to_bf16(model_path: str, save_dir: str, max_workers: int = 4):
 def _raw_key_to_hf_key(key: str) -> str:
     """Convert raw checkpoint key to HuggingFace model format.
 
-    Transforms: head.* -> model.lm_head.*, other -> model.*
+    Transforms raw ``head.*``/``lm_head.*`` names while leaving ``model.*``
+    names unchanged.
     This ensures from_pretrained can load without relying on state_dict hooks
     (which are bypassed by accelerate's low-memory loading path).
     """
+    if key.startswith("model."):
+        return key
     if key.startswith("head."):
         return "model.lm_head." + key[len("head."):]
+    if key.startswith("lm_head."):
+        return "model." + key
     return "model." + key
 
 
@@ -457,6 +453,10 @@ def _convert_shard(shard_path: str, save_dir: str):
     logger.info(f"Converting shard: {shard_name}")
 
     output_tensors = {}
+    materializer = DeepSeekV4WeightMaterializer(
+        fp8_block_size=(128, 128),
+        fp4_block_size=32,
+    )
 
     with SafetensorsReader(shard_path) as reader:
         # Group keys by module to pair weights with their scales
@@ -466,32 +466,33 @@ def _convert_shard(shard_path: str, save_dir: str):
         for key in sorted(weight_keys):
             info = reader.get_tensor_info(key)
             dtype_str = info["dtype"]
-            shape = tuple(info["shape"])
-            scale_key = key.rsplit(".", 1)[0] + ".scale" if key.endswith(".weight") else None
+            scale_key = (
+                key.rsplit(".", 1)[0] + ".scale"
+                if key.endswith(".weight")
+                else None
+            )
 
             if scale_key and scale_key in scale_keys:
-                # This weight has a corresponding scale → dequantize
-                scale_info = reader.get_tensor_info(scale_key)
-                scale_shape = tuple(scale_info["shape"])
-                weight_raw = reader.read_raw(key)
-                scale_raw = reader.read_raw(scale_key)
-
-                if dtype_str == "F8_E4M3":
-                    tensor = _dequant_fp8_block(
-                        weight_raw, shape, scale_raw, scale_shape
-                    )
-                elif dtype_str in ("I8", "U8"):
-                    tensor = _dequant_fp4(
-                        weight_raw, shape, scale_raw, scale_shape
-                    )
-                else:
-                    raise ValueError(
-                        f"Unexpected quantized dtype {dtype_str} for {key}"
-                    )
-                output_tensors[_raw_key_to_hf_key(key)] = tensor
+                # Use the streaming materializer as the canonical FP8/FP4
+                # decoder, including E8M0 endpoints and non-aligned FP4 tails.
+                logical_key = _raw_key_to_hf_key(key)
+                logical_scale_key = _raw_key_to_hf_key(scale_key)
+                tensors = {
+                    logical_key: reader.get_tensor(key),
+                    logical_scale_key: reader.get_tensor(scale_key),
+                }
+                output_tensors[logical_key] = materializer.materialize_cpu(
+                    logical_key,
+                    tensors,
+                    target_dtype=torch.bfloat16,
+                )
             elif key.endswith(".scale"):
                 # Skip standalone scale keys (already handled above)
                 continue
+            elif dtype_str in {"F8_E4M3", "I8", "U8"}:
+                raise ValueError(
+                    f"Scaled DeepSeek-V4 tensor {key!r} is missing its .scale tensor"
+                )
             else:
                 # Non-quantized tensor: read as-is
                 output_tensors[_raw_key_to_hf_key(key)] = reader.get_tensor(key)
@@ -764,11 +765,25 @@ elif args.quant_mode == "w4a8":
 else:
     raise ValueError(f"Unknown quant_mode: {args.quant_mode}")
 
+# AutoRound performs its own weight calibration and does not use the separate
+# IMatrixGatherer pass. Keep observer settings out of its saved scheme metadata.
+if args.modifier == "AutoRound":
+    if args.observer:
+        logger.warning(
+            "Ignoring --observer={} for AutoRound; AutoRound computes weight "
+            "scales during tuning.",
+            args.observer,
+        )
+    for scheme in config_groups.values():
+        if scheme.weights is not None:
+            scheme.weights.observer = None
+
 # Observer-specific recipe additions.
-if args.observer in ("imatrix_mse", "mse"):
+use_imatrix = args.observer == "imatrix_mse" and args.modifier != "AutoRound"
+if args.observer in ("imatrix_mse", "mse") and args.modifier != "AutoRound":
     tail_name += "-IMatrix" if args.observer == "imatrix_mse" else "-MSE"
 
-if args.observer == "imatrix_mse":
+if use_imatrix:
     imatrix_fallback_stats = ImatrixFallbackStats()
     imatrix_fallback_stats.install_hooks()
     imatrix_kwargs = dict(ignore=ignores)
@@ -776,7 +791,7 @@ if args.observer == "imatrix_mse":
         imatrix_kwargs["attach_by_initialize"] = False
     recipes.append(IMatrixGatherer(**imatrix_kwargs))
 
-# Quantization modifier (GPTQ or RTN).
+# Quantization modifier.
 if args.modifier == "GPTQ":
     recipes.append(
         GPTQModifier(
@@ -794,6 +809,27 @@ elif args.modifier == "RTN":
         )
     )
     tail_name += "-RTN"
+elif args.modifier == "AutoRound":
+    if args.pipeline in ("basic", "data_free"):
+        raise ValueError(
+            "AutoRound requires the sequential calibration pipeline; use "
+            "--pipeline sequential or --pipeline independent."
+        )
+    from llmcompressor.modifiers.autoround import AutoRoundModifier
+
+    recipes.append(
+        AutoRoundModifier(
+            config_groups=config_groups,
+            ignore=ignores,
+            iters=args.autoround_iters,
+            batch_size=args.autoround_batch_size,
+            lr=args.autoround_lr,
+            device_ids=args.autoround_device_ids,
+            enable_torch_compile=not args.autoround_disable_torch_compile,
+            disable_opt_rtn=args.autoround_disable_opt_rtn,
+        )
+    )
+    tail_name += "-AutoRound"
 else:
     raise ValueError(f"Invalid modifier selected: {args.modifier}")
 
@@ -810,7 +846,7 @@ oneshot_kwargs = dict(
     pipeline=args.pipeline,
 )
 
-if args.observer == "imatrix_mse":
+if use_imatrix:
     with imatrix_fallback_stats:
         oneshot(**oneshot_kwargs)
 else:
