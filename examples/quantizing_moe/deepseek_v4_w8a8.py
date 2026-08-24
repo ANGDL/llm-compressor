@@ -580,9 +580,9 @@ if len(all_datasets) == 1:
 else:
     ds = concatenate_datasets(all_datasets)
 
-# Load the BF16 model using our custom DeepseekV4NativeForCausalLM implementation.
-# This bypasses the transformers library's native DeepSeek V4 support which has
-# known issues with quantization workflows.
+# Load the BF16 model using our custom DeepSeek-V4 implementation. DSpark
+# checkpoints use a different MTP block layout and therefore need their
+# dedicated model class for calibration and quantization.
 bf16_model_id = BFLOAT16_SAVE_DIR
 
 # Override cache-related config to avoid allocating hundreds of GB of KV cache
@@ -591,9 +591,19 @@ bf16_model_id = BFLOAT16_SAVE_DIR
 from llmcompressor.modeling.deepseekv4.config import ModelConfig
 config = ModelConfig.from_pretrained(bf16_model_id)
 config.max_batch_size = 1
-config.max_seq_len = MAX_SEQUENCE_LENGTH
+is_dspark = config.is_dspark
+config.max_seq_len = MAX_SEQUENCE_LENGTH + (
+    config.dspark_block_size if is_dspark else 0
+)
+model_factory = DeepseekV4NativeForCausalLM
+if is_dspark:
+    from llmcompressor.modeling.deepseekv4.model_dspark import (
+        DeepseekV4DSparkForCausalLM,
+    )
 
-model = DeepseekV4NativeForCausalLM.from_pretrained(
+    model_factory = DeepseekV4DSparkForCausalLM
+
+model = model_factory.from_pretrained(
     bf16_model_id,
     config=config,
     dtype="auto",
@@ -640,6 +650,7 @@ ignores = [
     "re:.*attn\\.indexer\\.compressor\\.wgate$",
     "re:.*attn\\.indexer\\.compressor\\.wkv$",
     "re:.*attn\\.indexer\\.weights_proj$",
+    "re:.*confidence_head\\.proj$",
 ]
 if not args.quantize_wo_a:
     ignores.append(_WO_A_PATTERN)
@@ -698,13 +709,18 @@ elif args.quant_mode == "wNa8":
         input_activations=activations_args,
     )
 
-    # INT8: attention projections, shared experts, MTP e_proj/h_proj (originally FP8)
+    # INT8: attention/shared-expert projections plus the checkpoint's MTP
+    # projection layout (preview e_proj/h_proj or DSpark main_proj).
     other_targets = [
         r"re:.*attn\.(wq_a|wq_b|wkv|wo_b)$",
         r"re:.*attn\.indexer\.wq_b$",
         r"re:.*ffn\.shared_experts\.(w1|w2|w3)$",
-        r"re:.*mtp\.\d+\.(e_proj|h_proj)$",
     ]
+    other_targets.append(
+        r"re:.*mtp\.0\.main_proj$"
+        if is_dspark
+        else r"re:.*mtp\.\d+\.(e_proj|h_proj)$"
+    )
     if args.quantize_wo_a:
         other_targets.append(_WO_A_PATTERN)
     other_w8_scheme = QuantizationScheme(
