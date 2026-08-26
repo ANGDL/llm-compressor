@@ -232,9 +232,9 @@ parser.add_argument(
     action=argparse.BooleanOptionalAction,
     default=True,
     help=(
-        "Save weights in raw DeepSeek checkpoint format (no 'model.' prefix, "
-        "'.weight_scale' → '.scale') for compatibility with sglang/vLLM. "
-        "Disable to keep HuggingFace format."
+        "Save BF16 and quantized weights in raw DeepSeek checkpoint format "
+        "(no 'model.' prefix, '.weight_scale' → '.scale') for compatibility "
+        "with sglang/vLLM. Disable to keep HuggingFace format."
     ),
 )
 args = parser.parse_args()
@@ -357,7 +357,13 @@ class SafetensorsReader:
             raise ValueError(f"Unsupported dtype: {dtype_str} for key {key}")
 
 
-def convert_to_bf16(model_path: str, save_dir: str, max_workers: int = 4):
+def convert_to_bf16(
+    model_path: str,
+    save_dir: str,
+    max_workers: int = 4,
+    *,
+    save_raw_checkpoint_format: bool = False,
+):
     """
     Convert DeepSeek V4 mixed-precision checkpoint (FP8+FP4) to BF16.
 
@@ -366,6 +372,12 @@ def convert_to_bf16(model_path: str, save_dir: str, max_workers: int = 4):
     - FP4 experts (I8 packed + F8_E8M0 scale): unpack and dequantize to BF16
     - BF16/F32 weights: pass through unchanged
     - .scale tensors: removed (no longer needed after dequantization)
+
+    ``save_raw_checkpoint_format`` controls the on-disk key layout. Raw keys
+    (``mtp.*``, ``layers.*``, ``attn.*``, ``lm_head.*``) are understood by the
+    DeepSeek serving loaders, while the HF layout (``model.*``) is useful for
+    generic Transformers tooling. The materializer always receives the HF
+    logical name internally; only the emitted key is format-dependent.
     """
     import shutil
     from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -399,11 +411,20 @@ def convert_to_bf16(model_path: str, save_dir: str, max_workers: int = 4):
 
     if max_workers <= 1:
         for shard_path in shard_files:
-            _convert_shard(shard_path, save_dir)
+            _convert_shard(
+                shard_path,
+                save_dir,
+                save_raw_checkpoint_format=save_raw_checkpoint_format,
+            )
     else:
         with ProcessPoolExecutor(max_workers=max_workers) as executor:
             futures = {
-                executor.submit(_convert_shard, sp, save_dir): sp
+                executor.submit(
+                    _convert_shard,
+                    sp,
+                    save_dir,
+                    save_raw_checkpoint_format=save_raw_checkpoint_format,
+                ): sp
                 for sp in shard_files
             }
             for future in as_completed(futures):
@@ -414,13 +435,15 @@ def convert_to_bf16(model_path: str, save_dir: str, max_workers: int = 4):
                     logger.error(f"Failed to convert {sp}: {e}")
                     raise
 
-    # Update the index file: remove .scale entries and remap keys to HF format
+    # Update the index file: remove .scale entries and apply the selected
+    # key layout.
     index_path = os.path.join(save_dir, "model.safetensors.index.json")
     if os.path.exists(index_path):
         with open(index_path) as f:
             index = json.load(f)
         index["weight_map"] = {
-            _raw_key_to_hf_key(k): v for k, v in index["weight_map"].items()
+            _bf16_output_key(k, save_raw_checkpoint_format): v
+            for k, v in index["weight_map"].items()
             if not k.endswith(".scale")
         }
         with open(index_path, "w") as f:
@@ -446,7 +469,26 @@ def _raw_key_to_hf_key(key: str) -> str:
     return "model." + key
 
 
-def _convert_shard(shard_path: str, save_dir: str):
+def _bf16_output_key(key: str, save_raw_checkpoint_format: bool) -> str:
+    """Return the serialized key for a BF16 conversion output shard."""
+    if save_raw_checkpoint_format:
+        # Keep the serving layout unprefixed. ``lm_head`` is accepted by both
+        # SGLang/vLLM and the custom Transformers loader, whereas the original
+        # raw checkpoint spelling ``head`` is not recognized by low-memory
+        # Transformers loading.
+        key = key.removeprefix("model.")
+        if key.startswith("head."):
+            return "lm_head." + key[len("head.") :]
+        return key
+    return _raw_key_to_hf_key(key)
+
+
+def _convert_shard(
+    shard_path: str,
+    save_dir: str,
+    *,
+    save_raw_checkpoint_format: bool = False,
+):
     """Convert a single safetensors shard from FP8/FP4 to BF16."""
     shard_name = os.path.basename(shard_path)
     out_path = os.path.join(save_dir, shard_name)
@@ -481,7 +523,9 @@ def _convert_shard(shard_path: str, save_dir: str):
                     logical_key: reader.get_tensor(key),
                     logical_scale_key: reader.get_tensor(scale_key),
                 }
-                output_tensors[logical_key] = materializer.materialize_cpu(
+                output_tensors[
+                    _bf16_output_key(key, save_raw_checkpoint_format)
+                ] = materializer.materialize_cpu(
                     logical_key,
                     tensors,
                     target_dtype=torch.bfloat16,
@@ -495,7 +539,9 @@ def _convert_shard(shard_path: str, save_dir: str):
                 )
             else:
                 # Non-quantized tensor: read as-is
-                output_tensors[_raw_key_to_hf_key(key)] = reader.get_tensor(key)
+                output_tensors[
+                    _bf16_output_key(key, save_raw_checkpoint_format)
+                ] = reader.get_tensor(key)
 
     save_file(output_tensors, out_path)
     logger.info(f"Saved: {shard_name} ({len(output_tensors)} tensors)")
@@ -512,12 +558,40 @@ BFLOAT16_SAVE_DIR = os.path.join(
 # --- Step 1: Convert to BF16 ---
 if args.step in ("all", "bf16"):
     if os.path.exists(BFLOAT16_SAVE_DIR):
-        logger.info(f"BF16 directory already exists: {BFLOAT16_SAVE_DIR}, skipping conversion")
+        index_path = os.path.join(BFLOAT16_SAVE_DIR, "model.safetensors.index.json")
+        existing_names = set()
+        if os.path.isfile(index_path):
+            with open(index_path) as f:
+                existing_names = set(json.load(f).get("weight_map", {}))
+        existing_is_raw = bool(existing_names) and not any(
+            name.startswith("model.") for name in existing_names
+        )
+        requested_is_raw = args.save_raw_checkpoint_format
+        if existing_names and existing_is_raw != requested_is_raw:
+            logger.info(
+                "BF16 directory exists with {} keys, requested {} keys; "
+                "reconverting: {}",
+                "raw" if existing_is_raw else "HF",
+                "raw" if requested_is_raw else "HF",
+                BFLOAT16_SAVE_DIR,
+            )
+            convert_to_bf16(
+                model_path=args.model_id,
+                save_dir=BFLOAT16_SAVE_DIR,
+                max_workers=args.bf16_convert_workers,
+                save_raw_checkpoint_format=requested_is_raw,
+            )
+        else:
+            logger.info(
+                f"BF16 directory already exists: {BFLOAT16_SAVE_DIR}, "
+                "skipping conversion"
+            )
     else:
         convert_to_bf16(
             model_path=args.model_id,
             save_dir=BFLOAT16_SAVE_DIR,
             max_workers=args.bf16_convert_workers,
+            save_raw_checkpoint_format=args.save_raw_checkpoint_format,
         )
 
 if args.step == "bf16":
