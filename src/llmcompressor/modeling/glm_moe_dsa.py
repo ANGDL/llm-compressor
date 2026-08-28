@@ -121,7 +121,11 @@ class CalibrationGlmMoeDsaMoE(MoECalibrationModule):
             topk_indices, topk_weights = self.route_tokens_to_experts(router_logits)
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
 
-        final_hidden_states = torch.zeros_like(hidden_states, dtype=topk_weights.dtype)
+        # Match the Transformers eager experts implementation: routed outputs
+        # are accumulated in the input hidden-state dtype, while the router
+        # weights may be FP32. This keeps calibration replacement numerically
+        # aligned with the source MoE forward for BF16/FP16 models.
+        final_hidden_states = torch.zeros_like(hidden_states)
         with torch.no_grad():
             expert_mask = torch.nn.functional.one_hot(
                 topk_indices, num_classes=self.num_experts
