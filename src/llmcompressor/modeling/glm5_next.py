@@ -421,53 +421,6 @@ def attach_mtp_layer(model, model_path: str) -> None:
     model.forward = types.MethodType(forward, model)
 
 
-def load_fp8_quantized_weight_names(reference_model: str) -> set[str]:
-    """Read the FP8 reference's exact ``weight_scale_inv`` module set."""
-    index_path = os.path.join(reference_model, "model.safetensors.index.json")
-    if not os.path.exists(index_path):
-        raise FileNotFoundError(f"FP8 reference index not found: {index_path}")
-    with open(index_path, encoding="utf-8") as file:
-        names = json.load(file)["weight_map"]
-    suffix = ".weight_scale_inv"
-    return {name[: -len(suffix)] for name in names if name.endswith(suffix)}
-
-
-GLM5_NEXT_W8A8_TARGETS = [
-    r"re:^model\.language_model\.layers\.\d+\.mlp\."
-    r"(gate_proj|up_proj|down_proj)$",
-    r"re:^model\.language_model\.layers\.\d+\.mlp\.shared_experts\."
-    r"(gate_proj|up_proj|down_proj)$",
-    r"re:^model\.language_model\.layers\.\d+\.mlp\.experts\.\d+\."
-    r"(gate_proj|up_proj|down_proj)$",
-    r"re:^model\.language_model\.layers\.\d+\.self_attn\."
-    r"(q_a_proj|q_b_proj|kv_a_proj_with_mqa|o_proj)$",
-]
-
-
-def _target_matches(name: str) -> bool:
-    return any(re.fullmatch(pattern[3:], name) for pattern in GLM5_NEXT_W8A8_TARGETS)
-
-
-def validate_fp8_target_alignment(model, reference_model: str) -> set[str]:
-    """Fail early if target rules drift from the supplied FP8 checkpoint."""
-    reference_names = load_fp8_quantized_weight_names(reference_model)
-    actual_names = {
-        name
-        for name, module in model.named_modules()
-        if isinstance(module, nn.Linear) and _target_matches(name)
-    }
-    missing = reference_names - actual_names
-    extra = actual_names - reference_names
-    if missing or extra:
-        raise ValueError(
-            "GLM-5.3 W8A8 targets do not match the FP8 reference: "
-            f"missing={len(missing)}, extra={len(extra)}; "
-            f"missing_examples={sorted(missing)[:5]}, "
-            f"extra_examples={sorted(extra)[:5]}"
-        )
-    return reference_names
-
-
 try:
     from transformers.models.glm5_next.modeling_glm5_next import (
         MoeCausalLMOutputWithPast,
@@ -478,9 +431,6 @@ except ImportError:  # pragma: no cover - imported only by the attach path
 
 __all__ = [
     "CalibrationGlm5NextTextMoE",
-    "GLM5_NEXT_W8A8_TARGETS",
     "Glm5NextMTPLayer",
     "attach_mtp_layer",
-    "load_fp8_quantized_weight_names",
-    "validate_fp8_target_alignment",
 ]
