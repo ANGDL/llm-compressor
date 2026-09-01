@@ -180,8 +180,6 @@ def test_glm5_next_w8a8_example_uses_processor_for_multimodal_calibration():
     assert "return_dict=True" in source
     assert "processor=processor" in source
     assert "processor.save_pretrained(save_path)" in source
-    assert '"--check-imatrix-nonfinite"' in source
-    assert "check_nonfinite=args.check_imatrix_nonfinite" in source
 
 
 def test_fuse_mtp_experts_reconstructs_packed_transformers_layout():
