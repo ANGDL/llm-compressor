@@ -17,7 +17,6 @@ Example::
         --dataset_id lmms-lab/flickr30k --dataset_split test \
         --text_dataset_id HuggingFaceH4/ultrachat_200k \
         --text_dataset_split train_sft --text_calibration_samples 128 \
-        --check-imatrix-nonfinite \
         --pipeline sequential
 """
 
@@ -120,15 +119,6 @@ parser.add_argument(
     "--moe-calibrate-all-experts",
     action=argparse.BooleanOptionalAction,
     default=False,
-)
-parser.add_argument(
-    "--check-imatrix-nonfinite",
-    action=argparse.BooleanOptionalAction,
-    default=False,
-    help=(
-        "Check iMatrix x/x^2/FP32 channel reductions during calibration and "
-        "raise on the first NaN or Inf."
-    ),
 )
 args = parser.parse_args()
 if args.text_calibration_samples < 0:
@@ -368,9 +358,7 @@ if args.observer:
 tail_name = "-W8A8"
 recipes = []
 if args.observer == "imatrix_mse":
-    fallback_stats = ImatrixFallbackStats(
-        check_nonfinite=args.check_imatrix_nonfinite
-    )
+    fallback_stats = ImatrixFallbackStats()
     fallback_stats.install_hooks()
     recipes.append(
         IMatrixGatherer(
