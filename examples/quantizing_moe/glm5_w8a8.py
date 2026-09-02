@@ -2,7 +2,7 @@ import argparse
 import os
 from contextlib import contextmanager
 
-from datasets import load_dataset
+from datasets import concatenate_datasets, load_dataset
 from loguru import logger
 from torch.utils._pytree import tree_leaves
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -33,8 +33,10 @@ configure_logger(LoggerConfig(console_log_level="DEBUG"))
 Usage example for quantizing GLM-5.1 with MoE layers to W8A8 using LLM Compressor.
 1. 更改权重文件中的generation_config.json, 添加："do_sample": true
 2. 量化
-python glm5_w8a8.py --model_id /ssd3/models/GLM-5.1/ --save_dir /ssd2/models/ --transform "" --modifier RTN  --observer imatrix_mse  \
-    --num_calibration_samples 512 --max_sequence_length 2048 --dataset_id ./ultrachat_200k --dataset_split train_sft  \
+python glm5_w8a8.py --model_id /ssd4/models/GLM-5.3-BF16/ \
+    --save_dir /ssd2/models/ --transform "" --modifier RTN  \
+    --observer imatrix_mse --num_calibration_samples 256 --max_sequence_length 8192 \
+    --dataset_id ./ultrachat_200k ./calibration_data_deepseek-v4-flash-0731.jsonl --dataset_split train_sft  \
     --indexer-ignore-mode indexer_all --dispatch_extra_memory_gb 10 --pipeline sequential
 """
 
@@ -63,7 +65,16 @@ parser.add_argument(
     choices=["", "AutoSmooth", "SmoothQuant"],
     help="Optional transform: empty(default), AutoSmooth, or SmoothQuant.",
 )
-parser.add_argument("--dataset_id", type=str, default="HuggingFaceH4/ultrachat_200k")
+parser.add_argument(
+    "--dataset_id",
+    type=str,
+    nargs="+",
+    default=["HuggingFaceH4/ultrachat_200k"],
+    help=(
+        "HuggingFace dataset ID(s) or path(s) to local JSON/JSONL files. "
+        "Multiple sources can be specified and will be concatenated."
+    ),
+)
 parser.add_argument("--dataset_split", type=str, default="train_sft")
 parser.add_argument(
     "--num_calibration_samples",
@@ -212,15 +223,34 @@ def maybe_skip_from_accelerate(skip_restore: bool):
 
 
 # Select calibration dataset.
-DATASET_ID = args.dataset_id
+DATASET_IDS = args.dataset_id
 DATASET_SPLIT = args.dataset_split
 NUM_CALIBRATION_SAMPLES = args.num_calibration_samples
 MAX_SEQUENCE_LENGTH = args.max_sequence_length
 
 
 # Load dataset and preprocess.
-ds = load_dataset(DATASET_ID, split=f"{DATASET_SPLIT}[:{NUM_CALIBRATION_SAMPLES}]")
-ds = ds.shuffle(seed=42)
+if NUM_CALIBRATION_SAMPLES < len(DATASET_IDS):
+    raise ValueError(
+        f"num_calibration_samples ({NUM_CALIBRATION_SAMPLES}) must be >= "
+        f"number of dataset sources ({len(DATASET_IDS)}): {DATASET_IDS}"
+    )
+
+per_source_samples = NUM_CALIBRATION_SAMPLES // len(DATASET_IDS)
+remainder = NUM_CALIBRATION_SAMPLES % len(DATASET_IDS)
+
+all_datasets = []
+for i, dataset_id in enumerate(DATASET_IDS):
+    n_samples = per_source_samples + (1 if i < remainder else 0)
+    if os.path.isfile(dataset_id) or dataset_id.endswith((".json", ".jsonl")):
+        part = load_dataset(
+            "json",
+            data_files=dataset_id,
+            split=f"train[:{n_samples}]",
+        )
+    else:
+        part = load_dataset(dataset_id, split=f"{DATASET_SPLIT}[:{n_samples}]")
+    all_datasets.append(part.shuffle(seed=42))
 
 # Load the model
 model_id = args.model_id
@@ -256,7 +286,15 @@ def preprocess(example):
         return {"text": example["text"]}
 
 
-ds = ds.map(preprocess)
+all_datasets = [
+    part.map(preprocess, remove_columns=part.column_names) for part in all_datasets
+]
+
+if len(all_datasets) == 1:
+    ds = all_datasets[0]
+else:
+    ds = concatenate_datasets(all_datasets)
+
 print(ds[0])
 
 
