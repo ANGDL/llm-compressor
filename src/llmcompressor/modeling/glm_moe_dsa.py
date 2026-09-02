@@ -121,8 +121,6 @@ class CalibrationGlmMoeDsaMoE(MoECalibrationModule):
             topk_indices, topk_weights = self.route_tokens_to_experts(router_logits)
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
 
-        # Accumulate in the router-weight dtype, matching the previous GLM MoE
-        # calibration path before the final cast back to hidden-state dtype.
         final_hidden_states = torch.zeros_like(hidden_states, dtype=topk_weights.dtype)
         with torch.no_grad():
             expert_mask = torch.nn.functional.one_hot(
