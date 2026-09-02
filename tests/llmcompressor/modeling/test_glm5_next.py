@@ -27,20 +27,46 @@ def _load_example_assignment(name):
         for node in tree.body
         if isinstance(node, ast.Assign)
         and any(
-            isinstance(target, ast.Name)
-            and target.id == name
+            isinstance(target, ast.Name) and target.id == name
             for target in node.targets
         )
     )
     return ast.literal_eval(assignment.value)
 
 
+def _load_example_function(name):
+    example_path = (
+        Path(__file__).parents[3] / "examples" / "quantizing_moe" / "glm5_next_w8a8.py"
+    )
+    tree = ast.parse(example_path.read_text(encoding="utf-8"))
+    functions = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name in {"_config_value", "build_glm5_next_w8a8_ignores"}
+    }
+    namespace = {}
+    exec(
+        compile(
+            ast.Module(body=list(functions.values()), type_ignores=[]),
+            str(example_path),
+            "exec",
+        ),
+        namespace,
+    )
+    return namespace[name]
+
+
 GLM5_NEXT_W8A8_TARGETS = _load_example_assignment("GLM5_NEXT_W8A8_TARGETS")
-GLM5_NEXT_W8A8_IGNORES = _load_example_assignment("GLM5_NEXT_W8A8_IGNORES")
-
-
-def _target_matches(name: str) -> bool:
-    return any(re.fullmatch(pattern[3:], name) for pattern in GLM5_NEXT_W8A8_TARGETS)
+BUILD_GLM5_NEXT_W8A8_IGNORES = _load_example_function("build_glm5_next_w8a8_ignores")
+GLM5_NEXT_W8A8_IGNORES = BUILD_GLM5_NEXT_W8A8_IGNORES(
+    SimpleNamespace(
+        text_config=SimpleNamespace(
+            num_hidden_layers=4,
+            linear_attn_config={"kda_layers": [0, 2]},
+        )
+    )
+)
 
 
 def _ignore_matches(name: str) -> bool:
@@ -148,16 +174,34 @@ def test_glm5_next_calibration_forward_matches_transformers_bfloat16(
     torch.testing.assert_close(actual, expected, rtol=0, atol=2e-5)
 
 
-def test_glm5_next_w8a8_target_patterns_are_fixed_and_model_independent():
-    assert len(GLM5_NEXT_W8A8_TARGETS) == 4
-    assert all(pattern.startswith("re:") for pattern in GLM5_NEXT_W8A8_TARGETS)
+def test_glm5_next_w8a8_targets_all_linear_modules():
+    assert GLM5_NEXT_W8A8_TARGETS == ["Linear"]
 
 
 def test_glm5_next_w8a8_ignores_multimodal_vision_modules():
-    assert "lm_head" in GLM5_NEXT_W8A8_IGNORES
+    assert _ignore_matches("lm_head")
     assert _ignore_matches("model.visual.patch_embed.proj")
     assert not _ignore_matches("model.language_model.layers.0.mlp.gate_proj")
     assert not _ignore_matches("model.audio_tower.proj")
+
+
+def test_glm5_next_w8a8_ignores_follow_configured_kda_layers():
+    ignores = BUILD_GLM5_NEXT_W8A8_IGNORES(
+        SimpleNamespace(
+            text_config=SimpleNamespace(
+                num_hidden_layers=49,
+                linear_attn_config={"kda_layers": [0, 46, 48]},
+            )
+        )
+    )
+
+    def is_ignored(name):
+        return any(re.match(pattern.removeprefix("re:"), name) for pattern in ignores)
+
+    assert is_ignored("model.language_model.layers.48.self_attn.o_proj")
+    assert not is_ignored("model.language_model.layers.47.self_attn.o_proj")
+    assert is_ignored("model.language_model.layers.47.self_attn.kv_b_proj")
+    assert is_ignored("model.language_model.layers.49.eh_proj")
 
 
 def test_glm5_next_w8a8_example_uses_processor_for_multimodal_calibration():
@@ -220,8 +264,8 @@ def test_fuse_mtp_experts_reconstructs_packed_transformers_layout():
         "model.language_model.layers.45.self_attn.kv_a_proj_with_mqa",
     ],
 )
-def test_glm5_next_target_patterns_include_main_and_mtp_w8a8_modules(name):
-    assert _target_matches(name)
+def test_glm5_next_ignores_keep_main_and_mtp_w8a8_modules_quantized(name):
+    assert not _ignore_matches(name)
 
 
 @pytest.mark.parametrize(
@@ -234,8 +278,8 @@ def test_glm5_next_target_patterns_include_main_and_mtp_w8a8_modules(name):
         "lm_head",
     ],
 )
-def test_glm5_next_target_patterns_keep_non_fp8_modules_unquantized(name):
-    assert not _target_matches(name)
+def test_glm5_next_ignores_keep_non_fp8_modules_unquantized(name):
+    assert _ignore_matches(name)
 
 
 def test_glm5_next_mtp_skips_empty_continuation():
