@@ -28,11 +28,6 @@ def _reset_class_state():
     ImatrixFallbackStats._no_importance.clear()
     ImatrixFallbackStats._all_zero.clear()
     ImatrixFallbackStats._other.clear()
-    ImatrixFallbackStats._activation_stats.clear()
-    for handle in ImatrixFallbackStats._diagnostic_handles.values():
-        handle.remove()
-    ImatrixFallbackStats._diagnostic_handles.clear()
-    ImatrixFallbackStats._check_nonfinite = False
     ImatrixFallbackStats._module_name_by_id.clear()
     # Remove any lingering sink
     if ImatrixFallbackStats._sink_id is not None:
@@ -285,31 +280,6 @@ class TestPrintSummary:
         # Sorted by hit count descending
         assert output.index("layer_a") < output.index("layer_b")
 
-    def test_activation_diagnostics_are_printed(self):
-        _reset_class_state()
-        ImatrixFallbackStats._check_nonfinite = True
-        ImatrixFallbackStats._activation_stats["layer.18.mlp"] = {
-            "calls": 2,
-            "x_nonfinite": 1,
-            "x_nan": 1,
-            "x_inf": 0,
-            "x2_nonfinite": 1,
-            "x2_nan": 1,
-            "x2_inf": 0,
-            "x2_sum_nonfinite": 1,
-            "imatrix_sum_nonfinite": 1,
-            "max_abs": 3.0,
-        }
-
-        buf = io.StringIO()
-        with redirect_stdout(buf):
-            ImatrixFallbackStats().print_summary()
-        output = buf.getvalue()
-        assert "[activation diagnostics]" in output
-        assert "layer.18.mlp" in output
-        assert "x2_sum_nonfinite=1" in output
-        assert "imatrix_sum_nonfinite=1" in output
-
 
 # ------------------------------------------------------------------ #
 #  Tests: counter properties
@@ -426,98 +396,6 @@ class TestIntegrationWithObserver:
         # ContextVar should be back to default
         assert ImatrixFallbackStats._current_module.get() is None
 
-        stats.remove_hooks()
-
-    def test_nonfinite_activation_is_logged_and_raises(self):
-        """check_nonfinite stops at the module receiving a NaN input."""
-        from llmcompressor.observers.imatrix import IMatrixMSEObserver
-        from compressed_tensors.quantization import QuantizationArgs
-
-        stats = ImatrixFallbackStats(check_nonfinite=True)
-        stats.install_hooks()
-        module = nn.Linear(4, 2, bias=False)
-        ImatrixFallbackStats._module_name_by_id[id(module)] = "layer.18.mlp.experts.0"
-        observer = IMatrixMSEObserver(
-            base_name="weight",
-            args=QuantizationArgs(observer="imatrix_mse", strategy="channel"),
-        )
-        observer.attach(module)
-
-        with pytest.raises(FloatingPointError, match="layer.18.mlp.experts.0"):
-            module(torch.tensor([[1.0, float("nan"), 0.0, 2.0]]))
-
-        diagnostics = stats.activation_stats["layer.18.mlp.experts.0"]
-        assert diagnostics["x_nan"] == 1
-        assert diagnostics["x_nonfinite"] == 1
-        stats.remove_hooks()
-
-    def test_nonfinite_square_sum_is_logged_and_raises(self):
-        """Finite x can still overflow the FP32 square/reduction."""
-        from llmcompressor.observers.imatrix import IMatrixMSEObserver
-        from compressed_tensors.quantization import QuantizationArgs
-
-        stats = ImatrixFallbackStats(check_nonfinite=True)
-        stats.install_hooks()
-        module = nn.Linear(2, 2, bias=False)
-        ImatrixFallbackStats._module_name_by_id[id(module)] = "layer.20.mlp"
-        observer = IMatrixMSEObserver(
-            base_name="weight",
-            args=QuantizationArgs(observer="imatrix_mse", strategy="channel"),
-        )
-        observer.attach(module)
-
-        with pytest.raises(FloatingPointError, match="layer.20.mlp"):
-            module(torch.tensor([[1.0e20, 1.0e20]]))
-
-        diagnostics = stats.activation_stats["layer.20.mlp"]
-        assert diagnostics["x_nonfinite"] == 0
-        assert diagnostics["x2_inf"] == 2
-        assert diagnostics["x2_sum_nonfinite"] == 2
-        stats.remove_hooks()
-
-    def test_nonfinite_accumulator_is_logged_and_raises(self):
-        """Repeated finite x**2 values can overflow the FP32 accumulator."""
-        from llmcompressor.observers.imatrix import IMatrixMSEObserver
-        from compressed_tensors.quantization import QuantizationArgs
-
-        stats = ImatrixFallbackStats(check_nonfinite=True)
-        stats.install_hooks()
-        module = nn.Linear(2, 2, bias=False)
-        ImatrixFallbackStats._module_name_by_id[id(module)] = "layer.21.mlp"
-        observer = IMatrixMSEObserver(
-            base_name="weight",
-            args=QuantizationArgs(observer="imatrix_mse", strategy="channel"),
-        )
-        observer.attach(module)
-        input_value = torch.full((1, 2), 1.0e19)
-
-        for _ in range(3):
-            module(input_value)
-        with pytest.raises(FloatingPointError, match="layer.21.mlp"):
-            module(input_value)
-
-        diagnostics = stats.activation_stats["layer.21.mlp"]
-        assert diagnostics["x_nonfinite"] == 0
-        assert diagnostics["x2_nonfinite"] == 0
-        assert diagnostics["imatrix_sum_nonfinite"] == 2
-        stats.remove_hooks()
-
-    def test_nonfinite_check_is_disabled_by_default(self):
-        """Existing tracking remains non-blocking unless explicitly enabled."""
-        from llmcompressor.observers.imatrix import IMatrixMSEObserver
-        from compressed_tensors.quantization import QuantizationArgs
-
-        stats = ImatrixFallbackStats()
-        stats.install_hooks()
-        module = nn.Linear(2, 2, bias=False)
-        ImatrixFallbackStats._module_name_by_id[id(module)] = "layer.normal"
-        observer = IMatrixMSEObserver(
-            base_name="weight",
-            args=QuantizationArgs(observer="imatrix_mse", strategy="channel"),
-        )
-        observer.attach(module)
-        module(torch.tensor([[1.0, float("nan")]]))
-        assert "layer.normal" not in stats.activation_stats
         stats.remove_hooks()
 
 
