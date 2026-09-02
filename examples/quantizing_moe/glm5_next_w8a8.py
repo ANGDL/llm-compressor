@@ -1,11 +1,11 @@
 """Calibrate GLM-5.3-Flash-BF16 to W8A8.
 
-The fixed target set in ``GLM5_NEXT_W8A8_TARGETS`` covers dense/shared/routed
-MLP projections and the four DSA projections. KDA projections, mHC
-parameters, indexer projections, norms, embeddings and the language-model head
-remain BF16. ``GLM5_NEXT_W8A8_IGNORES`` also excludes the multimodal vision
-branch under ``model.visual``. No separate FP8 checkpoint is required to
-determine this scope.
+All ``Linear`` modules are targeted. ``GLM5_NEXT_W8A8_IGNORES`` summarizes the
+``quantization_config.modules_to_not_convert`` entries from the released
+GLM-5.3-Flash config into one regex. This keeps KDA projections, mHC
+parameters, indexer projections, norms, embeddings, the language-model head,
+and the multimodal vision branch in BF16 without reading a reference checkpoint
+at runtime.
 
 Example::
 
@@ -52,22 +52,58 @@ from llmcompressor.modifiers.quantization import QuantizationModifier
 from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
 from llmcompressor.utils import ImatrixFallbackStats
 
-# These are the GLM-5.3 modules that use the W8A8 INT8 scheme. Keep this list
-# local to the quantization entrypoint so the model adapter remains model-only.
-GLM5_NEXT_W8A8_TARGETS = [
-    r"re:^model\.language_model\.layers\.\d+\.mlp\."
-    r"(gate_proj|up_proj|down_proj)$",
-    r"re:^model\.language_model\.layers\.\d+\.mlp\.shared_experts\."
-    r"(gate_proj|up_proj|down_proj)$",
-    r"re:^model\.language_model\.layers\.\d+\.mlp\.experts\.\d+\."
-    r"(gate_proj|up_proj|down_proj)$",
-    r"re:^model\.language_model\.layers\.\d+\.self_attn\."
-    r"(q_a_proj|q_b_proj|kv_a_proj_with_mqa|o_proj)$",
-]
-GLM5_NEXT_W8A8_IGNORES = [
-    "lm_head",
-    r"re:^model\.visual\..*",
-]
+# The released config uses ``model.layers``/``visual`` names, while the HF
+# multimodal wrapper exposes them as ``model.language_model.layers`` and
+# ``model.visual``. The regex below applies that namespace mapping while
+# collapsing the exact ``modules_to_not_convert`` entries.
+GLM5_NEXT_W8A8_TARGETS = ["Linear"]
+
+
+def _config_value(config, key):
+    if isinstance(config, dict):
+        return config.get(key)
+    return getattr(config, key, None)
+
+
+def build_glm5_next_w8a8_ignores(config) -> list[str]:
+    """Build ignores from the checkpoint's configured KDA layer layout."""
+    text_config = _config_value(config, "text_config")
+    linear_attn_config = _config_value(text_config, "linear_attn_config")
+    kda_layers = _config_value(linear_attn_config, "kda_layers")
+    num_hidden_layers = _config_value(text_config, "num_hidden_layers")
+    if not isinstance(kda_layers, (list, tuple)) or not kda_layers:
+        raise ValueError(
+            "GLM-5.3 text config must define linear_attn_config.kda_layers"
+        )
+    if not isinstance(num_hidden_layers, int) or any(
+        not isinstance(layer, int) or layer < 0 or layer >= num_hidden_layers
+        for layer in kda_layers
+    ):
+        raise ValueError("GLM-5.3 text config contains invalid KDA layer indices")
+
+    kda_layer_pattern = "(?:" + "|".join(map(str, sorted(set(kda_layers)))) + ")"
+    ignore_pattern = (
+        r"re:^(?:"
+        r"lm_head|"
+        r"(?:model\.)?visual(?:\..*)?|"
+        r"(?:.*\.)?(?:attn_mha|attn_mqa|dt_bias|hyper_connection|"
+        r"mapping_proj|router|weights_proj)|"
+        r"model\.language_model\.(?:embed_tokens|norm)|"
+        r"model\.language_model\.layers\.\d+\."
+        r"(?:hc_(?:attn|ffn)_(?:base|fn|scale)|input_layernorm|"
+        r"post_attention_layernorm)|"
+        rf"model\.language_model\.layers\.{kda_layer_pattern}\."
+        r"self_attn(?:\..*)?|"
+        r"model\.language_model\.layers\.\d+\.mlp\.gate(?:\..*)?|"
+        r"model\.language_model\.layers\.\d+\."
+        r"self_attn\.(?:indexer(?:\..*)?|kv_a_layernorm|kv_b_proj|"
+        r"q_a_layernorm)|"
+        r"model\.language_model\.layers\.\d+\."
+        r"(?:eh_proj|enorm|hnorm|shared_head\.norm)"
+        r")$"
+    )
+    return [ignore_pattern]
+
 
 configure_logger(LoggerConfig(console_log_level="DEBUG"))
 
@@ -184,6 +220,7 @@ model = Glm5NextForConditionalGeneration.from_pretrained(
     dtype="auto",
     device_map=None,
 )
+GLM5_NEXT_W8A8_IGNORES = build_glm5_next_w8a8_ignores(model.config)
 processor = AutoProcessor.from_pretrained(args.model_id)
 tokenizer = processor.tokenizer
 
@@ -333,7 +370,7 @@ def data_collator(batch):
 
 # HF intentionally ignores the flat MTP continuation. Attach it at the
 # canonical checkpoint path so save_pretrained remains consistent with
-# ``model.language_model.layers.45.*``.
+# ``model.language_model.layers.<num_hidden_layers>.*``.
 attach_mtp_layer(model, args.model_id)
 
 # The generic oneshot entrypoint linearizes any packed expert implementation before
@@ -345,8 +382,7 @@ with replace_moe_calibration_modules(
     # CalibrationGlm5NextTextMoE is permanent, so the replacements remain on
     # ``model`` after this block and are seen by the subsequent oneshot call.
     logger.info(
-        "Using fixed GLM-5.3 W8A8 target patterns for {} module groups",
-        len(GLM5_NEXT_W8A8_TARGETS),
+        "Targeting all GLM-5.3 Linear modules with config-derived ignores",
     )
 
 scheme = preset_name_to_scheme("W8A8", ["Linear"])
