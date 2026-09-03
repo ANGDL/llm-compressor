@@ -22,6 +22,7 @@ Example::
 
 import argparse
 import base64
+import json
 import os
 from contextlib import contextmanager
 from io import BytesIO
@@ -52,11 +53,15 @@ from llmcompressor.modifiers.quantization import QuantizationModifier
 from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
 from llmcompressor.utils import ImatrixFallbackStats
 
-# The released config uses ``model.layers``/``visual`` names, while the HF
-# multimodal wrapper exposes them as ``model.language_model.layers`` and
-# ``model.visual``. The regex below applies that namespace mapping while
-# collapsing the exact ``modules_to_not_convert`` entries.
+# Quantization targets every HF ``Linear`` and uses a config-derived regex to
+# exclude BF16 modules. After saving, the actual tensor index supplies the
+# canonical ignore names; only runtime structural aliases that vLLM cannot map
+# itself are added here.
 GLM5_NEXT_W8A8_TARGETS = ["Linear"]
+GLM5_NEXT_VLLM_FUSED_IGNORES = [
+    r"re:^(?:model\.language_model|(?:language_model\.|mtp\.)?model)"
+    r"\.layers\.\d+(?:\.mtp_block)?\.self_attn\.in_proj_qkvgfab$"
+]
 
 
 def _config_value(config, key):
@@ -66,7 +71,7 @@ def _config_value(config, key):
 
 
 def build_glm5_next_w8a8_ignores(config) -> list[str]:
-    """Build ignores from the checkpoint's configured KDA layer layout."""
+    """Build runtime-portable ignores from the configured KDA layer layout."""
     text_config = _config_value(config, "text_config")
     linear_attn_config = _config_value(text_config, "linear_attn_config")
     kda_layers = _config_value(linear_attn_config, "kda_layers")
@@ -82,27 +87,137 @@ def build_glm5_next_w8a8_ignores(config) -> list[str]:
         raise ValueError("GLM-5.3 text config contains invalid KDA layer indices")
 
     kda_layer_pattern = "(?:" + "|".join(map(str, sorted(set(kda_layers)))) + ")"
-    ignore_pattern = (
-        r"re:^(?:"
-        r"lm_head|"
-        r"(?:model\.)?visual(?:\..*)?|"
+    # Optional leading components cover vLLM wrappers such as
+    # ``language_model.model`` and a separately loaded ``mtp.model``. The HF
+    # model's checkpoint-facing namespace is the ``model.language_model``
+    # alternative.
+    model_root = r"(?:.*\.)?model(?:\.language_model)?"
+    layer_root = model_root + r"\.layers"
+    decoder_prefix = layer_root + r"\.\d+\.(?:mtp_block\.)?"
+    ignore_alternatives = (
+        r"(?:.*\.)?lm_head",
+        r"(?:.*\.)?visual(?:\..*)?",
         r"(?:.*\.)?(?:attn_mha|attn_mqa|dt_bias|hyper_connection|"
-        r"mapping_proj|router|weights_proj)|"
-        r"model\.language_model\.(?:embed_tokens|norm)|"
-        r"model\.language_model\.layers\.\d+\."
-        r"(?:hc_(?:attn|ffn)_(?:base|fn|scale)|input_layernorm|"
-        r"post_attention_layernorm)|"
-        rf"model\.language_model\.layers\.{kda_layer_pattern}\."
-        r"self_attn(?:\..*)?|"
-        r"model\.language_model\.layers\.\d+\.mlp\.gate(?:\..*)?|"
-        r"model\.language_model\.layers\.\d+\."
-        r"self_attn\.(?:indexer(?:\..*)?|kv_a_layernorm|kv_b_proj|"
-        r"q_a_layernorm)|"
-        r"model\.language_model\.layers\.\d+\."
-        r"(?:eh_proj|enorm|hnorm|shared_head\.norm)"
-        r")$"
+        r"mapping_proj|router|weights_proj)",
+        model_root + r"\.(?:embed_tokens|norm)",
+        decoder_prefix + r"(?:hc_(?:attn|ffn)_(?:base|fn|scale)|input_layernorm|"
+        r"post_attention_layernorm)",
+        layer_root + rf"\.{kda_layer_pattern}\.self_attn(?:\..*)?",
+        decoder_prefix + r"mlp\.gate(?:\..*)?",
+        decoder_prefix + r"self_attn\.(?:indexer(?:\..*)?|kv_a_layernorm|kv_b_proj|"
+        r"q_a_layernorm)",
+        layer_root + r"\.\d+\.(?:eh_proj|enorm|hnorm|shared_head\.norm)",
     )
+    ignore_pattern = r"re:^(?:" + "|".join(ignore_alternatives) + r")$"
     return [ignore_pattern]
+
+
+def _glm5_next_runtime_name_aliases(name: str, config) -> set[str]:
+    """Add aliases for runtime structures not covered by vLLM's name mapper."""
+    aliases = {name}
+    text_config = _config_value(config, "text_config")
+    num_hidden_layers = _config_value(text_config, "num_hidden_layers")
+    num_mtp_layers = _config_value(text_config, "num_nextn_predict_layers") or 0
+
+    if not name.startswith("model.language_model."):
+        return aliases
+
+    relative_name = name.removeprefix("model.language_model.")
+    if isinstance(num_hidden_layers, int):
+        layer_parts = relative_name.split(".", 2)
+        try:
+            layer_idx = int(layer_parts[1])
+        except (IndexError, ValueError):
+            layer_idx = -1
+        if (
+            len(layer_parts) == 3
+            and layer_parts[0] == "layers"
+            and num_hidden_layers <= layer_idx < num_hidden_layers + num_mtp_layers
+        ):
+            mtp_relative_name = layer_parts[2]
+            shared_prefixes = ("enorm", "hnorm", "eh_proj", "shared_head")
+            if mtp_relative_name.split(".", 1)[0] not in shared_prefixes:
+                mtp_relative_name = "mtp_block." + mtp_relative_name
+            mtp_name = f"model.layers.{layer_idx}.{mtp_relative_name}"
+            aliases.add(mtp_name)
+            aliases.add("mtp." + mtp_name)
+
+    # Transformers nests these checkpoint projections under ``forget_gate``.
+    for alias in tuple(aliases):
+        prefix, separator, suffix = alias.rpartition(".self_attn.")
+        if separator and suffix in {"f_a_proj", "f_b_proj"}:
+            aliases.add(f"{prefix}.self_attn.forget_gate.{suffix}")
+    return aliases
+
+
+def collect_glm5_next_ignored_checkpoint_names(
+    tensor_names: list[str],
+    config,
+) -> list[str]:
+    """Infer exhaustive ignores from the checkpoint's actual quantized tensors."""
+    quantized_modules = {
+        name.removesuffix(suffix)
+        for name in tensor_names
+        for suffix in (".weight_scale", ".weight_scale_inv")
+        if name.endswith(suffix)
+    }
+    quantization_suffixes = (
+        ".weight_scale",
+        ".weight_scale_inv",
+        ".weight_zero_point",
+        ".input_scale",
+        ".input_zero_point",
+        ".output_scale",
+        ".output_zero_point",
+    )
+    ignored_names = set(GLM5_NEXT_VLLM_FUSED_IGNORES)
+    for tensor_name in tensor_names:
+        if tensor_name.endswith(quantization_suffixes):
+            continue
+        parameter_name = tensor_name.rsplit(".", 1)[-1]
+        if parameter_name in {"weight", "bias"}:
+            module_name = tensor_name.rsplit(".", 1)[0]
+        else:
+            module_name = tensor_name
+        if module_name in quantized_modules:
+            continue
+        ignored_names.update(_glm5_next_runtime_name_aliases(module_name, config))
+        if parameter_name != "weight":
+            ignored_names.update(_glm5_next_runtime_name_aliases(tensor_name, config))
+    return sorted(ignored_names)
+
+
+def replace_glm5_next_saved_ignores(
+    config_data: dict,
+    checkpoint_ignores: list[str],
+) -> dict:
+    """Replace saved ignores with names derived from the checkpoint index."""
+    quantization_config = config_data.get("quantization_config")
+    if not isinstance(quantization_config, dict):
+        raise ValueError("Saved config is missing quantization_config")
+
+    quantization_config["ignore"] = list(dict.fromkeys(checkpoint_ignores))
+    return config_data
+
+
+def update_glm5_next_saved_ignores(save_path: str) -> None:
+    config_path = os.path.join(save_path, "config.json")
+    index_path = os.path.join(save_path, "model.safetensors.index.json")
+    with open(config_path, encoding="utf-8") as file:
+        config_data = json.load(file)
+    with open(index_path, encoding="utf-8") as file:
+        tensor_names = list(json.load(file)["weight_map"])
+    checkpoint_ignores = collect_glm5_next_ignored_checkpoint_names(
+        tensor_names,
+        config_data,
+    )
+    replace_glm5_next_saved_ignores(
+        config_data,
+        checkpoint_ignores,
+    )
+    with open(config_path, "w", encoding="utf-8") as file:
+        json.dump(config_data, file, indent=2, sort_keys=True)
+        file.write("\n")
 
 
 configure_logger(LoggerConfig(console_log_level="DEBUG"))
@@ -155,6 +270,15 @@ parser.add_argument(
     "--moe-calibrate-all-experts",
     action=argparse.BooleanOptionalAction,
     default=False,
+)
+parser.add_argument(
+    "--update-ignore-from-index",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help=(
+        "Replace the saved quantization ignore list using the actual "
+        "model.safetensors.index.json contents."
+    ),
 )
 args = parser.parse_args()
 if args.text_calibration_samples < 0:
@@ -440,4 +564,6 @@ save_path = os.path.join(args.save_dir, save_name)
 with maybe_skip_from_accelerate(args.skip_restore_from_accelerate):
     model.save_pretrained(save_path, save_compressed=True)
 processor.save_pretrained(save_path)
+if args.update_ignore_from_index:
+    update_glm5_next_saved_ignores(save_path)
 logger.info("Saved compressed GLM-5.3 checkpoint to {}", save_path)

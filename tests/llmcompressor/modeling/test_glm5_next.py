@@ -43,9 +43,21 @@ def _load_example_function(name):
         node.name: node
         for node in tree.body
         if isinstance(node, ast.FunctionDef)
-        and node.name in {"_config_value", "build_glm5_next_w8a8_ignores"}
+        and node.name
+        in {
+            "_config_value",
+            "_glm5_next_runtime_name_aliases",
+            "build_glm5_next_w8a8_ignores",
+            "collect_glm5_next_ignored_checkpoint_names",
+            "replace_glm5_next_saved_ignores",
+        }
     }
-    namespace = {}
+    namespace = {
+        "re": re,
+        "GLM5_NEXT_VLLM_FUSED_IGNORES": _load_example_assignment(
+            "GLM5_NEXT_VLLM_FUSED_IGNORES"
+        ),
+    }
     exec(
         compile(
             ast.Module(body=list(functions.values()), type_ignores=[]),
@@ -58,7 +70,14 @@ def _load_example_function(name):
 
 
 GLM5_NEXT_W8A8_TARGETS = _load_example_assignment("GLM5_NEXT_W8A8_TARGETS")
+GLM5_NEXT_VLLM_FUSED_IGNORES = _load_example_assignment("GLM5_NEXT_VLLM_FUSED_IGNORES")
 BUILD_GLM5_NEXT_W8A8_IGNORES = _load_example_function("build_glm5_next_w8a8_ignores")
+REPLACE_GLM5_NEXT_SAVED_IGNORES = _load_example_function(
+    "replace_glm5_next_saved_ignores"
+)
+COLLECT_GLM5_NEXT_IGNORED_CHECKPOINT_NAMES = _load_example_function(
+    "collect_glm5_next_ignored_checkpoint_names"
+)
 GLM5_NEXT_W8A8_IGNORES = BUILD_GLM5_NEXT_W8A8_IGNORES(
     SimpleNamespace(
         text_config=SimpleNamespace(
@@ -180,7 +199,9 @@ def test_glm5_next_w8a8_targets_all_linear_modules():
 
 def test_glm5_next_w8a8_ignores_multimodal_vision_modules():
     assert _ignore_matches("lm_head")
+    assert _ignore_matches("language_model.lm_head")
     assert _ignore_matches("model.visual.patch_embed.proj")
+    assert _ignore_matches("visual.patch_embed.proj")
     assert not _ignore_matches("model.language_model.layers.0.mlp.gate_proj")
     assert not _ignore_matches("model.audio_tower.proj")
 
@@ -198,10 +219,157 @@ def test_glm5_next_w8a8_ignores_follow_configured_kda_layers():
     def is_ignored(name):
         return any(re.match(pattern.removeprefix("re:"), name) for pattern in ignores)
 
-    assert is_ignored("model.language_model.layers.48.self_attn.o_proj")
-    assert not is_ignored("model.language_model.layers.47.self_attn.o_proj")
-    assert is_ignored("model.language_model.layers.47.self_attn.kv_b_proj")
-    assert is_ignored("model.language_model.layers.49.eh_proj")
+    for prefix in (
+        "model.language_model.layers",
+        "model.layers",
+        "language_model.model.layers",
+    ):
+        assert is_ignored(f"{prefix}.48.self_attn.o_proj")
+        assert not is_ignored(f"{prefix}.47.self_attn.o_proj")
+        assert is_ignored(f"{prefix}.47.self_attn.kv_b_proj")
+        assert is_ignored(f"{prefix}.47.self_attn.indexer.index_kpool_compress_gate")
+
+    for prefix in ("model.layers", "mtp.model.layers"):
+        assert is_ignored(f"{prefix}.49.eh_proj")
+        assert is_ignored(f"{prefix}.49.mtp_block.self_attn.kv_b_proj")
+        assert is_ignored(f"{prefix}.49.mtp_block.mlp.gate")
+        assert not is_ignored(f"{prefix}.49.mtp_block.self_attn.o_proj")
+
+
+def test_glm5_next_collects_ignored_checkpoint_aliases_and_parameters():
+    prefix = "model.language_model.layers.3.self_attn"
+    ignored = COLLECT_GLM5_NEXT_IGNORED_CHECKPOINT_NAMES(
+        [
+            f"{prefix}.f_a_proj.weight",
+            f"{prefix}.A_log",
+            f"{prefix}.indexer.k_norm.weight",
+            f"{prefix}.indexer.k_norm.bias",
+            f"{prefix}.indexer.index_kpool_compress_ape",
+            f"{prefix}.indexer.index_kpool_compress_gate",
+            "model.language_model.layers.3.mlp.experts.0.gate_proj.weight",
+            "model.language_model.layers.3.mlp.experts.0.gate_proj.weight_scale",
+        ],
+        {
+            "text_config": {
+                "num_hidden_layers": 45,
+                "num_nextn_predict_layers": 1,
+            }
+        },
+    )
+
+    assert f"{prefix}.f_a_proj" in ignored
+    assert f"{prefix}.forget_gate.f_a_proj" in ignored
+    assert f"{prefix}.A_log" in ignored
+    assert f"{prefix}.indexer.k_norm" in ignored
+    assert f"{prefix}.indexer.k_norm.bias" in ignored
+    assert f"{prefix}.indexer.index_kpool_compress_ape" in ignored
+    assert f"{prefix}.indexer.index_kpool_compress_gate" in ignored
+    assert not any("experts.0.gate_proj" in name for name in ignored)
+    assert not any(name.startswith("language_model.model.") for name in ignored)
+    assert not any(name.startswith("model.layers.") for name in ignored)
+    assert set(GLM5_NEXT_VLLM_FUSED_IGNORES).issubset(ignored)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "language_model.model.layers.0.self_attn.in_proj_qkvgfab",
+        "model.layers.44.self_attn.in_proj_qkvgfab",
+        "mtp.model.layers.45.mtp_block.self_attn.in_proj_qkvgfab",
+    ],
+)
+def test_glm5_next_saved_ignores_match_vllm_kda_fused_projection(name):
+    assert any(
+        re.match(pattern.removeprefix("re:"), name)
+        for pattern in GLM5_NEXT_VLLM_FUSED_IGNORES
+    )
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "language_model.model.layers.0.self_attn.fused_qkv_a_proj",
+        "language_model.model.layers.0.mlp.gate_up_proj",
+        "language_model.model.layers.0.self_attn.conv1d",
+    ],
+)
+def test_glm5_next_saved_ignores_do_not_match_other_vllm_fusions(name):
+    assert not any(
+        re.match(pattern.removeprefix("re:"), name)
+        for pattern in GLM5_NEXT_VLLM_FUSED_IGNORES
+    )
+
+
+def test_glm5_next_checkpoint_ignores_include_vllm_mtp_aliases():
+    checkpoint_name = (
+        "model.language_model.layers.45.self_attn.indexer.index_kpool_compress_gate"
+    )
+    ignored = COLLECT_GLM5_NEXT_IGNORED_CHECKPOINT_NAMES(
+        [checkpoint_name],
+        {
+            "text_config": {
+                "num_hidden_layers": 45,
+                "num_nextn_predict_layers": 1,
+            }
+        },
+    )
+
+    assert checkpoint_name in ignored
+    assert (
+        "model.layers.45.mtp_block.self_attn.indexer.index_kpool_compress_gate"
+    ) in ignored
+    assert (
+        "mtp.model.layers.45.mtp_block.self_attn.indexer.index_kpool_compress_gate"
+    ) in ignored
+
+
+def test_glm5_next_saved_ignores_replace_stale_names():
+    ignored_name = (
+        "model.language_model.layers.45.self_attn.indexer.index_kpool_compress_gate"
+    )
+    config = {"quantization_config": {"ignore": ["stale.ignore.from.previous.config"]}}
+
+    updated = REPLACE_GLM5_NEXT_SAVED_IGNORES(
+        config,
+        [ignored_name],
+    )
+
+    assert updated["quantization_config"]["ignore"] == [ignored_name]
+
+
+def test_glm5_next_index_ignore_update_is_enabled_by_default():
+    example_path = (
+        Path(__file__).parents[3] / "examples" / "quantizing_moe" / "glm5_next_w8a8.py"
+    )
+    tree = ast.parse(example_path.read_text(encoding="utf-8"))
+    argument = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "add_argument"
+        and node.args
+        and ast.literal_eval(node.args[0]) == "--update-ignore-from-index"
+    )
+    keywords = {keyword.arg: keyword.value for keyword in argument.keywords}
+
+    assert ast.literal_eval(keywords["default"]) is True
+    assert isinstance(keywords["action"], ast.Attribute)
+    assert keywords["action"].attr == "BooleanOptionalAction"
+
+    guarded_update = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.Attribute)
+        and node.test.attr == "update_ignore_from_index"
+    )
+    assert any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "update_glm5_next_saved_ignores"
+        for node in ast.walk(guarded_update)
+    )
 
 
 def test_glm5_next_w8a8_example_uses_processor_for_multimodal_calibration():
