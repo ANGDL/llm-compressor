@@ -19,7 +19,7 @@ from llmcompressor.modeling.moe_context import moe_calibration_context
 
 def _load_example_assignment(name):
     example_path = (
-        Path(__file__).parents[3] / "examples" / "quantizing_moe" / "glm5_next_w8a8.py"
+        Path(__file__).parents[3] / "examples" / "multimodal_vision" / "glm5_next_w8a8.py"
     )
     tree = ast.parse(example_path.read_text(encoding="utf-8"))
     assignment = next(
@@ -36,7 +36,7 @@ def _load_example_assignment(name):
 
 def _load_example_function(name):
     example_path = (
-        Path(__file__).parents[3] / "examples" / "quantizing_moe" / "glm5_next_w8a8.py"
+        Path(__file__).parents[3] / "examples" / "multimodal_vision" / "glm5_next_w8a8.py"
     )
     tree = ast.parse(example_path.read_text(encoding="utf-8"))
     functions = {
@@ -131,6 +131,36 @@ def test_glm5_next_calibration_moe_unpacks_packed_experts():
     torch.testing.assert_close(experts[0].down_proj.weight, original.down_proj[0])
 
 
+def test_glm5_next_routed_experts_use_silu_like_packed_experts():
+    from transformers.models.glm5_next.configuration_glm5_next import Glm5NextTextConfig
+    from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextMoE
+
+    config = Glm5NextTextConfig(
+        hidden_size=4,
+        intermediate_size=8,
+        moe_intermediate_size=3,
+        n_routed_experts=2,
+        num_experts_per_tok=1,
+        hidden_act="gelu",
+    )
+    original = Glm5NextTextMoE(config)
+    experts = SequentialGlm5NextExperts(config, original.experts)
+    hidden_states = torch.randn(5, config.hidden_size)
+
+    packed_gate_up = torch.nn.functional.linear(
+        hidden_states, original.experts.gate_up_proj[0]
+    )
+    gate, up = packed_gate_up.chunk(2, dim=-1)
+    gate = gate.clamp(max=config.swiglu_limit)
+    up = up.clamp(min=-config.swiglu_limit, max=config.swiglu_limit)
+    expected = torch.nn.functional.linear(
+        torch.nn.functional.silu(gate) * up,
+        original.experts.down_proj[0],
+    )
+
+    torch.testing.assert_close(experts[0](hidden_states), expected)
+
+
 def test_glm5_next_uses_moe_calibration_context_for_packed_moe():
     from transformers.models.glm5_next.configuration_glm5_next import Glm5NextTextConfig
     from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextMoE
@@ -186,11 +216,7 @@ def test_glm5_next_calibration_forward_matches_transformers_bfloat16(
     with moe_calibration_context(model, calibrate_all_experts=calibrate_all_experts):
         actual = model.mlp(hidden_states)
 
-    # The calibration adapter intentionally accumulates routed outputs in the
-    # router-weight dtype (FP32) before casting back to BF16. This improves
-    # accumulation precision versus the eager Transformers implementation, so
-    # exact BF16 equality is not expected here.
-    torch.testing.assert_close(actual, expected, rtol=0, atol=2e-5)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 def test_glm5_next_w8a8_targets_all_linear_modules():
@@ -339,7 +365,7 @@ def test_glm5_next_saved_ignores_replace_stale_names():
 
 def test_glm5_next_index_ignore_update_is_enabled_by_default():
     example_path = (
-        Path(__file__).parents[3] / "examples" / "quantizing_moe" / "glm5_next_w8a8.py"
+        Path(__file__).parents[3] / "examples" / "multimodal_vision" / "glm5_next_w8a8.py"
     )
     tree = ast.parse(example_path.read_text(encoding="utf-8"))
     argument = next(
@@ -374,7 +400,7 @@ def test_glm5_next_index_ignore_update_is_enabled_by_default():
 
 def test_glm5_next_w8a8_example_uses_processor_for_multimodal_calibration():
     example_path = (
-        Path(__file__).parents[3] / "examples" / "quantizing_moe" / "glm5_next_w8a8.py"
+        Path(__file__).parents[3] / "examples" / "multimodal_vision" / "glm5_next_w8a8.py"
     )
     source = example_path.read_text(encoding="utf-8")
 

@@ -18,6 +18,7 @@ import re
 import types
 
 import torch
+import torch.nn.functional as F
 from safetensors import safe_open
 from torch import nn
 
@@ -47,6 +48,17 @@ def _require_transformers_glm5() -> None:
         )
 
 
+class Glm5NextTextRoutedExpertMLP(Glm5NextTextMLP):
+    """Unpacked routed expert matching ``Glm5NextTextExperts._apply_gate``."""
+
+    def forward(self, x):
+        gate = self.gate_proj(x).clamp(min=None, max=self.swiglu_limit)
+        up = self.up_proj(x).clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
+        # HF's packed routed experts intentionally use SiLU regardless of
+        # config.hidden_act; shared/dense MLPs continue to use the config value.
+        return self.down_proj(F.silu(gate) * up)
+
+
 class SequentialGlm5NextExperts(nn.ModuleList):
     """Unpack packed 3-D tensors for the shared MoE calibration adapter."""
 
@@ -56,7 +68,7 @@ class SequentialGlm5NextExperts(nn.ModuleList):
         with skip_weights_initialize():
             super().__init__(
                 [
-                    Glm5NextTextMLP(
+                    Glm5NextTextRoutedExpertMLP(
                         config,
                         intermediate_size=config.moe_intermediate_size,
                     )
@@ -88,6 +100,33 @@ class CalibrationGlm5NextTextMoE(CalibrationGlmMoeDsaMoE):
             config.get_text_config() if hasattr(config, "get_text_config") else config
         )
         super().__init__(original, text_config, calibrate_all_experts)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Match ``Glm5NextTextMoE.forward`` with unpacked routed experts."""
+        residuals = hidden_states
+        orig_shape = hidden_states.shape
+        _, topk_weights, topk_indices = self.gate(hidden_states)
+        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+        final_hidden_states = torch.zeros_like(hidden_states)
+
+        with torch.no_grad():
+            expert_mask = torch.nn.functional.one_hot(
+                topk_indices, num_classes=self.num_experts
+            ).permute(2, 1, 0)
+            hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+
+        for expert_idx in hit:
+            expert_idx = expert_idx[0]
+            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
+            if self.calibrate_all_experts:
+                current = self.experts[expert_idx](hidden_states)[token_idx]
+            else:
+                current = self.experts[expert_idx](hidden_states[token_idx])
+            current = current * topk_weights[token_idx, top_k_pos, None]
+            final_hidden_states.index_add_(0, token_idx, current.to(final_hidden_states.dtype))
+
+        hidden_states = final_hidden_states.view(*orig_shape)
+        return hidden_states + self.shared_experts(residuals)
 
 
 def _load_mtp_tensors(model_path: str, prefix: str) -> dict[str, torch.Tensor]:
