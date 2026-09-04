@@ -394,6 +394,25 @@ def test_deepseek_v4_materializer_preserves_source_model_identity(
     assert updates == {"torch_dtype": "bfloat16"}
 
 
+def test_deepseek_v4_materializer_disables_absent_mtp_in_output_config():
+    materializer = DeepSeekV4WeightMaterializer(source_has_mtp=False)
+
+    output = materializer.transform_output_config(
+        {
+            "num_hidden_layers": 2,
+            "num_nextn_predict_layers": 1,
+            "compress_ratios": [0, 4, 0],
+            "dspark_block_size": 5,
+            "dspark_target_layer_ids": [0, 1],
+        }
+    )
+
+    assert output["num_nextn_predict_layers"] == 0
+    assert output["compress_ratios"] == [0, 4]
+    assert output["dspark_block_size"] == 0
+    assert output["dspark_target_layer_ids"] == []
+
+
 def test_kimi_k3_source_maps_packed_expert_to_logical_weight(tmp_path):
     path = tmp_path / "model.safetensors"
     raw_name = (
