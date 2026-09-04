@@ -124,12 +124,14 @@ class DeepSeekV4WeightMaterializer(WeightMaterializer):
         fp8_block_size: tuple[int, int] = (128, 128),
         fp4_block_size: int = 32,
         save_raw_checkpoint_format: bool = False,
+        source_has_mtp: bool | None = None,
     ):
         if min(fp8_block_size) <= 0 or fp4_block_size <= 0:
             raise ValueError("DeepSeek-V4 block sizes must be positive")
         self.fp8_block_size = tuple(fp8_block_size)
         self.fp4_block_size = fp4_block_size
         self.save_raw_checkpoint_format = save_raw_checkpoint_format
+        self.source_has_mtp = source_has_mtp
 
     def configuration(self) -> Mapping[str, Any]:
         return {
@@ -137,6 +139,7 @@ class DeepSeekV4WeightMaterializer(WeightMaterializer):
             "fp4_block_size": self.fp4_block_size,
             "key_layout": "deepseek-v4-raw",
             "save_raw_checkpoint_format": self.save_raw_checkpoint_format,
+            "source_has_mtp": self.source_has_mtp,
         }
 
     def create_source(self, checkpoint: str) -> CheckpointWeightSource:
@@ -144,6 +147,19 @@ class DeepSeekV4WeightMaterializer(WeightMaterializer):
 
     def output_config_updates(self) -> Mapping[str, Any]:
         return {"torch_dtype": "bfloat16"}
+
+    def transform_output_config(self, config: Mapping[str, Any]) -> Mapping[str, Any]:
+        if self.source_has_mtp is not False:
+            return config
+        updated = dict(config)
+        updated["num_nextn_predict_layers"] = 0
+        updated["dspark_block_size"] = 0
+        updated["dspark_target_layer_ids"] = []
+        compress_ratios = updated.get("compress_ratios")
+        num_hidden_layers = updated.get("num_hidden_layers")
+        if isinstance(compress_ratios, list) and isinstance(num_hidden_layers, int):
+            updated["compress_ratios"] = compress_ratios[:num_hidden_layers]
+        return updated
 
     def output_tensor_name(self, tensor_name: str) -> str:
         if not self.save_raw_checkpoint_format:

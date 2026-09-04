@@ -23,6 +23,7 @@ Example::
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from pathlib import Path
 from typing import Any
@@ -131,6 +132,33 @@ def load_calibration_dataset(
             f"got {schemas}"
         )
     return concatenate_datasets(parts)
+
+
+def _disable_absent_mtp(config: ModelConfig, tensor_names: set[str]) -> bool:
+    """Make an MTP-free fine-tuned checkpoint match the native model graph."""
+    has_mtp = any(
+        name.startswith(("mtp.", "model.mtp.")) for name in tensor_names
+    )
+    if has_mtp:
+        return False
+    config.num_nextn_predict_layers = 0
+    config.dspark_block_size = 0
+    config.dspark_target_layer_ids = []
+    config.compress_ratios = list(config.compress_ratios[: config.n_layers])
+    return True
+
+
+def _checkpoint_tensor_names(
+    checkpoint: Path, materializer: DeepSeekV4WeightMaterializer
+) -> set[str]:
+    index_path = checkpoint / "model.safetensors.index.json"
+    if index_path.is_file():
+        index = json.loads(index_path.read_text(encoding="utf-8"))
+        weight_map = index.get("weight_map")
+        if not isinstance(weight_map, dict):
+            raise ValueError(f"Invalid safetensors index: {index_path}")
+        return {name for name in weight_map if not name.endswith(".scale")}
+    return set(materializer.create_source(str(checkpoint)).tensor_names())
 
 
 _WO_A_PATTERN = r"re:.*attn\.wo_a$"
@@ -299,7 +327,15 @@ def main() -> None:
     _configure_reference_kernel(args.reference_kernel)
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_id, local_files_only=True)
+    source_probe = DeepSeekV4WeightMaterializer()
     config = ModelConfig.from_pretrained(args.model_id)
+    mtp_disabled = _disable_absent_mtp(
+        config, _checkpoint_tensor_names(args.model_id, source_probe)
+    )
+    materializer = DeepSeekV4WeightMaterializer(
+        save_raw_checkpoint_format=args.save_raw_checkpoint_format,
+        source_has_mtp=not mtp_disabled,
+    )
     config.max_batch_size = args.batch_size
     is_dspark = config.is_dspark
     config.max_seq_len = args.max_sequence_length + (
@@ -346,9 +382,7 @@ def main() -> None:
             max_seq_length=args.max_sequence_length,
             batch_size=args.batch_size,
             moe_calibrate_all_experts=args.moe_calibrate_all_experts,
-            materializer=DeepSeekV4WeightMaterializer(
-                save_raw_checkpoint_format=args.save_raw_checkpoint_format
-            ),
+            materializer=materializer,
             checkpoint_progress=args.checkpoint_progress,
             async_save=args.async_save,
             pack_to_int8=args.pack_to_int8,
