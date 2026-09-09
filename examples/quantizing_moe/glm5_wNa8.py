@@ -1,11 +1,18 @@
 import argparse
+import gc
+import json
 import os
+import shutil
+import subprocess
+import sys
 from contextlib import contextmanager
 
+import torch
 from datasets import concatenate_datasets, load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from llmcompressor import oneshot
+from llmcompressor.logger import LoggerConfig, configure_logger
 from llmcompressor.modeling.glm_moe_dsa import CalibrationGlmMoeDsaMoE  # noqa: F401
 from llmcompressor.modeling.glm_moe_dsa_mtp import attach_mtp_layer
 from llmcompressor.modifiers.gptq import GPTQModifier
@@ -14,7 +21,6 @@ from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
 from llmcompressor.pipelines.basic import pipeline as basic_pipeline
 from llmcompressor.pipelines.data_free import pipeline as data_free_pipeline
 from llmcompressor.utils import ImatrixFallbackStats
-from llmcompressor.logger import LoggerConfig, configure_logger
 
 from compressed_tensors.offload import load_offloaded_model
 from compressed_tensors.offload.dispatch import dispatch_model as _dispatch_model
@@ -29,17 +35,19 @@ configure_logger(LoggerConfig(console_log_level="DEBUG"))
 
 
 """
-Usage example for quantizing GLM-5.1 with MoE layers to mixed W4/W8 + A8 using LLM Compressor.
-1. 更改权重文件中的generation_config.json, 添加："do_sample": true
-2. 量化
-python glm5_wNa8.py --model_id /ssd3/models/GLM-5.1/ --save_dir /ssd2/models/ --modifier RTN --observer imatrix_mse \
+Usage example for quantizing GLM-5.1 with MoE layers to mixed W4/W8 + A8 using
+LLM Compressor. The script performs all three steps below: update
+generation_config.json, quantize, and pack the int4 weights for downstream runtimes.
+1. 更新权重文件中的 generation_config.json，添加："do_sample": true
+2. 量化并保存 unpacked checkpoint
+python glm5_wNa8.py --model_id /ssd3/models/GLM-5.1/ --save_dir /ssd2/models/ \
+    --modifier RTN --observer imatrix_mse \
     --num_calibration_samples 512 --max_sequence_length 4096 \
     --dataset_id ./ultrachat_200k ./calibration_data.jsonl --dataset_split train_sft \
-    --indexer-ignore-mode indexer_all --dispatch_extra_memory_gb 10 --pipeline sequential
-3. 打包，确保输入路径正确
-python src/llmcompressor/utils/pack_int4_to_int8.py \
-    -i /ssd2/models/GLM-5.1-WNA8-IMatrix-RTN-unpacked/ \
-    -o /ssd2/models/GLM-5.1-W4A8-v2
+    --indexer-ignore-mode indexer_all --dispatch_extra_memory_gb 10 \
+    --pipeline sequential --use-float32-scale-dtype
+3. 自动打包为 packed checkpoint（可使用 --no-pack 保留旧行为）
+4. 可选地备份并用原始模型的 config.json 覆盖输出配置
 """
 
 
@@ -127,6 +135,12 @@ parser.add_argument(
     ),
 )
 parser.add_argument(
+    "--use-float32-scale-dtype",
+    action=argparse.BooleanOptionalAction,
+    default=False,
+    help="Use float32 for weight scale tensors instead of bfloat16.",
+)
+parser.add_argument(
     "--pipeline",
     type=str,
     default="independent",
@@ -138,6 +152,29 @@ parser.add_argument(
     type=float,
     default=1500.0,
     help="Max CPU memory in GB for model loading (passed as max_memory={'cpu': <value>e9}).",
+)
+parser.add_argument(
+    "--pack",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="Pack int4 weights after quantization (use --no-pack to skip packing).",
+)
+parser.add_argument(
+    "--packed_save_dir",
+    type=str,
+    default=None,
+    help=(
+        "Directory for the packed checkpoint. Defaults to --save_dir with a W4A8 name."
+    ),
+)
+parser.add_argument(
+    "--use-original-config",
+    action=argparse.BooleanOptionalAction,
+    default=False,
+    help=(
+        "After quantization and packing, back up each output config.json as "
+        "config.json.bak and replace it with the source model config.json."
+    ),
 )
 args = parser.parse_args()
 
@@ -169,6 +206,52 @@ def maybe_skip_from_accelerate(skip_restore: bool):
         yield
     finally:
         ct_utils.from_accelerate = original_from_accelerate
+
+
+def ensure_do_sample(model_id: str) -> None:
+    """Ensure the source checkpoint's generation config enables sampling."""
+    if not os.path.isdir(model_id):
+        # Hub checkpoints are updated on the loaded model below instead.
+        return
+
+    generation_config_path = os.path.join(model_id, "generation_config.json")
+    if os.path.isfile(generation_config_path):
+        with open(generation_config_path, "r", encoding="utf-8") as config_file:
+            generation_config = json.load(config_file)
+    else:
+        generation_config = {}
+    if generation_config.get("do_sample") is True:
+        return
+
+    generation_config["do_sample"] = True
+    with open(generation_config_path, "w", encoding="utf-8") as config_file:
+        json.dump(generation_config, config_file, ensure_ascii=True, indent=2)
+        config_file.write("\n")
+
+
+def overwrite_with_original_config(model_id: str, output_dir: str) -> None:
+    """Back up an output config and replace it with the source config."""
+    source_config_path = os.path.join(model_id, "config.json")
+    output_config_path = os.path.join(output_dir, "config.json")
+    if not os.path.isfile(source_config_path):
+        raise FileNotFoundError(
+            f"Original config.json not found in model directory: {model_id}"
+        )
+    if not os.path.isfile(output_config_path):
+        raise FileNotFoundError(
+            f"Quantized config.json not found in output directory: {output_dir}"
+        )
+    if os.path.realpath(source_config_path) == os.path.realpath(output_config_path):
+        return
+
+    backup_config_path = f"{output_config_path}.bak"
+    shutil.copy2(output_config_path, backup_config_path)
+    shutil.copy2(source_config_path, output_config_path)
+    print(
+        f"Backed up quantized config to {backup_config_path} and restored "
+        f"original config to {output_config_path}"
+    )
+
 
 # Select calibration dataset.
 DATASET_IDS = args.dataset_id
@@ -203,6 +286,7 @@ for i, dataset_id in enumerate(DATASET_IDS):
 
 # Load the model
 model_id = args.model_id
+ensure_do_sample(model_id)
 with load_offloaded_model():
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
@@ -212,6 +296,10 @@ with load_offloaded_model():
         max_memory={"cpu": int(args.max_memory_cpu_gb * 1e9)},
     )
     tokenizer = AutoTokenizer.from_pretrained(model_id)
+# Apply the same setting for Hub checkpoints or checkpoints without a local
+# generation_config.json; save_pretrained will persist it in the output.
+if getattr(model, "generation_config", None) is not None:
+    model.generation_config.do_sample = True
 # MoE calibration is now handled automatically by the pipeline.
 # The `CalibrationGlmMoeDsaMoE` modules (from `llmcompressor.modeling.glm_moe_dsa`)
 # will be applied during calibration to enable proper expert calibration.
@@ -276,6 +364,8 @@ ignores = [
 ]
 
 # ---- Quantization config: mixed experts int4 + other linear int8 ----
+scale_dtype = torch.float32 if args.use_float32_scale_dtype else None
+
 # Weights: 4-bit, channelwise, symmetric, static
 weights_args_4 = QuantizationArgs(
     num_bits=4,
@@ -283,6 +373,7 @@ weights_args_4 = QuantizationArgs(
     strategy=QuantizationStrategy.CHANNEL,
     symmetric=True,
     dynamic=False,
+    scale_dtype=scale_dtype,
 )
 
 # Weights: 8-bit, channelwise, symmetric, static
@@ -292,6 +383,7 @@ weights_args_8 = QuantizationArgs(
     strategy=QuantizationStrategy.CHANNEL,
     symmetric=True,
     dynamic=False,
+    scale_dtype=scale_dtype,
 )
 
 # Activations: 8-bit, per-token, asymmetric, dynamic
@@ -302,6 +394,7 @@ activations_args = QuantizationArgs(
     symmetric=True,
     dynamic=True,
     observer=None,
+    scale_dtype=torch.float32,
 )
 
 # Routed experts always use int4 weights; shared experts follow --shared-experts-bits.
@@ -403,3 +496,41 @@ SAVE_DIR = os.path.join(args.save_dir, SAVE_NAME)
 with maybe_skip_from_accelerate(args.skip_restore_from_accelerate):
     model.save_pretrained(SAVE_DIR, save_compressed=True)
 tokenizer.save_pretrained(SAVE_DIR)
+
+if args.pack:
+    packed_name = model_id.rstrip("/").split("/")[-1] + tail_name.replace(
+        "-WNA8", "-W4A8"
+    )
+    packed_dir = args.packed_save_dir or os.path.join(args.save_dir, packed_name)
+    if os.path.realpath(packed_dir) == os.path.realpath(SAVE_DIR):
+        raise ValueError(
+            "packed_save_dir must differ from the unpacked save directory"
+        )
+
+    # The standalone packing step previously ran after the quantization process
+    # exited. Release its large objects before starting the packing subprocess.
+    del model, ds, oneshot_kwargs, recipes
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "llmcompressor.utils.pack_int4_to_int8",
+            "--model_path",
+            SAVE_DIR,
+            "--save_path",
+            packed_dir,
+        ],
+        check=True,
+    )
+    print(f"Saved packed quantized model to {packed_dir}")
+
+if args.use_original_config:
+    config_output_dirs = [SAVE_DIR]
+    if args.pack:
+        config_output_dirs.append(packed_dir)
+    for config_output_dir in config_output_dirs:
+        overwrite_with_original_config(model_id, config_output_dir)
