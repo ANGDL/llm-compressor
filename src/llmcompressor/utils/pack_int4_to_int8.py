@@ -162,7 +162,7 @@ class Int8Packer:
         # Prepare args for multiprocessing
         process_args = [(self.model_path, self.save_path, name, self.bias32, self.quant_config_parser, self.rename) for name in self.model_tensors]
 
-        with Pool(processes=min(len(self.model_tensors), 36)) as pool:
+        with Pool(processes=min(len(self.model_tensors), 8)) as pool:
             for local_map, local_size in tqdm(
                 pool.imap_unordered(_process_tensor_file, process_args),
                 total=len(self.model_tensors),
