@@ -108,9 +108,22 @@ def sparse_attention(
 
     bsz, seqlen, n_heads, head_dim = q.shape
     output_dtype = kv.dtype
-    kv_expanded = kv.unsqueeze(1).expand(-1, seqlen, -1, -1)
-    gather_indices = topk_idxs.clamp(min=0).long().unsqueeze(-1).expand(-1, -1, -1, head_dim)
-    gathered_kv = torch.gather(kv_expanded, 2, gather_indices)
+    # Index the flattened key/value cache rather than gathering from an
+    # expanded view. ``kv.unsqueeze(1).expand(-1, seqlen, -1, -1)`` followed by
+    # ``torch.gather`` materializes the full [bsz, seqlen, kv_len, head_dim]
+    # intermediate on backends that require contiguous operands, which is orders
+    # of magnitude larger than the [bsz, seqlen, topk, head_dim] result (e.g.
+    # 80 GiB versus 5 GiB for one 8192-token calibration batch of a compressed
+    # DeepSeek-V4 layer). Both forms select exactly the same values.
+    kv_len = kv.size(1)
+    flat_kv = kv.reshape(bsz * kv_len, head_dim)
+    flat_indices = topk_idxs.clamp(min=0).long()
+    flat_indices = flat_indices + (
+        torch.arange(bsz, device=flat_indices.device, dtype=flat_indices.dtype) * kv_len
+    ).view(bsz, 1, 1)
+    gathered_kv = flat_kv.index_select(0, flat_indices.reshape(-1)).view(
+        bsz, seqlen, -1, head_dim
+    )
     # scores: [bsz, seqlen, n_heads, topk]
     scores = torch.einsum("bshd,bskd->bshk", q.float(), gathered_kv.float()) * softmax_scale
     mask = topk_idxs.unsqueeze(2) < 0  # [bsz, seqlen, 1, topk]
