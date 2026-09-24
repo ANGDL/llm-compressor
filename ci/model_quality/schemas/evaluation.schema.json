@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "LLM Compressor model quality evaluation result",
+  "type": "object",
+  "required": ["schema_version", "status"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "status": {"enum": ["PASS", "WARN", "FAIL", "SKIPPED", "NOT_APPLICABLE", "DEFERRED_BUDGET", "CONFIG_ERROR", "INFRA_ERROR", "DEPENDENCY_FAILED"]},
+    "reason_code": {"type": ["string", "null"]},
+    "suite_id": {"type": "string", "minLength": 1},
+    "evaluator": {"type": "string", "minLength": 1},
+    "task": {"type": "string", "minLength": 1},
+    "metrics": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["name", "direction", "base_value", "compressed_value"],
+        "properties": {
+          "name": {"type": "string", "minLength": 1},
+          "direction": {"enum": ["higher", "lower"]},
+          "base_value": {"type": "number"},
+          "compressed_value": {"type": "number"},
+          "min_recovery": {"type": "number"},
+          "absolute_floor": {"type": "number"},
+          "max_relative_increase": {"type": "number"}
+        }
+      }
+    }
+  }
+}

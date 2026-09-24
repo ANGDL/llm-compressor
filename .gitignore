@@ -25,6 +25,7 @@ onnx/*
 repos/*
 # managed by setuptools-scm
 /src/llmcompressor/version.py
+/.model-quality/
 
 ### Python template
 # Byte-compiled / optimized / DLL files

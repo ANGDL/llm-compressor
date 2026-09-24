@@ -1,0 +1,12 @@
+steps:
+  - label: ":pipeline: plan model quality run"
+    key: "model-quality-plan"
+    agents:
+      queue: model-quality-gpu
+    concurrency: 1
+    concurrency_group: "llm-compressor/model-quality-host"
+    command:
+      - test -n "$${MODEL_QUALITY_RUNS_ROOT:-}"
+      - test "$${MODEL_QUALITY_RUNS_ROOT#/}" != "$${MODEL_QUALITY_RUNS_ROOT}"
+      - mkdir -p .model-quality
+      - python3 -m ci.model_quality.plan --config ci/model_quality/config/models.yaml --plan-output .model-quality/execution-plan.json --pipeline-output .model-quality/generated-pipeline.yml --persist-plan --upload
