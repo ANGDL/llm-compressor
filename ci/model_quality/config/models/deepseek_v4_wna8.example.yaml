@@ -1,0 +1,115 @@
+schema_version: 1
+
+# Copy this example into the root manifest includes list only after replacing all
+# target-host paths and validating the exact DeepSeek-V4 recipe. It remains disabled.
+models:
+  - id: deepseek-v4-wna8
+    enabled: false
+    priority: P1
+    business_tier: core
+    max_result_age_hours: 24
+    source:
+      path: /models/DeepSeek-V4
+      revision: local-checksum
+    resources:
+      # Quantization is streaming single-device. Runtime evaluation may use all 8.
+      gpu_count: 1
+      runtime_gpu_count: 8
+      evaluation_gpu_count: 8
+      gpu_memory_gib: 96
+      host_memory_gib: 512
+      minimum_free_disk_gib: 1024
+      io_weight: 3
+      estimated_gpu_hours: 14
+      estimated_eval_gpu_hours: 16
+      timeout_hours: 18
+      required_capabilities:
+        - torch_accelerator
+        - runtime:vllm
+    workflow:
+      revision: replace-with-entrypoint-commit-or-image-digest
+      # Each CLI token is a YAML list item. Do not store one shell command string.
+      quantize:
+        - python3
+        - examples/streaming_oneshot/deepseek_v4_wNa8.py
+        - --model-id
+        - "{source_path}"
+        - --dataset-id
+        - /datasets/ultrachat_200k
+        - /datasets/domain-calibration.jsonl
+        - --dataset-split
+        - train_sft
+        - --num-calibration-samples
+        - "256"
+        - --max-sequence-length
+        - "4096"
+        - --batch-size
+        - "1"
+        - --quant-mode
+        - wna8
+        - --quantize-wo-a
+        - --use-float32-scale-dtype
+        - --checkpoint-progress
+        - --no-async-save
+        - --pack-to-int8
+        - --save-raw-checkpoint-format
+        - --output-dir
+        - "{output_dir}"
+        - --work-dir
+        - "{work_dir}"
+      forbidden_argument_pairs:
+        # The streaming implementation rejects async saving in recovery mode.
+        - [--checkpoint-progress, --async-save]
+    validation:
+      profile: causal_lm
+      streaming: true
+      require_quantization_config: true
+      min_quantization_auxiliary_tensors: 1
+      required_files:
+        - config.json
+        - model.safetensors.index.json
+        - recipe.yaml
+        - FINALIZED
+    runtime_smoke:
+      enabled: true
+      python: /opt/vllm/bin/python
+      runtime_revision: replace-with-vllm-image-digest
+      tensor_parallel_size: 8
+      prompts:
+        - The capital of France is
+        - Solve 17 * 23.
+    evaluation:
+      enabled_by_default: false
+      profile: causal_lm
+      # Pin to the deployed evaluator image digest or lockfile revision.
+      runtime_revision: replace-with-vllm-lm-eval-image-digest
+      command:
+        - /opt/vllm/bin/python
+        - -m
+        - ci.model_quality.evaluators.lm_eval_pair
+        - --base-model
+        - "{source_path}"
+        - --compressed-model
+        - "{output_dir}"
+        - --task
+        - gsm8k
+        - --metrics-json
+        - '[{"name":"exact_match,flexible-extract","direction":"higher","min_recovery":0.95}]'
+        - --num-fewshot
+        - "5"
+        - --limit
+        - "250"
+        - --model-args-json
+        - '{"tensor_parallel_size":8,"dtype":"auto","add_bos_token":true}'
+        - --work-dir
+        - "{reports_dir}/lm-eval-work"
+        - --output
+        - "{reports_dir}/evaluation-raw.json"
+      result_file: "{reports_dir}/evaluation-raw.json"
+    upload:
+      enabled: false
+      remote_prefix: bos:/replace-me/llm-compressor
+      allowlist: [model, reports]
+      commands: []
+      verify_commands: []
+      success_commands: []

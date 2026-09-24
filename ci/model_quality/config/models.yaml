@@ -1,0 +1,80 @@
+schema_version: 1
+includes: []
+
+# After reviewing the target paths, add for example:
+# includes:
+#   - models/deepseek_v4_wna8.example.yaml
+
+# This manifest is safe by default: example jobs remain disabled until their local
+# paths, resource estimates, and commands are reviewed on the target machine.
+models:
+  - id: qwen3-dense-w4a8-smoke
+    enabled: false
+    priority: P1
+    business_tier: representative
+    max_result_age_hours: 24
+    source:
+      path: /models/Qwen3-0.6B
+      revision: local-checksum
+    resources:
+      gpu_count: 1
+      gpu_memory_gib: 96
+      host_memory_gib: 64
+      io_weight: 1
+      estimated_gpu_hours: 1
+      estimated_eval_gpu_hours: 0.5
+      timeout_hours: 2
+      required_capabilities:
+        - torch_accelerator
+        - runtime:vllm
+    workflow:
+      revision: replace-with-entrypoint-commit-or-image-digest
+      quantize:
+        - python3
+        - ci/model_quality/entrypoints/qwen3_dense_w4a8.py
+        - --model-id
+        - "{source_path}"
+        - --output-dir
+        - "{output_dir}"
+        - --work-dir
+        - "{work_dir}"
+    validation:
+      profile: causal_lm
+      require_quantization_config: true
+      min_quantization_auxiliary_tensors: 1
+      required_files:
+        - config.json
+        - model.safetensors.index.json
+    evaluation:
+      enabled_by_default: false
+      profile: causal_lm
+      suites: []
+      # When enabled, command writes {"metrics": [...]} to result_file.
+      # runtime_revision must pin the evaluator image digest or lockfile revision.
+      # command: [python3, evaluator.py, --model, "{output_dir}",
+      #           --output, "{reports_dir}/evaluation-raw.json"]
+      # result_file: "{reports_dir}/evaluation-raw.json"
+      # A ready pair adapter is available as:
+      # command: [/opt/vllm/bin/python, -m,
+      #           ci.model_quality.evaluators.lm_eval_pair,
+      #           --base-model, "{source_path}", --compressed-model, "{output_dir}",
+      #           --task, gsm8k, --metrics-json,
+      #           '[{"name":"exact_match,flexible-extract",
+      #              "direction":"higher","min_recovery":0.95}]',
+      #           --work-dir, "{reports_dir}/lm-eval-work",
+      #           --output, "{reports_dir}/evaluation-raw.json"]
+    runtime_smoke:
+      enabled: true
+      python: /opt/vllm/bin/python
+      runtime_revision: replace-with-vllm-image-digest
+      prompts:
+        - The capital of France is
+    upload:
+      enabled: false
+      remote_prefix: bos:/replace-me/llm-compressor
+      allowlist: [model, reports]
+      # Pin these argv lists to the bcecmd version installed on the target host.
+      # Upload commands must name only allowlisted model/report paths, not run_dir.
+      commands: []
+      verify_commands: []
+      success_commands: []
