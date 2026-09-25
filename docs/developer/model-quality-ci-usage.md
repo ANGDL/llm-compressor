@@ -1,36 +1,114 @@
 # Model Quality CI 中文部署与使用说明
 
-本文对应当前 `ci/model_quality` 实现。长期设计见 [方案文档](model-quality-ci-plan.md)，不要把方案中的规划能力视为当前已经支持的功能。
+本文对应当前 `ci/model_quality` 实现。长期设计见 [方案文档](model-quality-ci-plan.md)，不要把方案里的规划能力当成已经支持的功能。
 
-## 1. 从哪里开始
+全文命令默认在**仓库根目录**执行，并且默认在 CI 控制面容器/agent 里跑。Buildkite 只是把下面这些命令按顺序串起来；没有 Buildkite 也能手动跑完整流程。
 
-建议按以下顺序上线：准备目标环境 → 配置一个小模型 → 生成计划 → Buildkite 执行量化和验证 → 增加精度评测 → 测试 BCE 上传 → 接入大模型和定时触发。
+## 1. 最短路径
 
-所有命令均在仓库根目录执行。仓库中的模型示例默认 `enabled: false`，上传默认关闭。默认生成空计划是正常现象，不代表模型测试通过。
+先跑通，再看细节。建议的上线顺序是：准备环境 → 配一个小模型 → 生成计划 → 跑 quantize 全链路 → 加精度评测 → 测 BCE 上传 → 再接大模型和定时触发。
 
-## 2. 部署主机
+**前置条件**
 
-当前生成的步骤使用 Buildkite queue `model-quality-gpu`。先将一台目标 GPU 主机的 agent 加入该 queue，确保各步骤都能访问同一代码版本、模型路径、数据路径和运行目录。仅有 queue 名称不会保证步骤落在同一物理主机；初期建议该 queue 只接入这台机器。
+- 一台 GPU 主机，仓库已 checkout，`python3` 能 `import torch, yaml, safetensors, llmcompressor`。
+- 源 checkpoint、校准数据、运行目录都在这台主机上，且路径对容器/agent 可见。
+- `MODEL_QUALITY_RUNS_ROOT` 指向的目录存在且可写（见 §2.1）。
 
-准备两个环境：
+**第 1 步：生成计划，拿到 run 身份**
+
+```bash
+python3 -m ci.model_quality.plan \
+  --config ci/model_quality/config/models.yaml \
+  --git-sha "$(git rev-parse HEAD)" \
+  --model-filter deepseek-v4-flash-0731-wna8 \
+  --run-mode quantize \
+  --max-gpu-hours 12 \
+  --persist-plan \
+  --plan-output /tmp/mq-plan.json \
+  --pipeline-output /tmp/mq-pipeline.yml
+```
+
+`plan` 只做配置校验、排序和预算选择，**不碰 GPU、不跑模型、不上传**。所以 `selected` 为空是正常现象（模型没 `enabled`、filter 不匹配、或预算不够），不代表测试通过。
+
+**第 2 步：取出身份参数**
+
+后续每个阶段都要带上这几个值，用来保证审计记录和产物对得上：
+
+```bash
+P=/tmp/mq-plan.json
+RUN_ID=$(python3 -c "import json;print(json.load(open('$P'))['run_id'])")
+ATTEMPT=$(python3 -c "import json;print(json.load(open('$P'))['attempt_id'])")
+FP=$(python3 -c "import json;print(json.load(open('$P'))['selected'][0]['fingerprint'])")
+EFP=$(python3 -c "import json;print(json.load(open('$P'))['selected'][0]['evaluation_fingerprint'])")
+SHA=$(python3 -c "import json;print(json.load(open('$P'))['git_sha'])")
+```
+
+**第 3 步：按顺序跑阶段**
+
+每个阶段都是同一条命令换 `--stage`。先落一个模板脚本，前台后台都能用：
+
+```bash
+cat > /tmp/mq-stage.sh <<SCRIPT
+#!/bin/bash
+set -euo pipefail
+cd "$PWD"
+python3 -m ci.model_quality.stage --config ci/model_quality/config/models.yaml \
+  --model deepseek-v4-flash-0731-wna8 \
+  --run-id "$RUN_ID" --attempt-id "$ATTEMPT" \
+  --run-mode quantize --git-sha "$SHA" \
+  --fingerprint "$FP" --evaluation-fingerprint "$EFP" --stage "\$1"
+SCRIPT
+chmod +x /tmp/mq-stage.sh
+```
+
+然后：
+
+```bash
+bash /tmp/mq-stage.sh preflight
+nohup setsid bash /tmp/mq-stage.sh quantize > /tmp/mq-quantize.log 2>&1 &   # 几十分钟到数小时
+bash /tmp/mq-stage.sh validate
+bash /tmp/mq-stage.sh runtime-smoke   # 需要先有可用的 runtime 服务，见 §4.4
+bash /tmp/mq-stage.sh report
+```
+
+`quantize` 期间可以随时看进度，每层会打一条 `complete | time=`：
+
+```bash
+tail -f "$MODEL_QUALITY_RUNS_ROOT/$RUN_ID/deepseek-v4-flash-0731-wna8/logs/$ATTEMPT/quantization.log"
+```
+
+**完成标准**：`$MODEL_QUALITY_RUNS_ROOT/$RUN_ID/aggregate-report.json` 里该模型 `status: PASS`（聚合命令见 §3.2）。
+
+## 2. 环境准备
+
+### 2.1 环境变量
+
+| 变量 | 作用 | 在哪里设置 | 默认值 |
+|---|---|---|---|
+| `MODEL_QUALITY_RUNS_ROOT` | 各阶段共享的 run 根目录，run/model/日志/报告都在这里 | Buildkite agent 环境或 hook；手动执行时 export 或写进 profile | `.model-quality/runs`（相对 CWD；Buildkite 中直接报错） |
+| `VLLM_PYTHON_ENV` | vLLM runtime 的 Python 可执行文件 | 同上 | 无，缺省时用 `runtime_smoke.python` |
+| `RUN_MODE` | planner 的运行模式 | Buildkite 手动 build 变量 | `quantize` |
+| `MODEL_FILTER` | planner 的模型筛选 | 同上 | `all` |
+| `MAX_GPU_HOURS` | planner 的 GPU-hour 预算 | 同上 | `80` |
+| `PRIORITY_OVERRIDE` | 临时覆盖优先级 | 同上 | `none` |
+| `BUILDKITE_COMMIT` | 记进 plan/报告的 git sha | Buildkite 自动注入 | 无 |
+
+三个容易踩的点：
+
+- 只在个人终端 export 不会传给 Buildkite agent，必须在 agent 环境或 hook 里设置。
+- `MODEL_QUALITY_RUNS_ROOT` 在 Buildkite 中必须是绝对路径。
+- `VLLM_PYTHON_ENV` 指向的是**可执行文件**，不是虚拟环境目录。它优先于 `runtime_smoke.python`，但**不会**替换 `evaluation.command` 里写死的 Python。
+
+### 2.2 两个 Python 环境
 
 | 环境 | 用途 | 要求 |
 |---|---|---|
-| agent 的 `python3` | planner、stage、量化、checkpoint 检查 | 安装本项目及 PyTorch、PyYAML、safetensors 等依赖 |
-| 独立 runtime Python | vLLM smoke、lm-eval | 安装兼容的 vLLM、lm-evaluation-harness，并能导入仓库中的 CI 模块 |
+| agent/主环境 `python3` | planner、stage、量化、checkpoint 检查 | 安装本项目及 PyTorch、PyYAML、safetensors 等依赖 |
+| 独立 runtime Python | vLLM smoke、lm-eval | 安装兼容的 vLLM、lm-evaluation-harness，并能从仓库根导入 CI 模块 |
 
-依赖版本应按目标 GPU 和本项目的安装说明固定，不在夜间任务中临时升级。runtime 环境使用 `python -m ci.model_quality...` 时，需要能从仓库根目录导入这些模块。
+依赖版本按目标 GPU 和本项目安装说明固定，不要在夜间任务里临时升级。
 
-在 **Buildkite agent 环境或 hook** 中设置以下变量；只在个人终端 export 不会自动传给 agent：
-
-```bash
-export MODEL_QUALITY_RUNS_ROOT=/data/model-quality/runs
-export VLLM_PYTHON_ENV=/opt/vllm/bin/python
-```
-
-预先创建运行目录并赋予 agent 读写权限。`MODEL_QUALITY_RUNS_ROOT` 在 Buildkite 中必须为绝对路径。`VLLM_PYTHON_ENV` 指向 Python 可执行文件，不是虚拟环境目录；它优先于 `runtime_smoke.python`，但不会替换 `evaluation.command` 中的 Python。
-
-部署后检查：
+### 2.3 部署后自检
 
 ```bash
 python3 -c 'import torch, yaml, safetensors, llmcompressor; print(torch.accelerator.device_count())'
@@ -38,11 +116,78 @@ python3 -c 'import torch, yaml, safetensors, llmcompressor; print(torch.accelera
 python3 -m pytest tests/ci/model_quality -q -o addopts=''
 ```
 
-预期：主环境能导入依赖、看到所需 GPU；runtime 能导入对应工具；CPU 控制流测试通过。这些检查不等于真实模型量化和上传验收。
+预期：主环境能导入依赖并看到所需 GPU；runtime 能导入对应工具；CPU 控制流测试通过。**这些检查不等于真实量化和上传验收。**
 
-## 3. 配置第一个模型
+## 3. 触发 pipeline
 
-复制并调整 `ci/model_quality/config/models.yaml` 中的 Qwen3 示例，或通过根清单的 `includes` 引入独立文件：
+### 3.1 Buildkite（正式路径）
+
+1. 让目标 GPU 主机的 agent 加入 queue `model-quality-gpu`。queue 名本身不保证各步骤落在同一台物理机，初期建议该 queue 只接这一台，确保代码版本、模型路径、数据路径、运行目录一致。
+2. 在 Buildkite 建独立 pipeline 连接本仓库，初始步骤上传仓库内 bootstrap：
+
+```yaml
+steps:
+  - label: "Load model quality pipeline"
+    agents:
+      queue: model-quality-gpu
+    command: "buildkite-agent pipeline upload .buildkite/model-quality/pipeline.yml"
+```
+
+bootstrap 会检查共享目录变量、跑 planner、保存 execution plan，再动态上传模型步骤。agent 的 PATH 必须让 `python3` 指向 §2.2 的主环境。
+
+3. 手动 build 时设置 build 变量：
+
+```text
+RUN_MODE=quantize
+MODEL_FILTER=deepseek-v4-flash-0731-wna8
+MAX_GPU_HOURS=12
+PRIORITY_OVERRIDE=none
+```
+
+预期 Buildkite 出现 `preflight → quantize → validate → runtime-smoke → report → summary`；配置启用上传时还会多一个 publish。report 和 summary 允许上游失败后继续执行，用来留下报告。
+
+两个注意点：
+
+- 现有 concurrency group 只对使用它的步骤串行限流，**不是**整次 build 的资源锁。同一 run 的多个 build 仍可能在阶段之间交错，不要同时操作同一个 run。
+- `plan --upload` 的含义是上传 **Buildkite pipeline**，不是把模型传到 BCE。模型上传由 `upload.enabled` 和运行模式决定。
+
+### 3.2 手动分阶段执行（没有 Buildkite 时）
+
+排障和首次验收建议直接手动跑，等价但更可控。命令与 §1 相同，补充几点：
+
+- 每个阶段的机器可读结果在 `<runs-root>/<run-id>/<model-id>/state/<stage>.json`，人读报告在 `reports/`。
+- 最后一步聚合要额外传 `--models-json`：
+
+```bash
+python3 -m ci.model_quality.stage --config ci/model_quality/config/models.yaml \
+  --run-id "$RUN_ID" --attempt-id "$ATTEMPT" --stage aggregate \
+  --run-mode quantize --git-sha "$SHA" \
+  --models-json '["deepseek-v4-flash-0731-wna8"]'
+```
+
+- `runtime-smoke` 之前必须先有可用的 runtime 服务（见 §4.4）。
+
+### 3.3 复用已有 run：eval_only / upload_only
+
+这两种模式**必须显式传 `--run-id`**。当前默认 bootstrap 既不读 `RESUME_RUN_ID` 也不传 `--run-id`，所以不能只改 `RUN_MODE` 就完成复用，需要加一个自定义初始步骤：
+
+```bash
+python3 -m ci.model_quality.plan \
+  --config ci/model_quality/config/models.yaml \
+  --run-mode eval_only \
+  --run-id EXISTING_RUN_ID \
+  --model-filter deepseek-v4-flash-0731-wna8 \
+  --max-gpu-hours 12 \
+  --persist-plan
+```
+
+只上传时改成 `--run-mode upload_only`，且模型必须 `upload.enabled: true`。显式 filter 允许选中 `enabled: false` 的模型来复用历史产物。每次计划默认生成新的 attempt ID，同一 run 的 source/model/input/artifact manifest 保持不变。
+
+## 4. 配置模型
+
+### 4.1 清单与 include
+
+复制 `ci/model_quality/config/models.yaml` 里的 Qwen3 示例，或通过根清单的 `includes` 引入独立文件（路径相对于清单文件）：
 
 ```yaml
 schema_version: 1
@@ -51,25 +196,34 @@ includes:
 models: []
 ```
 
-include 路径相对于清单文件。DeepSeek 示例位于 `ci/model_quality/config/models/deepseek_v4_wna8.example.yaml`。
+仓库里现成的参考：
 
-至少核对以下字段：
+- `config/models/deepseek_v4_flash_0731_wna8.yaml`：实际在跑的 DeepSeek-V4-Flash WNA8 定义（含 xSGL runtime smoke）。
+- `config/models/deepseek_v4_wna8.example.yaml`：量化入口所有参数的写法示例，默认 disabled。
+
+### 4.2 字段
 
 | 字段 | 配置内容 | 预期作用 |
 |---|---|---|
 | `id` / `enabled` | 唯一 ID；准备完成后改为 true | 决定模型是否进入计划 |
+| `priority` | P0–P3 | 排序 |
 | `source.path` / `revision` | 本地 checkpoint 和版本标识 | 记录源模型身份 |
 | `workflow.revision` | 量化入口 commit 或镜像 digest | 量化实现变化时使身份变化；必须由部署方维护 |
 | `workflow.quantize` | argv 数组 | 启动量化入口 |
 | `resources` | 卡数、GPU-hour、超时、磁盘等 | 预算选择及部分预检 |
-| `validation` | required files、profile、streaming 等 | 定义产物检查要求 |
-| `runtime_smoke` | Python 或 command、runtime revision、prompts、TP | 执行真实模型加载和最小生成 |
-| `evaluation` | command、result_file、runtime_revision | 可选精度评测 |
-| `upload` | 首次保持 `enabled: false` | 避免试运行直接发布 |
+| `validation` | required files、profile、streaming、量化后缀等 | 定义产物检查要求（见 §4.5） |
+| `runtime_smoke` | Python 或 command、runtime revision、prompts、TP | 执行真实模型加载和最小生成（见 §4.4） |
+| `evaluation` | command、result_file、runtime_revision | 可选精度评测（见 §7） |
+| `upload` | 首次保持 `enabled: false` | 避免试运行直接发布（见 §8） |
 
-不要保留 `replace-with-*` 等版本占位符。Qwen3 CI 入口本身也使用 streaming；应为它设置 `validation.streaming: true`，并按实际产物要求配置 `FINALIZED`。
+- `resources` 常用键：`gpu_count`（量化所需，必填）、`estimated_gpu_hours`（必填，用于预算）、`runtime_gpu_count`（smoke 用卡数）、`evaluation_gpu_count`、`estimated_eval_gpu_hours`、`timeout_hours`、`minimum_free_disk_gib`、`host_memory_gib`、`io_weight`、`required_capabilities`。
+- `workflow` 可选键：`env`（追加到量化进程的环境变量）、`cwd`、`forbidden_argument_pairs`、`exactly_one_argument_groups`（后两个用来拦掉入口不接受的参数组合）。
+- 不要保留 `replace-with-*` 之类的版本占位符。
+- Qwen3 CI 入口本身也使用 streaming，应为它设置 `validation.streaming: true` 并按实际产物要求配置 `FINALIZED`。
 
-命令必须使用 argv 数组，每个元素是一个参数：
+### 4.3 命令写法
+
+命令必须是 argv 数组，一个元素一个参数：
 
 ```yaml
 workflow:
@@ -85,13 +239,26 @@ workflow:
     - "{work_dir}"
 ```
 
-不能写成一条带管道或重定向的 shell 字符串。多值参数逐项列出；布尔开关按入口的 `--flag` / `--no-flag` 语法填写。JSON 花括号无需转义。校准数据参数必须按入口实际支持的格式设置；示例可能会访问外部数据集，离线主机需要事先准备数据或缓存。
+- 不能写成一条带管道或重定向的 shell 字符串。
+- 多值参数（`nargs="+"`）逐项列出，放在 flag 之后、下一个选项之前。
+- 布尔开关按入口的 `--flag` / `--no-flag` 语法填写；省略即用脚本默认值。
+- JSON 花括号无需转义：`{"name":"exact_match"}`、`a{2,4}` 都按原样保留，只替换 CI 自己拥有的占位符。
+- 校准数据参数必须按入口实际支持的格式设置；示例可能访问外部数据集，离线主机需要事先准备数据或缓存。
 
-### runtime_smoke 的两种运行时
+各命令可用的占位符：
 
-默认情况下 runtime smoke 用 `runtime_smoke.python`（或 `VLLM_PYTHON_ENV`）执行 `ci.model_quality.vllm_smoke`，由 vLLM 加载产物并生成固定 prompts。预检会检查该 Python 能否 `import vllm`。
+| 命令 | 可用占位符 |
+|---|---|
+| `workflow.quantize` | `{source_path}`、`{run_dir}`、`{output_dir}`、`{work_dir}`、`{logs_dir}`、`{reports_dir}` |
+| `runtime_smoke.command` | 同上 |
+| `evaluation.command` | 同上（其中 `{reports_dir}` 指向 attempt 内报告目录） |
+| `upload.commands` / `verify_commands` / `success_commands` | `{output_dir}`、`{reports_dir}`、`{remote_run_prefix}`、`{model_id}`、`{run_id}` |
 
-当目标主机不用 vLLM 提供产物时，配置 `runtime_smoke.command`（argv 数组，占位符与量化命令相同），由它替换内置的 vLLM 路径：
+### 4.4 runtime_smoke 的两种运行时
+
+**方式一：vLLM（默认）** 用 `runtime_smoke.python`（或 `VLLM_PYTHON_ENV`）执行 `ci.model_quality.vllm_smoke`，由 vLLM 加载产物并生成固定 prompts。预检会检查该 Python 能否 `import vllm`。
+
+**方式二：自定义 command** 目标主机不用 vLLM 提供产物时，配置 `runtime_smoke.command`（argv 数组，占位符规则同 §4.3），替换内置 vLLM 路径：
 
 ```yaml
 runtime_smoke:
@@ -107,6 +274,8 @@ runtime_smoke:
     - "{output_dir}"
     - --base-url
     - http://127.0.0.1:30000
+    - --served-model-name
+    - deepseek-v4-flash
     - --prompts-json
     - '["The capital of France is"]'
     - --wait-ready-seconds
@@ -116,13 +285,65 @@ runtime_smoke:
   result_file: "{reports_dir}/runtime-smoke-output.json"
 ```
 
-配置了 `command` 后，预检只校验 argv 第一个元素是可执行文件，不再要求 `import vllm`。命令必须自己写出 `result_file`，内容形如 `{"status": "PASS", "outputs": [...]}`；退出码为 0 但没有结果文件、或结果里 `status` 不是 `PASS`、`outputs` 为空，都会判定 `RUNTIME_SMOKE_FAILED`。`runtime_revision` 仍然必填，用于标识运行时身份。
+契约：
 
-`ci.model_quality.xsgl_smoke` 是已提供的 SGLang 适配器：它不自己拉起服务，而是查询一个已经运行中的 SGLang OpenAI 兼容服务（`--base-url`，`--wait-ready-seconds` 用于轮询 `/health`），并用 `--served-model-name` 指定 `--served-model-name` 注册的模型名。当前固定的 SGLang 版本不会返回输出 token id，因此适配器会用 checkpoint tokenizer 重新编码生成文本，并在记录里用 `token_ids_source: local_checkpoint_tokenizer` 标明来源；tokenizer 不可用时该字段为 null，`completion_tokens` 仍来自服务端 usage。
+- 配了 `command` 后，预检只校验 argv 第一个元素是可执行文件，不再要求 `import vllm`。
+- 命令必须自己写出 `result_file`，内容形如 `{"status": "PASS", "outputs": [...]}`。退出码为 0 但没有结果文件、结果里 `status` 不是 `PASS`、或 `outputs` 为空，都判定 `RUNTIME_SMOKE_FAILED`。
+- `runtime_revision` 仍然必填，用于标识运行时身份。
 
-仓库提供 `ci/model_quality/xsgl_launcher.sh`，用于在宿主机上从服务容器启动该服务并等待 `/health`；CI 控制面容器通常没有 docker 访问权限，服务生命周期应由部署方管理。两个容器共享 host network 时，`http://127.0.0.1:30000` 在控制面容器内可直接访问。
+**xSGL 适配器** `ci.model_quality.xsgl_smoke` 查询一个**已经在运行**的 SGLang OpenAI 兼容服务：
 
-## 4. 先生成计划，不启动模型
+- `--base-url` 指定服务地址；`--wait-ready-seconds` 用于轮询 `/health` 直到就绪。
+- `--served-model-name` 要与 `sglang serve --served-model-name` 一致。
+- 当前固定的 SGLang 版本不返回输出 token id，因此适配器会用 checkpoint tokenizer 重新编码生成文本，并在记录里用 `token_ids_source: local_checkpoint_tokenizer` 标明来源；tokenizer 不可用时该字段为 null，`completion_tokens` 仍来自服务端 usage。
+
+服务生命周期由部署方管理——CI 控制面容器通常没有 docker 访问权限。仓库提供 `ci/model_quality/xsgl_launcher.sh`，在**宿主机**上从服务容器拉起服务并等待 `/health`：
+
+```bash
+bash ci/model_quality/xsgl_launcher.sh <model_dir> [port] [container] [ready_timeout_seconds]
+
+# 例：把刚量化出来的产物喂给 xSGL 容器（在宿主机上执行）
+bash ci/model_quality/xsgl_launcher.sh \
+  /ssd2/model-quality/runs/$RUN_ID/deepseek-v4-flash-0731-wna8/model \
+  30000 zhuang_xsgl_0923 2400
+```
+
+两个容器共享 host network 时，`http://127.0.0.1:30000` 在控制面容器里可直接访问。
+
+### 4.5 validation 检查项
+
+`validation` 决定 validate 阶段查什么：
+
+| 键 | 含义 |
+|---|---|
+| `profile` | 目前只实现 `causal_lm` |
+| `required_files` | 必须存在的产物文件，如 `config.json`、`model.safetensors.index.json`、`recipe.yaml`、`FINALIZED` |
+| `streaming` | 为 true 时缺失 `FINALIZED` 直接判 FAIL；否则只记 warning |
+| `require_quantization_config` | 产物 config 里必须有非空 `quantization_config`；若写了 `quantization_status`，必须是 `compressed` |
+| `min_quantization_auxiliary_tensors` | 量化辅助张量（scale/zero_point/packed）的最小数量 |
+| `quantization_auxiliary_suffixes` | 辅助张量的命名后缀，默认 `.weight_scale`、`.weight_zero_point`、`.weight_packed`、`.weight_compressed` |
+| `quantization_scale_suffixes` | 参与"非正 scale"门禁的后缀，默认 `.weight_scale`、`.weight_zero_point` |
+
+validate 还会检查 index 与实际张量是否一一对应、有无 NaN/Inf、scale 是否非正。
+
+**原始格式要显式配后缀。** 例如 DeepSeek 原始 checkpoint 的量化 scale 叫 `...scale` 而不是 `.weight_scale`；不配的话辅助张量数会是 0、validate 直接 FAIL，而且"非正 scale"门禁会静默空转：
+
+```yaml
+validation:
+  min_quantization_auxiliary_tensors: 1
+  quantization_auxiliary_suffixes:
+    - .weight_scale
+    - .weight_zero_point
+    - .weight_packed
+    - .weight_compressed
+    - .scale
+  quantization_scale_suffixes:
+    - .weight_scale
+    - .weight_zero_point
+    - .scale
+```
+
+## 5. 先生成计划，不启动模型
 
 ```bash
 python3 -m ci.model_quality.plan \
@@ -140,38 +361,11 @@ python3 -m ci.model_quality.plan \
 - plan JSON：包含 `run_id`、`attempt_id`、selected/deferred、fingerprint 和预算。
 - pipeline YAML：包含每个阶段的 Buildkite command 和依赖关系。
 
+`--persist-plan` 会把 execution plan 同时写进 `<runs-root>/<run-id>/execution-plan.json`，让 aggregate report 保留预算和 deferred 信息；用默认 bootstrap 时必须加。
+
 此命令只校验配置并生成计划，不执行硬件 preflight、量化、评测或上传模型。检查 selected 非空、模型 ID 正确、预算合理后再运行。
 
 排序当前主要是 P0–P3、预计量化成本和模型 ID；预算不足的任务标为 `DEFERRED_BUDGET`。GPU-hour 是估算，不是强制运行时配额，也不是完整的 RAM/I/O 调度器。
-
-## 5. 部署 Buildkite pipeline
-
-在 Buildkite 创建独立 pipeline，连接本仓库。在初始步骤中上传仓库内 bootstrap：
-
-```yaml
-steps:
-  - label: "Load model quality pipeline"
-    agents:
-      queue: model-quality-gpu
-    command: "buildkite-agent pipeline upload .buildkite/model-quality/pipeline.yml"
-```
-
-bootstrap 会检查共享目录变量，运行 planner，保存 execution plan，并动态上传模型步骤。agent 的 PATH 必须让 `python3` 指向前面准备的主环境。
-
-首次手动 build 设置：
-
-```text
-RUN_MODE=quantize
-MODEL_FILTER=qwen3-dense-w4a8-smoke
-MAX_GPU_HOURS=8
-PRIORITY_OVERRIDE=none
-```
-
-预期：Buildkite 出现 `preflight → quantize → validate → runtime-smoke → report → summary`；配置启用上传时还会出现 publish。报告和聚合步骤允许上游失败后继续执行。
-
-现有 concurrency group 对使用它的步骤串行限流；它不是整次 build 的资源锁。同一 run 的多个 build 仍可能在阶段之间交错，不要同时操作同一个 run。
-
-`plan --upload` 的含义是上传 **Buildkite pipeline**，不是上传模型到 BCE。模型上传由 `upload.enabled` 和运行模式决定。
 
 ## 6. 四种模式与每一步效果
 
@@ -188,7 +382,7 @@ PRIORITY_OVERRIDE=none
 | preflight | 检查源文件、GPU 数、磁盘、runtime 等；比对身份 | 首次成功创建 input-manifest；失败不创建正式 manifest |
 | quantize | 执行入口命令，保留 work 和日志 | model 目录存在；命令成功退出 |
 | validate | 文件/index/tensor、finite、scale 等检查 | checksums、validation 结果；stage CLI 写 artifact-manifest |
-| runtime-smoke | vLLM 加载、固定 prompts 生成 | token ID、生成文本、runtime 日志 |
+| runtime-smoke | vLLM 或配置的 command 加载/访问产物并生成固定 prompts | token ID、生成文本、runtime 日志 |
 | evaluate | 执行 evaluator 或使用匹配缓存 | attempt 内 evaluation JSON；门禁按原始未舍入值比较 |
 | report | 汇总本 attempt 状态 | attempt 报告、共享报告视图、current-attempt 指针 |
 | publish | 身份和内容检查、上传、verify、最后提交标记 | 成功后生成并上传 SUCCESS；返回远端 run 前缀 |
@@ -196,30 +390,7 @@ PRIORITY_OVERRIDE=none
 
 `quantize_and_eval` / `eval_only` 必须配置 evaluator；只有退出码 0 而没有新结果文件不能通过。`quantize` 的 PASS 只表示本模式必需阶段通过，不表示完整精度已通过。
 
-## 7. 为已有 run 评测或上传
-
-这两种模式必须显式传 `--run-id`。**当前默认 bootstrap 不读取 `RESUME_RUN_ID`，也不传 `--run-id`**；因此不能只在默认 build 中设置 RUN_MODE 就完成复用。
-
-为复用任务增加一个自定义 Buildkite 初始步骤，在 agent 中运行以下命令，替换实际 run ID：
-
-```bash
-python3 -m ci.model_quality.plan \
-  --config ci/model_quality/config/models.yaml \
-  --run-mode eval_only \
-  --run-id EXISTING_RUN_ID \
-  --model-filter qwen3-dense-w4a8-smoke \
-  --max-gpu-hours 8 \
-  --persist-plan \
-  --upload
-```
-
-只上传时改为 `--run-mode upload_only`，且模型必须 `upload.enabled: true`。显式 filter 允许选择 disabled 模型来复用历史产物。每次计划默认生成新的 attempt ID；保留同一 run 的 source、model、input/artifact manifest。
-
-源内容、量化配置或产物 checksum 变化应使用新 run 或先解决不一致，不能靠删除 manifest 绕过检查。评测配置变化只应影响评测身份；修改量化实现时更新 workflow revision。
-
-匹配缓存会返回 `EVALUATION_CACHE_HIT`，包括历史 FAIL。当前没有专用强制重评测开关；不要把创建新 attempt 当作一定会重新执行 evaluator。
-
-## 8. 接入精度评测
+## 7. 接入精度评测
 
 可使用 `ci.model_quality.evaluators.lm_eval_pair`，其会在独立子进程中分别评估 base 和 compressed。参考 DeepSeek 示例中的 evaluation 配置，至少指定：
 
@@ -231,7 +402,7 @@ python3 -m ci.model_quality.plan \
 
 higher 指标可用 `min_recovery`、`absolute_floor`；lower 指标可用 `max_relative_increase`。首次先运行小规模任务验证链路；小样本分数不能当作完整发布基线。task/metric 名称必须在固定 lm-eval 版本上确认。
 
-## 9. 接入 BCE 上传
+## 8. 接入 BCE 上传
 
 先保持上传关闭，在目标机器确认 `bcecmd` 版本、凭证注入和具体命令。不能把本文当作某个 bcecmd 版本的参数规范。
 
@@ -260,7 +431,7 @@ upload:
 
 预期远端路径为 `<remote_prefix>/<model-id>/runs/<run-id>/`。SUCCESS 仅在 verify 成功后创建，上传重试会检查冻结清单。当前没有自动 latest/production 指针晋升功能，也没有自动远端不可覆盖保证；需用目标存储权限或经过验证的命令确保同一 run 不被不同内容覆盖。凭证只从 agent 环境注入。
 
-## 10. 查报告和失败处理
+## 9. 查报告与失败处理
 
 ```text
 <runs-root>/<run-id>/
@@ -280,7 +451,19 @@ upload:
     └── commit-markers/SUCCESS.json
 ```
 
-优先从 aggregate-report 找到失败模型，再读取 current-attempt 对应的 summary、state 和日志。quantization/evaluation 日志按 attempt 保存；runtime-smoke/publish 的部分日志仍在共享 logs 目录。报告保存在磁盘，当前 pipeline 不会自动将这些文件作为 Buildkite artifact 上传。
+优先从 `aggregate-report.json` 找到失败模型，再读 `current-attempt.json` 指向的 attempt 的 `summary.json`、`state/` 和日志。quantization/evaluation 日志按 attempt 保存在 `logs/<attempt-id>/`；runtime-smoke/publish 的部分日志仍在共享 `logs/` 目录。报告保存在磁盘，当前 pipeline 不会自动把这些文件作为 Buildkite artifact 上传。
+
+常用排查命令：
+
+```bash
+R="$MODEL_QUALITY_RUNS_ROOT/$RUN_ID/<model-id>"
+
+python3 -c "import json;d=json.load(open('$R/reports/summary.json'));print(d['status'], d['stages'])"
+cat "$R/attempts/$ATTEMPT/reports/summary.md"
+tail -50 "$R/logs/$ATTEMPT/quantization.log"
+tail -50 "$R/logs/runtime-smoke.log"
+python3 -m json.tool "$R/state/validate.json" | head -40
+```
 
 阶段失败通常表现为 `status: FAIL` 加 `reason_code`，并非所有原因码都是独立状态：
 
@@ -291,10 +474,25 @@ upload:
 | CONFIG_ERROR | 修 manifest/argv/evaluator 配置后重新生成计划 |
 | QUANTIZATION_FAILED / TIMEOUT | 查量化日志；保留 work；恢复是否可行取决于入口 checkpoint 支持 |
 | VALIDATION_FAILED | 检查缺文件、tensor、NaN/Inf、scale；不要跳过门禁 |
-| RUNTIME_SMOKE_FAILED | 检查量化格式、runtime 版本、TP 和 GPU 内存 |
+| RUNTIME_SMOKE_FAILED | 检查量化格式、runtime 版本、TP、GPU 内存，以及 runtime 服务是否真的起来了 |
 | QUALITY_GATE_FAILED | 查看原始指标及门槛；不要无限重跑选最好结果 |
 | DEPENDENCY_FAILED | 查最早失败阶段及 manifest/fingerprint |
 | REMOTE_VERIFY_FAILED | 不发布成功标记；先检查远端缺失/损坏对象 |
 | EVALUATION_CACHE_HIT | 使用了匹配缓存，未实际重跑 evaluator |
 
-首次验收应至少完成：小模型 quantize、quantize_and_eval、eval_only、测试 bucket upload_only，以及一次故意失败后的报告检查。当前尚无完整 recipe-aware 覆盖率、多模态 adapter、联合资源调度和自动发布晋升；这些不应成为操作人员对当前工具的默认预期。
+身份不一致类错误（`stale ... fingerprint`、`source checkpoint changed`）说明源内容、量化实现或产物 checksum 变了。正确处理是换新 run 或先解决不一致，**不能靠删除 manifest 绕过检查**。评测配置变化只影响评测身份；修改量化实现时更新 `workflow.revision`。
+
+匹配缓存会返回 `EVALUATION_CACHE_HIT`，包括历史 FAIL。当前没有专用强制重评测开关；不要把创建新 attempt 当作一定会重新执行 evaluator。
+
+## 10. 首次验收清单
+
+按顺序做完这些，才算把这个工具在当前主机上验收通过：
+
+- [ ] §2.3 自检通过（主环境依赖 + GPU 可见 + CPU 控制流测试）
+- [ ] 小模型 `quantize` 全链路 PASS
+- [ ] `quantize_and_eval` 跑通，门禁按预期判定
+- [ ] `eval_only` 复用既有产物跑通（显式 `--run-id`）
+- [ ] 测试 bucket 上的 `upload_only` 跑通并 verify 成功
+- [ ] 故意制造一次失败，确认报告和 `reason_code` 可定位
+
+当前尚无完整 recipe-aware 覆盖率、多模态 adapter、联合资源调度和自动发布晋升；这些不应成为操作人员对当前工具的默认预期。
