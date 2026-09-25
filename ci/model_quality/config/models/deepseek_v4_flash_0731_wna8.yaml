@@ -136,9 +136,23 @@ models:
         - "{reports_dir}/evaluation-raw.json"
       result_file: "{reports_dir}/evaluation-raw.json"
     upload:
-      enabled: false
-      remote_prefix: bos:/replace-me/llm-compressor
+      enabled: true
+      # Published layout:
+      #   bos:/klx-public/llm-demo/quant/<model-id>/runs/<run-id>/model
+      #   bos:/klx-public/llm-demo/quant/<model-id>/runs/<run-id>/reports
+      #   bos:/klx-public/llm-demo/quant/<model-id>/runs/<run-id>/SUCCESS.json
+      remote_prefix: bos:/klx-public/llm-demo/quant
       allowlist: [model, reports]
-      commands: []
-      verify_commands: []
-      success_commands: []
+      commands:
+        # `bcecmd bos cp -r <dir> <dst>` copies the *contents* of <dir> into
+        # <dst>, so object keys line up 1:1 with the allowlist entries.
+        - [bcecmd, bos, cp, -r, -y, --quiet, --disable-bar, "{output_dir}", "{remote_run_prefix}/model"]
+        - [bcecmd, bos, cp, -r, -y, --quiet, --disable-bar, "{reports_dir}", "{remote_run_prefix}/reports"]
+      verify_commands:
+        # `bcecmd bos ls` exits 0 even for missing prefixes, so existence is
+        # checked by downloading a small representative object: `bos cp`
+        # returns non-zero and writes nothing when the object is absent.
+        - [bcecmd, bos, cp, -y, --quiet, --disable-bar, "{remote_run_prefix}/model/config.json", /tmp/mqci-verify-model-config.json]
+        - [bcecmd, bos, cp, -y, --quiet, --disable-bar, "{remote_run_prefix}/reports/summary.json", /tmp/mqci-verify-reports-summary.json]
+      success_commands:
+        - [bcecmd, bos, cp, -y, --quiet, --disable-bar, "{run_dir}/commit-markers/SUCCESS.json", "{remote_run_prefix}/SUCCESS.json"]

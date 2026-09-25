@@ -214,7 +214,7 @@ models: []
 | `validation` | required files、profile、streaming、量化后缀等 | 定义产物检查要求（见 §4.5） |
 | `runtime_smoke` | Python 或 command、runtime revision、prompts、TP | 执行真实模型加载和最小生成（见 §4.4） |
 | `evaluation` | command、result_file、runtime_revision | 可选精度评测（见 §7） |
-| `upload` | 首次保持 `enabled: false` | 避免试运行直接发布（见 §8） |
+| `upload` | 新模型先 `enabled: false`；DeepSeek 参考模型已开启 | 控制是否发布到 BCE（见 §8.1 已验证示例） |
 
 - `resources` 常用键：`gpu_count`（量化所需，必填）、`estimated_gpu_hours`（必填，用于预算）、`runtime_gpu_count`（smoke 用卡数）、`evaluation_gpu_count`、`estimated_eval_gpu_hours`、`timeout_hours`、`minimum_free_disk_gib`、`host_memory_gib`、`io_weight`、`required_capabilities`。
 - `workflow` 可选键：`env`（追加到量化进程的环境变量）、`cwd`、`forbidden_argument_pairs`、`exactly_one_argument_groups`（后两个用来拦掉入口不接受的参数组合）。
@@ -406,30 +406,68 @@ higher 指标可用 `min_recovery`、`absolute_floor`；lower 指标可用 `max_
 
 先保持上传关闭，在目标机器确认 `bcecmd` 版本、凭证注入和具体命令。不能把本文当作某个 bcecmd 版本的参数规范。
 
-启用时需要：
+启用时需要三组非空命令：
 
 ```yaml
 upload:
   enabled: true
   remote_prefix: bos:/YOUR_BUCKET/model-quality
   allowlist: [model, reports]
-  # 以下三组必须填入已在目标主机验证过的 bcecmd argv 数组
-  commands: []
-  verify_commands: []
-  success_commands: []
+  commands: []          # 上传产物
+  verify_commands: []   # 校验远端确实存在
+  success_commands: []  # 最后写 SUCCESS 标记
 ```
 
 上述空数组是待填写模板，启用后保持为空会校验失败。
 
 三组命令分别完成：
 
-1. `commands`：把 `{output_dir}` 上传到 `{remote_run_prefix}/model`，把 `{reports_dir}` 上传到对应 reports 路径。
-2. `verify_commands`：依据 `{reports_dir}/upload-manifest.json` 校验远端文件、大小和 SHA256；必须失败时返回非零。程序本身不会解析任意 bcecmd 输出判断校验是否充分。
+1. `commands`：把 `{output_dir}` 上传到 `{remote_run_prefix}/model`，把 `{reports_dir}` 上传到 `{remote_run_prefix}/reports`。
+2. `verify_commands`：确认远端对象真的存在；缺失时必须返回非零。
 3. `success_commands`：最后上传 `{run_dir}/commit-markers/SUCCESS.json` 至 `{remote_run_prefix}/SUCCESS.json`。
 
 所有命令必须调用 bcecmd。数据上传本地路径必须为 allowlist 内绝对路径；不要传 `.`、`..`、`model` 这样的相对路径，也不要传源模型、work 或 run 根目录。当前 argv 校验支持固定的操作名及选项；带独立选项值的命令应在部署前确认可通过校验。
 
-预期远端路径为 `<remote_prefix>/<model-id>/runs/<run-id>/`。SUCCESS 仅在 verify 成功后创建，上传重试会检查冻结清单。当前没有自动 latest/production 指针晋升功能，也没有自动远端不可覆盖保证；需用目标存储权限或经过验证的命令确保同一 run 不被不同内容覆盖。凭证只从 agent 环境注入。
+### 8.1 一个已在真机验证的示例
+
+下面这段在 node16 `llm-quant-base` 上完整跑通（bcecmd v0.5.1，远端根 `bos:/klx-public/llm-demo/quant`），可以直接抄：
+
+```yaml
+upload:
+  enabled: true
+  remote_prefix: bos:/klx-public/llm-demo/quant
+  allowlist: [model, reports]
+  commands:
+    # `cp -r <dir> <dst>` 复制的是 <dir> 的内容（不会多套一层目录），
+    # 所以 object key 与 allowlist 一一对应。
+    - [bcecmd, bos, cp, -r, -y, --quiet, --disable-bar, "{output_dir}", "{remote_run_prefix}/model"]
+    - [bcecmd, bos, cp, -r, -y, --quiet, --disable-bar, "{reports_dir}", "{remote_run_prefix}/reports"]
+  verify_commands:
+    - [bcecmd, bos, cp, -y, --quiet, --disable-bar, "{remote_run_prefix}/model/config.json", /tmp/mqci-verify-model-config.json]
+    - [bcecmd, bos, cp, -y, --quiet, --disable-bar, "{remote_run_prefix}/reports/summary.json", /tmp/mqci-verify-reports-summary.json]
+  success_commands:
+    - [bcecmd, bos, cp, -y, --quiet, --disable-bar, "{run_dir}/commit-markers/SUCCESS.json", "{remote_run_prefix}/SUCCESS.json"]
+```
+
+动手前先用 `bcecmd bos cp --help` 确认本机版本的参数名（`-r/--recursive`、`-y/--yes`、`--quiet`、`--disable-bar`、`--concurrency`、`--restart`、`--storage-class` 等），不要照抄别的版本。
+
+### 8.2 三个容易踩的坑
+
+- `bcecmd bos ls` 对**不存在的路径也返回 0** 且不打印内容，不能当作存在性校验。`bcecmd bos cp` 下载不存在的对象会返回非零、且不落任何文件，所以 verify 用「下载一个小的代表性对象」实现。
+- 单对象 `cp` 的目标是**完整 object key**，不是目录；对目录才用 `-r`。
+- `bcecmd bosapi get-object-meta --bucket-name B --object-name O` 也能在缺失时返回非零，但要求把 bucket 和 object 拆开，而配置里只有 `{remote_run_prefix}` 整体，无法拆分，只能硬编码 bucket/run-id，不适合复用。
+
+程序不会解析 bcecmd 输出判断校验是否充分，也不会逐对象比对 SHA256（149G 级别不现实）。`reports/upload-manifest.json` 冻结了每个文件的 `path`、`size_bytes` 和 `sha256`，需要人工复核时以它为准；上传命令的退出码加上对象大小核对是自动化层面的保证。
+
+### 8.3 跑 publish
+
+```bash
+bash stage.sh publish
+```
+
+`publish` 不需要重跑上游阶段：它自己会重新校验 `current-attempt.json`、`reports/summary.json`、`artifact-manifest.json` 的身份指纹和产物内容指纹，任何一项对不上都会以 `DEPENDENCY_FAILED` 失败。`--run-mode upload_only` 要求 `upload.enabled: true`，否则直接报 `CONFIG_ERROR`。
+
+预期远端路径为 `<remote_prefix>/<model-id>/runs/<run-id>/`，包含 `model/`、`reports/` 和 `SUCCESS.json`。`reports/upload-manifest.json` 与 `SUCCESS.json` 不计入冻结清单，但会随目录一起上传。SUCCESS 仅在 verify 成功后创建，上传重试会检查冻结清单是否与本次一致。当前没有自动 latest/production 指针晋升功能，也没有自动远端不可覆盖保证；需用目标存储权限或经过验证的命令确保同一 run 不被不同内容覆盖。凭证只从 agent 环境注入。
 
 ## 9. 查报告与失败处理
 
@@ -492,7 +530,7 @@ python3 -m json.tool "$R/state/validate.json" | head -40
 - [ ] 小模型 `quantize` 全链路 PASS
 - [ ] `quantize_and_eval` 跑通，门禁按预期判定
 - [ ] `eval_only` 复用既有产物跑通（显式 `--run-id`）
-- [ ] 测试 bucket 上的 `upload_only` 跑通并 verify 成功
+- [ ] 测试 bucket 上的 `publish` 跑通并 verify 成功（DeepSeek 模型已在 `bos:/klx-public/llm-demo/quant` 验证）
 - [ ] 故意制造一次失败，确认报告和 `reason_code` 可定位
 
 当前尚无完整 recipe-aware 覆盖率、多模态 adapter、联合资源调度和自动发布晋升；这些不应成为操作人员对当前工具的默认预期。
