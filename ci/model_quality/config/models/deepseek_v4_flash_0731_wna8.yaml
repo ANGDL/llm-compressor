@@ -39,7 +39,7 @@ models:
         - torch_accelerator
         - runtime:sglang
     workflow:
-      revision: c5921a139d9f076d26bfedec3fd88bf75c2ec
+      revision: c5921a139d9f076d07e26bfedec3fd88bf75c2ec
       quantize:
         - python3
         - examples/streaming_oneshot/deepseek_v4_wNa8.py
