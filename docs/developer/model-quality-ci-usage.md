@@ -420,6 +420,10 @@ upload:
 
 上述空数组是待填写模板，启用后保持为空会校验失败。
 
+当前 DeepSeek V4 WNA8 配置已启用上传。生成的 Buildkite pipeline 在 `quantize`、`quantize_and_eval`、`eval_only` 模式下都会加入 publish 步骤；`quantize` 并不表示禁止上传。仅量化或评测的实验应复制一份配置，将对应模型的 `upload.enabled` 设为 `false`，并在 plan 和所有 stage 中使用同一份配置。手动逐阶段执行时，上传需要显式执行 publish。
+
+该模型的 `workflow.revision` 已修正为完整提交 `c5921a139d9f076d07e26bfedec3fd88bf75c2ec`。这会改变 request fingerprint，并连带改变 evaluation fingerprint；后续量化应重新生成计划并使用新的 run。已发布的 `20260924T235322Z_c5921a139d9f` 使用当时冻结的身份，当前配置不能复现它；不要改写旧 run 的 plan、manifest 或 SUCCESS 标记来匹配新配置。
+
 三组命令分别完成：
 
 1. `commands`：把 `{output_dir}` 上传到 `{remote_run_prefix}/model`，把 `{reports_dir}` 上传到 `{remote_run_prefix}/reports`。
