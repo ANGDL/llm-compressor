@@ -490,3 +490,82 @@ def test_publish_reads_only_promoted_attempt_reports(tmp_path, monkeypatch):
     assert not (old_reports / "upload-manifest.json").exists()
     frozen = json.loads((new_reports / "upload-manifest.json").read_text())
     assert all(not item["path"].startswith("attempts/") for item in frozen["files"])
+
+
+def test_stage_result_identity_wins_over_payload_fingerprints(tmp_path, monkeypatch):
+    monkeypatch.setenv("MODEL_QUALITY_RUNS_ROOT", str(tmp_path / "runs"))
+    model = _fake_model(tmp_path)
+    run_id = "run-a"
+
+    write_stage_result(
+        run_id,
+        model["id"],
+        "preflight",
+        {
+            "status": "PASS",
+            "artifact_fingerprint": "planner-request-fingerprint",
+            "evaluation_fingerprint": "planner-request-evaluation",
+        },
+        attempt_id="attempt-a",
+        artifact_fingerprint="finalized-artifact-fingerprint",
+        evaluation_fingerprint="finalized-evaluation-fingerprint",
+    )
+
+    stored = read_stage_result(
+        run_id,
+        model["id"],
+        "preflight",
+        attempt_id="attempt-a",
+        artifact_fingerprint="finalized-artifact-fingerprint",
+    )
+
+    assert stored["artifact_fingerprint"] == "finalized-artifact-fingerprint"
+    assert stored["evaluation_fingerprint"] == "finalized-evaluation-fingerprint"
+
+
+def test_validate_uses_configured_quantization_scale_suffixes(tmp_path, monkeypatch):
+    import torch
+    from safetensors.torch import save_file
+
+    monkeypatch.setenv("MODEL_QUALITY_RUNS_ROOT", str(tmp_path / "runs"))
+    model = _fake_model(tmp_path)
+    model["validation"] = {
+        "profile": "causal_lm",
+        "require_quantization_config": True,
+        "min_quantization_auxiliary_tensors": 1,
+        "required_files": ["config.json", "model.safetensors.index.json"],
+    }
+    output = tmp_path / "runs/run-a/fake-model/model"
+    output.mkdir(parents=True)
+    (output / "config.json").write_text(
+        json.dumps({"quantization_config": {"quantization_status": "compressed"}})
+    )
+    save_file(
+        {"layer.weight": torch.ones(2, 2), "layer.scale": torch.ones(2)},
+        output / "model.safetensors",
+    )
+    (output / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "layer.weight": "model.safetensors",
+                    "layer.scale": "model.safetensors",
+                }
+            }
+        )
+    )
+
+    with pytest.raises(StageError) as error:
+        run_validate(model, "run-a")
+    assert "quantization auxiliary tensors" in str(error.value)
+
+    model["validation"]["quantization_auxiliary_suffixes"] = [".weight_scale", ".scale"]
+    model["validation"]["quantization_scale_suffixes"] = [".scale"]
+
+    result = run_validate(model, "run-a")
+
+    assert result["status"] in {"PASS", "WARN"}
+    assert result["quantization_auxiliary_tensor_count"] == 1
+    assert [record["name"] for record in result["quantization_tensor_health"]] == [
+        "layer.scale"
+    ]

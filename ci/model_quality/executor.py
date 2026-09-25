@@ -361,22 +361,35 @@ def run_preflight(
     if model.get("upload", {}).get("enabled") and not shutil.which("bcecmd"):
         failures.append("upload is enabled but bcecmd is not available")
     runtime = model.get("runtime_smoke") or {"enabled": False}
-    runtime_python = os.getenv("VLLM_PYTHON_ENV") or runtime.get("python")
     if runtime.get("enabled", True):
-        if not runtime_python or _resolve_executable(str(runtime_python)) is None:
-            failures.append(
-                "runtime_smoke.python or VLLM_PYTHON_ENV must name an "
-                "existing executable"
-            )
+        if runtime.get("command") is not None:
+            try:
+                runtime_argv = resolve_argv(
+                    runtime["command"], _command_values(model, run_id)
+                )
+            except PlaceholderError as error:
+                failures.append(f"runtime_smoke.command cannot be resolved: {error}")
+            else:
+                if _resolve_executable(runtime_argv[0]) is None:
+                    failures.append(
+                        "runtime_smoke.command must start with an existing executable"
+                    )
         else:
-            runtime_check = subprocess.run(
-                [str(runtime_python), "-c", "import vllm"],
-                text=True,
-                capture_output=True,
-                check=False,
-            )
-            if runtime_check.returncode != 0:
-                failures.append("configured runtime Python cannot import vllm")
+            runtime_python = os.getenv("VLLM_PYTHON_ENV") or runtime.get("python")
+            if not runtime_python or _resolve_executable(str(runtime_python)) is None:
+                failures.append(
+                    "runtime_smoke.python or VLLM_PYTHON_ENV must name an "
+                    "existing executable"
+                )
+            else:
+                runtime_check = subprocess.run(
+                    [str(runtime_python), "-c", "import vllm"],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                if runtime_check.returncode != 0:
+                    failures.append("configured runtime Python cannot import vllm")
     if not model.get("evaluation", {}).get("enabled_by_default", False):
         warnings.append("optional evaluation is disabled for this model")
 
@@ -571,6 +584,29 @@ def _is_path_within(path: Path, root: Path) -> bool:
     return True
 
 
+DEFAULT_QUANTIZATION_AUXILIARY_SUFFIXES = (
+    ".weight_scale",
+    ".weight_zero_point",
+    ".weight_packed",
+    ".weight_compressed",
+)
+DEFAULT_QUANTIZATION_SCALE_SUFFIXES = (".weight_scale", ".weight_zero_point")
+
+
+def _name_suffixes(validation: dict[str, Any], key: str, default: tuple[str, ...]):
+    configured = validation.get(key)
+    if configured is None:
+        return default
+    if not isinstance(configured, list) or not all(
+        isinstance(value, str) and value for value in configured
+    ):
+        raise StageError(
+            f"validation.{key} must be a list of non-empty strings",
+            reason_code="CONFIG_ERROR",
+        )
+    return tuple(configured)
+
+
 def run_validate(model: dict[str, Any], run_id: str) -> dict[str, Any]:
     output = _paths(run_id, model["id"])["output_dir"]
     failures = []
@@ -629,6 +665,17 @@ def run_validate(model: dict[str, Any], run_id: str) -> dict[str, Any]:
     if missing_shards:
         failures.append(f"missing shards: {', '.join(missing_shards)}")
 
+    auxiliary_suffixes = _name_suffixes(
+        validation,
+        "quantization_auxiliary_suffixes",
+        DEFAULT_QUANTIZATION_AUXILIARY_SUFFIXES,
+    )
+    scale_suffixes = _name_suffixes(
+        validation,
+        "quantization_scale_suffixes",
+        DEFAULT_QUANTIZATION_SCALE_SUFFIXES,
+    )
+
     tensor_count = 0
     non_finite = []
     actual_names = set()
@@ -647,10 +694,7 @@ def run_validate(model: dict[str, Any], run_id: str) -> dict[str, Any]:
                     )
                     if not finite:
                         non_finite.append(name)
-                    if tensor.is_floating_point() and (
-                        name.endswith(".weight_scale")
-                        or name.endswith(".weight_zero_point")
-                    ):
+                    if tensor.is_floating_point() and name.endswith(scale_suffixes):
                         values = tensor.float()
                         tensor_health.append(
                             {
@@ -700,15 +744,7 @@ def run_validate(model: dict[str, Any], run_id: str) -> dict[str, Any]:
         )
 
     quantization_auxiliary_count = sum(
-        name.endswith(
-            (
-                ".weight_scale",
-                ".weight_zero_point",
-                ".weight_packed",
-                ".weight_compressed",
-            )
-        )
-        for name in actual_names
+        name.endswith(auxiliary_suffixes) for name in actual_names
     )
     minimum_auxiliary = int(validation.get("min_quantization_auxiliary_tensors", 0))
     if quantization_auxiliary_count < minimum_auxiliary:
@@ -755,6 +791,38 @@ def run_validate(model: dict[str, Any], run_id: str) -> dict[str, Any]:
     return result
 
 
+def _resolved_runtime_smoke_command(
+    model: dict[str, Any],
+    run_id: str,
+    runtime: dict[str, Any],
+    command: Any,
+) -> tuple[list[str], Path]:
+    if (
+        not isinstance(command, list)
+        or not command
+        or not all(isinstance(value, str) and value for value in command)
+    ):
+        raise StageError(
+            "runtime_smoke.command must be a non-empty argv list",
+            reason_code="CONFIG_ERROR",
+        )
+    paths = _paths(run_id, model["id"])
+    reports_dir = paths["reports_dir"]
+    result_file = runtime.get("result_file", "{reports_dir}/runtime-smoke-output.json")
+    if not isinstance(result_file, str) or not result_file:
+        raise StageError(
+            "runtime_smoke.result_file must be a non-empty string",
+            reason_code="CONFIG_ERROR",
+        )
+    values = _command_values(model, run_id, reports_dir=reports_dir)
+    try:
+        argv = resolve_argv(command, values)
+        result_path = Path(resolve_argument(result_file, values))
+    except PlaceholderError as error:
+        raise StageError(str(error), reason_code="CONFIG_ERROR") from error
+    return argv, result_path
+
+
 def run_runtime_smoke(model: dict[str, Any], run_id: str) -> dict[str, Any]:
     paths = _paths(run_id, model["id"])
     runtime = model.get("runtime_smoke", {})
@@ -769,13 +837,6 @@ def run_runtime_smoke(model: dict[str, Any], run_id: str) -> dict[str, Any]:
             f"runtime smoke adapter for profile {profile!r} is not implemented",
             reason_code="CONFIG_ERROR",
         )
-    configured_python = runtime.get("python")
-    python = os.getenv("VLLM_PYTHON_ENV") or configured_python
-    if not python:
-        raise StageError(
-            "runtime_smoke.python or VLLM_PYTHON_ENV is required",
-            reason_code="CONFIG_ERROR",
-        )
     runtime_revision = runtime.get("runtime_revision")
     if not runtime_revision:
         raise StageError(
@@ -783,25 +844,39 @@ def run_runtime_smoke(model: dict[str, Any], run_id: str) -> dict[str, Any]:
             reason_code="CONFIG_ERROR",
         )
     prompts = runtime.get("prompts", ["The capital of France is"])
-    result_path = paths["reports_dir"] / "runtime-smoke-output.json"
+    command = runtime.get("command")
+    if command is not None:
+        argv, result_path = _resolved_runtime_smoke_command(
+            model, run_id, runtime, command
+        )
+    else:
+        configured_python = runtime.get("python")
+        python = os.getenv("VLLM_PYTHON_ENV") or configured_python
+        if not python:
+            raise StageError(
+                "runtime_smoke.python, runtime_smoke.command or VLLM_PYTHON_ENV "
+                "is required",
+                reason_code="CONFIG_ERROR",
+            )
+        result_path = paths["reports_dir"] / "runtime-smoke-output.json"
+        argv = [
+            str(python),
+            "-m",
+            "ci.model_quality.vllm_smoke",
+            "--model",
+            str(paths["output_dir"]),
+            "--tensor-parallel-size",
+            str(
+                runtime.get("tensor_parallel_size")
+                or model["resources"].get("runtime_gpu_count")
+                or model["resources"]["gpu_count"]
+            ),
+            "--prompts-json",
+            json.dumps(prompts),
+            "--output",
+            str(result_path),
+        ]
     result_path.parent.mkdir(parents=True, exist_ok=True)
-    argv = [
-        str(python),
-        "-m",
-        "ci.model_quality.vllm_smoke",
-        "--model",
-        str(paths["output_dir"]),
-        "--tensor-parallel-size",
-        str(
-            runtime.get("tensor_parallel_size")
-            or model["resources"].get("runtime_gpu_count")
-            or model["resources"]["gpu_count"]
-        ),
-        "--prompts-json",
-        json.dumps(prompts),
-        "--output",
-        str(result_path),
-    ]
     env = os.environ.copy()
     repository_root = str(Path(__file__).parents[2])
     existing_pythonpath = env.get("PYTHONPATH")
@@ -818,10 +893,20 @@ def run_runtime_smoke(model: dict[str, Any], run_id: str) -> dict[str, Any]:
     log.write_text(completed.stdout + completed.stderr, encoding="utf-8")
     if completed.returncode != 0:
         raise StageError(
-            f"vLLM runtime smoke failed with {completed.returncode}; see {log}",
+            f"runtime smoke failed with {completed.returncode}; see {log}",
+            reason_code="RUNTIME_SMOKE_FAILED",
+        )
+    if not result_path.is_file():
+        raise StageError(
+            f"runtime smoke did not write {result_path}; see {log}",
             reason_code="RUNTIME_SMOKE_FAILED",
         )
     payload = json.loads(result_path.read_text(encoding="utf-8"))
+    if payload.get("status") != "PASS" or not payload.get("outputs"):
+        raise StageError(
+            f"runtime smoke result is not a passing generation: {result_path}",
+            reason_code="RUNTIME_SMOKE_FAILED",
+        )
     return {
         "status": "PASS",
         "result": payload,
