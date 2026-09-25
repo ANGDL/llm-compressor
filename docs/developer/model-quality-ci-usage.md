@@ -420,10 +420,6 @@ upload:
 
 上述空数组是待填写模板，启用后保持为空会校验失败。
 
-当前 DeepSeek V4 WNA8 配置已启用上传。生成的 Buildkite pipeline 在 `quantize`、`quantize_and_eval`、`eval_only` 模式下都会加入 publish 步骤；`quantize` 并不表示禁止上传。仅量化或评测的实验应复制一份配置，将对应模型的 `upload.enabled` 设为 `false`，并在 plan 和所有 stage 中使用同一份配置。手动逐阶段执行时，上传需要显式执行 publish。
-
-该模型的 `workflow.revision` 已修正为完整提交 `c5921a139d9f076d07e26bfedec3fd88bf75c2ec`。这会改变 request fingerprint，并连带改变 evaluation fingerprint；后续量化应重新生成计划并使用新的 run。已发布的 `20260924T235322Z_c5921a139d9f` 使用当时冻结的身份，当前配置不能复现它；不要改写旧 run 的 plan、manifest 或 SUCCESS 标记来匹配新配置。
-
 三组命令分别完成：
 
 1. `commands`：把 `{output_dir}` 上传到 `{remote_run_prefix}/model`，把 `{reports_dir}` 上传到 `{remote_run_prefix}/reports`。
@@ -455,6 +451,8 @@ upload:
 
 动手前先用 `bcecmd bos cp --help` 确认本机版本的参数名（`-r/--recursive`、`-y/--yes`、`--quiet`、`--disable-bar`、`--concurrency`、`--restart`、`--storage-class` 等），不要照抄别的版本。
 
+> **已知状态**：该模型的 `workflow.revision` 曾被写成截断的 37 字符 SHA，现已修正为完整提交 `c5921a139d9f076d07e26bfedec3fd88bf75c2ec`。修正会改变 request fingerprint 并连带改变 evaluation fingerprint，所以后续量化要重新生成计划、使用新的 run。已发布的 `20260924T235322Z_c5921a139d9f` 用的是当时冻结的身份，当前配置无法复现它；不要改写旧 run 的 plan、manifest 或 SUCCESS 标记去迁就新配置。
+
 ### 8.2 三个容易踩的坑
 
 - `bcecmd bos ls` 对**不存在的路径也返回 0** 且不打印内容，不能当作存在性校验。`bcecmd bos cp` 下载不存在的对象会返回非零、且不落任何文件，所以 verify 用「下载一个小的代表性对象」实现。
@@ -468,6 +466,8 @@ upload:
 ```bash
 bash stage.sh publish
 ```
+
+只要 `upload.enabled: true`，生成的 Buildkite pipeline 就会在 `quantize`、`quantize_and_eval`、`eval_only`、`upload_only` 四种模式下都追加 publish 步骤 —— `quantize` 并不等于「只量化不上传」。只做量化或评测的实验请复制一份配置，把对应模型的 `upload.enabled` 改成 `false`，并让 plan 和所有 stage 都用这同一份配置。手动逐阶段执行时不会自动上传，必须显式跑 `--stage publish`。
 
 `publish` 不需要重跑上游阶段：它自己会重新校验 `current-attempt.json`、`reports/summary.json`、`artifact-manifest.json` 的身份指纹和产物内容指纹，任何一项对不上都会以 `DEPENDENCY_FAILED` 失败。`--run-mode upload_only` 要求 `upload.enabled: true`，否则直接报 `CONFIG_ERROR`。
 
