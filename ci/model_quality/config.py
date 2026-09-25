@@ -88,6 +88,20 @@ def _validate_model(model: Any, index: int) -> dict[str, Any]:
     profile = validation.get("profile", "causal_lm")
     if not isinstance(profile, str) or not profile:
         raise ConfigError(f"{context}.validation.profile must be a string")
+    for suffixes_key in (
+        "quantization_auxiliary_suffixes",
+        "quantization_scale_suffixes",
+    ):
+        suffixes = validation.get(suffixes_key)
+        if suffixes is None:
+            continue
+        if not isinstance(suffixes, list) or not all(
+            isinstance(value, str) and value for value in suffixes
+        ):
+            raise ConfigError(
+                f"{context}.validation.{suffixes_key} must be a list of "
+                "non-empty strings"
+            )
 
     runtime_smoke = model.get("runtime_smoke", {})
     if not isinstance(runtime_smoke, dict):
@@ -99,6 +113,16 @@ def _validate_model(model: Any, index: int) -> dict[str, Any]:
         )
     if runtime_smoke and runtime_smoke.get("enabled", True):
         _require(runtime_smoke, "runtime_revision", f"{context}.runtime_smoke")
+        if runtime_smoke.get("command") is not None:
+            _validate_argv(
+                runtime_smoke["command"], f"{context}.runtime_smoke.command"
+            )
+        if runtime_smoke.get("result_file") is not None:
+            result_file = runtime_smoke["result_file"]
+            if not isinstance(result_file, str) or not result_file:
+                raise ConfigError(
+                    f"{context}.runtime_smoke.result_file must be a non-empty string"
+                )
 
     evaluation = model.get("evaluation", {})
     if not isinstance(evaluation, dict):

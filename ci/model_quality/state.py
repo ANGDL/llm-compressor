@@ -91,7 +91,12 @@ def write_stage_result(
     artifact_fingerprint: str | None = None,
     evaluation_fingerprint: str | None = None,
 ) -> Path:
+    # The identity fields are authoritative: a stage payload may also carry its
+    # own request-level fingerprints, so it must never override them. Preflight,
+    # for example, returns the planner fingerprint while the recorded identity is
+    # the finalized artifact fingerprint that later stages filter on.
     payload = {
+        **result,
         "schema_version": 1,
         "run_id": run_id,
         "model_id": model_id,
@@ -100,7 +105,6 @@ def write_stage_result(
         "artifact_fingerprint": artifact_fingerprint,
         "evaluation_fingerprint": evaluation_fingerprint,
         "recorded_at": utc_now(),
-        **result,
     }
     attempt_path = attempt_state_dir(run_id, model_id, attempt_id) / f"{stage}.json"
     atomic_write_json(attempt_path, payload)

@@ -63,7 +63,7 @@ include 路径相对于清单文件。DeepSeek 示例位于 `ci/model_quality/co
 | `workflow.quantize` | argv 数组 | 启动量化入口 |
 | `resources` | 卡数、GPU-hour、超时、磁盘等 | 预算选择及部分预检 |
 | `validation` | required files、profile、streaming 等 | 定义产物检查要求 |
-| `runtime_smoke` | Python、runtime revision、prompts、TP | 执行真实模型加载和最小生成 |
+| `runtime_smoke` | Python 或 command、runtime revision、prompts、TP | 执行真实模型加载和最小生成 |
 | `evaluation` | command、result_file、runtime_revision | 可选精度评测 |
 | `upload` | 首次保持 `enabled: false` | 避免试运行直接发布 |
 
@@ -86,6 +86,41 @@ workflow:
 ```
 
 不能写成一条带管道或重定向的 shell 字符串。多值参数逐项列出；布尔开关按入口的 `--flag` / `--no-flag` 语法填写。JSON 花括号无需转义。校准数据参数必须按入口实际支持的格式设置；示例可能会访问外部数据集，离线主机需要事先准备数据或缓存。
+
+### runtime_smoke 的两种运行时
+
+默认情况下 runtime smoke 用 `runtime_smoke.python`（或 `VLLM_PYTHON_ENV`）执行 `ci.model_quality.vllm_smoke`，由 vLLM 加载产物并生成固定 prompts。预检会检查该 Python 能否 `import vllm`。
+
+当目标主机不用 vLLM 提供产物时，配置 `runtime_smoke.command`（argv 数组，占位符与量化命令相同），由它替换内置的 vLLM 路径：
+
+```yaml
+runtime_smoke:
+  enabled: true
+  runtime_revision: sglang-0.5.10+44a64804b
+  prompts:
+    - The capital of France is
+  command:
+    - python3
+    - -m
+    - ci.model_quality.xsgl_smoke
+    - --model
+    - "{output_dir}"
+    - --base-url
+    - http://127.0.0.1:30000
+    - --prompts-json
+    - '["The capital of France is"]'
+    - --wait-ready-seconds
+    - "1800"
+    - --output
+    - "{reports_dir}/runtime-smoke-output.json"
+  result_file: "{reports_dir}/runtime-smoke-output.json"
+```
+
+配置了 `command` 后，预检只校验 argv 第一个元素是可执行文件，不再要求 `import vllm`。命令必须自己写出 `result_file`，内容形如 `{"status": "PASS", "outputs": [...]}`；退出码为 0 但没有结果文件、或结果里 `status` 不是 `PASS`、`outputs` 为空，都会判定 `RUNTIME_SMOKE_FAILED`。`runtime_revision` 仍然必填，用于标识运行时身份。
+
+`ci.model_quality.xsgl_smoke` 是已提供的 SGLang 适配器：它不自己拉起服务，而是查询一个已经运行中的 SGLang OpenAI 兼容服务（`--base-url`，`--wait-ready-seconds` 用于轮询 `/health`），并用 `--served-model-name` 指定 `--served-model-name` 注册的模型名。当前固定的 SGLang 版本不会返回输出 token id，因此适配器会用 checkpoint tokenizer 重新编码生成文本，并在记录里用 `token_ids_source: local_checkpoint_tokenizer` 标明来源；tokenizer 不可用时该字段为 null，`completion_tokens` 仍来自服务端 usage。
+
+仓库提供 `ci/model_quality/xsgl_launcher.sh`，用于在宿主机上从服务容器启动该服务并等待 `/health`；CI 控制面容器通常没有 docker 访问权限，服务生命周期应由部署方管理。两个容器共享 host network 时，`http://127.0.0.1:30000` 在控制面容器内可直接访问。
 
 ## 4. 先生成计划，不启动模型
 
