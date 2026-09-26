@@ -1,0 +1,265 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+DEFAULT_CONFIG="${ROOT_DIR}/.model-quality/web-remote.env"
+CONFIG_FILE=${MQ_WEB_CONFIG:-${DEFAULT_CONFIG}}
+SOCKET_DIR=${XDG_RUNTIME_DIR:-/tmp}
+
+usage() {
+    cat <<'EOF'
+Usage: scripts/model-quality-web-remote [--config FILE] COMMAND
+
+Commands:
+  init        Create a local configuration file from the example
+  up          Ensure SSH master, remote service, and local tunnel are healthy
+  down        Remove the tunnel; optionally stop the managed remote service
+  restart     Restart the remote service and repair the tunnel
+  status      Show SSH, container, service, tunnel, and health status
+  doctor      Run actionable prerequisite and connectivity diagnostics
+  logs        Follow the remote Web service log
+  open        Run `up`, then open the UI in the local default browser
+  tunnel      Repair only the local SSH tunnel
+  service     Ensure only the remote container service is running
+
+Environment:
+  MQ_WEB_CONFIG   Override the local configuration file
+  MQ_STOP_SERVICE=1  Also stop the remote service during `down`
+EOF
+}
+
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+info() { printf '==> %s\n' "$*"; }
+warn() { printf 'warning: %s\n' "$*" >&2; }
+
+load_config() {
+    [[ -f ${CONFIG_FILE} ]] || die "configuration not found: ${CONFIG_FILE}; run '$0 init'"
+    # shellcheck disable=SC1090
+    source "${CONFIG_FILE}"
+    : "${MQ_SSH_HOST:?MQ_SSH_HOST is required}"
+    : "${MQ_CONTAINER:?MQ_CONTAINER is required}"
+    : "${MQ_REPO:?MQ_REPO is required}"
+    : "${MQ_LOCAL_PORT:?MQ_LOCAL_PORT is required}"
+    : "${MQ_REMOTE_PORT:?MQ_REMOTE_PORT is required}"
+    : "${MQ_RUNS_ROOT:?MQ_RUNS_ROOT is required}"
+    : "${MQ_CONFIG:?MQ_CONFIG is required}"
+    MQ_REMOTE_BIND=${MQ_REMOTE_BIND:-127.0.0.1}
+    MQ_GIT_SHA=${MQ_GIT_SHA:-local}
+    MQ_EXECUTOR=${MQ_EXECUTOR:-queue}
+    MQ_GPU_HOUR_CAPACITY=${MQ_GPU_HOUR_CAPACITY:-80}
+    MQ_RUNTIME_DIR=${MQ_RUNTIME_DIR:-/tmp/model-quality-web}
+    local token
+    token=$(printf '%s' "${MQ_SSH_HOST}" | tr -cs 'A-Za-z0-9._-' '_')
+    MQ_CONTROL_SOCKET=${MQ_CONTROL_SOCKET:-${SOCKET_DIR%/}/model-quality-${token}.sock}
+    MQ_URL="http://127.0.0.1:${MQ_LOCAL_PORT}/"
+}
+
+ssh_base() { ssh -S "${MQ_CONTROL_SOCKET}" "${MQ_SSH_HOST}" "$@"; }
+
+master_ok() {
+    [[ -S ${MQ_CONTROL_SOCKET} ]] && ssh -S "${MQ_CONTROL_SOCKET}" -O check "${MQ_SSH_HOST}" >/dev/null 2>&1
+}
+
+adopt_existing_master() {
+    local candidate
+    for candidate in "${MQ_EXISTING_CONTROL_SOCKET:-}" "/tmp/codex-${MQ_SSH_HOST}.sock"; do
+        [[ -n ${candidate} && -S ${candidate} ]] || continue
+        if ssh -S "${candidate}" -O check "${MQ_SSH_HOST}" >/dev/null 2>&1; then
+            MQ_CONTROL_SOCKET=${candidate}
+            info "reusing authenticated SSH master ${candidate}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+ensure_master() {
+    if master_ok; then
+        return
+    fi
+    if adopt_existing_master; then
+        return
+    fi
+    [[ ! -e ${MQ_CONTROL_SOCKET} ]] || rm -f "${MQ_CONTROL_SOCKET}"
+    info "creating SSH master for ${MQ_SSH_HOST}"
+    if [[ -t 0 ]]; then
+        ssh -M -S "${MQ_CONTROL_SOCKET}" -o ControlPersist=8h \
+            -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -NT "${MQ_SSH_HOST}"
+    else
+        ssh -M -S "${MQ_CONTROL_SOCKET}" -o ControlPersist=8h \
+            -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -fnNT "${MQ_SSH_HOST}" || \
+            die "SSH authentication needs a terminal; run '$0 up' interactively or set MQ_EXISTING_CONTROL_SOCKET"
+    fi
+    master_ok || die "SSH master did not become healthy"
+}
+
+remote() { ssh_base "$@"; }
+
+discover_python() {
+    if [[ -n ${MQ_PYTHON:-} ]]; then
+        return
+    fi
+    MQ_PYTHON=$(remote "docker exec ${MQ_CONTAINER} bash -lc 'for candidate in .venv/bin/python /root/miniconda/envs/python312_torch212_cuda/bin/python python3 python; do if command -v \"\${candidate}\" >/dev/null 2>&1 || [[ -x \"\${candidate}\" ]]; then command -v \"\${candidate}\" 2>/dev/null || printf %s \"\${candidate}\"; break; fi; done'" | tail -1)
+    [[ -n ${MQ_PYTHON} ]] || die "no Python found inside ${MQ_CONTAINER}; set MQ_PYTHON"
+}
+
+container_ok() {
+    remote "docker inspect -f '{{.State.Running}}' '${MQ_CONTAINER}' 2>/dev/null" 2>/dev/null | grep -qx true
+}
+
+service_pid() {
+    remote "docker exec '${MQ_CONTAINER}' bash -lc 'cat \"${MQ_RUNTIME_DIR}/server.pid\" 2>/dev/null || true'" 2>/dev/null | tail -1
+}
+
+service_healthy() {
+    remote "docker exec '${MQ_CONTAINER}' bash -lc 'curl -fsS --max-time 3 http://${MQ_REMOTE_BIND}:${MQ_REMOTE_PORT}/api/health >/dev/null'" >/dev/null 2>&1
+}
+
+start_service() {
+    container_ok || die "container ${MQ_CONTAINER} is missing or stopped; update MQ_CONTAINER or start it"
+    discover_python
+    if service_healthy; then
+        return
+    fi
+    info "starting Web service in ${MQ_CONTAINER}"
+    remote "docker exec '${MQ_CONTAINER}' bash -lc 'mkdir -p \"${MQ_RUNTIME_DIR}\"; old=\$(cat \"${MQ_RUNTIME_DIR}/server.pid\" 2>/dev/null || true); if [[ -n \"\${old}\" ]] && kill -0 \"\${old}\" 2>/dev/null; then kill \"\${old}\"; fi; cd \"${MQ_REPO}\"; export MODEL_QUALITY_RUNS_ROOT=\"${MQ_RUNS_ROOT}\" MODEL_QUALITY_CONFIG=\"${MQ_CONFIG}\" MODEL_QUALITY_GIT_SHA=\"${MQ_GIT_SHA}\" MODEL_QUALITY_WEB_EXECUTOR=\"${MQ_EXECUTOR}\" MODEL_QUALITY_GPU_HOUR_CAPACITY=\"${MQ_GPU_HOUR_CAPACITY}\" PYTHONUNBUFFERED=1; nohup \"${MQ_PYTHON}\" -m ci.model_quality.web --host \"${MQ_REMOTE_BIND}\" --port \"${MQ_REMOTE_PORT}\" --runs-root \"${MQ_RUNS_ROOT}\" --config \"${MQ_CONFIG}\" --git-sha \"${MQ_GIT_SHA}\" >> \"${MQ_RUNTIME_DIR}/server.log\" 2>&1 < /dev/null & echo \$! > \"${MQ_RUNTIME_DIR}/server.pid\"'"
+    for _ in {1..20}; do
+        service_healthy && return
+        sleep 0.5
+    done
+    remote "docker exec '${MQ_CONTAINER}' bash -lc 'tail -40 \"${MQ_RUNTIME_DIR}/server.log\"'" >&2 || true
+    die "remote Web service failed its health check"
+}
+
+stop_service() {
+    container_ok || return
+    remote "docker exec '${MQ_CONTAINER}' bash -lc 'pid=\$(cat \"${MQ_RUNTIME_DIR}/server.pid\" 2>/dev/null || true); if [[ -n \"\${pid}\" ]] && kill -0 \"\${pid}\" 2>/dev/null; then kill \"\${pid}\"; fi; rm -f \"${MQ_RUNTIME_DIR}/server.pid\"'"
+}
+
+local_health() { curl -fsS --max-time 3 "${MQ_URL}api/health" >/dev/null 2>&1; }
+
+local_listener_pid() {
+    if command -v lsof >/dev/null; then
+        lsof -nP -tiTCP:"${MQ_LOCAL_PORT}" -sTCP:LISTEN 2>/dev/null | head -1
+    elif command -v ss >/dev/null; then
+        ss -ltn "sport = :${MQ_LOCAL_PORT}" 2>/dev/null | grep -q LISTEN && echo unknown
+    fi
+}
+
+cancel_tunnel() {
+    master_ok || return
+    ssh -S "${MQ_CONTROL_SOCKET}" -O cancel \
+        -L "127.0.0.1:${MQ_LOCAL_PORT}:${MQ_REMOTE_BIND}:${MQ_REMOTE_PORT}" \
+        "${MQ_SSH_HOST}" >/dev/null 2>&1 || true
+}
+
+ensure_tunnel() {
+    if local_health; then
+        return
+    fi
+    local listener
+    listener=$(local_listener_pid || true)
+    if [[ -n ${listener} ]]; then
+        die "local port ${MQ_LOCAL_PORT} is already in use by PID ${listener}; change MQ_LOCAL_PORT or stop that process"
+    fi
+    cancel_tunnel
+    info "forwarding 127.0.0.1:${MQ_LOCAL_PORT} to ${MQ_CONTAINER}:${MQ_REMOTE_PORT}"
+    ssh -S "${MQ_CONTROL_SOCKET}" -O forward -o ExitOnForwardFailure=yes \
+        -L "127.0.0.1:${MQ_LOCAL_PORT}:${MQ_REMOTE_BIND}:${MQ_REMOTE_PORT}" \
+        "${MQ_SSH_HOST}"
+    for _ in {1..10}; do
+        local_health && return
+        sleep 0.3
+    done
+    die "tunnel exists but ${MQ_URL}api/health is unreachable"
+}
+
+command_init() {
+    [[ ! -e ${CONFIG_FILE} ]] || die "configuration already exists: ${CONFIG_FILE}"
+    mkdir -p "$(dirname "${CONFIG_FILE}")"
+    cp "${ROOT_DIR}/ci/model_quality/web/deploy/remote.env.example" "${CONFIG_FILE}"
+    printf 'created %s\nedit it, then run: %s doctor\n' "${CONFIG_FILE}" "$0"
+}
+
+command_status() {
+    if ! master_ok; then adopt_existing_master >/dev/null 2>&1 || true; fi
+    printf 'configuration : %s\n' "${CONFIG_FILE}"
+    printf 'SSH target    : %s\n' "${MQ_SSH_HOST}"
+    printf 'control socket: %s (%s)\n' "${MQ_CONTROL_SOCKET}" "$(master_ok && echo healthy || echo unavailable)"
+    if master_ok; then
+        printf 'container     : %s (%s)\n' "${MQ_CONTAINER}" "$(container_ok && echo running || echo unavailable)"
+        printf 'service       : %s\n' "$(service_healthy && echo healthy || echo unavailable)"
+    else
+        printf 'container     : unknown\nservice       : unknown\n'
+    fi
+    local tunnel_state=unavailable
+    if local_health; then
+        if master_ok; then tunnel_state=healthy; else tunnel_state='healthy (managed by another SSH process)'; fi
+    elif [[ -n $(local_listener_pid || true) ]]; then
+        tunnel_state='port occupied but health failed'
+    fi
+    printf 'local tunnel  : %s\n' "${tunnel_state}"
+    printf 'URL           : %s\n' "${MQ_URL}"
+}
+
+command_doctor() {
+    local failed=0
+    for command in ssh curl; do
+        if command -v "${command}" >/dev/null; then printf '[ok] local %s\n' "${command}"; else printf '[fail] local %s missing\n' "${command}"; failed=1; fi
+    done
+    if ensure_master; then printf '[ok] SSH master (%s)\n' "${MQ_CONTROL_SOCKET}"; else failed=1; fi
+    if remote 'command -v docker >/dev/null'; then printf '[ok] remote docker\n'; else printf '[fail] remote docker missing\n'; failed=1; fi
+    if container_ok; then printf '[ok] container %s running\n' "${MQ_CONTAINER}"; else printf '[fail] container %s missing/stopped\n' "${MQ_CONTAINER}"; failed=1; fi
+    if container_ok; then
+        discover_python
+        if remote "docker exec '${MQ_CONTAINER}' test -d '${MQ_REPO}'"; then printf '[ok] repository %s\n' "${MQ_REPO}"; else printf '[fail] repository missing: %s\n' "${MQ_REPO}"; failed=1; fi
+        if remote "docker exec '${MQ_CONTAINER}' test -f '${MQ_REPO}/${MQ_CONFIG}'"; then printf '[ok] manifest %s\n' "${MQ_CONFIG}"; else printf '[fail] manifest missing: %s/%s\n' "${MQ_REPO}" "${MQ_CONFIG}"; failed=1; fi
+        printf '[ok] Python %s\n' "${MQ_PYTHON}"
+    fi
+    command_status
+    return "${failed}"
+}
+
+command_up() { ensure_master; start_service; ensure_tunnel; command_status; }
+
+command_down() {
+    cancel_tunnel
+    if [[ ${MQ_STOP_SERVICE:-0} == 1 ]]; then stop_service; fi
+    info "tunnel stopped${MQ_STOP_SERVICE:+; service stop requested}"
+}
+
+command_restart() { ensure_master; stop_service; start_service; ensure_tunnel; command_status; }
+
+command_logs() {
+    ensure_master
+    container_ok || die "container ${MQ_CONTAINER} is unavailable"
+    remote "docker exec '${MQ_CONTAINER}' bash -lc 'touch \"${MQ_RUNTIME_DIR}/server.log\"; tail -n 100 -F \"${MQ_RUNTIME_DIR}/server.log\"'"
+}
+
+command_open() {
+    command_up
+    if command -v open >/dev/null; then open "${MQ_URL}#runs"
+    elif command -v xdg-open >/dev/null; then xdg-open "${MQ_URL}#runs"
+    else printf 'open %s#runs in your browser\n' "${MQ_URL}"; fi
+}
+
+if [[ ${1:-} == --config ]]; then
+    [[ $# -ge 3 ]] || die "--config requires a file and command"
+    CONFIG_FILE=$2
+    shift 2
+fi
+
+case ${1:-} in
+    init) command_init ;;
+    up) load_config; command_up ;;
+    down) load_config; ensure_master; command_down ;;
+    restart) load_config; command_restart ;;
+    status) load_config; command_status ;;
+    doctor) load_config; command_doctor ;;
+    logs) load_config; command_logs ;;
+    open) load_config; command_open ;;
+    tunnel) load_config; ensure_master; ensure_tunnel; command_status ;;
+    service) load_config; ensure_master; start_service; command_status ;;
+    -h|--help|help|"") usage ;;
+    *) die "unknown command: $1" ;;
+esac
