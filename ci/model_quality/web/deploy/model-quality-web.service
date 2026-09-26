@@ -1,0 +1,23 @@
+[Unit]
+Description=Model Quality Web control plane (container managed)
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/model-quality/web.env
+ExecStart=/usr/bin/docker exec \
+  -e MODEL_QUALITY_RUNS_ROOT=${MQ_RUNS_ROOT} \
+  -e MODEL_QUALITY_CONFIG=${MQ_CONFIG} \
+  -e MODEL_QUALITY_GIT_SHA=${MQ_GIT_SHA} \
+  -e MODEL_QUALITY_WEB_EXECUTOR=${MQ_EXECUTOR} \
+  -e MODEL_QUALITY_GPU_HOUR_CAPACITY=${MQ_GPU_HOUR_CAPACITY} \
+  ${MQ_CONTAINER} ${MQ_PYTHON} -m ci.model_quality.web \
+  --host ${MQ_REMOTE_BIND} --port ${MQ_REMOTE_PORT} \
+  --runs-root ${MQ_RUNS_ROOT} --config ${MQ_CONFIG} --git-sha ${MQ_GIT_SHA}
+Restart=always
+RestartSec=3
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

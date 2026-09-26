@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light dark">
+    <title>Model Quality Control</title>
+    <link rel="stylesheet" href="/ui/app.css">
+    <script src="/ui/app.js" defer></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="#runs" aria-label="Model Quality home">
+        <span class="brand-mark" aria-hidden="true">MQ</span>
+        <span>
+          <strong>Model Quality</strong>
+          <small>Compression control plane</small>
+        </span>
+      </a>
+      <nav aria-label="Primary navigation">
+        <a href="#runs" data-nav="runs">Runs</a>
+        <a href="#plan" data-nav="plan">New plan</a>
+        <a href="#operations" data-nav="operations">Operations</a>
+      </nav>
+      <div class="identity">
+        <span id="connection" class="connection pending">Connecting</span>
+        <button id="identity-button" class="ghost" type="button">Identity</button>
+      </div>
+    </header>
+
+    <main id="app" tabindex="-1">
+      <section id="notice" class="notice hidden" role="status" aria-live="polite"></section>
+
+      <section id="runs-view" class="view">
+        <div class="page-heading">
+          <div>
+            <p class="eyebrow">Production compression</p>
+            <h1>Runs</h1>
+            <p>Inspect quality gates, artifacts, attempts, and publish readiness.</p>
+          </div>
+          <a class="button primary" href="#plan">Create plan</a>
+        </div>
+        <div id="run-summary" class="summary-grid" aria-label="Run summary"></div>
+        <form id="run-filters" class="toolbar">
+          <label>Status
+            <select name="status">
+              <option value="">All statuses</option>
+              <option>RUNNING</option><option>FAIL</option><option>WARN</option>
+              <option>PASS</option><option>PLANNED</option><option>CANCELED</option>
+            </select>
+          </label>
+          <label>Model
+            <select name="model"><option value="">All models</option></select>
+          </label>
+          <button class="button" type="submit">Apply filters</button>
+          <button id="refresh-runs" class="ghost" type="button">Refresh</button>
+        </form>
+        <div class="table-shell">
+          <table>
+            <thead><tr><th>Status</th><th>Run</th><th>Mode</th><th>Models</th><th>Budget</th><th>Publish</th><th>Updated</th></tr></thead>
+            <tbody id="run-rows"><tr><td colspan="7" class="empty">Loading runs…</td></tr></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="run-view" class="view hidden" aria-labelledby="run-title">
+        <button class="back-link" type="button" data-go="runs">← All runs</button>
+        <div class="page-heading compact">
+          <div><p class="eyebrow">Run detail</p><h1 id="run-title">Run</h1><p id="run-subtitle"></p></div>
+          <div id="run-actions" class="actions"></div>
+        </div>
+        <div id="run-cards" class="summary-grid"></div>
+        <section class="panel"><div class="panel-heading"><div><p class="eyebrow">Pipeline</p><h2>Stage timeline</h2></div><span id="live-state" class="connection">Snapshot</span></div><div id="timeline" class="timeline"></div></section>
+        <section class="panel"><div class="panel-heading"><div><p class="eyebrow">Execution</p><h2>Environment lanes</h2></div></div><div id="job-lanes" class="lanes"></div></section>
+        <section class="panel"><div class="panel-heading"><div><p class="eyebrow">Models</p><h2>Quality and identity</h2></div></div><div id="model-list"></div></section>
+        <section class="panel"><div class="panel-heading"><div><p class="eyebrow">Evidence</p><h2>Log viewer</h2></div></div><div class="log-controls"><select id="log-model"></select><select id="log-stage"></select><select id="log-attempt"></select><button id="load-log" class="button" type="button">Load log</button></div><pre id="log-output" class="log-output">Select a stage to load its log.</pre></section>
+      </section>
+
+      <section id="plan-view" class="view hidden">
+        <div class="page-heading"><div><p class="eyebrow">Controlled execution</p><h1>New plan</h1><p>Preview fingerprints, cost, environments, and risks before capacity is reserved.</p></div></div>
+        <div class="stepper"><span class="active">1 Scope</span><span>2 Environments</span><span>3 Review</span></div>
+        <form id="plan-form" class="panel form-grid">
+          <label>Run mode<select name="run_mode"><option value="quantize">Quantize</option><option value="quantize_and_eval">Quantize + evaluate</option><option value="eval_only">Evaluate only</option><option value="upload_only">Upload only</option></select></label>
+          <label>Models<select name="models"><option value="all">All enabled models</option></select></label>
+          <label>GPU-hour budget<input name="max_gpu_hours" type="number" min="0" step="0.5" value="8"></label>
+          <fieldset><legend>Prestarted inference container (optional)</legend><label>Container<input name="container_name" autocomplete="off" placeholder="registered-runtime"></label><label>Script<input name="script" autocomplete="off" placeholder="/workspace/run_smoke.sh"></label></fieldset>
+          <div class="form-actions"><button class="button primary" type="submit">Preview plan</button><span>Previewing does not consume GPU capacity.</span></div>
+        </form>
+        <section id="plan-review" class="panel hidden"><div class="panel-heading"><div><p class="eyebrow">Review</p><h2>Launch contract</h2></div></div><div id="plan-risks"></div><div id="plan-selected" class="review-grid"></div><details><summary>Final plan JSON</summary><pre id="plan-json" class="json-output"></pre></details><div class="danger-zone"><p>Launching reserves GPU-hours and may append publish when upload is enabled.</p><button id="launch-plan" class="button danger" type="button">Confirm and launch</button></div></section>
+      </section>
+
+      <section id="operations-view" class="view hidden">
+        <div class="page-heading"><div><p class="eyebrow">Fleet operations</p><h1>Operations</h1><p>Capacity, cost, schedules, and failure delivery from persisted facts.</p></div></div>
+        <div id="capacity-cards" class="summary-grid"></div>
+        <div class="two-column"><section class="panel"><div class="panel-heading"><div><p class="eyebrow">Capacity</p><h2>Queues and hosts</h2></div></div><div id="capacity-detail"></div></section><section class="panel"><div class="panel-heading"><div><p class="eyebrow">Trend</p><h2>GPU-hour cost</h2></div></div><div id="cost-trend"></div></section></div>
+        <section class="panel"><div class="panel-heading"><div><p class="eyebrow">Automation</p><h2>Schedules</h2></div></div><div id="schedule-list"></div></section>
+      </section>
+    </main>
+
+    <dialog id="identity-dialog">
+      <form method="dialog" class="dialog-card">
+        <div class="panel-heading"><div><p class="eyebrow">Development identity</p><h2>Request headers</h2></div><button class="ghost" value="cancel">Close</button></div>
+        <p>The production proxy should inject trusted identity headers. These values are stored only in this browser.</p>
+        <label>Actor<input id="actor-input" autocomplete="off" placeholder="your-name"></label>
+        <label>Role<select id="role-input"><option>viewer</option><option>operator</option><option>publisher</option><option>admin</option></select></label>
+        <label>Bearer token<input id="token-input" type="password" autocomplete="off"></label>
+        <button id="save-identity" class="button primary" value="default">Save identity</button>
+      </form>
+    </dialog>
+
+    <dialog id="confirm-dialog"><form method="dialog" class="dialog-card"><h2 id="confirm-title">Confirm action</h2><p id="confirm-message"></p><label id="confirm-reason-label" class="hidden">Reason<input id="confirm-reason" autocomplete="off"></label><div class="form-actions"><button class="ghost" value="cancel">Cancel</button><button id="confirm-submit" class="button danger" value="default">Confirm</button></div></form></dialog>
+  </body>
+</html>

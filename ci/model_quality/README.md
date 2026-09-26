@@ -2,8 +2,9 @@
 
 This directory is the isolated control plane for production model compression
 and quality jobs. It does not change library entrypoints or existing test
-pipelines. The design document is
-`docs/developer/model-quality-ci-plan.md`.
+pipelines. The design documents are
+`docs/developer/model-quality-ci-plan.md` and
+`docs/developer/model-quality-ci-web-design.md`.
 
 中文部署与逐步操作说明：[使用指南](../../docs/developer/model-quality-ci-usage.md)。
 
@@ -18,6 +19,139 @@ JSON/Markdown reports, and a guarded `bcecmd` publish stage.
 The checked-in example model is disabled so a checkout cannot accidentally run
 an expensive model job. Its source path, CI entrypoint, vLLM Python, resource
 estimate, and BCE target must be reviewed before enabling it.
+
+## Web control plane
+
+The web layer reads the same run directory used by the CI stages, so facts stay
+in the run JSON and the API never becomes a second source of truth. It is a
+WSGI application with no third-party framework and no shell execution inside a
+request:
+
+```bash
+MODEL_QUALITY_RUNS_ROOT=/data/model-quality/runs \
+python -m ci.model_quality.web --host 127.0.0.1 --port 8000 \
+  --config ci/model_quality/config/models.yaml
+```
+
+Open `http://127.0.0.1:8000/` for the browser UI. The server hosts the static
+HTML/CSS/JavaScript and same-origin API together; a developer working remotely
+can keep the server bound to loopback and forward it locally with
+`ssh -L 8000:127.0.0.1:8000 <host>`. The Runs, Run Detail, Plan Preview, log,
+capacity, trend, and schedule views are available without a frontend build
+tool. The Identity dialog is a development aid; production must have a trusted
+OIDC/reverse proxy inject actor and role headers rather than accepting browser
+claims directly.
+
+### Remote container lifecycle
+
+Use the checked-in manager instead of manually coordinating a container name,
+SSH control socket, service process, and local port forward:
+
+```bash
+scripts/model-quality-web-remote init
+$EDITOR .model-quality/web-remote.env
+scripts/model-quality-web-remote doctor
+scripts/model-quality-web-remote open
+```
+
+`open` is convergent: it recreates a missing SSH control socket, verifies the
+configured container, auto-discovers Python, starts or repairs the Web service,
+repairs the local tunnel, performs `/api/health`, and opens the browser. Run it
+again after a laptop restart or a dropped SSH connection. When a container,
+host, repository path, runs root, port, or service revision changes, edit only
+`.model-quality/web-remote.env` and run `restart`:
+
+```bash
+scripts/model-quality-web-remote restart
+scripts/model-quality-web-remote status
+scripts/model-quality-web-remote logs
+```
+
+By default `down` removes only the local tunnel, keeping the remote dashboard
+available to other clients. Use `MQ_STOP_SERVICE=1
+scripts/model-quality-web-remote down` to stop the managed container process as
+well. The service remains bound to container loopback, so it is never exposed
+directly on the node. An optional systemd unit template is available at
+`ci/model_quality/web/deploy/model-quality-web.service` for hosts where the
+service must survive all client sessions and host reboots.
+
+Read-only surface (Phase 1): `GET /api/health`, `GET /api/whoami`,
+`GET /api/models`, `GET /api/capabilities`, paginated `GET /api/runs`, run and
+model detail (attempt history, stage records, fingerprints, artifacts, publish,
+backup), stage-filtered logs, `GET /api/runs/{run_id}/artifacts/{id}/access`
+for short-lived download metadata, `GET /api/audit`, `GET /api/trends/quality`,
+`GET /api/trends/cost`, `GET /api/ops/schedules`, and
+`GET /api/ops/notifications`. `GET /api/runs/{run_id}/events` returns an
+ordered SSE snapshot; pass `after=<sequence>` when reconnecting to request only
+newer events. Malformed optional files are reported as missing so one partial
+run does not hide the others.
+
+Controlled execution (Phase 2): `POST /api/plans/preview`, `POST /api/runs`,
+`POST /api/runs/{run_id}/retry`, `POST /api/runs/{run_id}/evaluate`, and
+`POST /api/runs/{run_id}/cancel`. Every write carries an `idempotency_key`,
+records an audit entry, and only ever stores an allowlisted
+`ci.model_quality.stage` argv. Quantization commands are imported through
+`shell lexer → allowlist → structured argv`; shell operators, substitutions,
+unknown flags, and out-of-policy paths are rejected. Inference configuration
+accepts a prestarted container name and script only, never a server, port, URL,
+or shell string.
+
+The queue worker is the only component that spawns processes:
+
+```bash
+MODEL_QUALITY_RUNS_ROOT=/data/model-quality/runs \
+python -m ci.model_quality.web.worker --config ci/model_quality/config/models.yaml
+```
+
+It drains queued jobs in creation order, which is the run-mode stage order
+(preflight/quantize/validate → runtime-smoke → evaluate → report → publish).
+One GPU-hour reservation covers a model/attempt; it stays held until every lane
+is terminal, moves `RESERVED → QUEUED → RELEASED`, and is released immediately
+when a stage fails and cancels its siblings. A retryable job retry re-admits its
+GPU-hours before it is queued, so retrying never runs for free and never
+resurrects a released reservation. Failures are classified as
+`RESOURCE_TIMEOUT`, `RESOURCE_UNAVAILABLE`, `SCRIPT_FAILED`, or
+`QUALITY_GATE_FAILED` so retryable infrastructure problems are never confused
+with a rejected artifact.
+
+Publish and backup (Phase 3): `POST /api/runs/{run_id}/publish/preview`,
+`POST /api/runs/{run_id}/publish` (requires an explicit `confirm: true`, plus a
+second approver when `MODEL_QUALITY_PUBLISH_DUAL_APPROVAL=1`),
+`POST /api/runs/{run_id}/backup/preview`, `POST /api/runs/{run_id}/backup`,
+`POST /api/backups/{backup_id}/restore/preview`, and
+`POST /api/backups/{backup_id}/restore`. Preview shows the allowlist, file
+count, total bytes, checksums, remote target, and risks. Backup manifests are
+immutable; restore always creates a new run id, keeps the source backup id, and
+never overwrites an existing run or marks an artifact as current.
+
+Operations (Phase 4): cron schedules (`GET/POST /api/ops/schedules`,
+`PATCH/DELETE /api/ops/schedules/{id}`) start one run per occurrence and replay
+the recorded run when the same occurrence is processed again, a webhook
+notification service that stays disabled unless
+`MODEL_QUALITY_NOTIFY_ALLOW_NETWORK=1`, quality and GPU-hour cost trends, and a
+conservative queue capacity forecast inside `GET /api/capabilities` (drain
+estimate derived from GPU-hours actually released in the recent window,
+reported as `confidence: none` when there is no history). A cron unit or
+systemd timer drives the schedules with a single tick:
+
+```bash
+MODEL_QUALITY_RUNS_ROOT=/data/model-quality/runs \
+MODEL_QUALITY_CONFIG=ci/model_quality/config/models.yaml \
+python -m ci.model_quality.web.scheduler
+```
+
+The tick prints one JSON result per due schedule (`STARTED`, `REPLAYED`, or
+`FAILED`) so the timer log records exactly what happened.
+
+Roles come from trusted headers (`X-Model-Quality-Actor`,
+`X-Model-Quality-Roles`) or a bearer token (`MODEL_QUALITY_WEB_TOKEN`):
+`viewer` (read), `operator` (plan/start/retry/cancel/evaluate), `publisher`
+(publish/backup), `admin` (everything, including restore). Related environment
+variables: `MODEL_QUALITY_GPU_HOUR_CAPACITY`,
+`MODEL_QUALITY_INFERENCE_CONTAINERS`, `MODEL_QUALITY_INFERENCE_SCRIPT_ROOTS`,
+`MODEL_QUALITY_OUTPUT_ROOTS`, `MODEL_QUALITY_PUBLISH_DUAL_APPROVAL`,
+`MODEL_QUALITY_WEB_EXECUTOR`, `MODEL_QUALITY_BACKUP_*`, and
+`MODEL_QUALITY_WEB_STAGE_CLI`.
 
 ## Local dry run
 
@@ -131,6 +265,10 @@ Implemented now:
 - real causal-LM vLLM load/generation smoke;
 - generic higher/lower metric gates and paired lm-eval subprocesses;
 - failure-tolerant reports, aggregate reports, and guarded bcecmd command adapters.
+- the read-only WSGI observer, plan preview and controlled start/retry/evaluate/cancel;
+- the allowlisted queue worker with per-model GPU-hour reservations and failure classes;
+- publish preview/confirm with optional dual approval, plus immutable backups and restores;
+- cron schedules, notification log, quality/cost trends, and the capacity forecast.
 
 Target-host validation still required:
 
