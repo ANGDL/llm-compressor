@@ -281,6 +281,42 @@ def test_eval_only_rejects_changed_artifact_contents(runs_root, monkeypatch):
     assert any("contents changed" in failure for failure in reused["failures"])
 
 
+def test_eval_only_does_not_require_quantization_free_disk(runs_root, monkeypatch):
+    from ci.model_quality.executor import run_preflight
+
+    model = _model()
+    model["resources"]["minimum_free_disk_gib"] = 10**9
+    model["runtime_smoke"] = {}
+    model["upload"] = {"enabled": False}
+    model["workflow"]["quantize"] = ["/usr/bin/true"]
+    monkeypatch.setattr("torch.accelerator.is_available", lambda: True)
+    monkeypatch.setattr("torch.accelerator.device_count", lambda: 1)
+    source = runs_root / "source"
+    source.mkdir()
+    (source / "config.json").write_text("{}")
+    model["source"]["path"] = str(source)
+    (model_run_dir("run", model["id"]) / "model").mkdir(parents=True)
+    artifact = model_fingerprint(model)
+
+    first = run_preflight(
+        model,
+        "run",
+        run_mode="quantize",
+        fingerprint=artifact,
+        evaluation_fingerprint=evaluation_fingerprint(model, artifact),
+    )
+    reused = run_preflight(
+        model,
+        "run",
+        run_mode="eval_only",
+        fingerprint=artifact,
+        evaluation_fingerprint=evaluation_fingerprint(model, artifact),
+    )
+
+    assert any("free disk" in failure for failure in first["failures"])
+    assert not any("free disk" in failure for failure in reused["failures"])
+
+
 def test_upload_only_pipeline_revalidates_and_reconstructs_report():
     plan = build_execution_plan(
         {"models": [_model()]},

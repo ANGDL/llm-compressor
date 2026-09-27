@@ -1,6 +1,5 @@
 schema_version: 1
-includes:
-  - models/deepseek_v4_flash_0731_wna8.yaml
+includes: []
 
 # After reviewing the target paths, add for example:
 # includes:

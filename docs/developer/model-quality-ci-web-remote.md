@@ -45,9 +45,15 @@ MQ_REMOTE_PORT=18080
 MQ_RUNS_ROOT=/ssd2/model-quality/runs
 MQ_CONFIG=ci/model_quality/config/models.yaml
 MQ_GIT_SHA=<deployed-git-sha>
+MQ_INFERENCE_CONTAINERS=zhuang_xsgl_0923
+MQ_INFERENCE_SCRIPT_ROOTS=/data/quant/llm-compressor/ci/model_quality
 ```
 
 配置文件位于被 git 忽略的 `.model-quality/`，可以保存每台机器的真实容器名和路径。
+推理白名单不是硬编码：`MQ_INFERENCE_CONTAINERS` 是逗号分隔的已审核容器名，
+`MQ_INFERENCE_SCRIPT_ROOTS` 是冒号分隔的容器内绝对目录。Web 表单可以填写其中任一
+容器，但脚本必须位于登记目录内；空白名单会拒绝 Preview。修改后执行
+`scripts/model-quality-web-remote restart`，仅刷新浏览器不会更新服务进程环境。
 若需要管理多套服务，为每套服务保存独立配置：
 
 ```bash
@@ -94,6 +100,8 @@ scripts/model-quality-web-remote service
 ```bash
 MQ_CONTAINER=<new-container>
 MQ_PYTHON=<python-inside-new-container-or-empty>
+MQ_INFERENCE_CONTAINERS=<reviewed-inference-container-1>,<reviewed-inference-container-2>
+MQ_INFERENCE_SCRIPT_ROOTS=<absolute-script-root-1>:<absolute-script-root-2>
 ```
 
 然后执行：

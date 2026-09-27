@@ -113,16 +113,6 @@ def _validate_model(model: Any, index: int) -> dict[str, Any]:
         )
     if runtime_smoke and runtime_smoke.get("enabled", True):
         _require(runtime_smoke, "runtime_revision", f"{context}.runtime_smoke")
-        if runtime_smoke.get("command") is not None:
-            _validate_argv(
-                runtime_smoke["command"], f"{context}.runtime_smoke.command"
-            )
-        if runtime_smoke.get("result_file") is not None:
-            result_file = runtime_smoke["result_file"]
-            if not isinstance(result_file, str) or not result_file:
-                raise ConfigError(
-                    f"{context}.runtime_smoke.result_file must be a non-empty string"
-                )
 
     evaluation = model.get("evaluation", {})
     if not isinstance(evaluation, dict):

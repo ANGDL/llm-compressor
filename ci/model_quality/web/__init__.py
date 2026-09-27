@@ -29,6 +29,7 @@ from .plans import (
     build_quantization_argv,
     default_run_id,
     import_quantization_command,
+    validate_evaluation_command,
     validate_inference_config,
 )
 from .publishing import PublishService
@@ -71,6 +72,7 @@ __all__ = [
     "create_app",
     "default_run_id",
     "import_quantization_command",
+    "validate_evaluation_command",
     "next_run",
     "parse_roles",
     "serve",

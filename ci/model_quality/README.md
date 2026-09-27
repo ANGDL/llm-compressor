@@ -149,9 +149,48 @@ Roles come from trusted headers (`X-Model-Quality-Actor`,
 (publish/backup), `admin` (everything, including restore). Related environment
 variables: `MODEL_QUALITY_GPU_HOUR_CAPACITY`,
 `MODEL_QUALITY_INFERENCE_CONTAINERS`, `MODEL_QUALITY_INFERENCE_SCRIPT_ROOTS`,
+`MODEL_QUALITY_EVALUATION_COMMANDS`,
 `MODEL_QUALITY_OUTPUT_ROOTS`, `MODEL_QUALITY_PUBLISH_DUAL_APPROVAL`,
 `MODEL_QUALITY_WEB_EXECUTOR`, `MODEL_QUALITY_BACKUP_*`, and
 `MODEL_QUALITY_WEB_STAGE_CLI`.
+For the remote manager, set the corresponding `MQ_INFERENCE_CONTAINERS`
+(comma-separated container names) and `MQ_INFERENCE_SCRIPT_ROOTS`
+(colon-separated absolute paths) in the git-ignored
+`.model-quality/web-remote.env`, then run
+`scripts/model-quality-web-remote restart`. Real deployment container names
+belong in that local configuration, not in tracked source.
+
+Evaluation does not require another container. Create an isolated Conda
+environment inside the quantization container with
+`ci/model_quality/web/deploy/create_lm_eval_env.sh`. The Plan page accepts its
+Python path plus a reviewed argv command; the worker expands run placeholders
+and executes that command directly in the quant container. The bundled
+`ci.model_quality.evaluators.lm_eval_api_pair` adapter evaluates two
+OpenAI-compatible base/compressed endpoints, so model serving can stay in the
+user-selected inference container while lm-eval remains isolated from the
+quantization Python environment.
+
+When the base model cannot be served, the same adapter accepts a versioned
+dataset reference through `--reference-values-json` and `--reference-id`.
+Reference values are valid only when task version, few-shot count, prompt/chat
+template, seed, generation settings, and metric name match the compressed run;
+the evaluator records the reference ID and marks the baseline source as
+`reference-values` in the auditable result.
+
+The inference script remains a reviewed script inside the selected prestarted
+container. The queue worker may run in the quant container; deployments must
+provide an allowlisted container runtime adapter for that one inference step.
+The lm-eval command itself always runs through the isolated Conda Python in the
+quant container, so no lm-eval container or nested container orchestration is
+required.
+
+The quant container uses two isolated evaluation environments because
+EvalScope and lm-eval require incompatible `datasets` versions. Run
+`create_lm_eval_env.sh` and `create_evalscope_env.sh`, then select the tool on
+the Plan page to generate an
+`ci.model_quality.evaluators.evalscope_api` command, or provide a reviewed argv
+manually. It supports the same endpoint/reference-value baseline modes and
+normalizes EvalScope reports into the CI quality-gate schema.
 
 ## Local dry run
 

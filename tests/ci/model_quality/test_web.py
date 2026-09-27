@@ -64,9 +64,11 @@ def _make_run(root: Path) -> None:
 
 def test_store_lists_runs_and_model(tmp_path: Path) -> None:
     _make_run(tmp_path)
+    (tmp_path / "20260926T000000Z_local" / "attempt-plans").mkdir()
     store = RunStore(tmp_path)
     result = store.list_runs()
     assert result["total"] == 1
+    assert result["items"][0]["model_count"] == 1
     assert result["items"][0]["run_id"] == "20260926T000000Z_local"
     model = store.get_model("20260926T000000Z_local", "demo")
     assert model["artifact_fingerprint"] == "artifact-1"
@@ -177,7 +179,13 @@ def test_wsgi_serves_browser_ui_and_static_assets(tmp_path: Path) -> None:
     assert b'id="runs-view"' in index
     assert b'id="plan-form"' in index
     assert b'id="operations-view"' in index
-    assert b'<script src="/ui/app.js" defer>' in index
+    assert b'id="run-failures"' in index
+    assert b'data-modes="quantize quantize_and_eval"' in index
+    assert b"Existing run ID" in index
+    assert b'class="required-tag"' in index
+    assert b'<script src="/ui/app.js?v=' in index
+    assert b'id="plan-feedback"' in index
+    assert b'id="preview-plan"' in index
 
     response, css = request("/ui/app.css")
     assert response["headers"]["Content-Type"].startswith("text/css")
@@ -189,6 +197,14 @@ def test_wsgi_serves_browser_ui_and_static_assets(tmp_path: Path) -> None:
     assert b"/api/plans/preview" in javascript
     assert b"window.setInterval" in javascript
     assert b"window.clearInterval" in javascript
+    assert b"updatePlanMode" in javascript
+    assert b"Required fields missing" in javascript
+    assert b"Submitting plan preview" in javascript
+    assert b"showPlanError" in javascript
+    assert b"renderFailures" in javascript
+    assert b"Open stage log" in javascript
+    assert b"Failure history" in javascript
+    assert b'!evaluation.includes("--reference-values-json")' in javascript
     assert b"textContent" in javascript
 
     response, body = request("/ui/unknown.js")

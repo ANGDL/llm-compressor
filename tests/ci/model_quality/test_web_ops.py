@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,7 +28,7 @@ from ci.model_quality.web import (
     scheduler,
 )
 from ci.model_quality.web.ops import cron_matches, parse_cron, run_due_schedules
-from ci.model_quality.web.worker import execute_job, run_once
+from ci.model_quality.web.worker import execute_job, execution_argv, run_once
 
 OPERATOR = Principal(actor="alice", roles=frozenset({"operator"}), authenticated=True)
 ADMIN = Principal(actor="dave", roles=frozenset({"admin"}), authenticated=True)
@@ -456,6 +457,84 @@ def test_worker_executes_queued_job_and_releases_reservation(web_env) -> None:
     assert "ok quantize" in log.read_text(encoding="utf-8")
 
 
+def test_worker_passes_evaluation_override_to_stage(web_env) -> None:
+    captured = {}
+
+    def runner(argv, **kwargs):
+        captured.update(argv=argv, env=kwargs["env"])
+        return type("Completed", (), {"returncode": 0})()
+
+    jobs = JobStore(web_env.root)
+    job = jobs.create(
+        run_id="run-a",
+        model_id=web_env.model_id,
+        attempt_id="attempt-1",
+        kind="evaluate",
+        executor="queue",
+        stages=["evaluate"],
+        details={
+            "run_mode": "eval_only",
+            "evaluation_command": [
+                "/root/miniconda/envs/model_quality_lm_eval/bin/python",
+                "eval.py",
+                "--output",
+                "{reports_dir}/evaluation-raw.json",
+            ],
+        },
+    )
+    execute_job(
+        job,
+        root=web_env.root,
+        config_path=web_env.config,
+        jobs=jobs,
+        ledger=ReservationLedger(web_env.root, capacity_gpu_hours=10),
+        argv_prefix=(sys.executable, "stage.py"),
+        runner=runner,
+    )
+    assert captured["argv"][captured["argv"].index("--stage") + 1] == "evaluate"
+    assert captured["env"]["PYTHONPATH"].split(os.pathsep)[0] == str(
+        Path(__file__).parents[3]
+    )
+    assert json.loads(captured["env"]["MODEL_QUALITY_EVALUATION_COMMAND_JSON"])[
+        0
+    ].endswith("model_quality_lm_eval/bin/python")
+
+
+def test_worker_builds_inference_container_command(web_env) -> None:
+    job = {
+        "run_id": "run-a",
+        "model_id": web_env.model_id,
+        "attempt_id": "attempt-1",
+        "kind": "inference",
+        "container_name": "zhuang_xsgl_0923",
+        "script": "/workspace/smoke.sh",
+        "details": {
+            "source_path": str(web_env.source),
+            "inference_arguments": ["{output_dir}", "{reports_dir}"],
+        },
+    }
+    argv = execution_argv(
+        job,
+        "runtime-smoke",
+        root=web_env.root,
+        config_path=web_env.config,
+        argv_prefix=(sys.executable,),
+        container_runtime=("docker",),
+    )
+    assert argv[:4] == ["docker", "exec", "zhuang_xsgl_0923", "/workspace/smoke.sh"]
+    assert argv[-2].endswith(f"run-a/{web_env.model_id}/model")
+    assert argv[-1].endswith("attempts/attempt-1/reports")
+    direct = execution_argv(
+        job,
+        "runtime-smoke",
+        root=web_env.root,
+        config_path=web_env.config,
+        argv_prefix=(sys.executable,),
+        container_runtime=("direct",),
+    )
+    assert direct[0] == "/workspace/smoke.sh"
+
+
 def test_worker_classifies_script_failure(web_env) -> None:
     stub = _stub(web_env.tmp_path)
     context = _queued_job(web_env)
@@ -561,6 +640,27 @@ def test_worker_returns_none_when_queue_is_empty(web_env) -> None:
     assert (
         run_once(
             root=web_env.root, config_path=web_env.config, jobs=JobStore(web_env.root)
+        )
+        is None
+    )
+
+
+def test_worker_filters_queue_by_job_kind(web_env) -> None:
+    jobs = JobStore(web_env.root)
+    jobs.create(
+        run_id="run-a",
+        model_id=web_env.model_id,
+        attempt_id="attempt-1",
+        kind="inference",
+        executor="queue",
+        stages=["runtime-smoke"],
+    )
+    assert (
+        run_once(
+            root=web_env.root,
+            config_path=web_env.config,
+            jobs=jobs,
+            kinds=frozenset({"evaluate"}),
         )
         is None
     )

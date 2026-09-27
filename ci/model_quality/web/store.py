@@ -114,7 +114,7 @@ class RunStore:
             for path in run_dir.iterdir()
             if path.is_dir()
             and _SAFE_COMPONENT.fullmatch(path.name)
-            and path.name not in {"events", "logs"}
+            and path.name not in {"attempt-plans", "events", "logs"}
         }
         return sorted(planned | materialized)
 
@@ -196,6 +196,90 @@ class RunStore:
             reverse=True,
         )
 
+    @staticmethod
+    def _compact_stage_detail(value: dict[str, Any] | None) -> dict[str, Any] | None:
+        """Keep status and diagnostics while excluding artifact inventories."""
+
+        if not isinstance(value, dict):
+            return None
+        keys = (
+            "status",
+            "reason_code",
+            "message",
+            "failure_class",
+            "attempt_id",
+            "artifact_fingerprint",
+            "evaluation_fingerprint",
+            "recorded_at",
+        )
+        result = {key: value[key] for key in keys if value.get(key) is not None}
+        failures = value.get("failures")
+        if isinstance(failures, list):
+            result["failures"] = [
+                item if isinstance(item, str) else str(item)
+                for item in failures[:20]
+            ]
+        return result
+
+    def _failure_history(
+        self, model_dir: Path, current_attempt_id: str | None
+    ) -> list[dict[str, Any]]:
+        """Return compact immutable stage and job failures for the run detail UI."""
+
+        history: list[dict[str, Any]] = []
+        attempts_dir = model_dir / "attempts"
+        for attempt_dir in attempts_dir.iterdir() if attempts_dir.is_dir() else []:
+            if not attempt_dir.is_dir() or not _SAFE_COMPONENT.fullmatch(attempt_dir.name):
+                continue
+            for path in sorted((attempt_dir / "state").glob("*.json")):
+                value = self._read_json(path)
+                if not isinstance(value, dict):
+                    continue
+                status = self._status(value)
+                if status not in _FAILURE_STATUSES | {"RESOURCE_TIMEOUT"}:
+                    continue
+                detail = self._compact_stage_detail(value) or {}
+                history.append(
+                    {
+                        "stage": path.stem,
+                        "status": status,
+                        "reason_code": detail.get("reason_code"),
+                        "message": detail.get("message"),
+                        "failure_class": detail.get("failure_class"),
+                        "attempt_id": detail.get("attempt_id") or attempt_dir.name,
+                        "recorded_at": detail.get("recorded_at"),
+                        "current": attempt_dir.name == current_attempt_id,
+                    }
+                )
+        for path in sorted((model_dir / "jobs").glob("*.json")):
+            value = self._read_json(path)
+            if not isinstance(value, dict):
+                continue
+            status = str(value.get("status") or "").upper()
+            if status not in {"FAILED", "EXPIRED", "CANCELED"}:
+                continue
+            details = value.get("details") if isinstance(value.get("details"), dict) else {}
+            failure_class = value.get("failure_class") or details.get("failure_class")
+            message = details.get("message") or details.get("cancel_reason")
+            history.append(
+                {
+                    "stage": details.get("failed_stage") or (value.get("stages") or [value.get("kind")])[0],
+                    "status": status,
+                    "reason_code": failure_class or status,
+                    "message": message,
+                    "failure_class": failure_class,
+                    "attempt_id": value.get("attempt_id"),
+                    "job_id": value.get("job_id"),
+                    "recorded_at": value.get("updated_at") or value.get("created_at"),
+                    "current": value.get("attempt_id") == current_attempt_id,
+                }
+            )
+        return sorted(
+            history,
+            key=lambda item: (self._timestamp(item.get("recorded_at")) or float("-inf"), item.get("attempt_id") or ""),
+            reverse=True,
+        )
+
     def _report(self, model_dir: Path) -> dict[str, Any] | None:
         for name in ("summary.json", "evaluation.json", "report.json"):
             value = self._read_json(model_dir / "reports" / name)
@@ -225,21 +309,40 @@ class RunStore:
             status = raw_status
         return {"status": status, "state": value, "success": success}
 
-    def _model_summary(self, run_id: str, model_id: str) -> dict[str, Any]:
+    def _model_summary(
+        self, run_id: str, model_id: str, *, include_details: bool = True
+    ) -> dict[str, Any]:
         model_dir = self._model_dir(run_id, model_id)
         stages = self._stage_records(model_dir)
         statuses = {stage: self._status(value) for stage, value in stages.items()}
+        if not include_details:
+            return {
+                "model_id": model_id,
+                "status": self._model_status(statuses),
+                "stages": statuses,
+                "publish": self._publish_summary(model_dir),
+            }
         manifest = self._read_json(model_dir / "artifact-manifest.json")
         current = self._read_json(model_dir / "current-attempt.json")
         return {
             "model_id": model_id,
             "status": self._model_status(statuses),
             "stages": statuses,
-            "stage_details": stages,
+            "stage_details": {
+                stage: self._compact_stage_detail(value)
+                for stage, value in stages.items()
+            },
             "attempt_id": (
                 current.get("attempt_id") if isinstance(current, dict) else None
             ),
             "attempts": self._attempts(model_dir),
+            "failure_history": [
+                {**item, "model_id": model_id}
+                for item in self._failure_history(
+                    model_dir,
+                    current.get("attempt_id") if isinstance(current, dict) else None,
+                )
+            ],
             "artifact_fingerprint": (
                 current.get("artifact_fingerprint")
                 if isinstance(current, dict)
@@ -250,7 +353,15 @@ class RunStore:
                 if isinstance(current, dict)
                 else self._first_identity(stages, "evaluation_fingerprint")
             ),
-            "artifact_manifest": manifest if isinstance(manifest, dict) else None,
+            "artifact_manifest": (
+                {
+                    key: manifest[key]
+                    for key in ("schema_version", "artifact_fingerprint", "artifact_content_fingerprint", "content_fingerprint", "file_count")
+                    if isinstance(manifest, dict) and key in manifest
+                }
+                if isinstance(manifest, dict)
+                else None
+            ),
             "report": self._report(model_dir),
             "publish": self._publish_summary(model_dir),
         }
@@ -329,7 +440,7 @@ class RunStore:
                 continue
             run_id = str(plan.get("run_id", run_dir.name))
             models = [
-                self._model_summary(run_id, model_id)
+                self._model_summary(run_id, model_id, include_details=False)
                 for model_id in self._model_ids(run_dir, plan)
             ]
             if model and not any(item["model_id"] == model for item in models):
