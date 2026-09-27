@@ -129,6 +129,7 @@ class LaunchPolicy:
 
     inference_containers: tuple[str, ...] = ()
     inference_script_roots: tuple[Path, ...] = ()
+    evaluation_commands: tuple[str, ...] = ()
     quantization_executables: tuple[str, ...] = ("python3",)
     allowed_output_roots: tuple[Path, ...] = ()
     gpu_hour_capacity: float = 80.0
@@ -179,6 +180,9 @@ class LaunchPolicy:
                     env.get("MODEL_QUALITY_INFERENCE_SCRIPT_ROOTS"), os.pathsep
                 )
             ),
+            evaluation_commands=cls._split(
+                env.get("MODEL_QUALITY_EVALUATION_COMMANDS"), os.pathsep
+            ),
             quantization_executables=executables,
             allowed_output_roots=tuple(
                 Path(part).expanduser()
@@ -199,6 +203,40 @@ class LaunchPolicy:
             ),
             executor=env.get("MODEL_QUALITY_WEB_EXECUTOR", "queue"),
         )
+
+
+def validate_evaluation_command(
+    value: Any, *, policy: LaunchPolicy
+) -> list[str] | None:
+    """Validate an optional evaluation argv override for the quant container."""
+
+    if value is None:
+        return None
+    if (
+        not isinstance(value, list)
+        or not value
+        or not all(isinstance(token, str) and token for token in value)
+    ):
+        raise ValidationError("evaluation_command must be a non-empty argv list")
+    command = list(value)
+    if policy.evaluation_commands:
+        executable = command[0]
+        if executable not in policy.evaluation_commands:
+            raise ValidationError(
+                "evaluation command must start with one of "
+                + ", ".join(policy.evaluation_commands)
+            )
+    for index, token in enumerate(command):
+        literal = token
+        for placeholder in PLACEHOLDERS:
+            literal = literal.replace(placeholder, "placeholder")
+        _reject_shell_metacharacters(literal, f"evaluation_command[{index}]")
+        unknown = re.findall(r"\{[A-Za-z_][A-Za-z0-9_]*\}", literal)
+        if unknown:
+            raise ValidationError(
+                f"evaluation_command[{index}] uses an unknown placeholder"
+            )
+    return command
 
 
 def validate_inference_config(
@@ -593,6 +631,9 @@ class PlanService:
         inference = validate_inference_config(
             request.get("inference"), policy=self.policy
         )
+        evaluation_command = validate_evaluation_command(
+            request.get("evaluation_command"), policy=self.policy
+        )
         quantization_argv = None
         if request.get("quantization") is not None:
             quantization_argv = build_quantization_argv(
@@ -622,11 +663,19 @@ class PlanService:
         for job in plan["selected"]:
             if quantization_argv is not None:
                 job["quantization_argv"] = list(quantization_argv)
-        review = self._review(plan, request, models, inference, quantization_argv)
+        review = self._review(
+            plan,
+            request,
+            models,
+            inference,
+            evaluation_command,
+            quantization_argv,
+        )
         payload = {
             "plan": plan,
             "review": review,
             "inference": inference,
+            "evaluation_command": evaluation_command,
             "quantization_argv": quantization_argv,
         }
         plan_hash = hashlib.sha256(
@@ -645,6 +694,7 @@ class PlanService:
         request: dict[str, Any],
         models: dict[str, dict[str, Any]],
         inference: dict[str, Any] | None,
+        evaluation_command: list[str] | None,
         quantization_argv: list[str] | None,
     ) -> dict[str, Any]:
         selected_ids = [job["id"] for job in plan["selected"]]
@@ -764,6 +814,7 @@ class PlanService:
                 ],
             },
             "evaluation": {
+                "argv_override": evaluation_command,
                 "models": [
                     {
                         "model_id": model_id,
@@ -781,7 +832,7 @@ class PlanService:
                         .get("runtime_revision"),
                     }
                     for model_id in selected_ids
-                ]
+                ],
             },
         }
         return {
@@ -822,5 +873,6 @@ class PlanService:
             "plan_hash": plan_hash,
             "plan": record.get("plan"),
             "inference": record.get("inference"),
+            "evaluation_command": record.get("evaluation_command"),
             "quantization_argv": record.get("quantization_argv"),
         }

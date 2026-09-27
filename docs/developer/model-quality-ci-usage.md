@@ -198,7 +198,6 @@ models: []
 
 仓库里现成的参考：
 
-- `config/models/deepseek_v4_flash_0731_wna8.yaml`：实际在跑的 DeepSeek-V4-Flash WNA8 定义（含 xSGL runtime smoke）。
 - `config/models/deepseek_v4_wna8.example.yaml`：量化入口所有参数的写法示例，默认 disabled。
 
 ### 4.2 字段
@@ -250,65 +249,38 @@ workflow:
 | 命令 | 可用占位符 |
 |---|---|
 | `workflow.quantize` | `{source_path}`、`{run_dir}`、`{output_dir}`、`{work_dir}`、`{logs_dir}`、`{reports_dir}` |
-| `runtime_smoke.command` | 同上 |
 | `evaluation.command` | 同上（其中 `{reports_dir}` 指向 attempt 内报告目录） |
 | `upload.commands` / `verify_commands` / `success_commands` | `{output_dir}`、`{reports_dir}`、`{remote_run_prefix}`、`{model_id}`、`{run_id}` |
 
-### 4.4 runtime_smoke 的两种运行时
+### 4.4 runtime_smoke 的运行方式
 
-**方式一：vLLM（默认）** 用 `runtime_smoke.python`（或 `VLLM_PYTHON_ENV`）执行 `ci.model_quality.vllm_smoke`，由 vLLM 加载产物并生成固定 prompts。预检会检查该 Python 能否 `import vllm`。
+`runtime_smoke` 默认使用 vLLM：由 `runtime_smoke.python`（或 `VLLM_PYTHON_ENV`）执行 `ci.model_quality.vllm_smoke`，加载量化产物并生成固定 prompts。预检会检查该 Python 能否 `import vllm`。
 
-**方式二：自定义 command** 目标主机不用 vLLM 提供产物时，配置 `runtime_smoke.command`（argv 数组，占位符规则同 §4.3），替换内置 vLLM 路径：
+如果推理容器已经由用户或运维启动，可以使用自定义脚本。Web/API 只接受已登记的容器名和容器内脚本 argv；它不会创建、启动或停止容器，也不接受服务器地址、固定端口、任意 URL 或未审核的 shell 字符串：
 
 ```yaml
 runtime_smoke:
   enabled: true
-  runtime_revision: sglang-0.5.10+44a64804b
-  prompts:
-    - The capital of France is
-  command:
-    - python3
-    - -m
-    - ci.model_quality.xsgl_smoke
+  runtime_revision: approved-runtime-revision
+  container_name: user-provided-runtime
+  script:
+    - /workspace/run_inference_smoke.sh
     - --model
     - "{output_dir}"
-    - --base-url
-    - http://127.0.0.1:30000
-    - --served-model-name
-    - deepseek-v4-flash
-    - --prompts-json
-    - '["The capital of France is"]'
-    - --wait-ready-seconds
-    - "1800"
-    - --output
-    - "{reports_dir}/runtime-smoke-output.json"
+    - --reports
+    - "{reports_dir}"
+    - --run-id
+    - "{run_id}"
+    - --model-id
+    - "{model_id}"
   result_file: "{reports_dir}/runtime-smoke-output.json"
 ```
 
 契约：
 
-- 配了 `command` 后，预检只校验 argv 第一个元素是可执行文件，不再要求 `import vllm`。
-- 命令必须自己写出 `result_file`，内容形如 `{"status": "PASS", "outputs": [...]}`。退出码为 0 但没有结果文件、结果里 `status` 不是 `PASS`、或 `outputs` 为空，都判定 `RUNTIME_SMOKE_FAILED`。
-- `runtime_revision` 仍然必填，用于标识运行时身份。
-
-**xSGL 适配器** `ci.model_quality.xsgl_smoke` 查询一个**已经在运行**的 SGLang OpenAI 兼容服务：
-
-- `--base-url` 指定服务地址；`--wait-ready-seconds` 用于轮询 `/health` 直到就绪。
-- `--served-model-name` 要与 `sglang serve --served-model-name` 一致。
-- 当前固定的 SGLang 版本不返回输出 token id，因此适配器会用 checkpoint tokenizer 重新编码生成文本，并在记录里用 `token_ids_source: local_checkpoint_tokenizer` 标明来源；tokenizer 不可用时该字段为 null，`completion_tokens` 仍来自服务端 usage。
-
-服务生命周期由部署方管理——CI 控制面容器通常没有 docker 访问权限。仓库提供 `ci/model_quality/xsgl_launcher.sh`，在**宿主机**上从服务容器拉起服务并等待 `/health`：
-
-```bash
-bash ci/model_quality/xsgl_launcher.sh <model_dir> [port] [container] [ready_timeout_seconds]
-
-# 例：把刚量化出来的产物喂给 xSGL 容器（在宿主机上执行）
-bash ci/model_quality/xsgl_launcher.sh \
-  /ssd2/model-quality/runs/$RUN_ID/deepseek-v4-flash-0731-wna8/model \
-  30000 zhuang_xsgl_0923 2400
-```
-
-两个容器共享 host network 时，`http://127.0.0.1:30000` 在控制面容器里可直接访问。
+- 容器在 run 启动前必须已存在且可执行；CI 只在该容器中运行受审核脚本，并记录容器名、脚本 revision、退出码和日志。
+- 脚本必须读取指定 artifact，生成 `result_file`，内容形如 `{"status": "PASS", "outputs": [...]}`。退出码非零、结果文件缺失、结果里 `status` 不是 `PASS` 或 `outputs` 为空，都判定为 `RUNTIME_SMOKE_FAILED`。
+- `runtime_revision` 用于标识推理环境；脚本执行不会改变容器生命周期。
 
 ### 4.5 validation 检查项
 

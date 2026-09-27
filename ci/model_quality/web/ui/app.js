@@ -51,6 +51,20 @@ function notify(message, error = false) {
   notify.timeout = setTimeout(() => element.classList.add("hidden"), 6000);
 }
 
+function setPlanFeedback(message = "", error = false) {
+  const element = $("#plan-feedback");
+  element.textContent = message;
+  element.classList.toggle("error", error);
+  element.classList.toggle("hidden", !message);
+}
+
+function setPreviewPending(pending) {
+  const button = $("#preview-plan");
+  button.disabled = pending;
+  button.textContent = pending ? "Previewing…" : "Preview plan";
+  button.setAttribute("aria-busy", String(pending));
+}
+
 function metric(label, value, detail = "") {
   return `<article class="metric"><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong>${detail ? `<small>${escapeHtml(detail)}</small>` : ""}</article>`;
 }
@@ -67,6 +81,7 @@ async function bootstrap() {
     state.models = models.items || [];
     setConnection(true, `Connected · ${health.principal.actor}`);
     populateModels();
+    updatePlanMode();
     route();
   } catch (error) {
     setConnection(false, "API unavailable");
@@ -80,6 +95,75 @@ function populateModels() {
   $("#plan-form [name=models]").insertAdjacentHTML("beforeend", options);
 }
 
+function populateRunIds() {
+  const select = $("#plan-form [name=run_id]");
+  if (!select) return;
+  select.innerHTML = '<option value="">Select an existing run</option>' + state.runs.map((run) => `<option value="${escapeHtml(run.run_id)}">${escapeHtml(run.run_id)} · ${escapeHtml(run.status)}</option>`).join("");
+}
+
+const MODE_GUIDANCE = {
+  quantize: ["Quantize new artifact", "Model, budget, inference container, and smoke script are required. Quality evaluation is skipped."],
+  quantize_and_eval: ["Quantize and evaluate", "Model, budget, inference smoke, evaluation tool, and baseline are required."],
+  eval_only: ["Evaluate an existing artifact", "Existing run, budget, inference smoke, evaluation tool, and baseline are required. Quantization fields are hidden."],
+  upload_only: ["Publish an existing artifact", "Existing run and inference smoke are required. Evaluation and quantization fields are hidden."],
+};
+
+function updatePlanMode() {
+  const form = $("#plan-form");
+  const mode = form.elements.run_mode.value;
+  $$('[data-modes]', form).forEach((element) => {
+    const visible = element.dataset.modes.split(" ").includes(mode);
+    element.classList.toggle("hidden", !visible);
+    $$('input, select, textarea', element).forEach((field) => { field.disabled = !visible; });
+  });
+  const [title, detail] = MODE_GUIDANCE[mode];
+  $("#mode-guidance").innerHTML = `<strong>${escapeHtml(title)}</strong> · ${escapeHtml(detail)}`;
+  setPlanFeedback();
+  clearPlanFieldErrors();
+  updateBaselineFields();
+}
+
+function updateBaselineFields() {
+  const form = $("#plan-form");
+  const reference = form.elements.baseline_source?.value === "reference";
+  $$('[data-baseline="reference"]', form).forEach((element) => {
+    const visible = !element.closest("fieldset").classList.contains("hidden") && reference;
+    element.classList.toggle("hidden", !visible);
+    $$('input, select, textarea', element).forEach((field) => { field.disabled = !visible; });
+  });
+}
+
+function validatePlanForm(form) {
+  const mode = form.get("run_mode");
+  const missing = [];
+  if (["eval_only", "upload_only"].includes(mode) && !form.get("run_id")) missing.push(["run_id", "existing run ID"]);
+  if (!form.get("container_name")) missing.push(["container_name", "inference container"]);
+  if (!form.get("script")) missing.push(["script", "inference script"]);
+  if (["quantize_and_eval", "eval_only"].includes(mode) && form.get("baseline_source") === "reference") {
+    if (!form.get("reference_id")) missing.push(["reference_id", "reference ID"]);
+    if (!form.get("reference_values")) missing.push(["reference_values", "reference metrics JSON"]);
+  }
+  if (missing.length) {
+    const error = new Error(`Required fields missing: ${missing.map((item) => item[1]).join(", ")}`);
+    error.fields = missing.map((item) => item[0]);
+    throw error;
+  }
+}
+
+function clearPlanFieldErrors() {
+  $$("[aria-invalid='true']", $("#plan-form")).forEach((field) => field.removeAttribute("aria-invalid"));
+}
+
+function showPlanError(error) {
+  clearPlanFieldErrors();
+  setPlanFeedback(error.message, true);
+  const fields = error.fields || [];
+  fields.forEach((name) => $(`#plan-form [name="${name}"]`)?.setAttribute("aria-invalid", "true"));
+  const firstField = fields.length ? $(`#plan-form [name="${fields[0]}"]`) : null;
+  (firstField || $("#plan-feedback")).scrollIntoView({ behavior: "smooth", block: "center" });
+  firstField?.focus({ preventScroll: true });
+}
+
 function route() {
   const hash = location.hash.slice(1) || "runs";
   closeEvents();
@@ -90,6 +174,7 @@ function route() {
     loadRun(decodeURIComponent(hash.slice(4)));
   } else if (hash === "plan") {
     $("#plan-view").classList.remove("hidden");
+    if (!state.runs.length) loadRuns({ updateTable: false });
   } else if (hash === "operations") {
     $("#operations-view").classList.remove("hidden");
     loadOperations();
@@ -100,14 +185,17 @@ function route() {
   $("#app").focus({ preventScroll: true });
 }
 
-async function loadRuns() {
+async function loadRuns(options = {}) {
+  const updateTable = options.updateTable !== false;
   const form = new FormData($("#run-filters"));
   const query = new URLSearchParams();
   for (const [name, value] of form.entries()) if (value) query.set(name, value);
-  $("#run-rows").innerHTML = '<tr><td colspan="7" class="empty">Loading runs…</td></tr>';
+  if (updateTable) $("#run-rows").innerHTML = '<tr><td colspan="7" class="empty">Loading runs…</td></tr>';
   try {
     const result = await api(`/api/runs?${query}`);
     state.runs = result.items || [];
+    populateRunIds();
+    if (!updateTable) return;
     const totals = { total: result.total, running: 0, failed: 0, ready: 0 };
     for (const run of state.runs) {
       if (run.status === "RUNNING") totals.running += 1;
@@ -129,11 +217,14 @@ async function loadRuns() {
 async function loadRun(runId) {
   $("#run-title").textContent = runId;
   try {
-    const [run, jobs] = await Promise.all([api(`/api/runs/${encodeURIComponent(runId)}`), api(`/api/runs/${encodeURIComponent(runId)}/jobs`)]);
+    const run = await api(`/api/runs/${encodeURIComponent(runId)}`);
     state.run = run;
-    state.jobs = jobs.items || [];
+    state.jobs = [];
     renderRun();
     subscribe(runId);
+    const jobs = await api(`/api/runs/${encodeURIComponent(runId)}/jobs`);
+    state.jobs = jobs.items || [];
+    renderJobs();
   } catch (error) {
     notify(error.message, true);
   }
@@ -153,10 +244,61 @@ function renderRun() {
   if (permissions.has("publish")) actions.push('<button class="button" data-action="publish-preview">Publish preview</button>');
   if (permissions.has("cancel")) actions.push('<button class="button danger" data-action="cancel">Cancel run</button>');
   $("#run-actions").innerHTML = actions.join("");
+  renderFailures();
   renderTimeline(run.models || []);
   renderJobs();
   renderModels();
   configureLogs();
+}
+
+function failureMessage(value) {
+  if (!value || typeof value !== "object") return "No failure detail was recorded. Open the stage log for more information.";
+  if (value.message) return String(value.message);
+  if (Array.isArray(value.failures) && value.failures.length) return value.failures.join("; ");
+  if (value.reason) return String(value.reason);
+  if (value.reason_code) return String(value.reason_code).replaceAll("_", " " ).toLowerCase();
+  return "No failure detail was recorded. Open the stage log for more information.";
+}
+
+function renderFailures() {
+  const failures = [];
+  for (const failure of (state.run.failure_history || [])) {
+    failures.push({
+      model: failure.model_id || state.run.models?.[0]?.model_id || "model",
+      stage: failure.stage || "unknown",
+      reasonCode: failure.reason_code || failure.failure_class || failure.status,
+      message: failure.message || (failure.status === "CANCELED" ? "Job was canceled." : failureMessage(failure)),
+      attemptId: failure.attempt_id,
+      current: Boolean(failure.current),
+      status: failure.status,
+    });
+  }
+  for (const model of state.run.models || []) {
+    for (const stage of STAGES) {
+      const detail = model.stage_details?.[stage];
+      if (!["FAIL", "FAILED", "RESOURCE_TIMEOUT"].includes(String(detail?.status || "").toUpperCase())) continue;
+      if (!failures.some((item) => item.model === model.model_id && item.stage === stage && item.attemptId === detail.attempt_id)) failures.push({ model: model.model_id, stage, reasonCode: detail.reason_code, message: failureMessage(detail), attemptId: detail.attempt_id, current: true });
+    }
+  }
+  for (const job of state.jobs) {
+    if (!failureStatus(job.status) && job.failure_class !== "CANCELED") continue;
+    const failedStage = job.details?.failed_stage || (job.stages || [])[0] || job.kind;
+    const model = (state.run.models || []).find((item) => item.model_id === job.model_id);
+    const latestStage = model?.stage_details?.[failedStage];
+    if (latestStage?.attempt_id === job.attempt_id && !failureStatus(latestStage.status)) continue;
+    if (job.failure_class === "CANCELED" && !String(job.details?.cancel_reason || "").startsWith("failed:")) continue;
+    if (failures.some((item) => item.model === job.model_id && item.stage === failedStage && item.attemptId === job.attempt_id)) continue;
+    failures.push({ model: job.model_id, stage: failedStage, reasonCode: job.failure_class, message: job.details?.message || job.details?.cancel_reason || failureMessage(job.details), attemptId: job.attempt_id, current: false });
+  }
+  const hasCurrentFailure = failures.some((failure) => failure.current);
+  $("#failure-eyebrow").textContent = hasCurrentFailure ? "Needs attention" : "Earlier attempts";
+  $("#failure-heading").textContent = hasCurrentFailure ? "Current failure reasons" : "Failure history";
+  $("#run-failures").classList.toggle("hidden", !failures.length);
+  $("#failure-list").innerHTML = failures.map((failure) => `<article class="failure-item ${failure.current ? "current" : "historical"}"><div><strong>${escapeHtml(failure.stage)} failed</strong> ${failure.reasonCode ? `<span class="reason-code">${escapeHtml(failure.reasonCode)}</span>` : ""} <span class="failure-age">${failure.current ? "Current" : "Historical"}</span></div><p>${escapeHtml(failure.message)}</p><small>${escapeHtml(failure.model)} · attempt ${escapeHtml(short(failure.attemptId, 24))}</small><button class="ghost failure-log" type="button" data-failure-model="${escapeHtml(failure.model)}" data-failure-stage="${escapeHtml(failure.stage)}" data-failure-attempt="${escapeHtml(failure.attemptId || "")}">Open stage log</button></article>`).join("");
+}
+
+function failureStatus(value) {
+  return ["FAIL", "FAILED", "RESOURCE_TIMEOUT"].includes(String(value || "").toUpperCase());
 }
 
 function renderTimeline(models) {
@@ -169,7 +311,17 @@ function renderTimeline(models) {
 }
 
 function renderJobs() {
-  $("#job-lanes").innerHTML = state.jobs.length ? state.jobs.map((job) => `<article class="lane"><h3>${escapeHtml(job.kind)} ${badge(job.status)}</h3><dl><dt>Queue</dt><dd>${escapeHtml(text(job.queue))}</dd><dt>GPU</dt><dd>${escapeHtml(text(job.gpu_count, "0"))} · ${escapeHtml(formatNumber(job.gpu_hours))} h</dd><dt>Attempt</dt><dd class="mono">${escapeHtml(short(job.attempt_id, 18))}</dd><dt>Stages</dt><dd>${escapeHtml((job.stages || []).join(" → "))}</dd><dt>Exit</dt><dd>${escapeHtml(text(job.exit_code))}</dd></dl></article>`).join("") : '<p class="empty">No execution jobs recorded.</p>';
+  $("#job-lanes").innerHTML = state.jobs.length ? state.jobs.map((job) => `<article class="lane ${failureStatus(job.status) ? "failed" : ""}"><h3>${escapeHtml(job.kind)} ${badge(job.status)}</h3><dl><dt>Queue</dt><dd>${escapeHtml(text(job.queue))}</dd><dt>GPU</dt><dd>${escapeHtml(text(job.gpu_count, "0"))} · ${escapeHtml(formatNumber(job.gpu_hours))} h</dd><dt>Attempt</dt><dd class="mono">${escapeHtml(short(job.attempt_id, 18))}</dd><dt>Stages</dt><dd>${escapeHtml((job.stages || []).join(" → "))}</dd><dt>Exit</dt><dd>${escapeHtml(text(job.exit_code))}</dd>${failureStatus(job.status) ? `<dt>Reason</dt><dd class="job-failure">${escapeHtml(job.failure_class || job.details?.reason_code || "FAILED")} · ${escapeHtml(job.details?.message || "Open the stage log for details.")}</dd>` : ""}</dl></article>`).join("") : '<p class="empty">No execution jobs recorded.</p>';
+  renderFailures();
+}
+
+function openFailureLog(button) {
+  $("#log-model").value = button.dataset.failureModel;
+  $("#log-stage").value = button.dataset.failureStage;
+  updateAttempts();
+  if (button.dataset.failureAttempt) $("#log-attempt").value = button.dataset.failureAttempt;
+  loadLog();
+  $("#log-output").scrollIntoView({ behavior: "smooth", block: "center" });
 }
 
 function renderModels() {
@@ -182,15 +334,26 @@ function renderModels() {
 
 function configureLogs() {
   const models = state.run.models || [];
+  const selectedModel = $("#log-model").value;
+  const selectedStage = $("#log-stage").value;
   $("#log-model").innerHTML = models.map((model) => `<option>${escapeHtml(model.model_id)}</option>`).join("");
   $("#log-stage").innerHTML = STAGES.map((stage) => `<option>${stage}</option>`).join("");
+  if (models.some((model) => model.model_id === selectedModel)) $("#log-model").value = selectedModel;
+  if (STAGES.includes(selectedStage)) $("#log-stage").value = selectedStage;
   updateAttempts();
 }
 
 function updateAttempts() {
   const model = (state.run?.models || []).find((item) => item.model_id === $("#log-model").value);
-  const attempts = model?.attempts || [];
-  $("#log-attempt").innerHTML = attempts.length ? attempts.map((attempt) => `<option>${escapeHtml(attempt.attempt_id)}</option>`).join("") : `<option value="${escapeHtml(state.run?.attempt_id || "")}">${escapeHtml(state.run?.attempt_id || "Latest")}</option>`;
+  const stage = $("#log-stage").value;
+  const allAttempts = model?.attempts || [];
+  const attempts = allAttempts.filter((attempt) => {
+    const stages = attempt.stages || {};
+    return Object.prototype.hasOwnProperty.call(stages, stage);
+  });
+  const selectedAttempt = $("#log-attempt").value;
+  $("#log-attempt").innerHTML = attempts.length ? attempts.map((attempt) => `<option>${escapeHtml(attempt.attempt_id)}</option>`).join("") : '<option value="">No recorded attempt</option>';
+  if (attempts.some((attempt) => attempt.attempt_id === selectedAttempt)) $("#log-attempt").value = selectedAttempt;
 }
 
 async function loadLog() {
@@ -232,9 +395,31 @@ function closeEvents() {
 
 async function previewPlan(event) {
   event.preventDefault();
+  setPlanFeedback();
+  clearPlanFieldErrors();
   const form = new FormData(event.currentTarget);
-  const request = { run_mode: form.get("run_mode"), models: form.get("models"), max_gpu_hours: Number(form.get("max_gpu_hours")) };
-  if (form.get("container_name") || form.get("script")) request.inference = { container_name: form.get("container_name"), script: form.get("script"), arguments: [], result_file: "{reports_dir}/runtime-smoke-output.json" };
+  try { validatePlanForm(form); } catch (error) { showPlanError(error); return; }
+  const request = { run_mode: form.get("run_mode"), max_gpu_hours: Number(form.get("max_gpu_hours")) };
+  if (form.get("models")) request.models = form.get("models");
+  if (form.get("run_id")) request.run_id = form.get("run_id");
+  if (form.get("container_name") || form.get("script")) request.inference = { container_name: form.get("container_name"), script: form.get("script"), arguments: lines(form.get("inference_arguments")), result_file: "{reports_dir}/runtime-smoke-output.json" };
+  const evaluationRequired = ["quantize_and_eval", "eval_only"].includes(form.get("run_mode"));
+  const evaluation = lines(form.get("evaluation_command"));
+  if (evaluationRequired && !evaluation.length) {
+    const selectedTool = form.get("evaluation_tool");
+    const selectedPython = form.get("evaluation_python") || (selectedTool === "evalscope" ? "/root/miniconda/envs/model_quality_evalscope/bin/python" : "/root/miniconda/envs/model_quality_lm_eval/bin/python");
+    evaluation.push(
+      selectedPython, "-m",
+      selectedTool === "evalscope" ? "ci.model_quality.evaluators.evalscope_api" : "ci.model_quality.evaluators.lm_eval_api_pair"
+    );
+  }
+  if (evaluationRequired && form.get("baseline_source") === "reference" && form.get("reference_values")) {
+    if (!evaluation.includes("--reference-values-json")) evaluation.push("--reference-values-json", form.get("reference_values"));
+    if (form.get("reference_id") && !evaluation.includes("--reference-id")) evaluation.push("--reference-id", form.get("reference_id"));
+  }
+  if (evaluationRequired && evaluation.length) request.evaluation_command = evaluation;
+  setPreviewPending(true);
+  setPlanFeedback("Submitting plan preview…");
   try {
     state.plan = await api("/api/plans/preview", { method: "POST", body: JSON.stringify(request) });
     const risks = state.plan.review?.risks || [];
@@ -243,8 +428,18 @@ async function previewPlan(event) {
     $("#plan-json").textContent = JSON.stringify(state.plan, null, 2);
     $("#plan-review").classList.remove("hidden");
     $("#launch-plan").disabled = risks.some((risk) => risk.severity === "error");
+    setPlanFeedback("Plan preview is ready. Review the launch contract below.");
     $("#plan-review").scrollIntoView({ behavior: "smooth", block: "start" });
-  } catch (error) { notify(error.message, true); }
+  } catch (error) {
+    showPlanError(error);
+    notify(error.message, true);
+  } finally {
+    setPreviewPending(false);
+  }
+}
+
+function lines(value) {
+  return String(value || "").split("\n").map((token) => token.trim()).filter(Boolean);
 }
 
 async function launchPlan() {
@@ -343,11 +538,15 @@ window.addEventListener("hashchange", route);
 $("#run-filters").addEventListener("submit", (event) => { event.preventDefault(); loadRuns(); });
 $("#refresh-runs").addEventListener("click", loadRuns);
 $("#plan-form").addEventListener("submit", previewPlan);
+$("#plan-form [name=run_mode]").addEventListener("change", updatePlanMode);
+$("#plan-form [name=baseline_source]").addEventListener("change", updateBaselineFields);
 $("#launch-plan").addEventListener("click", launchPlan);
 $("#identity-button").addEventListener("click", openIdentity);
 $("#save-identity").addEventListener("click", saveIdentity);
 $("#log-model").addEventListener("change", updateAttempts);
+$("#log-stage").addEventListener("change", updateAttempts);
 $("#load-log").addEventListener("click", loadLog);
 $("#run-actions").addEventListener("click", async (event) => { const action = event.target.closest("[data-action]")?.dataset.action; if (action) try { await runAction(action); } catch (error) { notify(error.message, true); } });
 document.addEventListener("click", (event) => { const target = event.target.closest("[data-go]"); if (target) location.hash = target.dataset.go; });
+$("#failure-list").addEventListener("click", (event) => { const button = event.target.closest(".failure-log"); if (button) openFailureLog(button); });
 bootstrap();

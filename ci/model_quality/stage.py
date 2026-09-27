@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import traceback
 from pathlib import Path
 
@@ -92,7 +93,10 @@ def main() -> int:
             effective_artifact_fingerprint = manifest.get(
                 "finalized_artifact_fingerprint", args.fingerprint
             )
-            if effective_artifact_fingerprint is not None:
+            if effective_artifact_fingerprint is not None and not (
+                args.stage in {"evaluate", "report"}
+                and os.getenv("MODEL_QUALITY_EVALUATION_COMMAND_JSON")
+            ):
                 effective_evaluation_fingerprint = configured_evaluation_fingerprint(
                     model, effective_artifact_fingerprint
                 )

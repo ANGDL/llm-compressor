@@ -16,7 +16,8 @@ from ci.model_quality.executor import (
     run_report,
     run_validate,
 )
-from ci.model_quality.state import read_stage_result, write_stage_result
+from ci.model_quality.state import model_run_dir, read_stage_result, write_stage_result
+from ci.model_quality import stage as stage_module
 
 
 def _fake_model(tmp_path: Path) -> dict:
@@ -198,6 +199,115 @@ Path(sys.argv[2]).write_text(json.dumps({
 
     assert result["status"] == "PASS"
     assert result["argv"][2] == json_argument
+
+
+def test_report_keeps_override_evaluation_fingerprint(tmp_path, monkeypatch):
+    run_root = tmp_path / "runs"
+    monkeypatch.setenv("MODEL_QUALITY_RUNS_ROOT", str(run_root))
+    monkeypatch.setenv("MODEL_QUALITY_EVALUATION_COMMAND_JSON", '["custom-eval"]')
+    model = _fake_model(tmp_path)
+    config = tmp_path / "models.yaml"
+    config.write_text("unused")
+    artifact = "final-artifact"
+    override_evaluation = "override-evaluation"
+    model_dir = model_run_dir("run-a", model["id"])
+    model_dir.mkdir(parents=True)
+    (model_dir / "input-manifest.json").write_text(
+        json.dumps({"finalized_artifact_fingerprint": artifact})
+    )
+    monkeypatch.setattr(stage_module, "load_model_config", lambda _path: {"models": [model]})
+    captured = {}
+    monkeypatch.setattr(
+        stage_module,
+        "run_report",
+        lambda *_args, **kwargs: captured.update(kwargs) or {"status": "PASS"},
+    )
+    monkeypatch.setattr(
+        stage_module,
+        "parse_args",
+        lambda: type(
+            "Args",
+            (),
+            {
+                "config": config,
+                "model": model["id"],
+                "run_id": "run-a",
+                "attempt_id": "attempt-1",
+                "stage": "report",
+                "models_json": "[]",
+                "git_sha": "git",
+                "fingerprint": "planned-artifact",
+                "evaluation_fingerprint": override_evaluation,
+                "run_mode": "eval_only",
+                "dry_run": False,
+            },
+        )(),
+    )
+
+    assert stage_module.main() == 0
+    assert captured["artifact_fingerprint"] == artifact
+    assert captured["evaluation_fingerprint"] == override_evaluation
+
+
+def test_eval_only_report_accepts_planned_runtime_smoke_fingerprint(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("MODEL_QUALITY_RUNS_ROOT", str(tmp_path / "runs"))
+    model = _fake_model(tmp_path)
+    model["runtime_smoke"] = {"enabled": True}
+    run_id = "run-a"
+    attempt_id = "attempt-a"
+    planned = "planned-artifact"
+    finalized = "finalized-artifact"
+    evaluation = "override-evaluation"
+    run_dir = model_run_dir(run_id, model["id"])
+    run_dir.mkdir(parents=True)
+    (run_dir / "input-manifest.json").write_text(
+        json.dumps(
+            {
+                "fingerprint": planned,
+                "finalized_artifact_fingerprint": finalized,
+            }
+        )
+    )
+    for stage, status, fingerprint in (
+        ("preflight", "WARN", finalized),
+        ("validate", "PASS", finalized),
+        ("runtime-smoke", "PASS", planned),
+        ("evaluate", "PASS", finalized),
+    ):
+        write_stage_result(
+            run_id,
+            model["id"],
+            stage,
+            {"status": status},
+            attempt_id=attempt_id,
+            artifact_fingerprint=fingerprint,
+            evaluation_fingerprint=(evaluation if stage == "evaluate" else None),
+        )
+    reports = run_dir / "attempts" / attempt_id / "reports"
+    reports.mkdir(parents=True, exist_ok=True)
+    (reports / "evaluation.json").write_text(
+        json.dumps(
+            {
+                "status": "PASS",
+                "artifact_fingerprint": finalized,
+                "evaluation_fingerprint": evaluation,
+            }
+        )
+    )
+
+    result = run_report(
+        model,
+        run_id,
+        run_mode="eval_only",
+        artifact_fingerprint=finalized,
+        evaluation_fingerprint=evaluation,
+        attempt_id=attempt_id,
+    )
+
+    assert result["status"] == "PASS"
+    assert result["summary"]["stages"]["runtime-smoke"] == "PASS"
 
 
 def test_evaluation_cache_requires_matching_fingerprint(tmp_path, monkeypatch):

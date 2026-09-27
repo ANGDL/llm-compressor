@@ -270,6 +270,15 @@ stateDiagram-v2
 - “仅预览，不消耗 GPU”或“启动后会消耗 GPU/触发上传”的明确文案。
 
 页面要求填写已启动的推理容器名和容器内脚本；服务器、端口和容器生命周期由用户/运维管理。
+评测运行时不要求另建容器：可以在量化容器中创建独立 Conda 环境，页面填写该
+环境的 Python 路径和结构化 argv。worker 在量化容器内直接执行评测命令；模型仍由
+推理容器提供 OpenAI-compatible endpoint，避免 Web 容器再控制另一个评测容器。
+原模型无法启动时，可以为特定 task 配置带版本的参考指标。参考记录必须冻结 task
+version、fewshot、seed、prompt/chat template、generation 参数、metric 名称和来源；
+UI 将 reference ID 与数值写进 evaluation argv 和结果，不能把不同评测协议的参考值
+当作同一 baseline。
+评测工具可选 lm-eval 或 EvalScope；两者均安装在量化容器的独立评测环境中，通过
+OpenAI-compatible endpoint 访问推理服务，并把结果统一归一化为 CI metric gate。
 
 ### 7.3 Run Detail
 

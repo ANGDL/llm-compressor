@@ -47,6 +47,12 @@ load_config() {
     MQ_GIT_SHA=${MQ_GIT_SHA:-local}
     MQ_EXECUTOR=${MQ_EXECUTOR:-queue}
     MQ_GPU_HOUR_CAPACITY=${MQ_GPU_HOUR_CAPACITY:-80}
+    MQ_WORKER_ENABLED=${MQ_WORKER_ENABLED:-0}
+    MQ_WORKER_POLL_SECONDS=${MQ_WORKER_POLL_SECONDS:-2}
+    MQ_CONTAINER_RUNTIME=${MQ_CONTAINER_RUNTIME:-docker}
+    MQ_INFERENCE_CONTAINERS=${MQ_INFERENCE_CONTAINERS:-}
+    MQ_INFERENCE_SCRIPT_ROOTS=${MQ_INFERENCE_SCRIPT_ROOTS:-/workspace}
+    MQ_EVALUATION_COMMANDS=${MQ_EVALUATION_COMMANDS:-}
     MQ_RUNTIME_DIR=${MQ_RUNTIME_DIR:-/tmp/model-quality-web}
     local token
     token=$(printf '%s' "${MQ_SSH_HOST}" | tr -cs 'A-Za-z0-9._-' '_')
@@ -111,6 +117,10 @@ service_pid() {
     remote "docker exec '${MQ_CONTAINER}' bash -lc 'cat \"${MQ_RUNTIME_DIR}/server.pid\" 2>/dev/null || true'" 2>/dev/null | tail -1
 }
 
+service_pids() {
+    remote "docker exec '${MQ_CONTAINER}' bash -lc 'pid=\$(cat \"${MQ_RUNTIME_DIR}/server.pid\" 2>/dev/null || true); [[ -n \"\${pid}\" ]] && printf \"%s\\n\" \"\${pid}\"; pgrep -f \"[c]i.model_quality.web --host ${MQ_REMOTE_BIND} --port ${MQ_REMOTE_PORT}\" || true'" 2>/dev/null | awk 'NF && !seen[$0]++'
+}
+
 service_healthy() {
     remote "docker exec '${MQ_CONTAINER}' bash -lc 'curl -fsS --max-time 3 http://${MQ_REMOTE_BIND}:${MQ_REMOTE_PORT}/api/health >/dev/null'" >/dev/null 2>&1
 }
@@ -122,7 +132,7 @@ start_service() {
         return
     fi
     info "starting Web service in ${MQ_CONTAINER}"
-    remote "docker exec '${MQ_CONTAINER}' bash -lc 'mkdir -p \"${MQ_RUNTIME_DIR}\"; old=\$(cat \"${MQ_RUNTIME_DIR}/server.pid\" 2>/dev/null || true); if [[ -n \"\${old}\" ]] && kill -0 \"\${old}\" 2>/dev/null; then kill \"\${old}\"; fi; cd \"${MQ_REPO}\"; export MODEL_QUALITY_RUNS_ROOT=\"${MQ_RUNS_ROOT}\" MODEL_QUALITY_CONFIG=\"${MQ_CONFIG}\" MODEL_QUALITY_GIT_SHA=\"${MQ_GIT_SHA}\" MODEL_QUALITY_WEB_EXECUTOR=\"${MQ_EXECUTOR}\" MODEL_QUALITY_GPU_HOUR_CAPACITY=\"${MQ_GPU_HOUR_CAPACITY}\" PYTHONUNBUFFERED=1; nohup \"${MQ_PYTHON}\" -m ci.model_quality.web --host \"${MQ_REMOTE_BIND}\" --port \"${MQ_REMOTE_PORT}\" --runs-root \"${MQ_RUNS_ROOT}\" --config \"${MQ_CONFIG}\" --git-sha \"${MQ_GIT_SHA}\" >> \"${MQ_RUNTIME_DIR}/server.log\" 2>&1 < /dev/null & echo \$! > \"${MQ_RUNTIME_DIR}/server.pid\"'"
+    remote "docker exec '${MQ_CONTAINER}' bash -lc 'mkdir -p \"${MQ_RUNTIME_DIR}\"; old=\$(cat \"${MQ_RUNTIME_DIR}/server.pid\" 2>/dev/null || true); if [[ -n \"\${old}\" ]] && kill -0 \"\${old}\" 2>/dev/null; then kill \"\${old}\"; fi; cd \"${MQ_REPO}\"; export MODEL_QUALITY_RUNS_ROOT=\"${MQ_RUNS_ROOT}\" MODEL_QUALITY_CONFIG=\"${MQ_CONFIG}\" MODEL_QUALITY_GIT_SHA=\"${MQ_GIT_SHA}\" MODEL_QUALITY_WEB_EXECUTOR=\"${MQ_EXECUTOR}\" MODEL_QUALITY_GPU_HOUR_CAPACITY=\"${MQ_GPU_HOUR_CAPACITY}\" MODEL_QUALITY_INFERENCE_CONTAINERS=\"${MQ_INFERENCE_CONTAINERS}\" MODEL_QUALITY_INFERENCE_SCRIPT_ROOTS=\"${MQ_INFERENCE_SCRIPT_ROOTS}\" MODEL_QUALITY_EVALUATION_COMMANDS=\"${MQ_EVALUATION_COMMANDS}\" PYTHONUNBUFFERED=1; nohup \"${MQ_PYTHON}\" -m ci.model_quality.web --host \"${MQ_REMOTE_BIND}\" --port \"${MQ_REMOTE_PORT}\" --runs-root \"${MQ_RUNS_ROOT}\" --config \"${MQ_CONFIG}\" --git-sha \"${MQ_GIT_SHA}\" >> \"${MQ_RUNTIME_DIR}/server.log\" 2>&1 < /dev/null & echo \$! > \"${MQ_RUNTIME_DIR}/server.pid\"'"
     for _ in {1..20}; do
         service_healthy && return
         sleep 0.5
@@ -131,9 +141,29 @@ start_service() {
     die "remote Web service failed its health check"
 }
 
+worker_healthy() {
+    remote "docker exec '${MQ_CONTAINER}' bash -lc 'pid=\$(cat \"${MQ_RUNTIME_DIR}/worker.pid\" 2>/dev/null || true); [[ -n \"\${pid}\" ]] && kill -0 \"\${pid}\" 2>/dev/null'" >/dev/null 2>&1
+}
+
+start_worker() {
+    if [[ ${MQ_WORKER_ENABLED} != 1 ]]; then
+        return 0
+    fi
+    worker_healthy && return
+    info "starting queue worker in ${MQ_CONTAINER}"
+    remote "docker exec '${MQ_CONTAINER}' bash -lc 'cd \"${MQ_REPO}\"; export MODEL_QUALITY_RUNS_ROOT=\"${MQ_RUNS_ROOT}\" MODEL_QUALITY_GPU_HOUR_CAPACITY=\"${MQ_GPU_HOUR_CAPACITY}\" MODEL_QUALITY_CONTAINER_RUNTIME=\"${MQ_CONTAINER_RUNTIME}\" PYTHONUNBUFFERED=1; nohup \"${MQ_PYTHON}\" -m ci.model_quality.web.worker --runs-root \"${MQ_RUNS_ROOT}\" --config \"${MQ_CONFIG}\" --poll-seconds \"${MQ_WORKER_POLL_SECONDS}\" >> \"${MQ_RUNTIME_DIR}/worker.log\" 2>&1 < /dev/null & echo \$! > \"${MQ_RUNTIME_DIR}/worker.pid\"'"
+}
+
 stop_service() {
     container_ok || return
-    remote "docker exec '${MQ_CONTAINER}' bash -lc 'pid=\$(cat \"${MQ_RUNTIME_DIR}/server.pid\" 2>/dev/null || true); if [[ -n \"\${pid}\" ]] && kill -0 \"\${pid}\" 2>/dev/null; then kill \"\${pid}\"; fi; rm -f \"${MQ_RUNTIME_DIR}/server.pid\"'"
+    local pids
+    pids=$(service_pids || true)
+    if [[ -n ${pids} ]]; then
+        info "stopping Web service process(es): $(tr '\n' ' ' <<<"${pids}")"
+        remote "docker exec '${MQ_CONTAINER}' bash -lc 'for pid in ${pids//$'\n'/ }; do kill \"\${pid}\" 2>/dev/null || true; done; for _ in {1..20}; do alive=0; for pid in ${pids//$'\n'/ }; do kill -0 \"\${pid}\" 2>/dev/null && alive=1; done; [[ \"\${alive}\" == 0 ]] && break; sleep 0.1; done; rm -f \"${MQ_RUNTIME_DIR}/server.pid\"'"
+    else
+        remote "docker exec '${MQ_CONTAINER}' rm -f '${MQ_RUNTIME_DIR}/server.pid'"
+    fi
 }
 
 local_health() { curl -fsS --max-time 3 "${MQ_URL}api/health" >/dev/null 2>&1; }
@@ -155,7 +185,7 @@ cancel_tunnel() {
 
 ensure_tunnel() {
     if local_health; then
-        return
+        return 0
     fi
     local listener
     listener=$(local_listener_pid || true)
@@ -220,7 +250,7 @@ command_doctor() {
     return "${failed}"
 }
 
-command_up() { ensure_master; start_service; ensure_tunnel; command_status; }
+command_up() { ensure_master; start_service; start_worker; ensure_tunnel; command_status; }
 
 command_down() {
     cancel_tunnel

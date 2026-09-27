@@ -352,7 +352,10 @@ def run_preflight(
                     )
     free_bytes = shutil.disk_usage(run_dir).free
     minimum_free_gib = float(model["resources"].get("minimum_free_disk_gib", 1))
-    if free_bytes < minimum_free_gib * 1024**3:
+    if (
+        run_mode in {"quantize", "quantize_and_eval"}
+        and free_bytes < minimum_free_gib * 1024**3
+    ):
         failures.append(
             f"requires {minimum_free_gib:g} GiB free disk, found "
             f"{free_bytes / 1024**3:.2f} GiB"
@@ -924,7 +927,17 @@ def run_evaluate(
     attempt_id: str = "default",
 ) -> dict[str, Any]:
     evaluation = model.get("evaluation", {})
-    command = evaluation.get("command")
+    command_override = os.getenv("MODEL_QUALITY_EVALUATION_COMMAND_JSON")
+    if command_override:
+        try:
+            command = json.loads(command_override)
+        except json.JSONDecodeError as error:
+            raise StageError(
+                f"invalid evaluation command override: {error}",
+                reason_code="CONFIG_ERROR",
+            ) from error
+    else:
+        command = evaluation.get("command")
     if not command:
         raise StageError(
             "evaluation was requested but evaluation.command is not configured",
@@ -1056,14 +1069,29 @@ def run_report(
     state_dir = attempt_state_dir(run_id, model["id"], attempt_id)
     states = {}
     stale_stages = []
+    input_manifest_path = paths["run_dir"] / "input-manifest.json"
+    input_manifest = (
+        json.loads(input_manifest_path.read_text(encoding="utf-8"))
+        if input_manifest_path.is_file()
+        else None
+    )
     for path in sorted(state_dir.glob("*.json")) if state_dir.exists() else []:
         candidate = json.loads(path.read_text(encoding="utf-8"))
         if candidate.get("attempt_id", "default") != attempt_id:
             stale_stages.append(path.stem)
             continue
+        candidate_fingerprint = candidate.get("artifact_fingerprint")
         if (
             artifact_fingerprint is not None
-            and candidate.get("artifact_fingerprint") != artifact_fingerprint
+            and candidate_fingerprint != artifact_fingerprint
+            and not (
+                run_mode in {"eval_only", "upload_only"}
+                and path.stem == "runtime-smoke"
+                and isinstance(input_manifest, dict)
+                and candidate_fingerprint == input_manifest.get("fingerprint")
+                and artifact_fingerprint
+                == input_manifest.get("finalized_artifact_fingerprint")
+            )
         ):
             stale_stages.append(path.stem)
             continue
@@ -1649,7 +1677,9 @@ def run_aggregate(
         try:
             current = json.loads(current_attempt_path.read_text(encoding="utf-8"))
             attempt_id = current["attempt_id"]
-            report_path = attempt_reports_dir(run_id, model_id, attempt_id) / "summary.json"
+            report_path = (
+                attempt_reports_dir(run_id, model_id, attempt_id) / "summary.json"
+            )
             summary = json.loads(report_path.read_text(encoding="utf-8"))
             identity = ("attempt_id", "artifact_fingerprint", "evaluation_fingerprint")
             if (
@@ -1660,7 +1690,9 @@ def run_aggregate(
                 row["reason_code"] = "STALE_PROMOTED_REPORT"
             else:
                 row = summary
-                publish_path = attempt_state_dir(run_id, model_id, attempt_id) / "publish.json"
+                publish_path = (
+                    attempt_state_dir(run_id, model_id, attempt_id) / "publish.json"
+                )
                 if publish_path.is_file():
                     publish = json.loads(publish_path.read_text(encoding="utf-8"))
                     if any(publish.get(key) != current.get(key) for key in identity):

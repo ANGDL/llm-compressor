@@ -25,7 +25,12 @@ from .jobs import (
     ReservationLedger,
     settle_model_group,
 )
-from .plans import LaunchPolicy, PlanService
+from .plans import (
+    LaunchPolicy,
+    PlanService,
+    validate_evaluation_command,
+    validate_inference_config,
+)
 from .security import Principal
 from .store import NotFoundError, RunStore, read_json, safe_component
 
@@ -217,6 +222,7 @@ class ControlPlane:
             run_mode=plan["run_mode"],
             git_sha=plan["git_sha"],
             inference=record.get("inference"),
+            evaluation_command=record.get("evaluation_command"),
             principal=principal,
             reason="start",
             extra_request=request,
@@ -286,6 +292,7 @@ class ControlPlane:
             run_mode=run_mode,
             git_sha=plan.get("git_sha", "local"),
             inference=request.get("inference"),
+            evaluation_command=request.get("evaluation_command"),
             principal=principal,
             reason="retry",
             extra_request=request,
@@ -321,6 +328,12 @@ class ControlPlane:
             raise ValidationError("a model quality --config path is required")
         config = load_model_config(self.config_path)
         configured = {model["id"]: model for model in config["models"]}
+        inference = validate_inference_config(
+            request.get("inference"), policy=self.policy
+        )
+        evaluation_command = validate_evaluation_command(
+            request.get("evaluation_command"), policy=self.policy
+        )
 
         run = self.store.get_run(run_id)
         requested = request.get("model_id")
@@ -355,7 +368,8 @@ class ControlPlane:
             attempt_id=attempt_id,
             run_mode="eval_only",
             git_sha=plan.get("git_sha", "local"),
-            inference=request.get("inference"),
+            inference=inference,
+            evaluation_command=evaluation_command,
             principal=principal,
             reason="evaluate",
             extra_request=request,
@@ -615,6 +629,7 @@ class ControlPlane:
         run_mode: str,
         git_sha: str,
         inference: dict[str, Any] | None,
+        evaluation_command: list[str] | None,
         principal: Principal,
         reason: str,
         extra_request: dict[str, Any],
@@ -650,7 +665,9 @@ class ControlPlane:
                     if job_overrides and model_id in job_overrides
                     else list(STAGES_BY_MODE[run_mode])
                 )
-                if job.get("upload_enabled") or run_mode == "upload_only":
+                if run_mode == "upload_only" or (
+                    run_mode != "eval_only" and job.get("upload_enabled")
+                ):
                     stages = [*stages, "publish"]
                 reservation = self.ledger.reserve(
                     run_id=run_id,
@@ -671,6 +688,7 @@ class ControlPlane:
                         stages=stages,
                         reservation=reservation,
                         inference=inference,
+                        evaluation_command=evaluation_command,
                         plan_hash=plan_hash,
                     )
                 )
@@ -711,6 +729,7 @@ class ControlPlane:
                 "updated_at": utc_now(),
                 "last_actor": principal.actor,
                 "inference": inference,
+                "evaluation_command": evaluation_command,
                 "canceled": False,
             }
         )
@@ -785,6 +804,7 @@ class ControlPlane:
         stages: list[str],
         reservation: dict[str, Any],
         inference: dict[str, Any] | None,
+        evaluation_command: list[str] | None,
         plan_hash: str | None,
     ) -> list[dict[str, Any]]:
         model_id = definition["id"]
@@ -881,6 +901,7 @@ class ControlPlane:
                     details={
                         **details,
                         "suites": definition.get("evaluation", {}).get("suites", []),
+                        "evaluation_command": evaluation_command,
                     },
                 )
             )

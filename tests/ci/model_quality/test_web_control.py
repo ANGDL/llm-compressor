@@ -23,6 +23,7 @@ from ci.model_quality.web import (
     build_quantization_argv,
     create_app,
     import_quantization_command,
+    validate_evaluation_command,
     validate_inference_config,
 )
 
@@ -229,6 +230,7 @@ def test_evaluate_requires_passing_validate(web_env) -> None:
     stages = {stage for job in evaluated["jobs"] for stage in job["stages"]}
     assert "evaluate" in stages
     assert "quantize" not in stages
+    assert "publish" not in stages
     assert evaluated["reservations"][0]["gpu_hours"] == 1.0
 
 
@@ -347,6 +349,30 @@ def test_inference_config_is_allowlisted(tmp_path: Path) -> None:
                 "arguments": ["{unknown_thing}"],
             },
             policy=policy,
+        )
+
+
+def test_evaluation_command_is_allowlisted() -> None:
+    policy = LaunchPolicy(
+        evaluation_commands=("/root/miniconda/envs/model_quality_lm_eval/bin/python",)
+    )
+    command = validate_evaluation_command(
+        [
+            "/root/miniconda/envs/model_quality_lm_eval/bin/python",
+            "-m",
+            "ci.model_quality.evaluators.lm_eval_api_pair",
+            "--output",
+            "{reports_dir}/evaluation-raw.json",
+        ],
+        policy=policy,
+    )
+    assert command[-1] == "{reports_dir}/evaluation-raw.json"
+
+    with pytest.raises(ValidationError, match="start with"):
+        validate_evaluation_command(["python", "-V"], policy=policy)
+    with pytest.raises(ValidationError, match="metacharacters"):
+        validate_evaluation_command(
+            [policy.evaluation_commands[0], "$(whoami)"], policy=policy
         )
 
 

@@ -8,6 +8,7 @@ worker drains the queue and is the only component that runs the reviewed
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shlex
 import subprocess
@@ -15,6 +16,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from ..state import write_stage_result
 from .audit import AuditLog, ValidationError
 from .jobs import JobStore, ReservationLedger, settle_model_group
 from .ops import NotificationService
@@ -30,6 +32,75 @@ STAGE_LOG_FILENAMES = {
     "publish": "publish.log",
 }
 QUALITY_STAGES = {"evaluate", "report"}
+
+
+def job_values(job: dict[str, Any], root: Path) -> dict[str, str]:
+    model_dir = root / job["run_id"] / job["model_id"]
+    reports_dir = model_dir / "attempts" / job["attempt_id"] / "reports"
+    return {
+        "{run_id}": job["run_id"],
+        "{model_id}": job["model_id"],
+        "{run_dir}": str(model_dir),
+        "{output_dir}": str(model_dir / "model"),
+        "{work_dir}": str(model_dir / "work"),
+        "{reports_dir}": str(reports_dir),
+        "{source_path}": str(job.get("details", {}).get("source_path", "")),
+    }
+
+
+def resolve_tokens(values: list[Any], replacements: dict[str, str]) -> list[str]:
+    result = []
+    for value in values:
+        token = str(value)
+        for placeholder, replacement in replacements.items():
+            token = token.replace(placeholder, replacement)
+        result.append(token)
+    return result
+
+
+def execution_argv(
+    job: dict[str, Any],
+    stage: str,
+    *,
+    root: Path,
+    config_path: str | Path,
+    argv_prefix: tuple[str, ...],
+    container_runtime: tuple[str, ...],
+) -> list[str]:
+    if stage == "runtime-smoke" and job.get("container_name"):
+        replacements = job_values(job, root)
+        arguments = resolve_tokens(
+            job.get("details", {}).get("inference_arguments", []), replacements
+        )
+        if container_runtime == ("direct",):
+            return [str(job["script"]), *arguments]
+        return [*container_runtime, "exec", str(job["container_name"]), str(job["script"]), *arguments]
+    return stage_argv(job, stage, config_path=config_path, argv_prefix=argv_prefix)
+
+
+def record_inference_result(job: dict[str, Any], root: Path) -> None:
+    result_file = job.get("result_file")
+    if not result_file:
+        raise ValidationError("inference job has no result_file")
+    resolved = resolve_tokens([result_file], job_values(job, root))[0]
+    result_path = Path(resolved)
+    if not result_path.is_file():
+        raise ValidationError(f"inference result is missing: {result_path}")
+    try:
+        payload = json.loads(result_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValidationError(f"invalid inference result: {error}") from error
+    if payload.get("status") != "PASS":
+        raise ValidationError("inference result status is not PASS")
+    write_stage_result(
+        job["run_id"],
+        job["model_id"],
+        "runtime-smoke",
+        {"status": "PASS", "result": payload, "container_name": job["container_name"]},
+        attempt_id=job["attempt_id"],
+        artifact_fingerprint=job.get("artifact_fingerprint"),
+        evaluation_fingerprint=job.get("evaluation_fingerprint"),
+    )
 
 
 def stage_argv(
@@ -97,6 +168,7 @@ def execute_job(
     audit: AuditLog | None = None,
     notifications: NotificationService | None = None,
     argv_prefix: tuple[str, ...] = ("python3", "-m", "ci.model_quality.stage"),
+    container_runtime: tuple[str, ...] = ("docker",),
     env: dict[str, str] | None = None,
     timeout_seconds: float | None = None,
     runner=subprocess.run,
@@ -117,6 +189,18 @@ def execute_job(
     run_env = {**os.environ, **(env or {})}
     run_env["MODEL_QUALITY_RUNS_ROOT"] = str(root)
     run_env.pop("BUILDKITE", None)
+    repository_root = str(Path(__file__).parents[3])
+    existing_pythonpath = run_env.get("PYTHONPATH")
+    run_env["PYTHONPATH"] = (
+        repository_root
+        if not existing_pythonpath
+        else repository_root + os.pathsep + existing_pythonpath
+    )
+    evaluation_command = job.get("details", {}).get("evaluation_command")
+    if evaluation_command:
+        run_env["MODEL_QUALITY_EVALUATION_COMMAND_JSON"] = json.dumps(
+            evaluation_command
+        )
 
     claim_reservation(ledger, job)
     current = jobs.update(job, status="RUNNING")
@@ -124,8 +208,13 @@ def execute_job(
     failed_stage = None
     message = ""
     for stage in stages:
-        argv = stage_argv(
-            current, stage, config_path=config_path, argv_prefix=argv_prefix
+        argv = execution_argv(
+            current,
+            stage,
+            root=root,
+            config_path=config_path,
+            argv_prefix=argv_prefix,
+            container_runtime=container_runtime,
         )
         log_path = log_dir / STAGE_LOG_FILENAMES.get(stage, f"{stage}.log")
         try:
@@ -138,7 +227,7 @@ def execute_job(
                     stderr=subprocess.STDOUT,
                     text=True,
                     env=run_env,
-                    cwd=str(root),
+                    cwd=repository_root,
                     timeout=timeout_seconds,
                 )
             exit_code = int(completed.returncode)
@@ -152,6 +241,14 @@ def execute_job(
             failed_stage = stage
             message = message or f"{stage} exited with {exit_code}"
             break
+        if stage == "runtime-smoke" and current.get("container_name"):
+            try:
+                record_inference_result(current, root)
+            except ValidationError as error:
+                exit_code = 1
+                failed_stage = stage
+                message = str(error)
+                break
 
     if failed_stage is None:
         finished = jobs.update(
@@ -226,15 +323,19 @@ def run_once(
     ledger: ReservationLedger | None = None,
     notifications: NotificationService | None = None,
     argv_prefix: tuple[str, ...] = ("python3", "-m", "ci.model_quality.stage"),
+    container_runtime: tuple[str, ...] = ("docker",),
     env: dict[str, str] | None = None,
     timeout_seconds: float | None = None,
     capacity_gpu_hours: float = 80.0,
+    kinds: frozenset[str] | None = None,
 ) -> dict[str, Any] | None:
     """Execute the oldest queued job, or return ``None`` when idle."""
 
     jobs = jobs or JobStore(root)
     ledger = ledger or ReservationLedger(root, capacity_gpu_hours=capacity_gpu_hours)
-    queued = jobs.queued()
+    queued = [
+        job for job in jobs.queued() if kinds is None or job.get("kind") in kinds
+    ]
     if not queued:
         return None
     return execute_job(
@@ -245,6 +346,7 @@ def run_once(
         ledger=ledger,
         notifications=notifications,
         argv_prefix=argv_prefix,
+        container_runtime=container_runtime,
         env=env,
         timeout_seconds=timeout_seconds,
     )
@@ -271,6 +373,16 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--timeout-seconds", type=float)
     parser.add_argument(
+        "--container-runtime",
+        default=os.getenv("MODEL_QUALITY_CONTAINER_RUNTIME", "docker"),
+    )
+    parser.add_argument("--poll-seconds", type=float, default=0.0)
+    parser.add_argument(
+        "--kinds",
+        default="",
+        help="comma-separated job kinds handled by this worker; empty means all",
+    )
+    parser.add_argument(
         "--capacity-gpu-hours",
         type=float,
         default=float(os.getenv("MODEL_QUALITY_GPU_HOUR_CAPACITY", "80")),
@@ -284,7 +396,9 @@ def main(argv: list[str] | None = None) -> int:
         args.runs_root, capacity_gpu_hours=args.capacity_gpu_hours
     )
     prefix = parse_argv_prefix(args.stage_cli)
+    container_runtime = parse_argv_prefix(args.container_runtime)
     notifications = NotificationService(args.runs_root)
+    kinds = frozenset(token.strip() for token in args.kinds.split(",") if token.strip())
     completed = 0
     while True:
         result = run_once(
@@ -294,10 +408,17 @@ def main(argv: list[str] | None = None) -> int:
             ledger=ledger,
             notifications=notifications,
             argv_prefix=prefix,
+            container_runtime=container_runtime,
             timeout_seconds=args.timeout_seconds,
             capacity_gpu_hours=args.capacity_gpu_hours,
+            kinds=kinds or None,
         )
         if result is None:
+            if args.poll_seconds > 0:
+                import time
+
+                time.sleep(args.poll_seconds)
+                continue
             break
         completed += 1
         print(
