@@ -20,6 +20,7 @@ from compressed_tensors.base import (
     QUANTIZATION_METHOD,
     QUANTIZATION_METHOD_NAME,
 )
+from compressed_tensors.distributed import is_distributed
 from compressed_tensors.utils import getattr_chain
 from loguru import logger
 from torch.utils.data import DataLoader
@@ -143,6 +144,14 @@ class Oneshot:
         :param log_dir: Path to save logs during oneshot run.
             Nothing is logged to file if None.
         """
+        # Warn if oneshot is called with `torchrun` but did not call `init_dist`
+        if "TORCHELASTIC_RUN_ID" in os.environ and not is_distributed():
+            logger.warning(
+                "Detected torchrun environment, but no distributed process group was "
+                "found. If you intended to run with distributed data parallelism, "
+                "call 'compressed_tensors.offload.init_dist()' before calling oneshot."
+            )
+
         # Disable tokenizer parallelism to prevent warning when using
         # multiprocessing for dataset preprocessing. The warning occurs because
         # FastTokenizer's internal threading conflicts with dataset.map's num_proc.
@@ -279,8 +288,6 @@ class Oneshot:
                 sequential_targets=self.dataset_args.sequential_targets,
             )
 
-            session.state.enable_compile = self.dataset_args.enable_compile
-
             user_pipeline = self.dataset_args.pipeline
             pipeline = CalibrationPipeline.from_modifiers(
                 session.lifecycle.recipe.modifiers, user=user_pipeline
@@ -294,8 +301,7 @@ class Oneshot:
 
         session.finalize()
 
-    @staticmethod
-    def validate_model(model: PreTrainedModel):
+    def validate_model(self, model: PreTrainedModel):
         """
         Validate that oneshot can be applied to model.
         Raise warning if model is quantized with compressed-tensors quant method.
@@ -303,7 +309,10 @@ class Oneshot:
         """
         # Check on-disk config first because decompressed models
         # no longer retain quantization_config in memory
-        config = AutoConfig.from_pretrained(model.config.name_or_path)
+        config = AutoConfig.from_pretrained(
+            model.config.name_or_path,
+            trust_remote_code=self.model_args.trust_remote_code_model,
+        )
         qconfig = getattr_chain(config, QUANTIZATION_CONFIG_NAME, None)
         quant_method = (
             qconfig.get(QUANTIZATION_METHOD_NAME, None) if qconfig is not None else None
@@ -359,7 +368,7 @@ def oneshot(
     num_calibration_samples: int = 512,
     shuffle_calibration_samples: bool = True,
     max_seq_length: int | None = None,
-    pad_to_max_length: bool = True,
+    pad_to_max_length: bool = False,
     text_column: str = "text",
     concatenate_data: bool = False,
     streaming: bool = False,
@@ -382,6 +391,7 @@ def oneshot(
         "_prepare_4d_causal_attention_mask_with_cache_position",
         "_update_linear_attn_mask",
         "project_per_layer_inputs",
+        "_apply_attn_res",
     ],
     sequential_targets: list[str] | None = None,
     sequential_offload_device: str = "cpu",
@@ -390,7 +400,6 @@ def oneshot(
     # Miscellaneous arguments
     output_dir: str | None = None,
     log_dir: str | None = None,
-    enable_compile: bool = False,
     **kwargs,
 ) -> PreTrainedModel:
     """
@@ -485,9 +494,6 @@ def oneshot(
         Nothing is saved if None.
     :param log_dir: Path to save logs during oneshot run.
         Nothing is logged to file if None.
-    :param enable_compile: If True, use torch.compiled MSE observer inner loop
-        for faster calibration. Default False.
-
     :return: The calibrated PreTrainedModel
     """
 

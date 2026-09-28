@@ -62,6 +62,7 @@ _DISABLE_OFFSET_NORM_CALIBRATION = (
     alias=[
         "Gemma2RMSNorm",
         "Gemma3RMSNorm",
+        "MuseGlimmerTextCenteredRMSNorm",
         "Qwen3NextRMSNorm",
         "Qwen3_5RMSNorm",
         "Qwen3_5MoeRMSNorm",

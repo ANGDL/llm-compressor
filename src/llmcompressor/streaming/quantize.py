@@ -158,13 +158,35 @@ def _quantize_module(
     if use_gptq:
         count = statistics["gptq_num_samples"].to(device=device)
         hessian = statistics["gptq_hessian"].to(device=device) / count
-        _, qparams = quantize_weight(
-            module=module,
+        qparams = module.weight_observer.get_qparams()
+        scales = qparams["scale"].unsqueeze(0)
+        zero_points = qparams["zero_point"].unsqueeze(0)
+        global_scales = (
+            qparams["global_scale"].reshape(1, -1)
+            if qparams["global_scale"] is not None
+            else None
+        )
+        quantized, _, _ = quantize_weight(
+            weights=module.weight.unsqueeze(0),
+            hessians=hessian.unsqueeze(0),
+            scale=scales,
+            zero_point=zero_points,
+            global_scale=global_scales,
             quant_args=scheme.weights,
-            hessian=hessian,
             blocksize=blocksize,
             percdamp=dampening_frac,
         )
+        qparams = {
+            "weight": quantized[0],
+            "weight_scale": scales[0].to(
+                dtype=scheme.weights.scale_dtype or module.weight.dtype
+            ),
+            "weight_zero_point": zero_points[0].to(dtype=scheme.weights.zp_dtype),
+        }
+        if global_scales is not None:
+            qparams["weight_global_scale"] = global_scales[0].reshape_as(
+                module.weight_global_scale
+            )
         for name, value in qparams.items():
             setattr(module, name, torch.nn.Parameter(value, requires_grad=False))
     else:

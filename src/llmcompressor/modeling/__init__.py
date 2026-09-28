@@ -20,3 +20,4 @@ from .offset_norm import CalibrationOffsetNorm  # noqa: F401
 from .step3p5 import CalibrationStep3p5MoEMLP  # noqa: F401
 
 from .fuse import *
+from .moe.conversion_mappings import patch_moe_mappings  # noqa: F401

@@ -1,5 +1,4 @@
 import math
-from typing import Optional
 
 import torch
 from compressed_tensors.quantization import QuantizationArgs, QuantizationStrategy
@@ -28,8 +27,6 @@ IMATRIX_PRECISION = torch.float32
 def make_empty_imatrix_statistics(
     in_features: int, device: torch.device | str = "cpu"
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Create the raw sum/count representation consumed by iMatrix observers."""
-
     if not isinstance(in_features, int) or in_features <= 0:
         raise ValueError(f"in_features must be a positive integer, got {in_features!r}")
     return (
@@ -43,13 +40,6 @@ def accumulate_imatrix_statistics(
     imatrix_sum: torch.Tensor,
     imatrix_count: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Accumulate per-input-channel sum(x squared) and token count.
-
-    The accumulator device controls where collection happens. Existing oneshot
-    collection moves its accumulators to the activation device first; streaming
-    collection can instead keep them on CPU to bound accelerator memory.
-    """
-
     if inputs.ndim == 0:
         raise ValueError("iMatrix inputs must have at least one dimension")
     if inputs.shape[-1] != imatrix_sum.numel():
@@ -57,11 +47,8 @@ def accumulate_imatrix_statistics(
             f"iMatrix input width {inputs.shape[-1]} does not match accumulator "
             f"width {imatrix_sum.numel()}"
         )
-    values = inputs.detach().to(
-        device=imatrix_sum.device, dtype=IMATRIX_PRECISION
-    )
-    dimensions = tuple(range(values.ndim - 1))
-    imatrix_sum.add_(values.square().sum(dim=dimensions))
+    values = inputs.detach().to(device=imatrix_sum.device, dtype=IMATRIX_PRECISION)
+    imatrix_sum.add_(values.square().sum(dim=tuple(range(values.ndim - 1))))
     imatrix_count.add_(math.prod(values.shape[:-1]))
     return imatrix_sum, imatrix_count
 
@@ -94,11 +81,12 @@ class IMatrixMSEObserver(Observer):
         self.grid = kw.get("grid", 20)
         self.norm = kw.get("norm", 3.0)
         self.strict = kw.get("strict", False)
+        self.expand = kw.get("expand", 1.0)
         self.chunk_size = kw.get("chunk_size", 0)
 
-        self._imatrix_sum: Optional[torch.Tensor] = None
+        self._imatrix_sum: torch.Tensor | None = None
         self._imatrix_count: torch.Tensor = torch.tensor(0, dtype=torch.int64)
-        self._imatrix_hook: Optional[RemovableHandle] = None
+        self._imatrix_hook: RemovableHandle | None = None
 
         if self.grid <= 0:
             raise ValueError(f"grid must be > 0, got {self.grid}")
@@ -128,52 +116,46 @@ class IMatrixMSEObserver(Observer):
         if not hasattr(module, "in_features"):
             return
 
-        # Preserve handoff compatibility with statistics created by older
-        # IMatrixGatherer versions while keeping new collection observer-owned.
-        if hasattr(module, "_imatrix_sum") and hasattr(module, "_imatrix_count"):
-            self._imatrix_sum = module._imatrix_sum
-            self._imatrix_count = module._imatrix_count
-            del module._imatrix_sum
-            del module._imatrix_count
-            return
-
+        in_features = module.in_features
         param = next(module.parameters(), None)
         device = (
             param.device
             if param is not None and param.device.type != "meta"
             else "cpu"
         )
+        if hasattr(module, "_imatrix_sum") and hasattr(module, "_imatrix_count"):
+            self._imatrix_sum = module._imatrix_sum
+            self._imatrix_count = module._imatrix_count
+            del module._imatrix_sum
+            del module._imatrix_count
+            return
         self._imatrix_sum, self._imatrix_count = make_empty_imatrix_statistics(
-            module.in_features, device=device
+            in_features, device=device
         )
 
-        def _hook(_module, args):
+        def _hook(mod, args):
             if (
                 HooksMixin._HOOKS_DISABLED
                 and getattr(self, "_imatrix_hook", None)
                 not in HooksMixin._HOOKS_KEEP_ENABLED
             ):
                 return
-            if isinstance(args, tuple):
-                if len(args) == 0:
-                    # Some modules can be invoked with kwargs-only inputs.
-                    # In this case we cannot read the activation tensor here.
-                    return
-                x = args[0]
-            else:
-                x = args
+            x = args[0] if isinstance(args, tuple) else args
             if isinstance(x, tuple):
                 x = x[0]
             if x is None or not isinstance(x, torch.Tensor):
                 return
 
-            self._imatrix_sum = self._imatrix_sum.to(x.device)
-            self._imatrix_count = self._imatrix_count.to(x.device)
-            self._imatrix_sum, self._imatrix_count = (
-                accumulate_imatrix_statistics(
-                    x, self._imatrix_sum, self._imatrix_count
-                )
-            )
+            x_f = x.detach().to(IMATRIX_PRECISION)
+            device = x_f.device
+            n_tokens = math.prod(x_f.shape[:-1])
+            token_sum = x_f.pow(2).sum(dim=list(range(x_f.dim() - 1)))
+
+            self._imatrix_sum = self._imatrix_sum.to(device)
+            self._imatrix_count = self._imatrix_count.to(device)
+
+            self._imatrix_sum.add_(token_sum)
+            self._imatrix_count += n_tokens
 
         self._imatrix_hook = module.register_forward_pre_hook(_hook)
 
@@ -194,13 +176,14 @@ class IMatrixMSEObserver(Observer):
             self.patience,
             self.grid,
             self.norm,
+            expand=self.expand,
             importance_weights=importance_weights,
             chunk_size=self.chunk_size,
         )
 
     # ------------------------------------------------------------------
 
-    def _prepare_importance(self, observed: torch.Tensor) -> Optional[torch.Tensor]:
+    def _prepare_importance(self, observed: torch.Tensor) -> torch.Tensor | None:
         """Validate → normalize → broadcast to match observed shape."""
         imp = self._get_validated_importance(observed)
         if imp is None:
@@ -213,9 +196,7 @@ class IMatrixMSEObserver(Observer):
         imp_2d = imp.unsqueeze(0).expand(out_features, -1)
         return flatten_for_calibration(imp_2d, self.base_name, self.args)
 
-    def _get_validated_importance(
-        self, observed: torch.Tensor
-    ) -> Optional[torch.Tensor]:
+    def _get_validated_importance(self, observed: torch.Tensor) -> torch.Tensor | None:
         """Compute importance from sum/count, validate, and return 1D tensor or None."""
         if self.base_name != "weight":
             if self.strict:
@@ -321,9 +302,9 @@ def _grid_search(
     patience: int,
     grid: int,
     norm: float,
-    importance_weights: Optional[torch.Tensor] = None,
+    expand: float = 1.0,
+    importance_weights: torch.Tensor | None = None,
     chunk_size: int = 0,
-    _allow_oom_fallback: bool = True,
 ) -> MinMaxTuple:
     """Grid search for min/max minimizing (importance-weighted) quant error.
 
@@ -331,8 +312,14 @@ def _grid_search(
     using FP32 scales. After optimization, global_scale is computed from the final
     min/max values in get_qparams().
     """
-    min_val = torch.amin(observed, dim=(0, -1))
-    max_val = torch.amax(observed, dim=(0, -1))
+    if (
+        args.strategy == QuantizationStrategy.TENSOR_GROUP
+        and args.scale_dtype is not None
+    ):
+        args = args.model_copy(update={"scale_dtype": None})
+
+    min_val = torch.amin(observed, dim=(0, -1)) * expand
+    max_val = torch.amax(observed, dim=(0, -1)) * expand
     if args.scale_dtype == torch.float32:
         min_val = min_val.float()
         max_val = max_val.float()
@@ -347,27 +334,6 @@ def _grid_search(
 
     no_improve = 0
     observed_f = observed.float()
-    if importance_weights is not None:
-        importance_weights = importance_weights.to(observed_f.dtype)
-
-    qparam_count = min_val.numel()
-    num_observations = observed.shape[0]
-    group_size = observed.shape[-1]
-    effective_chunk_size = _get_effective_chunk_size(
-        requested_chunk_size=chunk_size,
-        qparam_count=qparam_count,
-        num_observations=num_observations,
-        group_size=group_size,
-    )
-
-    observed_flat = observed.reshape(num_observations, qparam_count, group_size)
-    observed_f_flat = observed_f.reshape(num_observations, qparam_count, group_size)
-    importance_flat = (
-        importance_weights.reshape(num_observations, qparam_count, group_size)
-        if importance_weights is not None
-        else None
-    )
-    fallback_to_cpu = False
 
     shrink_steps = max(1, int(maxshrink * grid))
     for i in range(shrink_steps + 1):
@@ -387,75 +353,48 @@ def _grid_search(
                 err = _compute_err(
                     observed=observed,
                     observed_f=observed_f,
-                    observed_flat=observed_flat,
-                    observed_f_flat=observed_f_flat,
+                    observed_flat=observed.reshape(
+                        observed.shape[0], scales.numel(), observed.shape[-1]
+                    ),
+                    observed_f_flat=observed_f.reshape(
+                        observed.shape[0], scales.numel(), observed.shape[-1]
+                    ),
                     scales=scales,
                     zps=zps,
                     args=args,
                     norm=norm,
                     importance_weights=importance_weights,
-                    importance_flat=importance_flat,
-                    effective_chunk_size=effective_chunk_size,
+                    importance_flat=(
+                        importance_weights.reshape(
+                            observed.shape[0], scales.numel(), observed.shape[-1]
+                        )
+                        if importance_weights is not None
+                        else None
+                    ),
+                    effective_chunk_size=chunk_size,
                 )
             except RuntimeError as error:
-                if (
-                    not _allow_oom_fallback
-                    or observed.device.type == "cpu"
-                    or not _is_oom_error(error)
-                ):
+                if observed.device.type == "cpu" or not _is_oom_error(error):
                     raise
-
-                if observed.device.type == "cuda":
-                    try:
-                        torch.cuda.empty_cache()
-                    except RuntimeError:
-                        pass
-
-                retry_chunk_size = _get_oom_retry_chunk_size(
-                    observed=observed,
-                    requested_chunk_size=effective_chunk_size,
-                )
-                if (
-                    retry_chunk_size is None
-                    or retry_chunk_size >= effective_chunk_size
-                ):
-                    fallback_to_cpu = True
-                    break
-
                 logger.warning(
-                    "imatrix_mse: out of memory during grid search on "
-                    f"{observed.device.type}. Retrying with chunk_size={retry_chunk_size}.",
+                    "imatrix_mse: out of memory during grid search; retrying on CPU.",
                     log_once=True,
                 )
-                effective_chunk_size = retry_chunk_size
-
-                try:
-                    err = _compute_err(
-                        observed=observed,
-                        observed_f=observed_f,
-                        observed_flat=observed_flat,
-                        observed_f_flat=observed_f_flat,
-                        scales=scales,
-                        zps=zps,
-                        args=args,
-                        norm=norm,
-                        importance_weights=importance_weights,
-                        importance_flat=importance_flat,
-                        effective_chunk_size=effective_chunk_size,
-                    )
-                except RuntimeError as retry_error:
-                    if not _is_oom_error(retry_error):
-                        raise
-                    if observed.device.type == "cuda":
-                        try:
-                            torch.cuda.empty_cache()
-                        except RuntimeError:
-                            pass
-                    fallback_to_cpu = True
-                    break
-
-        if fallback_to_cpu:
-            break
+                return _grid_search(
+                    observed.cpu(),
+                    args,
+                    maxshrink,
+                    patience,
+                    grid,
+                    norm,
+                    expand=expand,
+                    importance_weights=(
+                        importance_weights.cpu()
+                        if importance_weights is not None
+                        else None
+                    ),
+                    chunk_size=chunk_size,
+                )
 
         improved = err < best_error
         if torch.any(improved):
@@ -467,25 +406,6 @@ def _grid_search(
             no_improve += 1
             if patience > 0 and no_improve >= patience:
                 break
-
-    if fallback_to_cpu:
-        logger.warning(
-            "imatrix_mse: out of memory during grid search on "
-            f"{observed.device.type}. Retrying on CPU.",
-            log_once=True,
-        )
-        best_min, best_max = _grid_search(
-            observed.cpu(),
-            args,
-            maxshrink,
-            patience,
-            grid,
-            norm,
-            importance_weights.cpu() if importance_weights is not None else None,
-            chunk_size,
-            _allow_oom_fallback=False,
-        )
-        return best_min.to(observed.device), best_max.to(observed.device)
 
     return best_min, best_max
 
@@ -499,104 +419,65 @@ def _compute_err(
     zps: torch.Tensor,
     args: QuantizationArgs,
     norm: float,
-    importance_weights: Optional[torch.Tensor],
-    importance_flat: Optional[torch.Tensor],
+    importance_weights: torch.Tensor | None,
+    importance_flat: torch.Tensor | None,
     effective_chunk_size: int,
 ) -> torch.Tensor:
-    if effective_chunk_size >= scales.numel():
-        q = fake_quantize(observed, scales.unsqueeze(-1), zps.unsqueeze(-1), args)
-        q = q.float()
-
+    if effective_chunk_size <= 0 or scales.numel() <= effective_chunk_size:
+        q = fake_quantize(observed, scales.unsqueeze(-1), zps.unsqueeze(-1), args).float()
         q.sub_(observed_f).abs_().pow_(norm)
         if importance_weights is not None:
             q.mul_(importance_weights)
         return q.sum(dim=(0, -1), dtype=torch.float32)
 
-    scales_flat = scales.reshape(-1)
-    zps_flat = zps.reshape(-1)
-    err_flat = torch.empty(
-        scales_flat.numel(), dtype=torch.float32, device=scales_flat.device
-    )
-
-    for start in range(0, scales_flat.numel(), effective_chunk_size):
-        end = min(start + effective_chunk_size, scales_flat.numel())
-
+    observations = observed_flat
+    observations_f = observed_f_flat
+    importance = importance_flat
+    err = torch.empty_like(scales, dtype=torch.float32)
+    flat_scales = scales.reshape(-1)
+    flat_zps = zps.reshape(-1)
+    for start in range(0, flat_scales.numel(), effective_chunk_size):
+        end = min(start + effective_chunk_size, flat_scales.numel())
         q_chunk = fake_quantize(
-            observed_flat[:, start:end, :],
-            scales_flat[start:end].unsqueeze(-1),
-            zps_flat[start:end].unsqueeze(-1),
+            observations[:, start:end],
+            flat_scales[start:end].unsqueeze(-1),
+            flat_zps[start:end].unsqueeze(-1),
             args,
-        )
-        q_chunk = q_chunk.float()
-
-        q_chunk.sub_(observed_f_flat[:, start:end, :]).abs_().pow_(norm)
-        if importance_flat is not None:
-            q_chunk.mul_(importance_flat[:, start:end, :])
-
-        err_flat[start:end] = q_chunk.sum(dim=(0, -1), dtype=torch.float32)
-
-    return err_flat.reshape_as(scales)
-
-
-def _get_effective_chunk_size(
-    requested_chunk_size: int,
-    qparam_count: int,
-    num_observations: int,
-    group_size: int,
-) -> int:
-    if requested_chunk_size > 0:
-        return min(requested_chunk_size, qparam_count)
-
-    # Target <= 64MB temporary q tensor for error computation.
-    target_elements = 16 * 1024 * 1024
-    denom = max(1, num_observations * group_size)
-    auto_chunk = max(1, target_elements // denom)
-    return min(auto_chunk, qparam_count)
-
-
-def _get_oom_retry_chunk_size(
-    observed: torch.Tensor,
-    requested_chunk_size: int,
-) -> Optional[int]:
-    """Estimate a smaller chunk size for OOM retry on accelerator devices."""
-    qparam_count = max(1, math.prod(observed.shape[1:-1]))
-    if qparam_count <= 1:
-        return None
-
-    num_observations = observed.shape[0]
-    group_size = observed.shape[-1]
-    current_chunk_size = _get_effective_chunk_size(
-        requested_chunk_size=requested_chunk_size,
-        qparam_count=qparam_count,
-        num_observations=num_observations,
-        group_size=group_size,
-    )
-    if current_chunk_size <= 1:
-        return None
-
-    if observed.device.type != "cuda":
-        # No portable free-memory API for all accelerators (e.g. MPS),
-        # so shrink the current chunk conservatively.
-        return max(1, current_chunk_size // 2)
-
-    bytes_per_elem = torch.finfo(torch.float32).bits // 8
-    per_qparam_bytes = max(1, num_observations * group_size * bytes_per_elem)
-
-    try:
-        free_bytes, _ = torch.cuda.mem_get_info(observed.device)
-    except RuntimeError:
-        return max(1, current_chunk_size // 2)
-
-    target_bytes = max(1, int(free_bytes * 0.35))
-    memory_based_chunk = max(1, target_bytes // per_qparam_bytes)
-    memory_based_chunk = min(memory_based_chunk, current_chunk_size - 1)
-
-    if requested_chunk_size > 0:
-        memory_based_chunk = min(memory_based_chunk, requested_chunk_size)
-
-    return min(memory_based_chunk, qparam_count)
+        ).float()
+        q_chunk.sub_(observations_f[:, start:end]).abs_().pow_(norm)
+        if importance is not None:
+            q_chunk.mul_(importance[:, start:end])
+        err.reshape(-1)[start:end] = q_chunk.sum(dim=(0, -1), dtype=torch.float32)
+    return err
 
 
 def _is_oom_error(error: RuntimeError) -> bool:
     message = str(error).lower()
     return "out of memory" in message or "oom" in message
+
+
+@Observer.register("nvfp4_expanded_imatrix")
+class NVFP4ExpandedIMatrixObserver(IMatrixMSEObserver):
+    """
+    IMatrix observer with defaults tuned for NVFP4 range expansion.
+
+    Same search as :class:`IMatrixMSEObserver` but covers 1.8x down to
+    ~0.8x of the per-group range in 112 steps, matching
+    :class:`NVFP4ExpandedMSEObserver`.
+
+    Usage::
+
+        QuantizationArgs(
+            ...
+            observer="nvfp4_expanded_imatrix",
+        )
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        kw = self.args.observer_kwargs
+        self.expand = kw.get("expand", 1.8)
+        self.maxshrink = kw.get("maxshrink", 1 - 0.8 / 1.8)
+        self.grid = kw.get("grid", 200)
+        self.norm = kw.get("norm", 2.4)
+        self.patience = kw.get("patience", 1000)

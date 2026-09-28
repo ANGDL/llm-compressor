@@ -1,6 +1,6 @@
 # Key Models
 
-The following models are among the most commonly used with LLM Compressor: Llama 4, Qwen3.5, Qwen3.6, Kimi-K2, and Mistral Large 3. Each model page contains quantization examples with tested configurations and recommended parameters.
+The following models are among the most commonly used with LLM Compressor: Llama 4, Qwen3.5, Qwen3.6, Kimi-K2, Kimi-K3, and Mistral Large 3. Each model page contains quantization examples with tested configurations and recommended parameters.
 
 <div class="grid cards" markdown>
 
@@ -36,6 +36,14 @@ The following models are among the most commonly used with LLM Compressor: Llama
       Moonshot AI's latest multimodal agentic model.
 
       [:octicons-arrow-right-24: Kimi-K2.6](kimi-k26/index.md)
+
+  - **Kimi-K3**
+
+      ---
+
+      Moonshot AI's Kimi-K3 multimodal model, quantized to NVFP4.
+
+      [:octicons-arrow-right-24: Kimi-K3](kimi-k3/index.md)
 
   - **Gemma 4**
 
@@ -76,5 +84,13 @@ The following models are among the most commonly used with LLM Compressor: Llama
       THUDM's GLM-5.2 mixed dense/MoE model, quantized to NVFP4 + FP8.
 
       [:octicons-arrow-right-24: GLM-5.2](glm-5.2/index.md)
+
+  - **GLM-5.3-Flash**
+
+      ---
+
+      THUDM's GLM-5.3-Flash vision-language MoE model, quantized to NVFP4.
+
+      [:octicons-arrow-right-24: GLM-5.3-Flash](glm-5.3-flash/index.md)
 
 </div>

@@ -6,6 +6,7 @@ Common functions for interfacing with python primitives and directories/files.
 import contextlib
 import importlib
 import re
+from typing import Any
 
 import torch
 from compressed_tensors.quantization import disable_quantization, enable_quantization
@@ -13,6 +14,7 @@ from compressed_tensors.utils import patch_attr
 from loguru import logger
 from transformers import PreTrainedModel
 
+from llmcompressor.sentinel import Sentinel
 from llmcompressor.utils import get_embeddings
 
 __all__ = [
@@ -23,6 +25,9 @@ __all__ = [
     "disable_hf_kernels",
     "calibration_forward_context",
     "disable_lm_head",
+    "getattr_fallbacks",
+    "hasitem_fallbacks",
+    "getitem_fallbacks",
 ]
 
 
@@ -127,6 +132,7 @@ def calibration_forward_context(model: torch.nn.Module):
     - Disable train mode and enable eval mode
     - Disable hf kernels which could bypass hooks
     - Disable lm head (input and weights can still be calibrated, output will be meta)
+    - Force eager attention (see `use_eager_attention`)
     """
     with contextlib.ExitStack() as stack:
         stack.enter_context(torch.no_grad())
@@ -134,6 +140,25 @@ def calibration_forward_context(model: torch.nn.Module):
         stack.enter_context(eval_context(model))
         stack.enter_context(disable_hf_kernels(model))
         stack.enter_context(disable_lm_head(model))
+        stack.enter_context(use_eager_attention(model))
+        yield
+
+
+@contextlib.contextmanager
+def use_eager_attention(model: torch.nn.Module):
+    """
+    Temporarily force eager attention for the duration of calibration.
+
+    The sequential pipeline traces subgraphs under eager attention, which bakes an
+    unconditional causal-mask add into the traced graph. Runtime calibration must match
+    so that ``create_causal_mask`` uses the eager path and always returns a mask tensor;
+    otherwise (e.g. sdpa) it returns ``None`` for unpadded batches and the baked-in add
+    fails. This matters when samples are not padded to a fixed length.
+    """
+    if isinstance(model, PreTrainedModel):
+        with patch_attr(model.config, "_attn_implementation", "eager"):
+            yield
+    else:
         yield
 
 
@@ -196,3 +221,42 @@ def disable_lm_head(model: torch.nn.Module):
                 stack.enter_context(patch_attr(model._hf_hook, "io_same_device", False))
 
             yield
+
+
+def getattr_fallbacks(
+    target: object, attrs: list[str], default: Any = Sentinel("None")
+) -> Any:
+    for attr in attrs:
+        if hasattr(target, attr):
+            return getattr(target, attr)
+
+    if default is not Sentinel("None"):
+        return default
+
+    raise AttributeError(f"{target} does not have any of {attrs} attributes")
+
+
+def hasitem_fallbacks(
+    target: dict, keys: list[str], default: Any = Sentinel("None")
+) -> Any:
+    for key in keys:
+        if key in target:
+            return key
+
+    if default is not Sentinel("None"):
+        return default
+
+    raise AttributeError(f"{target} does not have any of {keys} keys")
+
+
+def getitem_fallbacks(
+    target: dict, keys: list[str], default: Any = Sentinel("None")
+) -> Any:
+    for key in keys:
+        if key in target:
+            return target[key]
+
+    if default is not Sentinel("None"):
+        return default
+
+    raise AttributeError(f"{target} does not have any of {keys} keys")

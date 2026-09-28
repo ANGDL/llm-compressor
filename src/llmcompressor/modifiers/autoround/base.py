@@ -21,12 +21,13 @@ from compressed_tensors.quantization import (
 from compressed_tensors.utils import align_module_device, match_named_modules
 from loguru import logger
 from pydantic import PrivateAttr
-
 from llmcompressor._torch_accelerator_compat import (
     accelerator_is_available,
     current_accelerator_type,
     current_device_index,
 )
+from torch.utils._pytree import tree_map
+
 from llmcompressor.core import Event, State
 from llmcompressor.modifiers import Modifier
 from llmcompressor.modifiers.autoround.utils import (
@@ -233,7 +234,17 @@ class AutoRoundModifier(Modifier, QuantizationMixin):
 
     def input_capture_hook(self, module, args, kwargs):
         name = module._tmp_name
-        self._all_module_input.setdefault(name, []).append((args, kwargs))
+        # Immediately offload to CPU so captured inputs don't accumulate on GPU.
+        # auto_round's block_forward (compressors/utils.py) handles per-batch CPU->GPU
+        # transfer, so no device mismatch occurs during optimization.
+        # tree_map handles nested structures (lists/dicts of tensors) robustly.
+        cpu_args = tree_map(
+            lambda x: x.detach().cpu() if isinstance(x, torch.Tensor) else x, args
+        )
+        cpu_kwargs = tree_map(
+            lambda x: x.detach().cpu() if isinstance(x, torch.Tensor) else x, kwargs
+        )
+        self._all_module_input.setdefault(name, []).append((cpu_args, cpu_kwargs))
 
     def on_calibration_start(self, state: State, event: Event, **kwargs):
         # register quantization calibration hooks
@@ -247,7 +258,11 @@ class AutoRoundModifier(Modifier, QuantizationMixin):
                 self._capture_hooks[module._tmp_name] = handle
 
     def on_sequential_epoch_end(
-        self, state: State, event: Event, modules: list[torch.nn.Module], **kwargs
+        self,
+        state: State,
+        event: Event,
+        modules: list[torch.nn.Module],
+        **kwargs,
     ):
         self.apply_autoround(state, modules)
         self.post_autoround_cleanup()
@@ -302,6 +317,9 @@ class AutoRoundModifier(Modifier, QuantizationMixin):
             "device_map": self.device_ids,
             "ignore_layers": ",".join(ignore_layers) if ignore_layers else "",
             "disable_opt_rtn": self.disable_opt_rtn,
+            # Keep fp_outputs and best_params on CPU so that the previous block's
+            # cache_device tensors don't accumulate on GPU between blocks.
+            "low_gpu_mem_usage": True,
         }
 
         llmc_registered_qparams = self._preprocess_qparams(decoding_layer)
@@ -332,7 +350,10 @@ class AutoRoundModifier(Modifier, QuantizationMixin):
                     "This can happen if calibration data is missing or the "
                     "forward pass did not execute for this layer."
                 )
-            self._set_attention_masks(ar, decoding_layer, cur_inputs)
+            cur_inputs, padded_masks = self._pad_captured_inputs(cur_inputs)
+            self._set_attention_masks(
+                ar, decoding_layer, cur_inputs, padded_masks=padded_masks
+            )
             decoding_layer.tuning_device = device
             # Only hand device placement to AutoRound when the caller explicitly
             # requested it or when a rank is configured to use a local GPU group.
@@ -345,10 +366,26 @@ class AutoRoundModifier(Modifier, QuantizationMixin):
                 device = get_main_device()
                 decoding_layer.to("cpu")
                 auto_offload = True
+            elif torch.distributed.is_initialized():
+                # Standard DDP (1 GPU per rank): pre-load the block onto the rank's
+                # local GPU before quantize_block is called.  auto_round 0.14.2+
+                # calls _move_block_to_device inside setup_ddp_if_needed_, which
+                # triggers a slow reload when the block was evicted from page cache
+                # during the sequential calibration pass.
+                # Moving it here makes that call a no-op.
+                # Use current_device_index() (local GPU index) rather than global
+                # rank to avoid invalid device ordinal errors on multi-node setups.
+                if accelerator_is_available():
+                    device = torch.device(
+                        current_accelerator_type(),
+                        current_device_index(),
+                    )
+                else:
+                    device = torch.device("cpu")
+                decoding_layer.to(device)
 
-            # Ensure cached inputs are on the same device as the block.
-            # Calibration forward may have run on a different GPU.
-            cur_inputs = self._move_inputs_to(cur_inputs, device)
+            # cur_inputs remain on CPU; auto_round's block_forward handles
+            # per-batch CPU->GPU transfer automatically.
             ar_inputs = [((args, kwargs),) for args, kwargs in cur_inputs]
 
             q_input, _ = ar.quantize_block(
@@ -368,6 +405,13 @@ class AutoRoundModifier(Modifier, QuantizationMixin):
 
     def post_autoround_cleanup(self):
         self._all_module_input.clear()
+        # Release cached GPU memory back to the driver so the next block starts
+        # with a clean allocator state (avoids cross-block fragmentation).
+        if accelerator_is_available():
+            device_type = current_accelerator_type()
+            device_module = getattr(torch, device_type, None)
+            if device_module is not None and hasattr(device_module, "empty_cache"):
+                device_module.empty_cache()
 
     def on_calibration_end(self, state: State, event: Event, **kwargs):
         """
@@ -382,13 +426,27 @@ class AutoRoundModifier(Modifier, QuantizationMixin):
     def get_unquantized_layer_names(self, wrapped_model: torch.nn.Module) -> list[str]:
         unquantized_layers = []
 
-        for name, module in wrapped_model.named_modules():
-            if (
-                module.__class__.__name__ in self.resolved_targets
-                and getattr(module, "quantization_scheme", None) is None
-            ):
+        for name, module in match_named_modules(wrapped_model, self.resolved_targets):
+            if getattr(module, "quantization_scheme", None) is None:
                 unquantized_layers.append(name)
         return unquantized_layers
+
+    def _match_autoround_targets(self, model: torch.nn.Module) -> set[torch.nn.Module]:
+        """
+        Modules within ``model`` that this modifier's own `resolved_targets`/
+        `ignore` match. Used to distinguish AutoRound's own target modules
+        from modules quantized by other modifiers.
+
+        Returned as a set of module identities (not names), since callers may
+        need to match these targets against a model whose module names differ
+        (e.g. a re-parented/wrapped copy of the same submodules).
+        """
+        return {
+            module
+            for _, module in match_named_modules(
+                model, self.resolved_targets, self.ignore
+            )
+        }
 
     def _update_device_map_for_dp(self, ar_kwargs):
         if torch.distributed.is_initialized():
@@ -431,22 +489,6 @@ class AutoRoundModifier(Modifier, QuantizationMixin):
         for _, mod in model.named_modules():
             if hasattr(mod, "_tmp_name"):
                 del mod._tmp_name
-
-    @staticmethod
-    def _move_inputs_to(
-        inputs: list[tuple[tuple, dict]], device: torch.device
-    ) -> list[tuple[tuple, dict]]:
-        """Move all tensors in cached forward inputs to *device*."""
-        return [
-            (
-                tuple(x.to(device) if isinstance(x, torch.Tensor) else x for x in args),
-                {
-                    k: v.to(device) if isinstance(v, torch.Tensor) else v
-                    for k, v in kwargs.items()
-                },
-            )
-            for args, kwargs in inputs
-        ]
 
     def _is_decoding_layer(self, module: torch.nn.Module) -> bool:
         return module.__class__.__name__ in self._sequential_targets
@@ -503,14 +545,19 @@ class AutoRoundModifier(Modifier, QuantizationMixin):
             return cleared_scheme
 
         # Update offload parameters and remove temporary attributes
+        autoround_targets = self._match_autoround_targets(model)
         for name, module in model.named_modules():
-            # Respect AutoRound's final layer decision: if a layer is set back to
-            # full precision (bits/act_bits > 8), do not restore legacy LLMC
-            # qparams, otherwise the layer can look quantized again.
-            layer_should_be_quantized = check_to_quantized(module)
-            if not layer_should_be_quantized:
-                _clear_layer_quantization_metadata(module)
-                continue
+            # Apply AutoRound's quantization decision only to its target modules.
+            is_autoround_target = module in autoround_targets
+            if is_autoround_target:
+                # Respect AutoRound's final layer decision: if a layer is set
+                # back to full precision (bits/act_bits > 8), do not restore
+                # legacy LLMC qparams, otherwise the layer can look quantized
+                # again.
+                layer_should_be_quantized = check_to_quantized(module)
+                if not layer_should_be_quantized:
+                    _clear_layer_quantization_metadata(module)
+                    continue
 
             # Mapping qparams from AutoRound to LLMC naming
             for ar_param_name, llmc_param_name in qparams_mapping.items():
@@ -666,7 +713,18 @@ class AutoRoundModifier(Modifier, QuantizationMixin):
         default_config = self._quant_scheme_to_autoround_config(default_quant_scheme)
         layer_config: dict[str, dict] = {}
 
+        # Resolve targets against the original (unwrapped) decoding layer:
+        # names inside `wrapped_model` are prefixed (e.g.
+        # "model.layers.0.q_proj"), so exact-name targets like "q_proj" would
+        # otherwise fail to match. Module identity is preserved across
+        # wrapping, so match by identity instead of by name.
+        decoding_layer = wrapped_model.model.layers[0]
+        autoround_targets = self._match_autoround_targets(decoding_layer)
+
         for name, module in wrapped_model.named_modules():
+            if module not in autoround_targets:
+                continue
+
             quant_scheme = getattr(module, "quantization_scheme", None)
             if quant_scheme is None:
                 continue
@@ -675,19 +733,148 @@ class AutoRoundModifier(Modifier, QuantizationMixin):
                 raise TypeError(
                     f"Expected QuantizationScheme, got {type(quant_scheme)}"
                 )
+
             layer_scheme = self._quant_scheme_to_autoround_config(quant_scheme)
             if layer_scheme != default_config:
                 layer_config[name] = layer_scheme
 
         return layer_config
 
+    @staticmethod
+    def _hidden_states_seq_len(args: tuple) -> int | None:
+        """Sequence length of a captured decoding-layer call, or None if unknown."""
+        if not args or not isinstance(args[0], torch.Tensor) or args[0].ndim < 2:
+            return None
+        return args[0].shape[1]
+
+    @staticmethod
+    def _pad_seq_dims(value: Any, seq_len: int, max_seq: int, pad_value: float) -> Any:
+        """
+        Right-pad the sequence dimension of captured tensors up to ``max_seq``.
+
+        The sequence dimension is taken to be dim 0 for 1-D tensors (e.g.
+        ``cache_position``) and dim 1 otherwise (e.g. ``hidden_states`` of shape
+        ``[batch, seq, hidden]`` or the ``(cos, sin)`` position embeddings), matching
+        the decoding-layer input layout. Tensors whose sequence dim does not equal
+        ``seq_len`` (and non-tensor leaves) are returned unchanged. Recurses through
+        nested tuples/lists/dicts so grouped tensors are padded consistently.
+        """
+        pad = max_seq - seq_len
+        if pad <= 0:
+            return value
+
+        def _pad(x: Any) -> Any:
+            if isinstance(x, torch.Tensor) and x.ndim >= 1:
+                dim = 0 if x.ndim == 1 else 1
+                if x.shape[dim] == seq_len:
+                    block_shape = list(x.shape)
+                    block_shape[dim] = pad
+                    block = x.new_full(block_shape, pad_value)
+                    return torch.cat([x, block], dim=dim)
+            return x
+
+        return tree_map(_pad, value)
+
+    def _pad_captured_inputs(
+        self, captured_inputs: list[tuple[tuple, dict]]
+    ) -> tuple[list[tuple[tuple, dict]], list[torch.Tensor] | None]:
+        """
+        Right-pad captured decoding-layer inputs to a common sequence length.
+
+        AutoRound batches calibration samples together (concatenating along the batch
+        dimension), which requires every sample to share the same sequence length.
+        Since calibration data is no longer padded to a fixed ``max_seq_length`` by
+        default, captured samples may have differing lengths. Right-padding is safe
+        because causal attention prevents valid positions from attending to trailing
+        pad positions, and the returned validity masks exclude pad positions from
+        AutoRound's tuning loss.
+
+        :param captured_inputs: list of ``(args, kwargs)`` captured from the layer
+        :return: ``(padded_inputs, attention_masks)`` where ``attention_masks`` is a
+            list of ``[1, max_seq]`` validity masks, or ``None`` when no padding was
+            required (in which case any originally-captured masks should be used)
+        """
+        seq_lens = [self._hidden_states_seq_len(args) for args, _ in captured_inputs]
+        if any(length is None for length in seq_lens):
+            # Unable to infer sequence length; leave inputs untouched
+            return captured_inputs, None
+
+        max_seq = max(seq_lens)
+        if all(length == max_seq for length in seq_lens):
+            # Already uniform, no padding needed
+            return captured_inputs, None
+
+        padded_inputs = []
+        attention_masks = []
+        for (args, kwargs), seq_len in zip(captured_inputs, seq_lens):
+            padded_args = tuple(
+                self._pad_seq_dims(arg, seq_len, max_seq, 0.0) for arg in args
+            )
+            padded_kwargs = {}
+            for key, value in kwargs.items():
+                if key == "past_key_values":
+                    # caches are not batched/concatenated by AutoRound
+                    padded_kwargs[key] = value
+                elif key == "attention_mask":
+                    padded_kwargs[key] = self._pad_attention_mask(
+                        value, seq_len, max_seq
+                    )
+                else:
+                    padded_kwargs[key] = self._pad_seq_dims(
+                        value, seq_len, max_seq, 0.0
+                    )
+            padded_inputs.append((padded_args, padded_kwargs))
+
+            mask = torch.ones((1, max_seq), dtype=torch.long)
+            mask[:, seq_len:] = 0
+            attention_masks.append(mask)
+
+        return padded_inputs, attention_masks
+
+    @staticmethod
+    def _pad_attention_mask(mask: Any, seq_len: int, max_seq: int) -> Any:
+        """
+        Right-pad a captured attention mask to ``max_seq`` along its sequence dims.
+
+        Boolean/integer masks (``[batch, seq]``) are padded with ``0`` to mark the new
+        positions as padding. Float causal masks (``[batch, heads, q, k]``) are padded
+        with the dtype minimum along the key (last) dimension so valid queries cannot
+        attend to pad keys, and with ``0`` along any other sequence dimension so pad
+        query rows do not become fully-masked (which would produce NaNs).
+        """
+        if not isinstance(mask, torch.Tensor) or (max_seq - seq_len) <= 0:
+            return mask
+
+        if not mask.is_floating_point():
+            return AutoRoundModifier._pad_seq_dims(mask, seq_len, max_seq, 0.0)
+
+        out = mask
+        min_value = torch.finfo(mask.dtype).min
+        for dim in range(out.ndim):
+            if out.shape[dim] == seq_len:
+                pad_value = min_value if dim == out.ndim - 1 else 0.0
+                block_shape = list(out.shape)
+                block_shape[dim] = max_seq - seq_len
+                block = out.new_full(block_shape, pad_value)
+                out = torch.cat([out, block], dim=dim)
+        return out
+
     def _set_attention_masks(
         self,
         autoround: AutoRound,
         block: torch.nn.Module,
         captured_inputs: list[tuple[tuple, dict]],
+        padded_masks: list[torch.Tensor] | None = None,
     ):
         import inspect
+
+        # When inputs were right-padded to a common length, use the validity masks
+        # produced during padding so AutoRound excludes pad positions from its loss.
+        if padded_masks is not None:
+            autoround.attention_mask = [
+                fix_attention_mask(mask) for mask in padded_masks
+            ]
+            return
 
         sig = inspect.signature(block.forward)
         attention_masks = []
