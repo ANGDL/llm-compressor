@@ -5,7 +5,7 @@ from contextlib import nullcontext
 
 import torch
 import transformers
-from transformers import AutoProcessor, PreTrainedModel
+from transformers import AutoProcessor, PreTrainedModel, AutoTokenizer
 
 from llmcompressor.utils.pytorch.module import get_no_split_params
 from llmcompressor.pipelines.sequential.helpers import trace_subgraphs, Subgraph
@@ -24,8 +24,8 @@ def parse_args():
     parser.add_argument("--sequential_targets", type=str, nargs="*", default=None, metavar="TARGET", help="List of targets for sequential tracing")  # noqa: E501
     parser.add_argument("--ignore", type=str, nargs="*", default=DatasetArguments().tracing_ignore, metavar="PATTERN", help="List of patterns to ignore during tracing")  # noqa: E501
     parser.add_argument("--modality", type=str, default="text", help="Modality of calibration dataset, defaults to text")  # noqa: E501
-    parser.add_argument("--trust_remote_code", type=bool, default=False, help="Whether to trust model remote code")  # noqa: E501
-    parser.add_argument("--skip_weights", type=bool, default=True, help="Whether to load the model with dummy weights")  # noqa: E501
+    parser.add_argument("--trust_remote_code", action=argparse.BooleanOptionalAction, default=False, help="Whether to trust model remote code")  # noqa: E501
+    parser.add_argument("--skip_weights", action=argparse.BooleanOptionalAction, default=True, help="Whether to load the model with dummy weights")  # noqa: E501
     parser.add_argument("--device_map", type=str, default="cpu", help="Device to load model and inputs onto")  # noqa: E501
     parser.add_argument("--targets_per_subgraph", type=int, default=1, help="Number of sequential targets to include per subgraph")  # noqa: E501
     return parser.parse_args()
@@ -37,7 +37,7 @@ def trace(
     sequential_targets: list[str] | str | None = None,
     ignore: list[str] | str = DatasetArguments().tracing_ignore,
     modality: str = "text",
-    trust_remote_code: bool = True,
+    trust_remote_code: bool = False,
     skip_weights: bool = True,
     device_map: str | dict = "cpu",
     targets_per_subgraph: int = 1
@@ -70,9 +70,14 @@ def trace(
             device_map=device_map,
             trust_remote_code=trust_remote_code,
         )
-    processor = AutoProcessor.from_pretrained(
-        model_id, trust_remote_code=trust_remote_code
-    )
+    if modality == "text":
+        processor = AutoTokenizer.from_pretrained(
+            model_id, trust_remote_code=trust_remote_code
+        )
+    else:
+        processor = AutoProcessor.from_pretrained(
+            model_id, trust_remote_code=trust_remote_code
+        )
     print("Loaded model")
 
     # Prepare sample data

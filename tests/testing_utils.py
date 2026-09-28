@@ -36,9 +36,12 @@ class BaseTestConfig(BaseModel):
 
     Required fields
     ---------------
-    cadence : str
-        When this test runs. One of: "commit", "nightly", "weekly".
+    cadence : str or list[str]
+        When this test runs. One of: "commit", "nightly", "weekly", "release",
+        or a list of these values.
         Determines the CI cadence for this test configuration.
+        When CADENCE is set to "release", all tests run regardless of their
+        individual cadence setting.
     model : str
         HuggingFace model ID to quantize (e.g. "meta-llama/Meta-Llama-3-8B-Instruct").
         Must be a valid model identifier on HuggingFace Hub or a local path.
@@ -65,12 +68,13 @@ class BaseTestConfig(BaseModel):
     Optional calibration dataset fields
     ------------------------------------
     dataset_id : str | None
-        HuggingFace dataset ID for calibration. Leave unset to skip calibration.
-        Datasets with special data-collator handling in run_oneshot_for_e2e_testing:
-          - "HuggingFaceH4/ultrachat_200k"  → text, DefaultDataCollator
+        Calibration dataset. Leave unset to skip calibration.
+        Names without "/" are treated as prebaked datasets (e.g. "perfectblend")
+        and passed directly to oneshot, which handles loading and preprocessing.
+        Names with "/" are HuggingFace dataset IDs loaded manually:
           - "neuralmagic/calibration"        → multimodal; set dataset_config="LLM"
           - any ID containing "flickr30k"   → multimodal, flickr30k collator
-        Any other dataset ID uses DefaultDataCollator.
+        Any other HuggingFace ID uses DefaultDataCollator.
     dataset_config : str | None
         Dataset config/subset name (e.g. "LLM" for "neuralmagic/calibration").
         Required for datasets with multiple configurations.
@@ -131,8 +135,7 @@ class BaseTestConfig(BaseModel):
         cadence: commit
         model: meta-llama/Meta-Llama-3-8B-Instruct
         scheme: FP8_DYNAMIC
-        dataset_id: HuggingFaceH4/ultrachat_200k
-        dataset_split: train_sft
+        dataset_id: perfectblend
         num_calibration_samples: 512
         ```
 
@@ -160,7 +163,9 @@ class BaseTestConfig(BaseModel):
     # -------------------------------------------------------------------------
     # Required
     # -------------------------------------------------------------------------
-    cadence: str = Field(..., description="'commit', 'nightly', or 'weekly'")
+    cadence: Union[str, List[str]] = Field(
+        ..., description="'commit', 'nightly', 'weekly', or 'release'"
+    )
     model: str = Field(..., description="HuggingFace model ID to quantize")
 
     # -------------------------------------------------------------------------
@@ -206,11 +211,9 @@ class BaseTestConfig(BaseModel):
     dataset_id: Optional[str] = Field(
         None,
         description=(
-            "HuggingFace dataset ID. Known datasets with special collator handling:\n"
-            " 'HuggingFaceH4/ultrachat_200k' — text, DefaultDataCollator\n"
-            " 'neuralmagic/calibration'      — multimodal (set dataset_config='LLM')\n"
-            " any ID containing 'flickr30k'  — multimodal, flickr30k collator\n"
-            "Any other ID uses DefaultDataCollator."
+            "Calibration dataset. Supports prebaked datasets (e.g. 'perfectblend')\n"
+            "Any ID containing 'flickr30k' uses the multimodal collator\n"
+            "Any other HuggingFace ID uses DefaultDataCollator."
         ),
     )
     dataset_config: Optional[str] = Field(
@@ -273,6 +276,13 @@ class BaseTestConfig(BaseModel):
             "Number of GPUs required for this test. "
             "Tests are skipped if fewer are available.",
         ),
+    )
+    max_num_seqs: int = Field(
+        128, description="Maximum number of sequences to process in parallel."
+    )
+    max_model_len: Optional[int] = Field(
+        default=None,
+        description="Maximum sequence length for the model. Not used by e2e tests.",
     )
     pipeline_parallel: bool = Field(
         False,
@@ -370,7 +380,7 @@ def requires_gpu_mem(required_amount: Union[int, float]) -> pytest.MarkDecorator
 
 def requires_compute_capability(major: int, minor: int = 0) -> pytest.MarkDecorator:
     """
-    Pytest decorator to skip based on GPU compute capability.
+    Pytest decorator to skip based on CUDA GPU compute capability.
 
     Usage:
     @requires_compute_capability(9, 0)  # Requires H100 or higher
@@ -381,9 +391,23 @@ def requires_compute_capability(major: int, minor: int = 0) -> pytest.MarkDecora
     :param minor: required minor compute capability version (default 0)
     """
     if not torch.accelerator.is_available():
-        return pytest.mark.skip(reason="CUDA not available")
+        return pytest.mark.skip(reason="No accelerator available")
 
-    device_capability = torch.get_device_module().get_device_capability(0)
+    accelerator_type = torch.accelerator.current_accelerator().type
+    if accelerator_type != "cuda":
+        return pytest.mark.skip(
+            reason=f"CUDA compute capability required, found {accelerator_type}"
+        )
+
+    device_module = torch.get_device_module()
+    if not hasattr(device_module, "get_device_capability"):
+        # not every accelerator backend reports a compute capability
+        # (e.g. `torch.mps` on Apple Silicon)
+        return pytest.mark.skip(
+            reason=f"{device_module.__name__} does not report compute capability"
+        )
+
+    device_capability = device_module.get_device_capability(0)
     has_capability = device_capability[0] > major or (
         device_capability[0] == major and device_capability[1] >= minor
     )
@@ -544,7 +568,7 @@ def _load_yaml(config_path: str):
     return None
 
 
-_VALID_CADENCES = {"commit", "weekly", "nightly"}
+_VALID_CADENCES = {"commit", "weekly", "nightly", "release"}
 
 
 def _validate_test_config(config: dict) -> bool:
@@ -580,7 +604,7 @@ def parse_params(configs_directory: Union[list, str]) -> List[dict]:
 
             if not isinstance(expected_cadence, list):
                 expected_cadence = [expected_cadence]
-            if cadence in expected_cadence:
+            if cadence == "release" or cadence in expected_cadence:
                 if not _validate_test_config(config):
                     raise ValueError(
                         "The config provided does not comply with the expected "
@@ -628,7 +652,7 @@ def process_dataset(
 
         def process(sample):
             return processor(
-                sample["question"],
+                text=sample["question"],
                 padding=False,
                 max_length=max_seq_length,
                 truncation=True,
@@ -639,7 +663,7 @@ def process_dataset(
 
         def process(sample):
             return processor(
-                processor.apply_chat_template(
+                text=processor.apply_chat_template(
                     sample["messages"],
                     tokenize=False,
                 ),
@@ -653,7 +677,7 @@ def process_dataset(
         # use the output rather than the instruction
         def process(sample):
             return processor(
-                processor.apply_chat_template(
+                text=processor.apply_chat_template(
                     sample["output"],
                     tokenize=False,
                 ),
@@ -699,13 +723,15 @@ def process_dataset(
             return processor.apply_chat_template(
                 messages,
                 return_tensors="pt",
-                padding=False,
-                truncation=True,
-                max_length=max_seq_length,
                 tokenize=True,
-                add_special_tokens=False,
                 return_dict=True,
                 add_generation_prompt=False,
+                processor_kwargs={
+                    "padding": False,
+                    "truncation": True,
+                    "max_length": max_seq_length,
+                    "add_special_tokens": False,
+                },
             )
 
     else:
@@ -721,7 +747,8 @@ def requires_cadence(cadence: Union[str, List[str]]) -> Callable:
     current_cadence = os.environ.get("CADENCE", "commit")
 
     return pytest.mark.skipif(
-        (current_cadence not in cadence), reason="cadence mismatch"
+        (current_cadence != "release" and current_cadence not in cadence),
+        reason="cadence mismatch",
     )
 
 

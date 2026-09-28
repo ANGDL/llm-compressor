@@ -55,8 +55,8 @@ def test_oneshot_integration():
         cadence="commit",
         model="nm-testing/tinysmokeqwen3moe",
         scheme="NVFP4",
-        dataset_id="HuggingFaceH4/ultrachat_200k",
-        dataset_split="train_sft",
+        dataset_id="perfectblend",
+        dataset_split="train[:1]",
         num_calibration_samples=1,
         max_seq_length=1,  # not enough tokens to send to all experts w/o context
     )

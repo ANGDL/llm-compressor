@@ -1,19 +1,8 @@
 import pytest
+import transformers
 from compressed_tensors.utils.match import match_named_modules
-from transformers import (
-    AutoModelForCausalLM,
-    Gemma3ForConditionalGeneration,
-    Gemma3nForConditionalGeneration,
-    Idefics3ForConditionalGeneration,
-    Llama4ForConditionalGeneration,
-    LlavaForConditionalGeneration,
-    Mistral3ForConditionalGeneration,
-    MllamaForConditionalGeneration,
-    Qwen2_5_VLForConditionalGeneration,
-    Qwen2VLForConditionalGeneration,
-    WhisperForConditionalGeneration,
-)
 
+from llmcompressor.modeling.kimi_k3 import KimiK3ForConditionalGeneration
 from llmcompressor.transformers.tracing.debug import trace
 from llmcompressor.utils.pytorch.module import get_no_split_params
 from tests.testing_utils import requires_hf_token
@@ -24,121 +13,165 @@ from tests.testing_utils import requires_hf_token
     "model_id,model_class,targets,modality,backends",
     [
         # --- text ---
-        ("meta-llama/Meta-Llama-3-8B-Instruct", AutoModelForCausalLM, None, "text", []),
         (
-            "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct",
-            AutoModelForCausalLM,
+            "meta-llama/Meta-Llama-3-8B-Instruct",
+            "AutoModelForCausalLM",
             None,
             "text",
             [],
         ),
         (
-            "mistralai/Mixtral-8x7B-Instruct-v0.1",
-            AutoModelForCausalLM,
+            "inference-optimization/gemma-4-1B-0.8B-tiny",
+            "Gemma4ForConditionalGeneration",
+            ["Gemma4TextDecoderLayer"],
+            "text",
+            [],
+        ),
+        (
+            "inference-optimization/DSV4-tiny-empty",
+            "AutoModelForCausalLM",
+            ["DeepseekV4DecoderLayer"],
+            "text",
+            [],
+        ),
+        (
+            "inference-optimization/Qwen3-1.6B-A0.9B",
+            "AutoModelForCausalLM",
             None,
             "text",
             [],
         ),
         (
-            "ibm-granite/granite-20b-code-instruct-8k",
-            AutoModelForCausalLM,
+            "inference-optimization/Llama-3.2-0.5B-Instruct",
+            "AutoModelForCausalLM",
             None,
             "text",
             [],
         ),
-        ("google/gemma-3n-E2B-it", AutoModelForCausalLM, None, "text", ["timm"]),
-        ("unsloth/DeepSeek-R1-0528-BF16", AutoModelForCausalLM, None, "text", []),
+        (
+            "inference-optimization/GLM-5.2-0.8B-A0.8B",
+            "AutoModelForCausalLM",
+            None,
+            "text",
+            [],
+        ),
+        (
+            "inference-optimization/Phi-3.5-MoE-0.8B-A0.2B",
+            "AutoModelForCausalLM",
+            None,
+            "text",
+            [],
+        ),
+        (
+            "inference-optimization/gpt-oss-2.5B-A1.3B",
+            "AutoModelForCausalLM",
+            None,
+            "text",
+            [],
+        ),
+        (
+            "inference-optimization/DeepSeek-V4-Pro-0.5B-A0.37B",
+            "AutoModelForCausalLM",
+            ["DeepseekV4DecoderLayer"],
+            "text",
+            [],
+        ),
+        (
+            "inference-optimization/Qwen3.8-1.0B-A0.6B",
+            "AutoModelForCausalLM",
+            None,
+            "text",
+            [],
+        ),
+        (
+            "inference-optimization/Qwen3.8-Flash-Next-0.2B-A0.2B",
+            "Qwen4ExpForConditionalGeneration",
+            ["Qwen4ExpTextDecoderLayer"],
+            "text",
+            ["transformers>=5.17.0"],
+        ),
+        (
+            "inference-optimization/NemotronH-0.3B-A0.3B",
+            "AutoModelForCausalLM",
+            None,
+            "text",
+            [],
+        ),
+        (
+            "inference-optimization/GLM-5.3-0.6B-A0.4B",
+            "AutoModelForCausalLM",
+            None,
+            "text",
+            [],
+        ),
         # --- vision ---
         (
-            "HuggingFaceM4/Idefics3-8B-Llama3",
-            Idefics3ForConditionalGeneration,
-            ["LlamaDecoderLayer"],
+            "inference-optimization/Llama-4-Scout-1.7B-0.4B-Instruct",
+            "Llama4ForConditionalGeneration",
+            ["Llama4TextDecoderLayer"],
             "vision",
             [],
         ),
         (
-            "llava-hf/llava-1.5-7b-hf",
-            LlavaForConditionalGeneration,
-            ["LlamaDecoderLayer"],
-            "vision",
-            [],
-        ),
-        (
-            "meta-llama/Llama-3.2-11B-Vision-Instruct",
-            MllamaForConditionalGeneration,
-            ["MllamaSelfAttentionDecoderLayer"],
-            "vision",
-            [],
-        ),
-        # skip phi3_v because of its processor is annoying and requires special code
-        (
-            "mgoin/pixtral-12b",
-            LlavaForConditionalGeneration,
-            ["MistralDecoderLayer"],
-            "vision",
-            [],
-        ),
-        (
-            "Qwen/Qwen2.5-VL-7B-Instruct",
-            Qwen2_5_VLForConditionalGeneration,
-            ["Qwen2_5_VLDecoderLayer"],
-            "vision",
-            ["torchvision"],
-        ),
-        # TODO: add gated model command-a to CI runner tokens
-        # (
-        #     "CohereLabs/command-a-vision-07-2025",
-        #     Cohere2VisionForConditionalGeneration,
-        #     ["Cohere2DecoderLayer"],
-        #     "vision",
-        #     [],
-        # ),
-        (
-            "Qwen/Qwen2-VL-2B-Instruct",
-            Qwen2VLForConditionalGeneration,
-            ["Qwen2VLDecoderLayer"],
+            "inference-optimization/Qwen3-VL-1.0B-A0.4B-Instruct",
+            "Qwen3VLMoeForConditionalGeneration",
+            ["Qwen3VLMoeTextDecoderLayer"],
             "vision",
             ["torchvision"],
         ),
         (
-            "mistralai/Mistral-Small-3.1-24B-Instruct-2503",
-            Mistral3ForConditionalGeneration,
-            ["MistralDecoderLayer"],
+            "inference-optimization/Inkling-0.6B-A0.6B",
+            "InklingForConditionalGeneration",
+            ["InklingDecoderLayer"],
             "vision",
             [],
         ),
         (
-            "google/gemma-3-4b-it",
-            Gemma3ForConditionalGeneration,
-            ["Gemma3DecoderLayer"],
+            "inference-optimization/Kimi-K3-0.40B",
+            "KimiK3ForConditionalGeneration",
+            ["KimiDecoderLayer"],
+            "vision",
+            ["einops", "fla-core", "tiktoken"],
+        ),
+        (
+            "inference-optimization/gemma-4-unified-0.8B-tiny",
+            "Gemma4UnifiedForConditionalGeneration",
+            ["Gemma4UnifiedTextDecoderLayer"],
             "vision",
             [],
         ),
         (
-            "meta-llama/Llama-4-Scout-17B-16E-Instruct",
-            Llama4ForConditionalGeneration,
-            "Llama4TextDecoderLayer",
+            "inference-optimization/granite-vision-4.1-0.2B-tiny",
+            "Granite4VisionForConditionalGeneration",
+            ["Granite4VisionTextDecoderLayer"],
             "vision",
             [],
         ),
         (
-            "meta-llama/Llama-4-Maverick-17B-128E-Instruct",
-            Llama4ForConditionalGeneration,
-            "Llama4TextDecoderLayer",
+            "inference-optimization/Qwen3-VL-Reranker-0.1B-tiny",
+            "Qwen3VLForConditionalGeneration",
+            ["Qwen3VLTextDecoderLayer"],
             "vision",
-            [],
+            ["torchvision"],
         ),
         (
-            "google/gemma-3n-E2B-it",
-            Gemma3nForConditionalGeneration,
-            None,
+            "inference-optimization/GLM-5.3-Flash-0.1B-A0.1B",
+            "Glm5NextForConditionalGeneration",
+            ["Glm5NextTextDecoderLayer"],
             "vision",
-            ["timm"],
+            ["transformers>=5.16.0"],
+        ),
+        (
+            "inference-optimization/Qwen3.6-8B-A1.6B",
+            "Qwen3_5MoeForConditionalGeneration",
+            ["Qwen3_5MoeDecoderLayer"],
+            "vision",
+            ["torchvision"],
         ),
         # --- audio ---
         (
             "openai/whisper-large-v3",
-            WhisperForConditionalGeneration,
+            "WhisperForConditionalGeneration",
             ["WhisperDecoderLayer"],
             "audio",
             ["librosa", "soundfile", "torchcodec"],
@@ -147,14 +180,21 @@ from tests.testing_utils import requires_hf_token
 )
 def test_model_trace(model_id, model_class, targets, modality, backends):
     for backend in backends:
-        pytest.importorskip(backend)
+        pytest.importorskip(*backend.split(">="))
+
+    if "kimi" in model_id.lower():
+        model_class = KimiK3ForConditionalGeneration
+        trust_remote_code = True
+    else:
+        model_class = getattr(transformers, model_class)
+        trust_remote_code = False
 
     model, subgraphs, sample_input = trace(
         model_id,
         model_class,
         targets,
         modality=modality,
-        trust_remote_code=False,
+        trust_remote_code=trust_remote_code,
         device_map="meta",
         skip_weights=True,
     )

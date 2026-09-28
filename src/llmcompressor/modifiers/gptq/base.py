@@ -1,11 +1,9 @@
 import contextlib
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from queue import Empty, Queue
-from time import perf_counter
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Literal
 
 import torch
 from compressed_tensors.distributed import greedy_bin_packing, wait_for_comms
+from compressed_tensors.offload import disable_offloading
 from compressed_tensors.offload.dist_utils import is_distributed
 from compressed_tensors.offload.dist_utils import is_source_process as is_src
 from compressed_tensors.quantization import (
@@ -16,22 +14,23 @@ from compressed_tensors.quantization import (
 from compressed_tensors.quantization.quant_args import ActivationOrdering
 from compressed_tensors.quantization.utils import is_module_quantized
 from compressed_tensors.utils import (
-    align_module_device,
     get_execution_device,
     getattr_chain,
     match_named_modules,
-    update_offload_parameter,
 )
 from loguru import logger
-from pydantic import PrivateAttr
+from pydantic import PrivateAttr, StrictInt, field_validator
 from torch import distributed as dist
 
 from llmcompressor.core import Event, State
 from llmcompressor.modifiers import Modifier
-from llmcompressor.modifiers.gptq.gptq_quantize import (
+from llmcompressor.modifiers.gptq.gptq_quantize import quantize_weight
+from llmcompressor.modifiers.gptq.helpers import (
     accumulate_hessian,
-    make_empty_gptq_statistics,
-    quantize_weight,
+    assign_batches,
+    make_empty_hessian,
+    prepare_batch,
+    update_batch_qparams,
 )
 from llmcompressor.modifiers.quantization.calibration import (
     observe,
@@ -45,7 +44,7 @@ from llmcompressor.utils.metric_logging import CompressionLogger
 
 __all__ = ["GPTQModifier"]
 
-_GPTQ_Q_PARAMS = ["weight", "weight_scale", "weight_zero_point", "weight_g_idx"]
+_GPTQ_Q_PARAMS = ["weight", "weight_scale", "weight_zero_point"]
 
 
 class GPTQModifier(Modifier, QuantizationMixin):
@@ -62,7 +61,6 @@ class GPTQModifier(Modifier, QuantizationMixin):
         GPTQModifier:
           block_size: 128
           dampening_frac: 0.001
-          offload_hessians: False
           actorder: static
           config_groups:
             group_0:
@@ -97,9 +95,10 @@ class GPTQModifier(Modifier, QuantizationMixin):
     :param actorder: order in which weight columns are quantized. Defaults to "static"
         activation ordering, which achieves best accuracy recovery with no runtime cost.
         For more information, see https://github.com/vllm-project/vllm/pull/8135.
-        Note: "group"/ "dynamic" are deprecated and will be removed in a future release.
-    :param offload_hessians: Set to True for decreased memory usage but increased
-        runtime.
+    :param batched_quantization: Controls batching of same-shape modules (e.g.
+        linearized MoE experts). ``"auto"`` (the default) limits batches to 75% of
+        available CUDA memory. A positive integer sets a maximum batch size without
+        consulting available memory. ``None`` disables batching.
 
     :param config_groups: dictionary specifying quantization schemes to apply to target
         modules. Modules not matching a scheme target will NOT be quantized.
@@ -123,8 +122,6 @@ class GPTQModifier(Modifier, QuantizationMixin):
         There is an explicit assumption that the model contains modules with
         `k_proj` and `v_proj` in their names. If this is not the case
         and kv_cache_scheme != None, the quantization of kv cache will fail
-    :param muti_gpu_compression: Whether to use multiple GPUs to compress the model in parallel. 
-        Only has an effect if more than 1 GPU is available.
     """
 
     requires_calibration_data: bool = True
@@ -133,8 +130,7 @@ class GPTQModifier(Modifier, QuantizationMixin):
     block_size: int = 128
     dampening_frac: float | None = 0.01
     actorder: ActivationOrdering | Sentinel | None = Sentinel("static")
-    offload_hessians: bool = False
-    muti_gpu_compression: bool = False
+    batched_quantization: Literal["auto"] | StrictInt | None = "auto"
 
     # private variables
     _module_names: dict[torch.nn.Module, str] = PrivateAttr(default_factory=dict)
@@ -142,6 +138,15 @@ class GPTQModifier(Modifier, QuantizationMixin):
     _num_samples: dict[torch.nn.Module, torch.Tensor] = PrivateAttr(
         default_factory=dict
     )
+    _num_compressed_modules: int = PrivateAttr(default=0)
+    _rtn_fallback_module_names: list[str] = PrivateAttr(default_factory=list)
+
+    @field_validator("batched_quantization")
+    @classmethod
+    def _validate_batched_quantization(cls, value):
+        if isinstance(value, int) and value <= 0:
+            raise ValueError("batched_quantization must be a positive integer")
+        return value
 
     def resolve_quantization_config(self) -> QuantizationConfig:
         config = super().resolve_quantization_config()
@@ -164,13 +169,6 @@ class GPTQModifier(Modifier, QuantizationMixin):
                 "remove `actorder` from config groups."
             )
 
-        # compressed-tensors only accepts actorder=GROUP on these strategies
-        # on reload; other strategies fall back to None below.
-        grouped_strategies = (
-            QuantizationStrategy.GROUP,
-            QuantizationStrategy.TENSOR_GROUP,
-        )
-
         for scheme in config.config_groups.values():
             assert isinstance(scheme, QuantizationScheme)
             strategy = getattr_chain(scheme, "weights.strategy", None)
@@ -183,20 +181,6 @@ class GPTQModifier(Modifier, QuantizationMixin):
             ):
                 # Apply modifier-level actorder to already-constructed QuantizationArgs.
                 scheme.weights.actorder = resolve_actorder(scheme.weights.actorder)
-
-                if scheme.weights.actorder == ActivationOrdering.GROUP:
-                    logger.bind(log_once=False).warning(
-                        "ActivationOrdering.GROUP is deprecated and will be removed "
-                        "in a future release. Use default actorder='static' instead. "
-                    )
-
-                    if strategy not in grouped_strategies:
-                        logger.warning(
-                            f"ActivationOrdering.GROUP is not compatible with "
-                            f"strategy={strategy}; falling back to actorder=None "
-                            f"for this scheme."
-                        )
-                        scheme.weights.actorder = None
 
         return config
 
@@ -279,25 +263,19 @@ class GPTQModifier(Modifier, QuantizationMixin):
 
         # Initialize hessian if not present
         if module not in self._num_samples:
-            init_device = (
-                "cpu" if self.offload_hessians else get_execution_device(module)
+            self._hessians[module] = make_empty_hessian(
+                module, device=get_execution_device(module)
             )
-            self._hessians[module], self._num_samples[module] = (
-                make_empty_gptq_statistics(
-                    module,
-                    device=init_device,
-                    count_device=get_execution_device(module),
-                )
+            self._num_samples[module] = torch.zeros(
+                tuple(), device=get_execution_device(module)
             )
 
-        # Accumulate hessian with input with optional offloading
-        with self._maybe_onload_hessian(module):
-            self._hessians[module], self._num_samples[module] = accumulate_hessian(
-                inp,
-                module,
-                self._hessians[module],
-                self._num_samples[module],
-            )
+        self._hessians[module], self._num_samples[module] = accumulate_hessian(
+            inp,
+            module,
+            self._hessians[module],
+            self._num_samples[module],
+        )
 
     def compress_modules(self):
         """
@@ -305,11 +283,7 @@ class GPTQModifier(Modifier, QuantizationMixin):
         """
         ### Not Distributed
         if not is_distributed():
-            module_list = list(self._num_samples.keys())
-            if self.muti_gpu_compression and torch.cuda.is_available() and torch.cuda.device_count() > 1:
-                self.compress_module_list_muti_gpu(module_list)
-            else:
-                self.compress_module_list(module_list)
+            self.compress_module_list(list(self._num_samples.keys()))
             return
 
         ### Distributed
@@ -331,312 +305,111 @@ class GPTQModifier(Modifier, QuantizationMixin):
         # broadcast compressed modules to each rank
         broadcast_qparams_and_cleanup(module_list, module_to_rank, _GPTQ_Q_PARAMS)
 
-    def compress_module_list_muti_gpu(self, module_list):
-        n_gpus = torch.cuda.device_count()
-
-        if n_gpus <= 1 or len(module_list) <= 1:
-            self.compress_module_list(module_list)
-            return
-
-        module_payloads: List[Tuple[torch.nn.Module, torch.Tensor, torch.Tensor]] = []
-        for module in module_list:
-            module_payloads.append(
-                (
-                    module,
-                    self._hessians.pop(module),
-                    self._num_samples.pop(module),
-                )
-            )
-
-        # Prioritize larger modules to reduce straggler effects across workers.
-        module_payloads.sort(key=lambda payload: payload[1].shape[0], reverse=True)
-
-        active_devices = min(n_gpus, len(module_payloads))
-        devices = [torch.device(f"cuda:{gpu_idx}") for gpu_idx in range(active_devices)]
-
-        logger.info(
-            "Running GPTQ compression in parallel across "
-            f"{active_devices} devices with async task consumption"
-        )
-
-        self._warmup_cholesky_on_devices(devices)
-
-        # Per-device queues preserve affinity while still allowing work stealing.
-        per_device_queues: Dict[torch.device, Queue] = {
-            device: Queue() for device in devices
-        }
-        assigned_work: Dict[torch.device, int] = {device: 0 for device in devices}
-
-        for payload in module_payloads:
-            module, hessian, _ = payload
-            module_work = int(hessian.shape[0])
-            original_device = get_execution_device(module)
-            preferred_device: Optional[torch.device] = None
-
-            # Prefer the module's original CUDA device to minimize weight movement.
-            if (
-                isinstance(original_device, torch.device)
-                and original_device.type == "cuda"
-                and original_device.index is not None
-            ):
-                candidate_device = torch.device(f"cuda:{original_device.index}")
-                if candidate_device in per_device_queues:
-                    preferred_device = candidate_device
-
-            # Fallback to least-assigned worker by estimated hessian work.
-            if preferred_device is None:
-                preferred_device = min(devices, key=lambda device: assigned_work[device])
-
-            per_device_queues[preferred_device].put(payload)
-            assigned_work[preferred_device] += module_work
-
-        def _pop_next_payload(device: torch.device, allow_steal: bool = True):
-            try:
-                # Fast path: consume local queue first to keep affinity.
-                payload = per_device_queues[device].get_nowait()
-                return payload, per_device_queues[device]
-            except Empty:
-                pass
-
-            if not allow_steal:
-                return None, None
-
-            # Slow path: steal from peers to avoid idle workers.
-            for steal_device in devices:
-                if steal_device == device:
-                    continue
-                try:
-                    payload = per_device_queues[steal_device].get_nowait()
-                    return payload, per_device_queues[steal_device]
-                except Empty:
-                    continue
-
-            return None, None
-
-        def _schedule_payload_for_device(payload_and_queue, device, prefetch_stream):
-            payload, source_queue = payload_and_queue
-            module, hessian, num_samples = payload
-            module_work = int(hessian.shape[0])
-            original_device = get_execution_device(module)
-            ready_event = None
-
-            if device.type == "cuda" and prefetch_stream is not None:
-                # Prefetch tensors on a separate stream so copy can overlap compute.
-                with torch.cuda.stream(prefetch_stream):
-                    hessian = hessian.to(device=device, non_blocking=True)
-                    num_samples = num_samples.to(device=device, non_blocking=True)
-                    # Record readiness for this specific job.
-                    ready_event = torch.cuda.Event()
-                    ready_event.record(prefetch_stream)
-            else:
-                hessian = hessian.to(device=device)
-                num_samples = num_samples.to(device=device)
-
-            return {
-                "module": module,
-                "hessian": hessian,
-                "num_samples": num_samples,
-                "module_work": module_work,
-                "original_device": original_device,
-                "source_queue": source_queue,
-                "ready_event": ready_event,
-            }
-
-        def _compress_device_modules(device: torch.device):
-            if device.type == "cuda":
-                torch.cuda.set_device(device)
-
-            # Keep prefetch and compute streams separate for overlap.
-            prefetch_stream = (
-                torch.cuda.Stream(device=device) if device.type == "cuda" else None
-            )
-            compute_stream = (
-                torch.cuda.Stream(device=device) if device.type == "cuda" else None
-            )
-
-            worker_start = perf_counter()
-            processed_modules = 0
-            processed_work = 0
-
-            first_payload, first_queue = _pop_next_payload(device, allow_steal=True)
-            if first_payload is None:
-                elapsed = perf_counter() - worker_start
-                logger.info(
-                    f"[GPTQ multi-gpu] {device} processed {processed_modules} modules "
-                    f"(work={processed_work}) in {elapsed:.2f}s"
-                )
-                return processed_modules, processed_work, elapsed
-
-            # Prime the pipeline with the first prefetched job.
-            current_job = _schedule_payload_for_device(
-                (first_payload, first_queue), device, prefetch_stream
-            )
-
-            while current_job is not None:
-                # Double-buffering prefetch only from local queue.
-                # This avoids early global reservation that can starve faster workers.
-                next_payload, next_queue = _pop_next_payload(device, allow_steal=False)
-                next_job = None
-                if next_payload is not None:
-                    next_job = _schedule_payload_for_device(
-                        (next_payload, next_queue), device, prefetch_stream
-                    )
-
-                try:
-                    module = current_job["module"]
-                    hessian = current_job["hessian"]
-                    num_samples = current_job["num_samples"]
-                    module_work = current_job["module_work"]
-                    original_device = current_job["original_device"]
-                    source_queue = current_job["source_queue"]
-                    ready_event = current_job["ready_event"]
-                    name = self._module_names[module]
-                    quant_args = getattr_chain(module, "quantization_scheme.weights")
-
-                    logger.info(
-                        f"Quantizing {name} on {device} using {num_samples} samples"
-                    )
-
-                    # Wait only for this job's copy, not the whole prefetch stream.
-                    if compute_stream is not None and ready_event is not None:
-                        compute_stream.wait_event(ready_event)
-
-                    # Run compute in dedicated stream to avoid contention on default stream
-                    # in multi-threaded multi-GPU scenarios
-                    with torch.cuda.stream(compute_stream) if compute_stream else contextlib.nullcontext():
-                        with torch.no_grad():
-                            if original_device != device:
-                                module.to(device=device)
-
-                            with CompressionLogger(module) as comp_logger:
-                                loss, q_param_dict = quantize_weight(
-                                    module=module,
-                                    quant_args=quant_args,
-                                    hessian=hessian / num_samples,
-                                    blocksize=self.block_size,
-                                    percdamp=self.dampening_frac,
-                                )
-                                comp_logger.set_results(name="GPTQ", loss=loss)
-
-                            if original_device != device:
-                                module.to(device=original_device)
-
-                    for attr, val in q_param_dict.items():
-                        update_offload_parameter(module, attr, val)
-                    processed_modules += 1
-                    processed_work += module_work
-                finally:
-                    # Mark completion on the queue this job originally came from.
-                    source_queue = current_job["source_queue"]
-                    if source_queue is not None:
-                        source_queue.task_done()
-
-                current_job = next_job
-
-                # If local pipeline is empty, attempt to steal now.
-                # Stealing at this point keeps overlap benefits without hoarding.
-                if current_job is None:
-                    stolen_payload, stolen_queue = _pop_next_payload(
-                        device, allow_steal=True
-                    )
-                    if stolen_payload is not None:
-                        current_job = _schedule_payload_for_device(
-                            (stolen_payload, stolen_queue), device, prefetch_stream
-                        )
-
-            elapsed = perf_counter() - worker_start
-            logger.info(
-                f"[GPTQ multi-gpu] {device} processed {processed_modules} modules "
-                f"(work={processed_work}) in {elapsed:.2f}s"
-            )
-            return processed_modules, processed_work, elapsed
-
-        start_time = perf_counter()
-        with ThreadPoolExecutor(max_workers=active_devices) as executor:
-            futures = [executor.submit(_compress_device_modules, device) for device in devices]
-            worker_stats = [future.result() for future in as_completed(futures)]
-
-        # Summarize per-worker stats into wall-time and aggregate work numbers.
-        total_elapsed = perf_counter() - start_time
-        total_modules = sum(stat[0] for stat in worker_stats)
-        total_work = sum(stat[1] for stat in worker_stats)
-        sum_worker_time = sum(stat[2] for stat in worker_stats)
-
-        logger.info(
-            "[GPTQ multi-gpu] finished "
-            f"modules={total_modules}, work={total_work}, wall={total_elapsed:.2f}s, "
-            f"accumulated_worker_time={sum_worker_time:.2f}s"
-        )
-
-    def _warmup_cholesky_on_devices(self, devices: List[torch.device]) -> None:
-        # Warm up CUDA linalg kernels per device before worker threads start.
-        # This avoids concurrent first-use lazy initialization in thread workers.
-        for device in devices:
-            if device.type != "cuda":
-                continue
-
-            try:
-                with torch.cuda.device(device), torch.no_grad():
-                    warmup_hessian = torch.eye(2, dtype=torch.float32, device=device)
-                    torch.linalg.cholesky(warmup_hessian)
-                torch.cuda.synchronize(device)
-            except RuntimeError as exc:
-                logger.warning(
-                    "[GPTQ multi-gpu] failed to warm up cholesky on "
-                    f"{device}: {exc}. Continuing without explicit warmup."
-                )
-
     def compress_module_list(self, module_list):
-        for module in module_list:
-            name = self._module_names[module]
-            num_samples = self._num_samples[module]
-            quant_args = getattr_chain(module, "quantization_scheme.weights")
+        for batch in assign_batches(
+            module_list, self.batched_quantization, self.block_size
+        ):
+            quant_args = getattr_chain(batch[0], "quantization_scheme.weights")
+            batch_qparams = [module.weight_observer.get_qparams() for module in batch]
+            names = [self._module_names[module] for module in batch]
+            logger.info(f"Quantizing {len(batch)} module(s): {names}")
 
-            logger.info(f"Quantizing {name} using {int(num_samples)} samples")
             with (
                 torch.no_grad(),
-                align_module_device(module),
-                self._maybe_onload_hessian(module),
-                CompressionLogger(module) as comp_logger,
+                disable_offloading(),
+                contextlib.ExitStack() as ctx_stack,
             ):
-                loss, q_param_dict = quantize_weight(
-                    module=module,
+                (
+                    weights,
+                    hessians,
+                    scales,
+                    zero_points,
+                    global_scales,
+                ) = prepare_batch(
+                    batch,
+                    batch_qparams,
+                    self._hessians,
+                    self._num_samples,
+                )
+
+                comp_loggers = [
+                    ctx_stack.enter_context(CompressionLogger(module))
+                    for module in batch
+                ]
+                quantized, losses, used_rtn_fallback = quantize_weight(
+                    weights=weights,
+                    hessians=hessians,
+                    scale=scales,
+                    zero_point=zero_points,
+                    global_scale=global_scales,
                     quant_args=quant_args,
-                    hessian=self._hessians.pop(module) / self._num_samples.pop(module),
                     blocksize=self.block_size,
                     percdamp=self.dampening_frac,
                 )
-                comp_logger.set_results(name="GPTQ", loss=loss)
+                for index, comp_logger in enumerate(comp_loggers):
+                    comp_logger.set_results(name="GPTQ", loss=losses[index].item())
+                    if used_rtn_fallback[index].item():
+                        self._rtn_fallback_module_names.append(names[index])
 
-            for attr, val in q_param_dict.items():
-                update_offload_parameter(module, attr, val)
+                ctx_stack.close()
+                update_batch_qparams(
+                    batch,
+                    quantized,
+                    scales,
+                    zero_points,
+                    global_scales,
+                    quant_args,
+                )
+                self._num_compressed_modules += len(batch)
 
     def _reduce_hessian_to_target_rank(self, module_list, module_to_rank):
         rank = dist.get_rank()
         pending_comms = []
         for module in module_list:
             target_rank = module_to_rank[module]
-            with self._maybe_onload_hessian(module):
-                pending_comms.append(
-                    dist.reduce(
-                        self._hessians[module],
-                        op=dist.ReduceOp.SUM,
-                        dst=target_rank,
-                        async_op=True,
-                    )
+            pending_comms.append(
+                dist.reduce(
+                    self._hessians[module],
+                    op=dist.ReduceOp.SUM,
+                    dst=target_rank,
+                    async_op=True,
                 )
-                pending_comms.append(
-                    dist.reduce(
-                        self._num_samples[module],
-                        op=dist.ReduceOp.SUM,
-                        dst=target_rank,
-                        async_op=True,
-                    )
+            )
+            pending_comms.append(
+                dist.reduce(
+                    self._num_samples[module],
+                    op=dist.ReduceOp.SUM,
+                    dst=target_rank,
+                    async_op=True,
                 )
-                if rank != target_rank:
-                    self._hessians.pop(module, None)
-                    self._num_samples.pop(module, None)
+            )
+            if rank != target_rank:
+                self._hessians.pop(module, None)
+                self._num_samples.pop(module, None)
         wait_for_comms(pending_comms)
+
+    def _log_rtn_fallback_summary(self):
+        """Log a summary when modules used RTN because GPTQ failed."""
+        num_fallback = len(self._rtn_fallback_module_names)
+        if num_fallback == 0:
+            return
+
+        total = self._num_compressed_modules
+        shown = ", ".join(self._rtn_fallback_module_names[:10])
+        if num_fallback > 10:
+            shown += f", and {num_fallback - 10} more (full list at DEBUG level)"
+            logger.debug(
+                "Modules quantized with round-to-nearest due to hessian "
+                "inversion failure: " + ", ".join(self._rtn_fallback_module_names)
+            )
+        logger.warning(
+            f"Hessian inversion failed for {num_fallback}/{total} modules "
+            f"({num_fallback / total:.1%}). These modules were quantized with "
+            "round-to-nearest instead of GPTQ (the quantization scheme is "
+            "unchanged). Consider increasing GPTQModifier.dampening_frac, "
+            "increasing the number of calibration samples, or shuffling the "
+            f"calibration dataset. Affected modules: {shown}"
+        )
 
     def on_finalize(self, state: State, **kwargs) -> bool:
         """
@@ -647,22 +420,14 @@ class GPTQModifier(Modifier, QuantizationMixin):
         if not self.ended_:
             self.on_end(state, None)
 
+        self._log_rtn_fallback_summary()
+
         if len(self._num_samples) > 0:
             raise ValueError(f"Failed to compress {len(self._num_samples)} modules")
 
         self._hessians = dict()
         self._num_samples = dict()
+        self._num_compressed_modules = 0
+        self._rtn_fallback_module_names = []
 
         return True
-
-    @contextlib.contextmanager
-    def _maybe_onload_hessian(self, module: torch.nn.Module):
-        if self.offload_hessians:
-            device = get_execution_device(module)
-            self._hessians[module] = self._hessians[module].to(device=device)
-
-        yield
-
-        if self.offload_hessians:
-            if module in self._hessians:  # may have been deleted in context
-                self._hessians[module] = self._hessians[module].to(device="cpu")
