@@ -14,15 +14,15 @@ from llmcompressor.modifiers.quantization import QuantizationModifier
 from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
 from llmcompressor.streaming import streaming_oneshot
 
-MODEL = "/Users/ang/models/Qwen3-0.6B"
-OUTPUT_DIR = "/Users/ang/models/Qwen3-0.6B-W4A8-IMatrix-RTN"
-WORK_DIR = "/Users/ang/models/streaming-work-qwen3-0.6b-w4a8"
+MODEL = "/path/to/models/Qwen3-0.6B"
+OUTPUT_DIR = "/path/to/models/Qwen3-0.6B-W4A8-IMatrix-RTN"
+WORK_DIR = "/path/to/models/streaming-work-qwen3-0.6b-w4a8"
 # As with oneshot(), the dataset can instead be a pre-tokenized Hugging Face
 # Dataset or a PyTorch DataLoader. The shared tracer and checkpoint-backed
 # loader prepare the first boundary; users do not construct activations or list
 # model-specific layer boundaries.
 dataset = load_dataset(
-    "/Users/ang/Downloads/llm-demo/datasets/ultrachat_200k",
+    "/path/to/datasets/ultrachat_200k",
     split="train_sft[:16]",
 )
 

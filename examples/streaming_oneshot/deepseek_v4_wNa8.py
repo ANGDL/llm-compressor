@@ -11,13 +11,13 @@ SGLang and vLLM unless ``--no-save-raw-checkpoint-format`` is set.
 Example::
 
     python examples/streaming_oneshot/deepseek_v4_wNa8.py \
-        --model-id /Users/ang/models/DeepSeek-V4-Pro-Tiny-bf16 \
-        --dataset-id /Users/ang/Downloads/llm-demo/datasets/ultrachat_200k \
+        --model-id /path/to/models/DeepSeek-V4-Pro-Tiny-bf16 \
+        --dataset-id /path/to/datasets/ultrachat_200k \
         --quant-mode w4a8 \
         --reference-kernel \
-        /Users/ang/models/DeepSeek-V4-Flash-0731/inference/kernel.py \
+        /path/to/models/DeepSeek-V4-Flash-0731/inference/kernel.py \
         --pack-to-int8 \
-        --output-dir /Users/ang/models/DeepSeek-V4-Pro-Tiny-w4a8
+        --output-dir /path/to/models/DeepSeek-V4-Pro-Tiny-w4a8
 """
 
 from __future__ import annotations

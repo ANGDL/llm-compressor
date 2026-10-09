@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 from contextlib import contextmanager
 
@@ -50,6 +51,17 @@ def positive_int(value: str) -> int:
 parser = argparse.ArgumentParser()
 parser.add_argument("--model_id", type=str, default="/ssd4/models/GLM-5")
 parser.add_argument("--save_dir", type=str, default="/ssd3/models")
+parser.add_argument(
+    "--output-dir",
+    type=str,
+    default=None,
+    help=(
+        "Final output directory to save the quantized model into directly. "
+        "When set, the model is written here as-is (no auto-named subfolder); "
+        "used by CI so downstream stages find the artifact at this exact path. "
+        "When unset, falls back to <save_dir>/<model_name><scheme-suffix>."
+    ),
+)
 parser.add_argument(
     "--observer",
     type=str,
@@ -222,6 +234,27 @@ def maybe_skip_from_accelerate(skip_restore: bool):
         ct_utils.from_accelerate = original_from_accelerate
 
 
+def ensure_do_sample(model_id: str) -> None:
+    """Ensure the source checkpoint's generation config enables sampling."""
+    if not os.path.isdir(model_id):
+        # Hub checkpoints are updated on the loaded model below instead.
+        return
+
+    generation_config_path = os.path.join(model_id, "generation_config.json")
+    if os.path.isfile(generation_config_path):
+        with open(generation_config_path, "r", encoding="utf-8") as config_file:
+            generation_config = json.load(config_file)
+    else:
+        generation_config = {}
+    if generation_config.get("do_sample") is True:
+        return
+
+    generation_config["do_sample"] = True
+    with open(generation_config_path, "w", encoding="utf-8") as config_file:
+        json.dump(generation_config, config_file, ensure_ascii=True, indent=2)
+        config_file.write("\n")
+
+
 # Select calibration dataset.
 DATASET_IDS = args.dataset_id
 DATASET_SPLIT = args.dataset_split
@@ -254,6 +287,7 @@ for i, dataset_id in enumerate(DATASET_IDS):
 
 # Load the model
 model_id = args.model_id
+ensure_do_sample(model_id)
 with load_offloaded_model():
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
@@ -263,6 +297,10 @@ with load_offloaded_model():
         max_memory={"cpu": int(args.max_memory_cpu_gb * 1e9)},
     )
     tokenizer = AutoTokenizer.from_pretrained(model_id)
+# Apply the same setting for Hub checkpoints or checkpoints without a local
+# generation_config.json; save_pretrained will persist it in the output.
+if getattr(model, "generation_config", None) is not None:
+    model.generation_config.do_sample = True
 # MoE calibration is now handled automatically by the pipeline.
 # The `CalibrationGlmMoeDsaMoE` modules (from `llmcompressor.modeling.glm_moe_dsa`)
 # will be applied during calibration to enable proper expert calibration.
@@ -528,7 +566,6 @@ if args.modifier == "GPTQ":
         GPTQModifier(
             config_groups={"group_0": scheme},
             ignore=ignores,
-            offload_hessians=True,
         )
     )
     tail_name += "-GPTQ"
@@ -563,7 +600,7 @@ else:
 
 # Save to disk compressed.
 SAVE_NAME = model_id.rstrip("/").split("/")[-1] + tail_name
-SAVE_DIR = os.path.join(args.save_dir, SAVE_NAME)
+SAVE_DIR = args.output_dir or os.path.join(args.save_dir, SAVE_NAME)
 
 with maybe_skip_from_accelerate(args.skip_restore_from_accelerate):
     model.save_pretrained(SAVE_DIR, save_compressed=True)

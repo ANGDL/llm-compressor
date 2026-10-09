@@ -55,12 +55,12 @@ parser = argparse.ArgumentParser()
 parser.add_argument(
     "--model_id",
     type=str,
-    default="/Users/ang/models/Qwen3-0.6B",
+    default="/path/to/models/Qwen3-0.6B",
 )
 parser.add_argument(
     "--save_dir",
     type=str,
-    default="/Users/ang/models/",
+    default="/path/to/models/",
 )
 parser.add_argument(
     "--scheme",
@@ -107,7 +107,7 @@ parser.add_argument(
 parser.add_argument(
     "--dataset_id",
     type=str,
-    default="/Users/ang/Downloads/llm-demo/datasets/ultrachat_200k",
+    default="/path/to/datasets/ultrachat_200k",
 )
 parser.add_argument("--dataset_split", type=str, default="train_sft")
 parser.add_argument(

@@ -323,7 +323,6 @@ if args.modifier == "GPTQ":
         GPTQModifier(
             config_groups=config_groups,
             ignore=ignores,
-            offload_hessians=True,
         )
     )
     tail_name += "-GPTQ"

@@ -180,7 +180,6 @@ if args.modifier == "GPTQ":
         GPTQModifier(
             config_groups={"group_0": scheme},
             ignore=ignores,
-            offload_hessians=True,
         )
     )
     tail_name += "-GPTQ"

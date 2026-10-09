@@ -18,13 +18,13 @@ source dtype to match the K3 W4A8 checkpoint layout.
 Example::
 
     python examples/streaming_oneshot/kimi_k3_wNa8.py \
-        --model-id /Users/ang/models/K3 \
+        --model-id /path/to/models/K3 \
         --dataset-id lmms-lab/flickr30k \
         --dataset-split test \
         --text-dataset-id HuggingFaceH4/ultrachat_200k \
         --text-dataset-split train_sft \
         --use-float32-scale-dtype \
-        --output-dir /Users/ang/models/K3-WNA8
+        --output-dir /path/to/models/K3-WNA8
 
 If quantization completes but publication fails, repeat the same command with
 ``--finalize-only``. Existing target shards are fingerprint-checked and reused;

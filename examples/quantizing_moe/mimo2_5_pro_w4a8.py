@@ -389,7 +389,7 @@ def patch_pipeline_dispatch(extra_memory_gb: float):
 
 patch_pipeline_dispatch(20)
 
-MODEL_ID = "/Users/ang/models/MiMo-V2.5-Pro"
+MODEL_ID = "/path/to/models/MiMo-V2.5-Pro"
 BFLOAT16_SAVE_DIR = os.path.join("/ssd3/models", MODEL_ID.rstrip("/").split("/")[-1] + "-bf16")
 
 def parse_args():
@@ -645,7 +645,6 @@ def quantize_model(args):
             GPTQModifier(
                 config_groups=config_groups,
                 ignore=ignores,
-                offload_hessians=True,
             )
         )
         tail_name += "-GPTQ"
