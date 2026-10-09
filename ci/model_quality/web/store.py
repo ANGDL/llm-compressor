@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
@@ -23,6 +24,9 @@ _STAGES = (
 _SUCCESS_STATUSES = {"PASS", "PASSED", "SUCCESS", "SUCCEEDED"}
 _FAILURE_STATUSES = {"FAIL", "FAILED"}
 _ACTIVE_STATUSES = {"CREATED", "QUEUED", "ALLOCATED", "RUNNING"}
+# Upper bound on a single log line's width in the API response; wider lines are
+# truncated so one giant line can't balloon a polled log fetch to tens of MB.
+_MAX_LOG_LINE_CHARS = 4000
 # Stage names do not always appear verbatim in the log file name written by
 # ``ci.model_quality.executor`` (``quantize`` writes ``quantization.log``).
 _STAGE_LOG_NAMES = {
@@ -132,6 +136,48 @@ class RunStore:
             result[stage] = value if isinstance(value, dict) else None
         return result
 
+    def _live_stages(
+        self, model_dir: Path, stages: dict[str, dict[str, Any] | None]
+    ) -> set[str]:
+        """Stages whose last record is terminal but whose log is still growing.
+
+        A stage record is written only when the stage ends, so if the stage's
+        log keeps advancing past that record a fresh invocation (a re-run) of
+        the same stage is in progress — the persisted FAIL/PASS is now history,
+        not the current state. Reading a log never updates its mtime, so this
+        only trips on genuine writes, and the recency guard keeps a stage that
+        died without recording a terminal state from looking live forever.
+        """
+
+        live: set[str] = set()
+        now = time.time()
+        for stage, record in stages.items():
+            if not isinstance(record, dict):
+                continue
+            if self._status(record) in _ACTIVE_STATUSES:
+                continue
+            recorded = self._timestamp(record.get("recorded_at"))
+            attempt = record.get("attempt_id")
+            if (
+                recorded is None
+                or not attempt
+                or not _SAFE_COMPONENT.fullmatch(str(attempt))
+            ):
+                continue
+            log_dir = model_dir / "logs" / str(attempt)
+            newest: float | None = None
+            for name in _STAGE_LOG_NAMES.get(stage, ()):
+                try:
+                    mtime = (log_dir / name).stat().st_mtime
+                except OSError:
+                    continue
+                newest = mtime if newest is None else max(newest, mtime)
+            if newest is None:
+                continue
+            if newest > recorded + 2 and now - newest < 180:
+                live.add(stage)
+        return live
+
     @staticmethod
     def _first_identity(
         stages: dict[str, dict[str, Any] | None], key: str
@@ -158,6 +204,22 @@ class RunStore:
         if values and values <= _SUCCESS_STATUSES | {"SKIPPED"}:
             return "PASS"
         return "PENDING"
+
+    def _canceled_before_start(self, model_dir: Path) -> bool:
+        """True when every recorded job was canceled and no stage ever reported.
+
+        ``ControlPlane.cancel`` cancels queued jobs and releases their
+        reservations, but a run canceled before its first stage finishes leaves
+        no ``state/<stage>.json`` for the status derivation to read. Without this
+        signal such a run keeps reporting PENDING after it was canceled.
+        """
+
+        statuses = []
+        for path in sorted((model_dir / "jobs").glob("*.json")):
+            value = self._read_json(path)
+            if isinstance(value, dict):
+                statuses.append(str(value.get("status") or "").upper())
+        return bool(statuses) and all(status == "CANCELED" for status in statuses)
 
     def _attempts(self, model_dir: Path) -> list[dict[str, Any]]:
         current = self._read_json(model_dir / "current-attempt.json")
@@ -315,10 +377,15 @@ class RunStore:
         model_dir = self._model_dir(run_id, model_id)
         stages = self._stage_records(model_dir)
         statuses = {stage: self._status(value) for stage, value in stages.items()}
+        for stage in self._live_stages(model_dir, stages):
+            statuses[stage] = "RUNNING"
+        status = self._model_status(statuses)
+        if status == "PENDING" and self._canceled_before_start(model_dir):
+            status = "CANCELED"
         if not include_details:
             return {
                 "model_id": model_id,
-                "status": self._model_status(statuses),
+                "status": status,
                 "stages": statuses,
                 "publish": self._publish_summary(model_dir),
             }
@@ -326,7 +393,7 @@ class RunStore:
         current = self._read_json(model_dir / "current-attempt.json")
         return {
             "model_id": model_id,
-            "status": self._model_status(statuses),
+            "status": status,
             "stages": statuses,
             "stage_details": {
                 stage: self._compact_stage_detail(value)
@@ -414,6 +481,17 @@ class RunStore:
             value = self._read_json(path)
             if isinstance(value, dict) and value.get("recorded_at"):
                 values.append(str(value["recorded_at"]))
+        marker = self._read_json(run_dir / "cancel.json")
+        if isinstance(marker, dict) and marker.get("recorded_at"):
+            values.append(str(marker["recorded_at"]))
+        for path in run_dir.glob("*/jobs/*.json"):
+            value = self._read_json(path)
+            if not isinstance(value, dict):
+                continue
+            for key in ("updated_at", "finished_at", "created_at"):
+                if value.get(key):
+                    values.append(str(value[key]))
+                    break
         if not values:
             return None
         return max(values, key=lambda value: self._timestamp(value) or float("-inf"))
@@ -471,6 +549,7 @@ class RunStore:
                     "budget": plan.get("budget", {}),
                     "models": counts,
                     "model_count": len(models),
+                    "model_ids": [item["model_id"] for item in models],
                     "publish": self._run_publish(models),
                 }
             )
@@ -538,6 +617,7 @@ class RunStore:
         attempt_id: str | None = None,
         offset: int = 0,
         limit: int = 1000,
+        tail: bool = False,
     ) -> dict[str, Any]:
         self.get_model(run_id, model_id)
         if offset < 0 or limit < 1 or limit > 10000:
@@ -567,22 +647,42 @@ class RunStore:
                 if path.name in names or stage in path.name or stage in str(path.parent)
             ]
         lines = []
-        for path in sorted(set(files)):
+        # Order by mtime so the most recently written (actively-growing) log ends
+        # up last; tailing then surfaces the running attempt instead of a stale head.
+        def _sort_key(path: Path) -> tuple:
+            try:
+                return (path.stat().st_mtime, str(path))
+            except OSError:
+                return (0.0, str(path))
+
+        for path in sorted(set(files), key=_sort_key):
             try:
                 content = path.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 continue
-            lines.extend(
-                {
-                    "path": str(path.relative_to(self._run_dir(run_id))),
-                    "line": line_number,
-                    "text": text,
-                }
-                for line_number, text in enumerate(content.splitlines(), 1)
-            )
+            relative = str(path.relative_to(self._run_dir(run_id)))
+            for line_number, text in enumerate(content.splitlines(), 1):
+                # A single pathological line (e.g. a stage that dumps a huge JSON
+                # blob or tensor) can be megabytes wide. The log viewer polls on a
+                # timer, so returning raw lines lets one monster line balloon the
+                # response to tens of MB and stall the single-threaded server.
+                # Cap each line's width; the full log is still on disk.
+                if len(text) > _MAX_LOG_LINE_CHARS:
+                    dropped = len(text) - _MAX_LOG_LINE_CHARS
+                    text = f"{text[:_MAX_LOG_LINE_CHARS]}… [{dropped} more chars truncated]"
+                lines.append({"path": relative, "line": line_number, "text": text})
+        total = len(lines)
+        if tail:
+            start = max(0, total - limit)
+            return {
+                "items": lines[start : start + limit],
+                "total": total,
+                "offset": start,
+                "limit": limit,
+            }
         return {
             "items": lines[offset : offset + limit],
-            "total": len(lines),
+            "total": total,
             "offset": offset,
             "limit": limit,
         }

@@ -131,24 +131,27 @@ class AuditLog:
     ) -> dict[str, Any]:
         """Append one audit record and return it."""
 
-        sequence = self._next_sequence()
-        payload = {
-            "schema_version": 1,
-            "sequence": sequence,
-            "recorded_at": utc_now(),
-            "actor": actor,
-            "action": action,
-            "target": target,
-            "result": result,
-            "request_fingerprint": (
-                request_fingerprint(request) if request is not None else None
-            ),
-            "details": redact(details) if details is not None else None,
-        }
-        atomic_write_json(self.events_directory / f"{sequence:012d}.json", payload)
-        self.directory.mkdir(parents=True, exist_ok=True)
-        with self.journal_path.open("a", encoding="utf-8") as stream:
-            stream.write(canonical_json(payload) + "\n")
+        with exclusive_lock(self.directory / "audit.lock"):
+            sequence = self._next_sequence()
+            payload = {
+                "schema_version": 1,
+                "sequence": sequence,
+                "recorded_at": utc_now(),
+                "actor": actor,
+                "action": action,
+                "target": target,
+                "result": result,
+                "request_fingerprint": (
+                    request_fingerprint(request) if request is not None else None
+                ),
+                "details": redact(details) if details is not None else None,
+            }
+            atomic_write_json(
+                self.events_directory / f"{sequence:012d}.json", payload
+            )
+            self.directory.mkdir(parents=True, exist_ok=True)
+            with self.journal_path.open("a", encoding="utf-8") as stream:
+                stream.write(canonical_json(payload) + "\n")
         return payload
 
     def read(

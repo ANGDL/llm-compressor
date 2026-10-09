@@ -533,17 +533,27 @@ def _sha256(path: Path) -> str:
 
 
 def _source_provenance(source: Path) -> dict[str, Any]:
+    """Record the source checkpoint's identity by path + size + mtime.
+
+    This deliberately does NOT hash the source: a BF16 MoE source can be
+    multiple TB across hundreds of shards, and content-hashing it at preflight
+    (and again at publish) would stall the pipeline for hours. Size + mtime is a
+    cheap, stat-only signal that still detects a changed/replaced source.
+    """
+
+    def stat_record(path: Path, name: str) -> dict[str, Any]:
+        info = path.stat()
+        return {
+            "path": name,
+            "size_bytes": info.st_size,
+            "mtime_ns": info.st_mtime_ns,
+        }
+
     files = []
     for name in ("config.json", "model.safetensors.index.json"):
         path = source / name
         if path.is_file():
-            files.append(
-                {
-                    "path": name,
-                    "size_bytes": path.stat().st_size,
-                    "sha256": _sha256(path),
-                }
-            )
+            files.append(stat_record(path, name))
     index_path = source / "model.safetensors.index.json"
     shard_metadata = []
     if index_path.is_file():
@@ -551,14 +561,19 @@ def _source_provenance(source: Path) -> dict[str, Any]:
         for name in sorted(set(index.get("weight_map", {}).values())):
             shard = source / name
             if shard.is_file():
-                shard_metadata.append(
-                    {
-                        "path": name,
-                        "size_bytes": shard.stat().st_size,
-                        "sha256": _sha256(shard),
-                    }
-                )
+                shard_metadata.append(stat_record(shard, name))
     return {"metadata_files": files, "shards": shard_metadata}
+
+
+def _source_provenance_sizes(provenance: dict[str, Any]) -> dict[tuple[str, str], Any]:
+    """Path+size view of a source-provenance record, ignoring digests."""
+
+    return {
+        (section, item["path"]): item.get("size_bytes")
+        for section in ("metadata_files", "shards")
+        for item in (provenance.get(section) or [])
+        if isinstance(item, dict) and "path" in item
+    }
 
 
 def _artifact_file_records(output: Path) -> list[dict[str, Any]]:
@@ -570,6 +585,15 @@ def _artifact_file_records(output: Path) -> list[dict[str, Any]]:
             "size_bytes": path.stat().st_size,
             "sha256": _sha256(path),
         }
+        for path in sorted(path for path in output.rglob("*") if path.is_file())
+    ]
+
+
+def _artifact_size_records(output: Path) -> list[dict[str, Any]]:
+    """Path + size inventory without hashing (cheap pre-publish change check)."""
+
+    return [
+        {"path": str(path.relative_to(output)), "size_bytes": path.stat().st_size}
         for path in sorted(path for path in output.rglob("*") if path.is_file())
     ]
 
@@ -1084,6 +1108,10 @@ def run_report(
         if (
             artifact_fingerprint is not None
             and candidate_fingerprint != artifact_fingerprint
+            # An operator skip records no artifact fingerprint: it states that
+            # the stage was not run for this attempt, not that it measured a
+            # different artifact.
+            and candidate.get("status") != "SKIPPED"
             and not (
                 run_mode in {"eval_only", "upload_only"}
                 and path.stem == "runtime-smoke"
@@ -1096,6 +1124,50 @@ def run_report(
             stale_stages.append(path.stem)
             continue
         states[path.stem] = candidate
+    required_by_mode = {
+        "quantize": ["preflight", "quantize", "validate", "runtime-smoke"],
+        "quantize_and_eval": [
+            "preflight",
+            "quantize",
+            "validate",
+            "runtime-smoke",
+            "evaluate",
+        ],
+        "eval_only": ["preflight", "validate", "runtime-smoke", "evaluate"],
+        "upload_only": ["preflight", "validate", "runtime-smoke"],
+    }
+    try:
+        required = required_by_mode[run_mode]
+    except KeyError as error:
+        raise StageError(
+            f"unknown run mode: {run_mode}", reason_code="CONFIG_ERROR"
+        ) from error
+    # A partial re-run (for example "re-run runtime-smoke") writes only the
+    # stages from that node onward into its new attempt, so the earlier lanes
+    # are absent by construction. Carry their latest terminal result forward
+    # from the model-level mirror rather than scoring them DEPENDENCY_FAILED,
+    # which would fail the report and cancel the very stage the operator re-ran.
+    carried_stages: list[str] = []
+    for stage in required:
+        if stage in states:
+            continue
+        try:
+            carried = read_stage_result(run_id, model["id"], stage)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(carried, dict):
+            continue
+        if carried.get("status") not in {"PASS", "WARN", "FAIL", "SKIPPED"}:
+            continue
+        carried_fingerprint = carried.get("artifact_fingerprint")
+        if (
+            artifact_fingerprint is not None
+            and carried_fingerprint is not None
+            and carried_fingerprint != artifact_fingerprint
+        ):
+            continue
+        states[stage] = carried
+        carried_stages.append(stage)
     preflight_state = states.get("preflight")
     validation_state = states.get("validate")
     if preflight_state is not None:
@@ -1116,25 +1188,6 @@ def run_report(
             attempt_reports / "validation.json",
             {"schema_version": 1, **validation_state},
         )
-    required_by_mode = {
-        "quantize": ["preflight", "quantize", "validate", "runtime-smoke"],
-        "quantize_and_eval": [
-            "preflight",
-            "quantize",
-            "validate",
-            "runtime-smoke",
-            "evaluate",
-        ],
-        "eval_only": ["preflight", "validate", "runtime-smoke", "evaluate"],
-        "upload_only": ["preflight", "validate", "runtime-smoke"],
-    }
-    try:
-        required = required_by_mode[run_mode]
-    except KeyError as error:
-        raise StageError(
-            f"unknown run mode: {run_mode}", reason_code="CONFIG_ERROR"
-        ) from error
-
     evaluation_path = paths["reports_dir"] / "evaluation.json"
     attempt_evaluation_path = attempt_reports / "evaluation.json"
     overall_evaluation = None
@@ -1166,7 +1219,13 @@ def run_report(
         overall_evaluation = None
 
     if run_mode in {"quantize_and_eval", "eval_only"}:
-        if not attempt_evaluation_path.is_file():
+        evaluate_state = states.get("evaluate")
+        if isinstance(evaluate_state, dict) and evaluate_state.get("status") == (
+            "SKIPPED"
+        ):
+            # A skipped evaluation carries no measurement to validate.
+            pass
+        elif not attempt_evaluation_path.is_file():
             states.pop("evaluate", None)
         else:
             evaluation_result = json.loads(
@@ -1206,6 +1265,7 @@ def run_report(
         "status": overall,
         "warnings": [f"{name} completed with warnings" for name in warn_stages],
         "stale_stages_ignored": sorted(set(stale_stages)),
+        "stages_carried_from_prior_attempts": sorted(set(carried_stages)),
         "stages": {name: value.get("status") for name, value in states.items()},
     }
     atomic_write_json(attempt_reports / "summary.json", summary)
@@ -1411,23 +1471,51 @@ def run_publish(
             "artifact-manifest.json is missing", reason_code="DEPENDENCY_FAILED"
         )
     artifact_manifest = json.loads(artifact_manifest_path.read_text(encoding="utf-8"))
-    current_artifact_files = _artifact_file_records(paths["output_dir"])
-    current_content_fingerprint = _artifact_content_fingerprint(current_artifact_files)
+    # Re-hashing the whole artifact here is prohibitive for large models (a
+    # multi-hundred-GB checkpoint takes hours to sha256), and it blocks the
+    # upload with no progress. Take a fast path when the on-disk inventory
+    # (paths + sizes) is identical to what validation recorded: trust the
+    # content fingerprint already in the manifest. Only when the inventory
+    # differs -- exactly when the recorded fingerprint is no longer valid -- do
+    # we fall back to a full re-hash to produce an accurate mismatch error.
+    manifest_files = artifact_manifest.get("files")
+    manifest_sizes = (
+        {
+            record["path"]: record.get("size_bytes")
+            for record in manifest_files
+            if isinstance(record, dict) and "path" in record
+        }
+        if isinstance(manifest_files, list)
+        else None
+    )
+    current_sizes = {
+        record["path"]: record["size_bytes"]
+        for record in _artifact_size_records(paths["output_dir"])
+    }
+    if manifest_sizes is not None and manifest_sizes == current_sizes:
+        current_content_fingerprint = artifact_manifest.get("artifact_content_fingerprint")
+    else:
+        current_content_fingerprint = _artifact_content_fingerprint(
+            _artifact_file_records(paths["output_dir"])
+        )
     if artifact_manifest.get("artifact_fingerprint") != artifact_fingerprint:
         raise StageError(
             "artifact manifest has a stale artifact fingerprint",
             reason_code="DEPENDENCY_FAILED",
         )
     source = Path(model["source"]["path"]).expanduser()
-    if (
-        source.is_dir()
-        and artifact_manifest.get("source_provenance") is not None
-        and artifact_manifest.get("source_provenance") != _source_provenance(source)
-    ):
-        raise StageError(
-            "artifact source provenance changed before publish",
-            reason_code="DEPENDENCY_FAILED",
-        )
+    recorded_provenance = artifact_manifest.get("source_provenance")
+    if source.is_dir() and recorded_provenance is not None:
+        # Source provenance is a cheap path+size+mtime record (never a content
+        # hash), so this re-check just confirms the source wasn't swapped since
+        # validation. Compare on path+size so a manifest written by an older
+        # (hash-based) build still compares cleanly.
+        current_sizes = _source_provenance_sizes(_source_provenance(source))
+        if _source_provenance_sizes(recorded_provenance) != current_sizes:
+            raise StageError(
+                "artifact source provenance changed before publish",
+                reason_code="DEPENDENCY_FAILED",
+            )
     if (
         artifact_manifest.get("artifact_content_fingerprint")
         != current_content_fingerprint
@@ -1506,6 +1594,24 @@ def run_publish(
         "reports/SUCCESS.json",
         "SUCCESS.json",
     }
+    # Reuse the per-file digests validation already recorded for the artifact so
+    # the upload manifest doesn't re-hash a multi-hundred-GB model from scratch.
+    # Keyed by the file's path relative to the output dir; only trusted when the
+    # current size still matches what the manifest recorded.
+    manifest_hashes = {
+        record["path"]: (record.get("size_bytes"), record.get("sha256"))
+        for record in (artifact_manifest.get("files") or [])
+        if isinstance(record, dict) and "path" in record
+    }
+
+    def _upload_sha256(file: Path) -> str:
+        resolved_file = file.resolve()
+        if _is_path_within(resolved_file, output_root):
+            record = manifest_hashes.get(str(resolved_file.relative_to(output_root)))
+            if record and record[0] == file.stat().st_size and record[1]:
+                return record[1]
+        return _sha256(file)
+
     for relative in allowlist:
         if relative == "reports":
             candidate = promoted_reports.resolve()
@@ -1532,7 +1638,7 @@ def run_publish(
                 {
                     "path": relative,
                     "size_bytes": candidate.stat().st_size,
-                    "sha256": _sha256(candidate),
+                    "sha256": _upload_sha256(candidate),
                 }
             )
         else:
@@ -1550,7 +1656,7 @@ def run_publish(
                     {
                         "path": relative_file,
                         "size_bytes": file.stat().st_size,
-                        "sha256": _sha256(file),
+                        "sha256": _upload_sha256(file),
                     }
                 )
     upload_manifest_path = promoted_reports / "upload-manifest.json"

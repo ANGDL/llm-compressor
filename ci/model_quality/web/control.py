@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+import yaml
+
 from ..config import load_model_config
 from ..state import atomic_write_json, utc_now
 from .audit import (
@@ -28,6 +30,8 @@ from .jobs import (
 from .plans import (
     LaunchPolicy,
     PlanService,
+    SKIPPABLE_STAGES,
+    build_eval_command,
     validate_evaluation_command,
     validate_inference_config,
 )
@@ -50,6 +54,25 @@ STAGES_BY_MODE: dict[str, tuple[str, ...]] = {
 }
 
 _FAILED_STATUSES = {"FAIL", "FAILED"}
+
+
+def _publish_is_scheduled(
+    plan: dict[str, Any], job: dict[str, Any], run_mode: str
+) -> bool:
+    """Whether this launch owns the model's publish lane.
+
+    A script-first plan carries an upload target so an operator can publish
+    from the run page on demand; the ``publish_trigger: manual`` marker keeps
+    that lane out of the pipeline while ``upload_only`` still runs it.
+    """
+
+    if run_mode == "upload_only":
+        return True
+    if run_mode == "eval_only":
+        return False
+    if plan.get("publish_trigger") == "manual":
+        return False
+    return bool(job.get("upload_enabled"))
 
 
 def _new_attempt_id() -> str:
@@ -194,7 +217,7 @@ class ControlPlane:
     def _start_run(
         self, plan_hash: str, principal: Principal, request: dict[str, Any]
     ) -> dict[str, Any]:
-        record = self.plan_service.registry.consume(plan_hash)
+        record = self.plan_service.registry.load(plan_hash)
         plan = record["plan"]
         review = record.get("review", {})
         blocking = [
@@ -215,6 +238,10 @@ class ControlPlane:
                 raise ConflictError(
                     "plan git_sha does not match the deployed revision; preview again"
                 )
+        # Only burn the single-use preview once it has passed validation, so a
+        # recoverable rejection does not force the caller to preview again.
+        record = self.plan_service.registry.consume(plan_hash)
+        plan = record["plan"]
         return self._launch(
             plan=plan,
             plan_hash=plan_hash,
@@ -285,14 +312,24 @@ class ControlPlane:
             first_failed = order.index(failed[0])
             stages = list(order[min(start, first_failed) :])
             retry_jobs.append((model_id_value, stages))
+        # A plain Retry (no body) should reuse the run's original inference and
+        # evaluation configuration so stages like runtime-smoke still target the
+        # prestarted container instead of silently dropping to the in-executor
+        # path. The request may still override either.
+        marker = read_json(run_dir / "run.json")
+        marker = marker if isinstance(marker, dict) else {}
+        inference = request.get("inference", marker.get("inference"))
+        evaluation_command = request.get(
+            "evaluation_command", marker.get("evaluation_command")
+        )
         return self._launch(
             plan=plan,
             plan_hash=plan.get("plan_hash"),
             attempt_id=attempt_id,
             run_mode=run_mode,
             git_sha=plan.get("git_sha", "local"),
-            inference=request.get("inference"),
-            evaluation_command=request.get("evaluation_command"),
+            inference=inference,
+            evaluation_command=evaluation_command,
             principal=principal,
             reason="retry",
             extra_request=request,
@@ -519,6 +556,7 @@ class ControlPlane:
         claim = self.idempotency.begin(key, {"job_id": job_id, **request})
         if claim["replayed"]:
             return claim["response"]
+        reservation = None
         try:
             job = self.jobs.get(run_id, model_id, job_id)
             if job.get("status") not in {"FAILED", "EXPIRED", "CANCELED"}:
@@ -536,7 +574,6 @@ class ControlPlane:
             # The failed group already released its reservation, so a retried
             # job needs its own admission or the GPU-hours would be free.
             hours = float(job.get("gpu_hours") or 0.0)
-            reservation = None
             if hours > 0:
                 reservation = self.ledger.reserve(
                     run_id=run_id,
@@ -580,6 +617,13 @@ class ControlPlane:
                 "reservation": reservation,
             }
         except Exception as error:
+            if reservation is not None:
+                try:
+                    self.ledger.release(
+                        reservation["reservation_id"], reason="job retry aborted"
+                    )
+                except NotFoundError:
+                    pass
             self.idempotency.fail(key, str(error))
             raise
         self.audit.record(
@@ -593,7 +637,266 @@ class ControlPlane:
         self.idempotency.complete(key, response)
         return response
 
+    def rerun_stage(
+        self,
+        run_id: str,
+        model_id: str,
+        stage: str,
+        request: dict[str, Any],
+        principal: Principal,
+    ) -> dict[str, Any]:
+        """Re-run one model from an arbitrary stage as a fresh attempt.
+
+        Unlike ``retry`` (which only resumes *failed* stages), this launches the
+        chosen stage and everything after it regardless of its current status,
+        so an operator can re-run a node that already passed.
+        """
+
+        principal.require("retry")
+        key = self._resolve_key(
+            request, action="stage.rerun", target=f"{run_id}/{model_id}/{stage}"
+        )
+        claim = self.idempotency.begin(
+            key,
+            {"run_id": run_id, "model_id": model_id, "stage": stage, **request},
+        )
+        if claim["replayed"]:
+            return claim["response"]
+        try:
+            response = self._rerun_stage(run_id, model_id, stage, request, principal)
+        except Exception as error:
+            self.idempotency.fail(key, str(error))
+            raise
+        self.idempotency.complete(key, response)
+        return response
+
+    def _rerun_stage(
+        self,
+        run_id: str,
+        model_id: str,
+        stage: str,
+        request: dict[str, Any],
+        principal: Principal,
+    ) -> dict[str, Any]:
+        run_dir = self._require_run(run_id)
+        plan = read_json(run_dir / "execution-plan.json")
+        if not isinstance(plan, dict):
+            raise NotFoundError(f"run {run_id!r} has no execution plan")
+        run_mode = plan["run_mode"]
+        order = STAGES_BY_MODE[run_mode]
+        selected = {
+            job["id"]: job
+            for job in plan.get("selected", [])
+            if isinstance(job, dict)
+        }
+        if model_id not in selected:
+            raise NotFoundError(f"model {model_id!r} is not part of run {run_id!r}")
+        # ``publish`` is not in STAGES_BY_MODE; it is appended by ``_launch`` when
+        # the model's upload lane is enabled, so mirror that rule to decide
+        # whether a publish node may be re-run at all.
+        upload_enabled = _publish_is_scheduled(plan, selected[model_id], run_mode)
+        allowed = list(order) + (["publish"] if upload_enabled else [])
+        if stage not in allowed:
+            raise ValidationError(f"stage must be one of {', '.join(allowed)}")
+        # Leave ``publish`` out of the override and let ``_launch`` append it, so
+        # the publish lane is never duplicated.
+        stages = [] if stage == "publish" else list(order[order.index(stage) :])
+
+        # Re-running a node un-skips it: drop ``stage`` from the persisted skip
+        # set so the relaunch actually runs it. Honor any new skips the request
+        # asks for (validated against the skippable set).
+        add_skips = [
+            value
+            for value in (request.get("skip_stages") or [])
+            if isinstance(value, str)
+        ]
+        unknown = [value for value in add_skips if value not in SKIPPABLE_STAGES]
+        if unknown:
+            raise ValidationError(
+                "skip_stages may only contain "
+                + ", ".join(sorted(SKIPPABLE_STAGES))
+            )
+        self._update_skip(
+            run_dir, plan, model_id, remove={stage}, add=set(add_skips)
+        )
+
+        attempt_id = request.get("attempt_id") or _new_attempt_id()
+        safe_component(attempt_id, "attempt_id")
+        # Allow a UI rerun to configure the evaluate command from a tool+dataset
+        # preset (like the plan form) when no explicit argv override is given.
+        evaluation_command = request.get("evaluation_command")
+        if evaluation_command is None and request.get("evaluation_tool"):
+            evaluation_command = build_eval_command(request, policy=self.policy)
+        return self._launch(
+            plan=plan,
+            plan_hash=plan.get("plan_hash"),
+            attempt_id=attempt_id,
+            run_mode=run_mode,
+            git_sha=plan.get("git_sha", "local"),
+            inference=request.get("inference"),
+            evaluation_command=evaluation_command,
+            principal=principal,
+            reason="rerun",
+            extra_request=request,
+            job_overrides={model_id: stages},
+        )
+
+    def skip_stage(
+        self,
+        run_id: str,
+        model_id: str,
+        stage: str,
+        request: dict[str, Any],
+        principal: Principal,
+    ) -> dict[str, Any]:
+        """Mark an optional stage as skipped for one model.
+
+        Live node-skip covers ``evaluate``/``publish`` (each its own job): a
+        queued/running job for the stage is canceled and the skip is persisted
+        so re-runs honor it. ``validate`` is bundled into the quantize job and
+        can only be skipped when the plan is created, not live.
+        """
+
+        principal.require("retry")
+        key = self._resolve_key(
+            request, action="stage.skip", target=f"{run_id}/{model_id}/{stage}"
+        )
+        claim = self.idempotency.begin(
+            key,
+            {"run_id": run_id, "model_id": model_id, "stage": stage, **request},
+        )
+        if claim["replayed"]:
+            return claim["response"]
+        try:
+            response = self._skip_stage(run_id, model_id, stage, request)
+        except Exception as error:
+            self.idempotency.fail(key, str(error))
+            raise
+        self.audit.record(
+            actor=principal.actor,
+            action="stage.skip",
+            target=f"{run_id}/{model_id}/{stage}",
+            result="ACCEPTED",
+            request=request,
+            details={"canceled_jobs": response["canceled_jobs"]},
+        )
+        self.idempotency.complete(key, response)
+        return response
+
+    def _skip_stage(
+        self, run_id: str, model_id: str, stage: str, request: dict[str, Any]
+    ) -> dict[str, Any]:
+        if stage not in SKIPPABLE_STAGES:
+            raise ValidationError(
+                "stage must be one of " + ", ".join(sorted(SKIPPABLE_STAGES))
+            )
+        if stage == "validate":
+            raise ValidationError(
+                "validate is bundled with quantize and can only be skipped when "
+                "creating the plan"
+            )
+        run_dir = self._require_run(run_id)
+        plan = read_json(run_dir / "execution-plan.json")
+        if not isinstance(plan, dict):
+            raise NotFoundError(f"run {run_id!r} has no execution plan")
+        selected = {
+            job["id"]: job
+            for job in plan.get("selected", [])
+            if isinstance(job, dict)
+        }
+        if model_id not in selected:
+            raise NotFoundError(f"model {model_id!r} is not part of run {run_id!r}")
+        run_mode = plan["run_mode"]
+        if stage == "publish":
+            upload_enabled = _publish_is_scheduled(plan, selected[model_id], run_mode)
+            if not upload_enabled:
+                raise ValidationError("this run has no publish stage to skip")
+
+        # Cancel any non-terminal job that owns the stage (evaluate/publish own a
+        # single-stage job) and release its reservation when the group settles.
+        canceled: list[str] = []
+        attempt_id = "default"
+        for job in self.jobs.list_jobs(run_id, model_id=model_id):
+            if stage not in (job.get("stages") or []):
+                continue
+            attempt_id = job.get("attempt_id") or attempt_id
+            if job.get("status") in ACTIVE_JOB_STATUSES:
+                settled = self.jobs.cancel(job, f"stage {stage} skipped")
+                self._release_if_settled(settled)
+                canceled.append(job["job_id"])
+
+        self._update_skip(run_dir, plan, model_id, add={stage})
+        self._write_skipped(run_id, model_id, stage, attempt_id)
+        return {
+            "skipped": stage,
+            "model_id": model_id,
+            "canceled_jobs": canceled,
+        }
+
     # ------------------------------------------------------------- internals
+
+    def _update_skip(
+        self,
+        run_dir: Path,
+        plan: dict[str, Any],
+        model_id: str,
+        *,
+        add: set[str] = frozenset(),
+        remove: set[str] = frozenset(),
+    ) -> None:
+        """Mutate ``plan['skip_stages'][model_id]`` and persist the plan.
+
+        Updating both the in-memory plan (consumed by the same-call ``_launch``)
+        and ``execution-plan.json`` keeps future retries/re-runs consistent.
+        """
+
+        skip_stages = plan.get("skip_stages")
+        if not isinstance(skip_stages, dict):
+            skip_stages = {}
+            plan["skip_stages"] = skip_stages
+        current = set(skip_stages.get(model_id, ()))
+        current = (current | add) - remove
+        if current:
+            skip_stages[model_id] = [
+                stage for stage in sorted(SKIPPABLE_STAGES) if stage in current
+            ]
+        else:
+            skip_stages.pop(model_id, None)
+        atomic_write_json(run_dir / "execution-plan.json", plan)
+
+
+    def _write_skipped(
+        self, run_id: str, model_id: str, stage: str, attempt_id: str
+    ) -> None:
+        """Record a stage as SKIPPED so the pipeline shows it as skipped.
+
+        Mirrors ``store._model_dir`` and writes both the model-level state file
+        (what the summary reads) and the attempt-scoped copy (attempt history).
+        """
+
+        record = {
+            "schema_version": 1,
+            "run_id": run_id,
+            "model_id": model_id,
+            "stage": stage,
+            "attempt_id": attempt_id,
+            "status": "SKIPPED",
+            "reason": "operator skip",
+            "recorded_at": utc_now(),
+        }
+        model_dir = self.root / safe_component(run_id, "run_id") / safe_component(
+            model_id, "model_id"
+        )
+        atomic_write_json(model_dir / "state" / f"{stage}.json", record)
+        atomic_write_json(
+            model_dir
+            / "attempts"
+            / safe_component(attempt_id, "attempt_id")
+            / "state"
+            / f"{stage}.json",
+            record,
+        )
+
 
     def _resolve_key(
         self,
@@ -641,17 +944,37 @@ class ControlPlane:
             raise ValidationError("a model quality --config path is required")
         config = load_model_config(self.config_path)
         definitions = {model["id"]: model for model in config["models"]}
+        # A script-first plan carries a synthesized one-model manifest. Fold it
+        # into the known definitions so job creation and reservation see it, and
+        # it is persisted as a run-local config below for the worker to prefer.
+        generated_config = plan.get("generated_config")
+        if isinstance(generated_config, dict):
+            for model in generated_config.get("models", []):
+                if isinstance(model, dict) and model.get("id"):
+                    definitions[model["id"]] = model
+        skip_raw = plan.get("skip_stages") or {}
+        skip_stages = {
+            model_id: list(stages)
+            for model_id, stages in skip_raw.items()
+            if isinstance(stages, list)
+        }
 
         planned = {
             job["id"]: job for job in plan.get("selected", []) if isinstance(job, dict)
         }
         if job_overrides:
+            # retry/evaluate target a subset of the original plan. Restrict the
+            # launch set to those models so already-passed models are neither
+            # re-run nor re-reserved (which would waste GPU-hours and could push
+            # the run over admission capacity).
+            restricted: dict[str, Any] = {}
             for model_id in job_overrides:
                 if model_id not in definitions:
                     raise ValidationError(f"unknown model: {model_id!r}")
-                planned.setdefault(
+                restricted[model_id] = planned.get(
                     model_id, {"id": model_id, "estimated_gpu_hours": 0.0}
                 )
+            planned = restricted
         if not planned:
             raise ConflictError("the plan has no selected model to launch")
 
@@ -665,10 +988,17 @@ class ControlPlane:
                     if job_overrides and model_id in job_overrides
                     else list(STAGES_BY_MODE[run_mode])
                 )
-                if run_mode == "upload_only" or (
-                    run_mode != "eval_only" and job.get("upload_enabled")
-                ):
+                if _publish_is_scheduled(plan, job, run_mode):
                     stages = [*stages, "publish"]
+                # Honor the operator's skip choice: drop skipped optional stages
+                # from the launch set and leave a SKIPPED record so the pipeline
+                # shows them as deliberately skipped rather than blank/pending.
+                skip = set(skip_stages.get(model_id, ()))
+                if skip:
+                    skipped_here = [stage for stage in stages if stage in skip]
+                    stages = [stage for stage in stages if stage not in skip]
+                    for stage in skipped_here:
+                        self._write_skipped(run_id, model_id, stage, attempt_id)
                 reservation = self.ledger.reserve(
                     run_id=run_id,
                     model_id=model_id,
@@ -703,6 +1033,15 @@ class ControlPlane:
             raise
 
         run_dir.mkdir(parents=True, exist_ok=True)
+        if isinstance(generated_config, dict) and generated_config.get("models"):
+            # The worker reloads workflow.quantize from this run-local manifest,
+            # so the user's script argv is what actually executes.
+            config_path = run_dir / "model-config.yaml"
+            if not config_path.is_file():
+                config_path.write_text(
+                    yaml.safe_dump(generated_config, sort_keys=False),
+                    encoding="utf-8",
+                )
         if not (run_dir / "execution-plan.json").is_file():
             atomic_write_json(run_dir / "execution-plan.json", plan)
         if attempt_id != plan.get("attempt_id"):
@@ -873,6 +1212,9 @@ class ControlPlane:
                         **details,
                         "inference_arguments": (
                             inference["arguments"] if inference else []
+                        ),
+                        "inference_port": (
+                            inference.get("port", 8025) if inference else 8025
                         ),
                         "inference_source": (
                             "prestarted-container" if inference else "ci-executor"

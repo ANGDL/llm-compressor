@@ -281,7 +281,7 @@ class ReservationLedger:
         with exclusive_lock(self.lock_path):
             ledger = self._load()
             outstanding = sum(
-                float(record["gpu_hours"])
+                float(record.get("gpu_hours") or 0.0)
                 for record in ledger["reservations"]
                 if record.get("state") in {"RESERVED", "QUEUED"}
             )
@@ -382,12 +382,12 @@ class ReservationLedger:
         ledger = self._load()
         reservations = ledger["reservations"]
         reserved = sum(
-            float(record["gpu_hours"])
+            float(record.get("gpu_hours") or 0.0)
             for record in reservations
             if record.get("state") in {"RESERVED", "QUEUED"}
         )
         released = sum(
-            float(record["gpu_hours"])
+            float(record.get("gpu_hours") or 0.0)
             for record in reservations
             if record.get("state") == "RELEASED"
         )
@@ -405,7 +405,7 @@ class ReservationLedger:
 
     def outstanding_for_run(self, run_id: str) -> float:
         return sum(
-            float(record["gpu_hours"])
+            float(record.get("gpu_hours") or 0.0)
             for record in self._load()["reservations"]
             if record.get("run_id") == run_id
             and record.get("state") in {"RESERVED", "QUEUED"}

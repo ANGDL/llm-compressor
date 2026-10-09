@@ -69,6 +69,110 @@ def gpu_device_count(env: dict[str, str] | None = None) -> int:
         return 0
 
 
+def gpu_telemetry(env: dict[str, str] | None = None) -> dict[str, Any]:
+    """Report live GPU devices and memory using only the torch Python API.
+
+    The function stays on the high-level ``torch.cuda`` surface (names, memory,
+    properties, utilization) and never touches a lower-level C/C++ binding
+    directly. torch is imported lazily so the dependency-free web layer only
+    pays the import cost when an operator opens this panel, and every probe is
+    guarded so a host without CUDA (e.g. a laptop) returns a clear reason
+    instead of raising.
+    """
+
+    try:
+        import torch
+    except Exception:
+        return {
+            "generated_at": utc_now(),
+            "available": False,
+            "backend": "none",
+            "device_count": 0,
+            "devices": [],
+            "reason": "torch is not installed in the web server environment",
+        }
+
+    info: dict[str, Any] = {
+        "generated_at": utc_now(),
+        "hostname": socket.gethostname(),
+        "platform": platform.platform(),
+        "torch_version": getattr(torch, "__version__", None),
+        "cuda_version": getattr(getattr(torch, "version", None), "cuda", None),
+    }
+    try:
+        cuda_available = bool(torch.cuda.is_available())
+    except Exception:
+        cuda_available = False
+
+    if not cuda_available:
+        mps = False
+        try:
+            mps = bool(torch.backends.mps.is_available())
+        except Exception:
+            mps = False
+        info.update(
+            available=False,
+            backend="mps" if mps else "none",
+            device_count=0,
+            devices=[],
+            reason=(
+                f"The web server is running on host {info['hostname']!r}, which "
+                "has no CUDA device (torch.cuda.is_available() is False)"
+                + (
+                    "; an Apple MPS device is present. "
+                    if mps
+                    else ". "
+                )
+                + "GPU telemetry reflects the host the server runs on, so start "
+                "the server on the GPU node to see its accelerators."
+            ),
+        )
+        return info
+
+    count = int(torch.cuda.device_count())
+    devices: list[dict[str, Any]] = []
+    for index in range(count):
+        device: dict[str, Any] = {"index": index}
+        try:
+            device["name"] = torch.cuda.get_device_name(index)
+        except Exception:
+            device["name"] = f"cuda:{index}"
+        try:
+            props = torch.cuda.get_device_properties(index)
+            device["total_memory_bytes"] = int(props.total_memory)
+            device["compute_capability"] = f"{props.major}.{props.minor}"
+            device["multiprocessors"] = int(
+                getattr(props, "multi_processor_count", 0)
+            )
+        except Exception:
+            pass
+        try:
+            free, total = torch.cuda.mem_get_info(index)
+            device["free_memory_bytes"] = int(free)
+            device["total_memory_bytes"] = int(total)
+            device["used_memory_bytes"] = int(total) - int(free)
+        except Exception:
+            pass
+        try:
+            device["allocated_bytes"] = int(torch.cuda.memory_allocated(index))
+            device["reserved_bytes"] = int(torch.cuda.memory_reserved(index))
+        except Exception:
+            pass
+        try:
+            # torch.cuda.utilization is a Python wrapper; it may be unavailable
+            # when pynvml is missing, so a failure just yields a null reading.
+            device["utilization_percent"] = int(torch.cuda.utilization(index))
+        except Exception:
+            device["utilization_percent"] = None
+        devices.append(device)
+
+    info.update(
+        available=True, backend="cuda", device_count=count, devices=devices
+    )
+    return info
+
+
+
 def capacity_forecast(
     *,
     ledger: ReservationLedger,
@@ -531,7 +635,12 @@ class NotificationService:
             "schema_version": 1,
             "enabled": False,
             "webhook_url": None,
-            "events": ["run.failed", "job.failed", "run.publish_failed"],
+            "events": [
+                "run.failed",
+                "job.failed",
+                "run.publish_failed",
+                "schedule.failed",
+            ],
         }
 
     def log(self, *, limit: int = 100) -> dict[str, Any]:

@@ -10,6 +10,7 @@ from ci.model_quality.executor import (
     _validate_argument_constraints,
     _artifact_content_fingerprint,
     _artifact_file_records,
+    _source_provenance,
     run_evaluate,
     run_publish,
     run_quantize,
@@ -88,6 +89,72 @@ def test_quantize_validate_report_flow(tmp_path, monkeypatch):
         (tmp_path / "runs/run-a/fake-model/reports/summary.json").read_text()
     )
     assert summary["status"] == "PASS"
+
+
+def test_report_carries_earlier_lanes_forward_on_partial_rerun(tmp_path, monkeypatch):
+    """Re-running one node must not fail the report on the untouched lanes."""
+
+    monkeypatch.setenv("MODEL_QUALITY_RUNS_ROOT", str(tmp_path / "runs"))
+    model = _fake_model(tmp_path)
+    run_id = "run-a"
+    fingerprint = model_fingerprint(model)
+
+    # The original attempt ran the whole pipeline.
+    for stage, status in (
+        ("preflight", "PASS"),
+        ("quantize", "PASS"),
+        ("validate", "WARN"),
+    ):
+        write_stage_result(
+            run_id,
+            model["id"],
+            stage,
+            {"status": status},
+            attempt_id="attempt-1",
+            artifact_fingerprint=fingerprint,
+        )
+
+    # The re-run attempt owns only the stages it actually executed; evaluate was
+    # explicitly skipped by the operator.
+    write_stage_result(
+        run_id,
+        model["id"],
+        "runtime-smoke",
+        {"status": "PASS"},
+        attempt_id="attempt-2",
+        artifact_fingerprint=fingerprint,
+    )
+    write_stage_result(
+        run_id,
+        model["id"],
+        "evaluate",
+        {"status": "SKIPPED", "reason": "operator skip"},
+        attempt_id="attempt-2",
+    )
+
+    result = run_report(
+        model,
+        run_id,
+        run_mode="quantize_and_eval",
+        artifact_fingerprint=fingerprint,
+        evaluation_fingerprint="eval-fingerprint",
+        attempt_id="attempt-2",
+    )
+
+    assert result["status"] == "PASS"
+    assert result["summary"]["stages"] == {
+        "preflight": "PASS",
+        "quantize": "PASS",
+        "validate": "WARN",
+        "runtime-smoke": "PASS",
+        "evaluate": "SKIPPED",
+    }
+    assert result["summary"]["stages_carried_from_prior_attempts"] == [
+        "preflight",
+        "quantize",
+        "validate",
+    ]
+    assert result["summary"]["warnings"] == ["validate completed with warnings"]
 
 
 def test_argument_constraints_reject_incompatible_flags(tmp_path):
@@ -497,6 +564,88 @@ def test_publish_executes_explicit_bcecmd_upload_and_verification(
     assert all("SUCCESS.json" not in item["path"] for item in frozen["files"])
     actual_manifest = json.loads((run_dir / "reports/upload-manifest.json").read_text())
     assert frozen == actual_manifest
+
+
+def test_source_provenance_is_stat_based_not_hashed(tmp_path):
+    """Source provenance must never content-hash a (potentially multi-TB) source."""
+
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "config.json").write_text("{}")
+    (source / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"w": "model-00001.safetensors"}})
+    )
+    (source / "model-00001.safetensors").write_bytes(b"x" * 1024)
+
+    provenance = _source_provenance(source)
+    records = provenance["metadata_files"] + provenance["shards"]
+    assert records, "expected provenance records"
+    for record in records:
+        assert "sha256" not in record  # no content hashing
+        assert record["size_bytes"] >= 0
+        assert "mtime_ns" in record
+    # A size change is still visible in the record.
+    (source / "model-00001.safetensors").write_bytes(b"x" * 2048)
+    assert _source_provenance(source)["shards"][0]["size_bytes"] == 2048
+
+
+def test_publish_fast_path_trusts_manifest_sizes_but_catches_size_change(
+    tmp_path, monkeypatch
+):
+    """A large artifact must not be re-hashed when its paths+sizes are unchanged.
+
+    The manifest's recorded file sizes are the fast-path check: matching sizes
+    reuse the stored content fingerprint (no multi-hundred-GB re-hash), while a
+    size change still fails the publish as a changed artifact.
+    """
+
+    monkeypatch.setenv("MODEL_QUALITY_RUNS_ROOT", str(tmp_path / "runs"))
+    model = _fake_model(tmp_path)
+    run_dir = tmp_path / "runs/run-a/fake-model"
+    (run_dir / "model").mkdir(parents=True)
+    (run_dir / "reports").mkdir()
+    (run_dir / "model" / "model.safetensors").write_bytes(b"weights-v1")
+    (run_dir / "artifact-manifest.json").write_text(
+        json.dumps(
+            {
+                "artifact_fingerprint": "artifact-a",
+                "files": _artifact_file_records(run_dir / "model"),
+                "artifact_content_fingerprint": _artifact_content_fingerprint(
+                    _artifact_file_records(run_dir / "model")
+                ),
+            }
+        )
+    )
+    (run_dir / "reports/summary.json").write_text(
+        json.dumps(
+            {"status": "PASS", "attempt_id": "attempt-a", "artifact_fingerprint": "artifact-a"}
+        )
+    )
+    (run_dir / "current-attempt.json").write_text(
+        json.dumps({"attempt_id": "attempt-a", "artifact_fingerprint": "artifact-a"})
+    )
+    bcecmd = tmp_path / "bcecmd"
+    bcecmd.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    bcecmd.chmod(0o755)
+    model["upload"] = {
+        "enabled": True,
+        "remote_prefix": "bos:/bucket/model-quality",
+        "allowlist": ["model", "reports"],
+        "commands": [[str(bcecmd), "upload", "{output_dir}", "{remote_run_prefix}/model"]],
+        "verify_commands": [[str(bcecmd), "verify", "{remote_run_prefix}"]],
+        "success_commands": [
+            [str(bcecmd), "upload", "{run_dir}/commit-markers/SUCCESS.json", "{remote_run_prefix}/SUCCESS.json"]
+        ],
+    }
+
+    # Same size (even if bytes differ) takes the fast path and publishes.
+    (run_dir / "model" / "model.safetensors").write_bytes(b"weights-v2")
+    assert run_publish(model, "run-a", artifact_fingerprint="artifact-a")["status"] == "PASS"
+
+    # A size change is still caught as a changed artifact.
+    (run_dir / "model" / "model.safetensors").write_bytes(b"weights-much-longer")
+    with pytest.raises(StageError, match="changed since validation"):
+        run_publish(model, "run-a", artifact_fingerprint="artifact-a")
 
 
 def test_success_marker_is_created_only_after_remote_verify(tmp_path, monkeypatch):

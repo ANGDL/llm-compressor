@@ -53,7 +53,21 @@ load_config() {
     MQ_INFERENCE_CONTAINERS=${MQ_INFERENCE_CONTAINERS:-}
     MQ_INFERENCE_SCRIPT_ROOTS=${MQ_INFERENCE_SCRIPT_ROOTS:-/workspace}
     MQ_EVALUATION_COMMANDS=${MQ_EVALUATION_COMMANDS:-}
+    MQ_EVAL_LM_EVAL=${MQ_EVAL_LM_EVAL:-lm_eval}
+    MQ_EVAL_EVALSCOPE=${MQ_EVAL_EVALSCOPE:-evalscope}
+    MQ_UPLOAD_PREFIXES=${MQ_UPLOAD_PREFIXES:-bos:/your-bucket/model-quality}
+    MQ_WORKER_KINDS=${MQ_WORKER_KINDS:-}
     MQ_RUNTIME_DIR=${MQ_RUNTIME_DIR:-/tmp/model-quality-web}
+    # Runtime-smoke runs its serve script inside the inference (sglang) container,
+    # which has the GPUs and the serve scripts, so it needs its own worker there
+    # draining only ``inference`` jobs in --container-runtime direct mode. The
+    # main worker above never handles ``inference``.
+    MQ_INFERENCE_WORKER_ENABLED=${MQ_INFERENCE_WORKER_ENABLED:-0}
+    MQ_INFERENCE_WORKER_CONTAINER=${MQ_INFERENCE_WORKER_CONTAINER:-}
+    if [[ -z ${MQ_INFERENCE_WORKER_CONTAINER} && -n ${MQ_INFERENCE_CONTAINERS} ]]; then
+        MQ_INFERENCE_WORKER_CONTAINER=$(printf '%s' "${MQ_INFERENCE_CONTAINERS}" | tr ', ' '\n\n' | sed '/^$/d' | head -1)
+    fi
+    MQ_INFERENCE_WORKER_PYTHON=${MQ_INFERENCE_WORKER_PYTHON:-}
     local token
     token=$(printf '%s' "${MQ_SSH_HOST}" | tr -cs 'A-Za-z0-9._-' '_')
     MQ_CONTROL_SOCKET=${MQ_CONTROL_SOCKET:-${SOCKET_DIR%/}/model-quality-${token}.sock}
@@ -132,7 +146,7 @@ start_service() {
         return
     fi
     info "starting Web service in ${MQ_CONTAINER}"
-    remote "docker exec '${MQ_CONTAINER}' bash -lc 'mkdir -p \"${MQ_RUNTIME_DIR}\"; old=\$(cat \"${MQ_RUNTIME_DIR}/server.pid\" 2>/dev/null || true); if [[ -n \"\${old}\" ]] && kill -0 \"\${old}\" 2>/dev/null; then kill \"\${old}\"; fi; cd \"${MQ_REPO}\"; export MODEL_QUALITY_RUNS_ROOT=\"${MQ_RUNS_ROOT}\" MODEL_QUALITY_CONFIG=\"${MQ_CONFIG}\" MODEL_QUALITY_GIT_SHA=\"${MQ_GIT_SHA}\" MODEL_QUALITY_WEB_EXECUTOR=\"${MQ_EXECUTOR}\" MODEL_QUALITY_GPU_HOUR_CAPACITY=\"${MQ_GPU_HOUR_CAPACITY}\" MODEL_QUALITY_INFERENCE_CONTAINERS=\"${MQ_INFERENCE_CONTAINERS}\" MODEL_QUALITY_INFERENCE_SCRIPT_ROOTS=\"${MQ_INFERENCE_SCRIPT_ROOTS}\" MODEL_QUALITY_EVALUATION_COMMANDS=\"${MQ_EVALUATION_COMMANDS}\" PYTHONUNBUFFERED=1; nohup \"${MQ_PYTHON}\" -m ci.model_quality.web --host \"${MQ_REMOTE_BIND}\" --port \"${MQ_REMOTE_PORT}\" --runs-root \"${MQ_RUNS_ROOT}\" --config \"${MQ_CONFIG}\" --git-sha \"${MQ_GIT_SHA}\" >> \"${MQ_RUNTIME_DIR}/server.log\" 2>&1 < /dev/null & echo \$! > \"${MQ_RUNTIME_DIR}/server.pid\"'"
+    remote "docker exec '${MQ_CONTAINER}' bash -lc 'mkdir -p \"${MQ_RUNTIME_DIR}\"; old=\$(cat \"${MQ_RUNTIME_DIR}/server.pid\" 2>/dev/null || true); if [[ -n \"\${old}\" ]] && kill -0 \"\${old}\" 2>/dev/null; then kill \"\${old}\"; fi; cd \"${MQ_REPO}\"; export MODEL_QUALITY_RUNS_ROOT=\"${MQ_RUNS_ROOT}\" MODEL_QUALITY_CONFIG=\"${MQ_CONFIG}\" MODEL_QUALITY_GIT_SHA=\"${MQ_GIT_SHA}\" MODEL_QUALITY_WEB_EXECUTOR=\"${MQ_EXECUTOR}\" MODEL_QUALITY_GPU_HOUR_CAPACITY=\"${MQ_GPU_HOUR_CAPACITY}\" MODEL_QUALITY_INFERENCE_CONTAINERS=\"${MQ_INFERENCE_CONTAINERS}\" MODEL_QUALITY_INFERENCE_SCRIPT_ROOTS=\"${MQ_INFERENCE_SCRIPT_ROOTS}\" MODEL_QUALITY_EVALUATION_COMMANDS=\"${MQ_EVALUATION_COMMANDS}\" MODEL_QUALITY_EVAL_LM_EVAL=\"${MQ_EVAL_LM_EVAL}\" MODEL_QUALITY_EVAL_EVALSCOPE=\"${MQ_EVAL_EVALSCOPE}\" MODEL_QUALITY_UPLOAD_PREFIXES=\"${MQ_UPLOAD_PREFIXES}\" PYTHONUNBUFFERED=1; nohup \"${MQ_PYTHON}\" -m ci.model_quality.web --host \"${MQ_REMOTE_BIND}\" --port \"${MQ_REMOTE_PORT}\" --runs-root \"${MQ_RUNS_ROOT}\" --config \"${MQ_CONFIG}\" --git-sha \"${MQ_GIT_SHA}\" >> \"${MQ_RUNTIME_DIR}/server.log\" 2>&1 < /dev/null & echo \$! > \"${MQ_RUNTIME_DIR}/server.pid\"'"
     for _ in {1..20}; do
         service_healthy && return
         sleep 0.5
@@ -150,8 +164,41 @@ start_worker() {
         return 0
     fi
     worker_healthy && return
+    local kinds=""
+    if [[ -n ${MQ_WORKER_KINDS} ]]; then
+        kinds=" --kinds ${MQ_WORKER_KINDS}"
+    fi
     info "starting queue worker in ${MQ_CONTAINER}"
-    remote "docker exec '${MQ_CONTAINER}' bash -lc 'cd \"${MQ_REPO}\"; export MODEL_QUALITY_RUNS_ROOT=\"${MQ_RUNS_ROOT}\" MODEL_QUALITY_GPU_HOUR_CAPACITY=\"${MQ_GPU_HOUR_CAPACITY}\" MODEL_QUALITY_CONTAINER_RUNTIME=\"${MQ_CONTAINER_RUNTIME}\" PYTHONUNBUFFERED=1; nohup \"${MQ_PYTHON}\" -m ci.model_quality.web.worker --runs-root \"${MQ_RUNS_ROOT}\" --config \"${MQ_CONFIG}\" --poll-seconds \"${MQ_WORKER_POLL_SECONDS}\" >> \"${MQ_RUNTIME_DIR}/worker.log\" 2>&1 < /dev/null & echo \$! > \"${MQ_RUNTIME_DIR}/worker.pid\"'"
+    remote "docker exec '${MQ_CONTAINER}' bash -lc 'cd \"${MQ_REPO}\"; export MODEL_QUALITY_RUNS_ROOT=\"${MQ_RUNS_ROOT}\" MODEL_QUALITY_GPU_HOUR_CAPACITY=\"${MQ_GPU_HOUR_CAPACITY}\" MODEL_QUALITY_CONTAINER_RUNTIME=\"${MQ_CONTAINER_RUNTIME}\" PYTHONUNBUFFERED=1; nohup \"${MQ_PYTHON}\" -m ci.model_quality.web.worker --runs-root \"${MQ_RUNS_ROOT}\" --config \"${MQ_CONFIG}\" --poll-seconds \"${MQ_WORKER_POLL_SECONDS}\"${kinds} >> \"${MQ_RUNTIME_DIR}/worker.log\" 2>&1 < /dev/null & echo \$! > \"${MQ_RUNTIME_DIR}/worker.pid\"'"
+}
+
+discover_inference_python() {
+    if [[ -n ${MQ_INFERENCE_WORKER_PYTHON:-} ]]; then
+        return
+    fi
+    MQ_INFERENCE_WORKER_PYTHON=$(remote "docker exec ${MQ_INFERENCE_WORKER_CONTAINER} bash -lc 'for candidate in /root/miniconda/envs/*/bin/python .venv/bin/python python3 python; do if command -v \"\${candidate}\" >/dev/null 2>&1 || [[ -x \"\${candidate}\" ]]; then command -v \"\${candidate}\" 2>/dev/null || printf %s \"\${candidate}\"; break; fi; done'" | tail -1)
+    [[ -n ${MQ_INFERENCE_WORKER_PYTHON} ]] || die "no Python found inside ${MQ_INFERENCE_WORKER_CONTAINER}; set MQ_INFERENCE_WORKER_PYTHON"
+}
+
+# The runtime-smoke worker's pid/log live under the shared runs root so they are
+# reachable from both containers (the inference container may not mount the main
+# container's MQ_RUNTIME_DIR).
+inference_worker_healthy() {
+    remote "docker exec '${MQ_INFERENCE_WORKER_CONTAINER}' bash -lc 'pid=\$(cat \"${MQ_RUNS_ROOT}/inference-worker.pid\" 2>/dev/null || true); [[ -n \"\${pid}\" ]] && kill -0 \"\${pid}\" 2>/dev/null'" >/dev/null 2>&1
+}
+
+start_inference_worker() {
+    if [[ ${MQ_INFERENCE_WORKER_ENABLED} != 1 ]]; then
+        return 0
+    fi
+    [[ -n ${MQ_INFERENCE_WORKER_CONTAINER} ]] || die "MQ_INFERENCE_WORKER_ENABLED=1 requires MQ_INFERENCE_WORKER_CONTAINER (or MQ_INFERENCE_CONTAINERS)"
+    inference_worker_healthy && return
+    discover_inference_python
+    info "starting runtime-smoke worker in ${MQ_INFERENCE_WORKER_CONTAINER}"
+    # The serve script invokes ``sglang`` by bare name, so the worker (whose env
+    # the serve subprocess inherits) must have the interpreter's conda bin dir on
+    # PATH; otherwise sglang is "command not found" and the server never comes up.
+    remote "docker exec '${MQ_INFERENCE_WORKER_CONTAINER}' bash -lc 'cd \"${MQ_REPO}\"; export MODEL_QUALITY_RUNS_ROOT=\"${MQ_RUNS_ROOT}\" MODEL_QUALITY_CONTAINER_RUNTIME=direct PYTHONPATH=\"${MQ_REPO}\" PYTHONUNBUFFERED=1; case \"${MQ_INFERENCE_WORKER_PYTHON}\" in */*) export PATH=\"\$(dirname \"${MQ_INFERENCE_WORKER_PYTHON}\"):\${PATH}\";; esac; nohup \"${MQ_INFERENCE_WORKER_PYTHON}\" -m ci.model_quality.web.worker --runs-root \"${MQ_RUNS_ROOT}\" --config \"${MQ_CONFIG}\" --kinds inference --container-runtime direct --poll-seconds \"${MQ_WORKER_POLL_SECONDS}\" >> \"${MQ_RUNS_ROOT}/inference-worker.log\" 2>&1 < /dev/null & echo \$! > \"${MQ_RUNS_ROOT}/inference-worker.pid\"'"
 }
 
 stop_service() {
@@ -219,6 +266,9 @@ command_status() {
     if master_ok; then
         printf 'container     : %s (%s)\n' "${MQ_CONTAINER}" "$(container_ok && echo running || echo unavailable)"
         printf 'service       : %s\n' "$(service_healthy && echo healthy || echo unavailable)"
+        if [[ ${MQ_INFERENCE_WORKER_ENABLED} == 1 ]]; then
+            printf 'smoke worker  : %s (%s)\n' "${MQ_INFERENCE_WORKER_CONTAINER:-unset}" "$(inference_worker_healthy && echo healthy || echo unavailable)"
+        fi
     else
         printf 'container     : unknown\nservice       : unknown\n'
     fi
@@ -250,7 +300,7 @@ command_doctor() {
     return "${failed}"
 }
 
-command_up() { ensure_master; start_service; start_worker; ensure_tunnel; command_status; }
+command_up() { ensure_master; start_service; start_worker; start_inference_worker; ensure_tunnel; command_status; }
 
 command_down() {
     cancel_tunnel
