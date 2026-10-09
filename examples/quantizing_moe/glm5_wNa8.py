@@ -62,6 +62,18 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--model_id", type=str, default="/ssd4/models/GLM-5")
 parser.add_argument("--save_dir", type=str, default="/ssd3/models")
 parser.add_argument(
+    "--output-dir",
+    type=str,
+    default=None,
+    help=(
+        "Final deliverable directory. When set, the packed int4->int8 checkpoint "
+        "(the deliverable) is written here directly, with no auto-named subfolder, "
+        "so CI's downstream stages find the artifact at this exact path. The "
+        "unpacked intermediate goes to a sibling scratch dir and is removed after "
+        "packing. When unset, falls back to the auto-named <save_dir>/<name> layout."
+    ),
+)
+parser.add_argument(
     "--observer",
     type=str,
     default="",
@@ -456,7 +468,6 @@ if args.modifier == "GPTQ":
         GPTQModifier(
             config_groups=config_groups,
             ignore=ignores,
-            offload_hessians=True,
         )
     )
     tail_name += "-GPTQ"
@@ -491,20 +502,38 @@ else:
 
 # Save to disk compressed.
 SAVE_NAME = model_id.rstrip("/").split("/")[-1] + tail_name + "-unpacked"
-SAVE_DIR = os.path.join(args.save_dir, SAVE_NAME)
+packed_name = model_id.rstrip("/").split("/")[-1] + tail_name.replace("-WNA8", "-W4A8")
+
+# ``--output-dir`` pins the final deliverable to an exact directory (used by CI
+# so downstream stages find the artifact there). The packed int4->int8
+# checkpoint is the deliverable, so it goes to ``--output-dir``; the unpacked
+# intermediate is written to a sibling scratch dir and removed after packing so
+# it never lands in the published tree. Without ``--output-dir`` the auto-named
+# CLI layout under ``--save_dir`` is kept.
+cleanup_unpacked = False
+if args.output_dir and args.pack:
+    SAVE_DIR = args.output_dir.rstrip("/") + "-unpacked"
+    packed_dir = args.output_dir
+    cleanup_unpacked = True
+elif args.output_dir:
+    SAVE_DIR = args.output_dir
+    packed_dir = None
+else:
+    SAVE_DIR = os.path.join(args.save_dir, SAVE_NAME)
+    packed_dir = (
+        args.packed_save_dir or os.path.join(args.save_dir, packed_name)
+        if args.pack
+        else None
+    )
 
 with maybe_skip_from_accelerate(args.skip_restore_from_accelerate):
     model.save_pretrained(SAVE_DIR, save_compressed=True)
 tokenizer.save_pretrained(SAVE_DIR)
 
 if args.pack:
-    packed_name = model_id.rstrip("/").split("/")[-1] + tail_name.replace(
-        "-WNA8", "-W4A8"
-    )
-    packed_dir = args.packed_save_dir or os.path.join(args.save_dir, packed_name)
     if os.path.realpath(packed_dir) == os.path.realpath(SAVE_DIR):
         raise ValueError(
-            "packed_save_dir must differ from the unpacked save directory"
+            "packed save directory must differ from the unpacked save directory"
         )
 
     # The standalone packing step previously ran after the quantization process
@@ -529,8 +558,17 @@ if args.pack:
     print(f"Saved packed quantized model to {packed_dir}")
 
 if args.use_original_config:
-    config_output_dirs = [SAVE_DIR]
-    if args.pack:
+    # Apply to the kept deliverables only: the packed checkpoint always, and the
+    # unpacked one unless it is the CI throwaway intermediate.
+    config_output_dirs = []
+    if args.pack and packed_dir:
         config_output_dirs.append(packed_dir)
+    if not cleanup_unpacked:
+        config_output_dirs.append(SAVE_DIR)
     for config_output_dir in config_output_dirs:
         overwrite_with_original_config(model_id, config_output_dir)
+
+# Reclaim the throwaway unpacked intermediate once packing (and any config
+# fixups) are done, so a CI run doesn't leave a second full-size copy on disk.
+if cleanup_unpacked and os.path.isdir(SAVE_DIR):
+    shutil.rmtree(SAVE_DIR, ignore_errors=True)

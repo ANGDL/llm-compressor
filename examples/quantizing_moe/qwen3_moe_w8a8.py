@@ -1,16 +1,17 @@
+import argparse
+import os
+import shutil
+from pathlib import Path
+
 import torch
-from datasets import load_dataset
+from datasets import Dataset, load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from llmcompressor import oneshot
-from llmcompressor.utils import dispatch_for_generation
-from llmcompressor.modifiers.quantization import GPTQModifier
 from llmcompressor.modifiers.autosmooth import AutoSmoothModifier
 from llmcompressor.modifiers.awq import AWQMapping
-import os
-import shutil
+from llmcompressor.modifiers.quantization import GPTQModifier
 
-# select a Mixture of Experts model for quantization
 
 MODEL_ARTIFACT_FILES = {
     "config.json",
@@ -31,53 +32,80 @@ def copy_original_non_model_files(source_dir, save_dir):
             continue
         shutil.copy2(source_path, os.path.join(save_dir, filename))
 
-MODEL_ID = "/ssd1/models/Qwen3-235B-A22B-Instruct-2507/"
 
-model = AutoModelForCausalLM.from_pretrained(
-    MODEL_ID, dtype="auto", trust_remote_code=True, device_map=None
+parser = argparse.ArgumentParser()
+parser.add_argument(
+    "--model-id", default="/ssd4/models/Qwen3-235B-A22B-Instruct-2507"
 )
-tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+parser.add_argument("--output-dir")
+parser.add_argument("--dataset-id", default="HuggingFaceH4/ultrachat_200k")
+parser.add_argument("--dataset-split", default="train_sft")
+parser.add_argument("--num-calibration-samples", type=int, default=128)
+parser.add_argument("--max-sequence-length", type=int, default=3072)
+args = parser.parse_args()
+if args.num_calibration_samples < 1 or args.max_sequence_length < 1:
+    parser.error("calibration samples and sequence length must be positive")
 
-# Select calibration dataset.
-DATASET_ID = "HuggingFaceH4/ultrachat_200k"
-DATASET_SPLIT = "train_sft"
-NUM_CALIBRATION_SAMPLES = 256
-MAX_SEQUENCE_LENGTH = 3072
+model_id = args.model_id
+num_calibration_samples = args.num_calibration_samples
+max_sequence_length = args.max_sequence_length
+tokenizer = AutoTokenizer.from_pretrained(model_id, local_files_only=True)
+model = AutoModelForCausalLM.from_pretrained(
+    model_id,
+    dtype="auto",
+    trust_remote_code=True,
+    device_map=None,
+    local_files_only=True,
+)
 
-
-# Load dataset and preprocess.
-ds = load_dataset(DATASET_ID, split=f"{DATASET_SPLIT}[:{NUM_CALIBRATION_SAMPLES}]")
-ds = ds.shuffle(seed=42)
+dataset_path = Path(args.dataset_id)
+if dataset_path.is_dir():
+    arrow_files = sorted(dataset_path.rglob("*.arrow"))
+    parquet_files = sorted(dataset_path.rglob("*.parquet"))
+    if arrow_files:
+        dataset = Dataset.from_file(str(arrow_files[0]))
+    elif parquet_files:
+        dataset = load_dataset(
+            "parquet",
+            data_files={args.dataset_split: [str(path) for path in parquet_files if args.dataset_split in path.name]},
+            split=args.dataset_split,
+        )
+    else:
+        raise FileNotFoundError(
+            f"no .arrow or .parquet files found under {dataset_path}"
+        )
+    dataset = dataset.select(range(min(num_calibration_samples, len(dataset))))
+else:
+    dataset = load_dataset(
+        args.dataset_id,
+        split=f"{args.dataset_split}[:{num_calibration_samples}]",
+    )
+dataset = dataset.shuffle(seed=42)
 
 
 def preprocess(example):
     return {
         "text": tokenizer.apply_chat_template(
-            example["messages"],
-            tokenize=False,
+            example["messages"], tokenize=False
         )
     }
 
 
-ds = ds.map(preprocess)
+dataset = dataset.map(preprocess)
 
 
-# Tokenize inputs.
 def tokenize(sample):
     return tokenizer(
         sample["text"],
         padding=False,
-        max_length=MAX_SEQUENCE_LENGTH,
+        max_length=max_sequence_length,
         truncation=True,
         add_special_tokens=False,
     )
 
 
-ds = ds.map(tokenize, remove_columns=ds.column_names)
+dataset = dataset.map(tokenize, remove_columns=dataset.column_names)
 
-# Configure the quantization algorithm to run.
-# since the MoE gate layers are sensitive to quantization, we add them to the ignore
-# list so they remain at full precision
 mapping = [
     AWQMapping(
         "re:.*input_layernorm$",
@@ -87,57 +115,44 @@ mapping = [
     AWQMapping(
         "re:.*post_attention_layernorm$",
         [
-            "re:.*mlp.experts.*.gate_proj$", 
+            "re:.*mlp.experts.*.gate_proj$",
             "re:.*mlp.experts.*.up_proj$",
         ],
     ),
-    AWQMapping(
-        "re:.*up_proj$",
-        ["re:.*down_proj$"],
-    ),
 ]
 
-# Recipe
 recipe = [
-    AutoSmoothModifier(activation_scale_type="max", norm_func='adaptive', mappings=mapping),
+    AutoSmoothModifier(
+        activation_scale_type="max",
+        norm_func="adaptive",
+        mappings=mapping,
+    ),
     GPTQModifier(
         targets="Linear",
         scheme="W8A8",
-        ignore=["lm_head", "re:.*mlp.gate$"],
-        offload_hessians=True,
+        ignore=["re:.*lm_head", "re:.*mlp.gate$"],
+        actorder=None,
+        batched_quantization=1,
     ),
 ]
 
 oneshot(
     model=model,
-    dataset=ds,
+    tokenizer=tokenizer,
+    dataset=dataset,
     recipe=recipe,
-    max_seq_length=MAX_SEQUENCE_LENGTH,
-    num_calibration_samples=NUM_CALIBRATION_SAMPLES,
+    max_seq_length=max_sequence_length,
+    num_calibration_samples=num_calibration_samples,
     trust_remote_code_model=True,
     batch_size=64,
     concatenate_data=True,
     moe_calibrate_all_experts=False,
+    sequential_targets=["Qwen3MoeDecoderLayer"],
+    sequential_targets_per_subgraph=1,
 )
 
-# print("========== SAMPLE GENERATION ==============")
-# try:
-#     dispatch_for_generation(model)
-#     sample = tokenizer("Hello my name is", return_tensors="pt")
-#     sample = {key: value.to(model.device) for key, value in sample.items()}
-#     output = model.generate(**sample, max_new_tokens=100)
-#     print(tokenizer.decode(output[0]))
-#     print("==========================================")
-# except Exception as e:
-#     print(f"Failed to generate sample: {e}")
-
-# Save to disk in compressed-tensors format.
-SAVE_DIR = MODEL_ID.rstrip("/").split("/")[-1] + "-w8a8-smooth-gptq"
-SAVE_DIR = os.path.join("/ssd1/models", SAVE_DIR)
-
-try:
-    model.save_pretrained(SAVE_DIR, save_compressed=True)
-except torch.OutOfMemoryError as e:
-    print(f"This error is just for accelerator dispatch, and can be ignored if it happens during saving: {e}")
-
-copy_original_non_model_files(MODEL_ID, SAVE_DIR)
+save_dir = args.output_dir or os.path.join(
+    "/data/models", model_id.rstrip("/").split("/")[-1] + "-w8a8-gptq"
+)
+model.save_pretrained(save_dir, save_compressed=True)
+copy_original_non_model_files(model_id, save_dir)

@@ -8,7 +8,7 @@ exercises the real K3 materializer before producing W4A8 output.
 Example:
 
     HF_HOME=/tmp/kimi-k3-hf-cache python tools/create_tiny_kimi_k3.py \
-        --source /Users/ang/models/K3 \
+        --source /path/to/models/K3 \
         --output /tmp/Kimi-K3-Tiny
 """
 

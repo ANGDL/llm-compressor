@@ -10,7 +10,7 @@ The test mirrors the real ``glm5_w8a8.py`` pipeline:
 Usage::
 
     # Use the real GLM-5.1 tokenizer (recommended)
-    python tests/unit/test_glm5_mtp_quant.py --tokenizer_path /Users/ang/models/GLM-5.1
+    python tests/unit/test_glm5_mtp_quant.py --tokenizer_path /path/to/models/GLM-5.1
 
     # Self-contained (builds a minimal byte-level tokenizer)
     python tests/unit/test_glm5_mtp_quant.py
@@ -459,7 +459,7 @@ if __name__ == "__main__":
         type=str,
         default=None,
         help=(
-            "Path to a tokenizer directory (e.g. /Users/ang/models/GLM-5.1). "
+            "Path to a tokenizer directory (e.g. /path/to/models/GLM-5.1). "
             "If omitted, a minimal byte-level BPE tokenizer is built on-the-fly."
         ),
     )

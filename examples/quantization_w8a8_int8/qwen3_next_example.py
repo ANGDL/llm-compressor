@@ -91,7 +91,6 @@ recipe = [
              "re:.*mlp.shared_expert_gate$",
              "re:.*linear_attn.*",
             ],
-        #offload_hessians=True,
     ),
 ]
 

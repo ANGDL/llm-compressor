@@ -17,7 +17,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 REFERENCE_KERNEL_PATH = os.environ.get(
     "DEEPSEEK_V4_REFERENCE_KERNEL_PATH",
-    "/Users/ang/models/DeepSeek-V4-Pro/inference/kernel.py",
+    "/path/to/models/DeepSeek-V4-Pro/inference/kernel.py",
 )
 os.environ["DEEPSEEK_V4_KERNEL_BACKEND"] = "reference"
 os.environ["DEEPSEEK_V4_REFERENCE_KERNEL_PATH"] = REFERENCE_KERNEL_PATH

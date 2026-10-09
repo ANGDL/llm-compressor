@@ -129,7 +129,6 @@ scheme = QuantizationScheme(
 recipe = [
     GPTQModifier(
         targets="Linear",
-        offload_hessians=True,
         config_groups={"group_0": scheme}, 
         ignore=[
             "re:.*lm_head",

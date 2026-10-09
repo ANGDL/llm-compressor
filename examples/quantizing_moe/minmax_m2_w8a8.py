@@ -85,7 +85,6 @@ recipe = [
         targets="Linear",
         scheme="W8A8",
         ignore=["lm_head", ],
-        offload_hessians=True,
     ),
 ]
 
