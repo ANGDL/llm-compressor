@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import io
 import json
 from pathlib import Path
 
 import pytest
+import yaml
 
 from ci.model_quality.state import atomic_write_json
 from ci.model_quality.web import (
@@ -14,7 +16,9 @@ from ci.model_quality.web import (
     PublishService,
     QueueExecutor,
     RunStore,
+    NotFoundError,
     ValidationError,
+    create_app,
 )
 from ci.model_quality.web import backups as backups_module
 from ci.model_quality.web.backups import BackupService
@@ -107,6 +111,33 @@ def make_publisher(env, policy: LaunchPolicy | None = None) -> PublishService:
     )
 
 
+def test_publish_definition_falls_back_to_the_run_manifest(publish_env) -> None:
+    """Script-first runs are absent from the global manifest on purpose."""
+
+    run_id = make_run(publish_env)
+    service = make_publisher(publish_env)
+    run_dir = publish_env.root / run_id
+    model_id = "script-first-model-abc12345"
+
+    with pytest.raises(NotFoundError):
+        service._definition(model_id, run_id)
+
+    manifest_model = yaml.safe_load(publish_env.config.read_text())["models"][0]
+    (run_dir / "model-config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "schema_version": 1,
+                "models": [{**manifest_model, "id": model_id}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    definition = service._definition(model_id, run_id)
+    assert definition["id"] == model_id
+    assert definition["upload"]["enabled"] is True
+
+
 def test_publish_preview_lists_allowlisted_files(publish_env) -> None:
     run_id = make_run(publish_env)
     service = make_publisher(publish_env)
@@ -131,6 +162,70 @@ def test_publish_preview_lists_allowlisted_files(publish_env) -> None:
     assert preview["identity"]["artifact_fingerprint"] == "artifact-1"
     assert preview["identity"]["artifact_content_fingerprint"] == "content-1"
     assert preview["approvals_required"] == 1
+
+
+def test_publish_preview_skips_hashing_oversized_files(publish_env) -> None:
+    """A multi-GB weight shard must not be digested inside the HTTP request."""
+
+    run_id = make_run(publish_env)
+    # ``model.safetensors`` is 7 bytes and ``config.json`` is 3; a 3-byte cap
+    # keeps the small config hashed while the larger weight file is listed with
+    # a null digest instead of stalling on a full read.
+    service = PublishService(
+        root=publish_env.root,
+        config_path=publish_env.config,
+        store=RunStore(publish_env.root),
+        policy=LaunchPolicy(),
+        executor=QueueExecutor(publish_env.root),
+        hash_max_bytes=3,
+    )
+    preview = service.preview(run_id, publish_env.model_id)
+
+    assert preview["ready"] is True
+    by_path = {entry["path"]: entry for entry in preview["files"]}
+    assert by_path["model/model.safetensors"]["sha256"] is None
+    assert by_path["model/model.safetensors"]["size_bytes"] == 7
+    assert by_path["model/config.json"]["sha256"] is not None
+
+
+def test_publish_preview_requires_publish_permission(publish_env) -> None:
+    run_id = make_run(publish_env)
+    app = create_app(
+        RunStore(publish_env.root),
+        config_path=publish_env.config,
+        git_sha="git:abc1234",
+    )
+
+    def call(headers):
+        captured: dict = {}
+
+        def start(status, response_headers):
+            captured["status"] = status
+
+        environ = {
+            "REQUEST_METHOD": "POST",
+            "PATH_INFO": f"/api/runs/{run_id}/publish/preview",
+            "QUERY_STRING": "",
+            "CONTENT_LENGTH": "2",
+            "wsgi.input": io.BytesIO(b"{}"),
+        }
+        for key, value in headers.items():
+            environ[f"HTTP_{key.upper().replace('-', '_')}"] = value
+        output = b"".join(app(environ, start))
+        return captured["status"], (json.loads(output) if output else None)
+
+    # An operator lacks the publish role and must be rejected before the
+    # preview leaks the allowlisted file listing.
+    status, payload = call(
+        {"X-Model-Quality-Actor": "alice", "X-Model-Quality-Roles": "operator"}
+    )
+    assert status == "403 Forbidden"
+
+    status, payload = call(
+        {"X-Model-Quality-Actor": "carol", "X-Model-Quality-Roles": "publisher"}
+    )
+    assert status == "200 OK"
+    assert payload["ready"] is True
 
 
 def test_publish_preview_blocks_disabled_upload(web_env) -> None:

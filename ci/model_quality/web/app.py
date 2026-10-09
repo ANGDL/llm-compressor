@@ -16,8 +16,14 @@ from .backups import BackupService
 from .control import ControlPlane
 from .executors import create_executor
 from .jobs import JobStore, ReservationLedger
-from .ops import NotificationService, ScheduleStore, TrendService, capabilities
-from .plans import LaunchPolicy
+from .ops import (
+    NotificationService,
+    ScheduleStore,
+    TrendService,
+    capabilities,
+    gpu_telemetry,
+)
+from .plans import LaunchPolicy, introspect_script
 from .publishing import PublishService
 from .security import (
     AuthenticationError,
@@ -26,7 +32,7 @@ from .security import (
     as_dict,
     principal_from_headers,
 )
-from .store import NotFoundError, RunStore
+from .store import NotFoundError, RunStore, read_json
 from .ui import asset as ui_asset
 from .ui import is_ui_path
 
@@ -278,8 +284,15 @@ class ModelQualityAPI:
                 "application/json",
                 [],
             )
+        if parts == ["api", "scripts", "introspect"]:
+            principal.require("read")
+            return (
+                introspect_script(self._one(query, "path"), policy=self.policy),
+                "application/json",
+                [],
+            )
         if parts == ["api", "capabilities"]:
-            principal.require("ops.read")
+            principal.require("read")
             return (
                 capabilities(
                     config_path=self.config_path,
@@ -321,10 +334,13 @@ class ModelQualityAPI:
                 [],
             )
         if parts == ["api", "ops", "schedules"]:
-            principal.require("ops.read")
+            principal.require("read")
             return self.schedules.list(), "application/json", []
+        if parts == ["api", "ops", "gpus"]:
+            principal.require("read")
+            return gpu_telemetry(), "application/json", []
         if parts == ["api", "ops", "notifications"]:
-            principal.require("ops.read")
+            principal.require("read")
             return (
                 {
                     "config": self.notifications.config(),
@@ -365,6 +381,15 @@ class ModelQualityAPI:
         run_id = parts[2]
         if len(parts) == 3:
             return self.store.get_run(run_id), "application/json", []
+        if parts[3] == "plan-request" and len(parts) == 4:
+            run_dir = self.store.root / run_id
+            plan = read_json(run_dir / "execution-plan.json")
+            source = plan.get("source_request") if isinstance(plan, dict) else None
+            if not source:
+                raise NotFoundError(
+                    f"run {run_id!r} has no clonable plan request"
+                )
+            return source, "application/json", []
         if parts[3] == "events" and len(parts) == 4:
             after_value = self._one(query, "after")
             events = self.store.events(
@@ -431,6 +456,8 @@ class ModelQualityAPI:
                         attempt_id=self._one(query, "attempt_id"),
                         offset=int(self._one(query, "offset") or 0),
                         limit=int(self._one(query, "limit") or 1000),
+                        tail=(self._one(query, "tail") or "").lower()
+                        in ("1", "true", "yes"),
                     ),
                     "application/json",
                     [],
@@ -614,6 +641,7 @@ class ModelQualityAPI:
             if action == "publish":
                 model_id = self._single_model(run_id, body, sub)
                 if sub == "preview":
+                    principal.require("publish")
                     return (
                         self.publishing.preview(run_id, model_id),
                         "application/json",
@@ -625,6 +653,7 @@ class ModelQualityAPI:
             model_id = parts[4]
             suffix = parts[5:]
             if suffix == ["publish", "preview"]:
+                principal.require("publish")
                 return (
                     self.publishing.preview(run_id, model_id),
                     "application/json",
@@ -645,6 +674,22 @@ class ModelQualityAPI:
             if len(parts) == 8 and parts[5] == "jobs" and parts[7] == "retry":
                 return (
                     control().retry_job(run_id, model_id, parts[6], body, principal),
+                    "application/json",
+                    [],
+                )
+            if len(parts) == 8 and parts[5] == "stages" and parts[7] == "rerun":
+                return (
+                    control().rerun_stage(
+                        run_id, model_id, parts[6], body, principal
+                    ),
+                    "application/json",
+                    [],
+                )
+            if len(parts) == 8 and parts[5] == "stages" and parts[7] == "skip":
+                return (
+                    control().skip_stage(
+                        run_id, model_id, parts[6], body, principal
+                    ),
                     "application/json",
                     [],
                 )

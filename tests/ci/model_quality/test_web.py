@@ -84,6 +84,63 @@ def test_store_lists_runs_and_model(tmp_path: Path) -> None:
     assert [item["text"] for item in logs["items"]] == ["first", "second"]
 
 
+def test_store_tails_logs(tmp_path: Path) -> None:
+    _make_run(tmp_path)
+    log = (
+        tmp_path
+        / "20260926T000000Z_local"
+        / "demo"
+        / "logs"
+        / "attempt-1"
+        / "quantization.log"
+    )
+    log.write_text("\n".join(f"line{n}" for n in range(1, 51)) + "\n", encoding="utf-8")
+    store = RunStore(tmp_path)
+    tailed = store.get_logs(
+        "20260926T000000Z_local",
+        "demo",
+        stage="quantize",
+        attempt_id="attempt-1",
+        limit=5,
+        tail=True,
+    )
+    assert tailed["total"] == 50
+    assert tailed["offset"] == 45
+    assert [item["text"] for item in tailed["items"]] == [
+        "line46",
+        "line47",
+        "line48",
+        "line49",
+        "line50",
+    ]
+
+
+
+def test_store_truncates_oversized_log_lines(tmp_path: Path) -> None:
+    _make_run(tmp_path)
+    log = (
+        tmp_path
+        / "20260926T000000Z_local"
+        / "demo"
+        / "logs"
+        / "attempt-1"
+        / "quantization.log"
+    )
+    log.write_text("x" * 2_000_000 + "\nsmall line\n", encoding="utf-8")
+    store = RunStore(tmp_path)
+    result = store.get_logs(
+        "20260926T000000Z_local",
+        "demo",
+        stage="quantize",
+        attempt_id="attempt-1",
+    )
+    huge, small = result["items"][0], result["items"][1]
+    # The 2 MB line is capped; a normal line is untouched.
+    assert len(huge["text"]) < 5000
+    assert "truncated" in huge["text"]
+    assert small["text"] == "small line"
+
+
 def test_store_uses_aggregate_and_filters_since(tmp_path: Path) -> None:
     _make_run(tmp_path)
     run = tmp_path / "20260926T000000Z_local"
@@ -180,8 +237,9 @@ def test_wsgi_serves_browser_ui_and_static_assets(tmp_path: Path) -> None:
     assert b'id="plan-form"' in index
     assert b'id="operations-view"' in index
     assert b'id="run-failures"' in index
-    assert b'data-modes="quantize quantize_and_eval"' in index
-    assert b"Existing run ID" in index
+    assert b'data-stage-section="inference"' in index
+    assert b'id="script-params"' in index
+    assert b'id="load-params"' in index
     assert b'class="required-tag"' in index
     assert b'<script src="/ui/app.js?v=' in index
     assert b'id="plan-feedback"' in index
@@ -197,14 +255,14 @@ def test_wsgi_serves_browser_ui_and_static_assets(tmp_path: Path) -> None:
     assert b"/api/plans/preview" in javascript
     assert b"window.setInterval" in javascript
     assert b"window.clearInterval" in javascript
-    assert b"updatePlanMode" in javascript
+    assert b"loadScriptParams" in javascript
     assert b"Required fields missing" in javascript
     assert b"Submitting plan preview" in javascript
     assert b"showPlanError" in javascript
     assert b"renderFailures" in javascript
     assert b"Open stage log" in javascript
     assert b"Failure history" in javascript
-    assert b'!evaluation.includes("--reference-values-json")' in javascript
+    assert b"renderScriptParams" in javascript
     assert b"textContent" in javascript
 
     response, body = request("/ui/unknown.js")

@@ -30,7 +30,8 @@ def asset(path: str) -> tuple[bytes, str, list[tuple[str, str]]]:
     headers = [
         (
             "Content-Security-Policy",
-            "default-src 'self'; script-src 'self'; style-src 'self'; "
+            "default-src 'self'; script-src 'self'; "
+            "style-src 'self' 'unsafe-inline'; "
             "img-src 'self' data:; connect-src 'self'; base-uri 'none'; "
             "frame-ancestors 'none'; form-action 'self'",
         ),

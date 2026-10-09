@@ -36,6 +36,26 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _safe_manifest_join(base: Path, relative: Any) -> Path:
+    """Join a manifest-supplied relative path, refusing traversal escapes.
+
+    ``manifest.json`` is not covered by the write-once immutability guard, so a
+    corrupt or tampered manifest could otherwise point ``entry["path"]`` at an
+    absolute path or ``../`` sequence and make an admin-triggered restore read
+    or write outside the backup/target directory.
+    """
+
+    if not isinstance(relative, str) or not relative:
+        raise ValidationError(f"backup manifest path is invalid: {relative!r}")
+    candidate = (base / relative).resolve()
+    base_resolved = base.resolve()
+    if candidate != base_resolved and base_resolved not in candidate.parents:
+        raise ValidationError(
+            f"backup manifest path escapes its directory: {relative!r}"
+        )
+    return candidate
+
+
 def _directory_size(path: Path, *, limit: int | None = None) -> int:
     total = 0
     for file in sorted(
@@ -419,7 +439,7 @@ class BackupService:
             if isinstance(state, dict) and state.get("status")
             else str(immutable.get("status", "VERIFIED"))
         )
-        expires_at = immutable.get("retention", {}).get("expires_at")
+        expires_at = (immutable.get("retention") or {}).get("expires_at")
         if isinstance(expires_at, str):
             try:
                 parsed = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
@@ -590,9 +610,10 @@ class BackupService:
                 )
             files_dir = Path(record["path"]) / "files"
             for entry in manifest.get("files", []):
-                destination = target_dir / entry["path"]
+                source = _safe_manifest_join(files_dir, entry.get("path"))
+                destination = _safe_manifest_join(target_dir, entry.get("path"))
                 destination.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(files_dir / entry["path"], destination)
+                shutil.copy2(source, destination)
             artifact_entry = next(
                 (
                     entry

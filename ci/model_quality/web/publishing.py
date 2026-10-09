@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from ..config import load_model_config
+from ..config import ConfigError, load_model_config
 from .audit import (
     AuditLog,
     ConflictError,
@@ -27,6 +27,13 @@ GENERATED_PUBLICATION_FILES = frozenset(
     {"reports/upload-manifest.json", "reports/SUCCESS.json", "SUCCESS.json"}
 )
 DEFAULT_PREVIEW_FILE_LIMIT = 200
+# The preview digests files inside the synchronous HTTP request only to show an
+# inventory before publishing. Quantized weight shards are tens of GB, so
+# hashing them here would stall the request for minutes (a 32B W8A8 model is
+# ~32GB across two safetensors files). The published artifact's integrity is
+# already captured by ``artifact-manifest.json``'s content fingerprint, so files
+# above this size are listed with their byte size and a null digest instead.
+DEFAULT_PREVIEW_HASH_MAX_BYTES = 256 * 1024 * 1024
 
 
 def _sha256(path: Path) -> str:
@@ -52,6 +59,7 @@ class PublishService:
         idempotency: IdempotencyStore | None = None,
         jobs: JobStore | None = None,
         file_limit: int = DEFAULT_PREVIEW_FILE_LIMIT,
+        hash_max_bytes: int = DEFAULT_PREVIEW_HASH_MAX_BYTES,
     ) -> None:
         self.root = Path(root).expanduser()
         self.config_path = Path(config_path) if config_path else None
@@ -62,6 +70,7 @@ class PublishService:
         self.idempotency = idempotency or IdempotencyStore(self.root)
         self.jobs = jobs or JobStore(self.root)
         self.file_limit = int(file_limit)
+        self.hash_max_bytes = int(hash_max_bytes)
 
     # ---------------------------------------------------------------- helpers
 
@@ -75,16 +84,33 @@ class PublishService:
             raise NotFoundError(f"model {model_id!r} was not found in run {run_id!r}")
         return path
 
-    def _definition(self, model_id: str) -> dict[str, Any]:
-        if self.config_path is None:
-            raise ValidationError(
-                "a model quality --config path is required to publish"
-            )
-        config = load_model_config(self.config_path)
-        for model in config["models"]:
-            if model["id"] == model_id:
-                return model
-        raise NotFoundError(f"model {model_id!r} is not in the manifest")
+    def _definition(self, model_id: str, run_id: str) -> dict[str, Any]:
+        """Return the model definition that owns this run's upload target.
+
+        Manifest-defined models come from ``--config``. Script-first runs are
+        not in that manifest, so their run-local ``model-config.yaml`` -- which
+        carries the upload block the plan recorded -- is the authority.
+        """
+
+        candidates: list[Path] = []
+        if self.config_path is not None:
+            candidates.append(self.config_path)
+        candidates.append(
+            self.root / safe_component(run_id, "run_id") / "model-config.yaml"
+        )
+        for path in candidates:
+            if not path.is_file():
+                continue
+            try:
+                config = load_model_config(path)
+            except ConfigError:
+                continue
+            for model in config["models"]:
+                if model["id"] == model_id:
+                    return model
+        raise NotFoundError(
+            f"model {model_id!r} is not defined in the manifest or the run config"
+        )
 
     @staticmethod
     def _promoted_reports(model_dir: Path) -> tuple[Path, dict[str, Any] | None]:
@@ -144,12 +170,16 @@ class PublishService:
                 relative_path = str(resolved_path.relative_to(run_dir.resolve()))
                 if relative_path in GENERATED_PUBLICATION_FILES:
                     continue
+                size_bytes = resolved_path.stat().st_size
                 entry: dict[str, Any] = {
                     "path": relative_path,
-                    "size_bytes": resolved_path.stat().st_size,
+                    "size_bytes": size_bytes,
                     "sha256": None,
                 }
-                if len(files) < self.file_limit:
+                # Only hash the first ``file_limit`` files, and never a file
+                # larger than ``hash_max_bytes`` -- a multi-GB weight shard would
+                # otherwise stall this synchronous request for minutes.
+                if len(files) < self.file_limit and size_bytes <= self.hash_max_bytes:
                     entry["sha256"] = _sha256(resolved_path)
                 files.append(entry)
         return files, risks
@@ -160,7 +190,7 @@ class PublishService:
         """Return the allowlist, file inventory, target, and publication risks."""
 
         model_dir = self._model_dir(run_id, model_id)
-        definition = self._definition(model_id)
+        definition = self._definition(model_id, run_id)
         upload = definition.get("upload", {})
         risks: list[dict[str, str]] = []
 

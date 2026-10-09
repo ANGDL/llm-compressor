@@ -132,7 +132,11 @@ class BuildkiteExecutor:
         directory = self.root / "_jobs" / "pipelines"
         directory.mkdir(parents=True, exist_ok=True)
         path = directory / f"{spec.run_id}-{spec.attempt_id}.yml"
-        path.write_text(pipeline, encoding="utf-8")
+        # Write atomically so a crash or concurrent read never observes a
+        # truncated pipeline (and never uploads one when ``upload`` is set).
+        tmp_path = path.with_name(path.name + ".tmp")
+        tmp_path.write_text(pipeline, encoding="utf-8")
+        os.replace(tmp_path, path)
         detail: dict[str, Any] = {
             "pipeline_path": str(path),
             "step_count": pipeline.count("label:"),

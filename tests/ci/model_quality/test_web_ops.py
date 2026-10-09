@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 import sys
@@ -28,7 +29,13 @@ from ci.model_quality.web import (
     scheduler,
 )
 from ci.model_quality.web.ops import cron_matches, parse_cron, run_due_schedules
-from ci.model_quality.web.worker import execute_job, execution_argv, run_once
+from ci.model_quality.web.worker import (
+    _dependencies_settled,
+    _stage_artifact_fingerprint,
+    execute_job,
+    execution_argv,
+    run_once,
+)
 
 OPERATOR = Principal(actor="alice", roles=frozenset({"operator"}), authenticated=True)
 ADMIN = Principal(actor="dave", roles=frozenset({"admin"}), authenticated=True)
@@ -289,6 +296,13 @@ def test_notifications_are_recorded_and_suppressed(tmp_path: Path) -> None:
     assert log["items"][0]["event"] == "run.started"
 
 
+def test_default_notification_events_include_schedule_failed(tmp_path: Path) -> None:
+    # run_due_schedules emits "schedule.failed"; if it were missing from the
+    # default events the webhook delivery would silently be disabled.
+    events = NotificationService(tmp_path / "runs").config()["events"]
+    assert "schedule.failed" in events
+
+
 def test_trends_report_quality_and_cost(web_env) -> None:
     make_trend_run(
         web_env.root,
@@ -506,11 +520,12 @@ def test_worker_builds_inference_container_command(web_env) -> None:
         "model_id": web_env.model_id,
         "attempt_id": "attempt-1",
         "kind": "inference",
-        "container_name": "zhuang_xsgl_0923",
+        "container_name": "demo-container",
         "script": "/workspace/smoke.sh",
         "details": {
             "source_path": str(web_env.source),
-            "inference_arguments": ["{output_dir}", "{reports_dir}"],
+            "inference_arguments": [],
+            "inference_port": 8025,
         },
     }
     argv = execution_argv(
@@ -521,9 +536,15 @@ def test_worker_builds_inference_container_command(web_env) -> None:
         argv_prefix=(sys.executable,),
         container_runtime=("docker",),
     )
-    assert argv[:4] == ["docker", "exec", "zhuang_xsgl_0923", "/workspace/smoke.sh"]
-    assert argv[-2].endswith(f"run-a/{web_env.model_id}/model")
-    assert argv[-1].endswith("attempts/attempt-1/reports")
+    # The serve script is wrapped by the built-in harness, run inside the
+    # container via docker exec.
+    assert argv[:3] == ["docker", "exec", "demo-container"]
+    assert argv[3] == "bash"
+    assert argv[4].endswith("entrypoints/runtime_smoke_harness.sh")
+    assert argv[5] == "/workspace/smoke.sh"
+    assert argv[6] == "8025"
+    assert argv[7].endswith("attempts/attempt-1/reports")
+    assert argv[8].endswith(f"run-a/{web_env.model_id}/model")
     direct = execution_argv(
         job,
         "runtime-smoke",
@@ -532,7 +553,9 @@ def test_worker_builds_inference_container_command(web_env) -> None:
         argv_prefix=(sys.executable,),
         container_runtime=("direct",),
     )
-    assert direct[0] == "/workspace/smoke.sh"
+    assert direct[0] == "bash"
+    assert direct[1].endswith("entrypoints/runtime_smoke_harness.sh")
+    assert direct[2] == "/workspace/smoke.sh"
 
 
 def test_worker_classifies_script_failure(web_env) -> None:
@@ -636,6 +659,41 @@ def test_worker_records_missing_executable_as_resource_failure(web_env) -> None:
     }
 
 
+def test_worker_does_not_overwrite_a_canceled_job(web_env) -> None:
+    context = _queued_job(web_env)
+    control, job = context["control"], context["job"]
+    assert control.ledger.summary()["reserved_gpu_hours"] == 2.0
+
+    calls = {"count": 0}
+
+    def runner(argv, **kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            # Simulate an operator pressing Stop while the first stage runs: the
+            # control plane flips the on-disk record to CANCELED.
+            live = control.jobs.get(job["run_id"], job["model_id"], job["job_id"])
+            control.jobs.cancel(live, "operator stopped it")
+        return type("Completed", (), {"returncode": 0})()
+
+    finished = execute_job(
+        job,
+        root=web_env.root,
+        config_path=web_env.config,
+        jobs=control.jobs,
+        ledger=control.ledger,
+        notifications=NotificationService(web_env.root),
+        argv_prefix=(sys.executable, "stage.py"),
+        runner=runner,
+    )
+
+    # The CANCELED record is never overwritten back to SUCCEEDED/FAILED, and the
+    # between-stage check stops the remaining stages from running.
+    assert finished["status"] == "CANCELED"
+    assert calls["count"] == 1
+    # The model-group reservation is released rather than leaked.
+    assert control.ledger.summary()["reserved_gpu_hours"] == 0.0
+
+
 def test_worker_returns_none_when_queue_is_empty(web_env) -> None:
     assert (
         run_once(
@@ -666,6 +724,73 @@ def test_worker_filters_queue_by_job_kind(web_env) -> None:
     )
 
 
+def test_worker_defers_a_lane_until_earlier_jobs_are_terminal(web_env) -> None:
+    """A kind-split worker must not start report while the smoke is still queued.
+
+    Without this gate the report lane runs on an attempt that only owns the
+    late stages, fails every missing stage as DEPENDENCY_FAILED, and cancels
+    the stage the operator actually asked to re-run.
+    """
+
+    jobs = JobStore(web_env.root)
+    smoke = jobs.create(
+        run_id="run-a",
+        model_id=web_env.model_id,
+        attempt_id="attempt-1",
+        kind="inference",
+        executor="queue",
+        stages=["runtime-smoke"],
+    )
+    report = jobs.create(
+        run_id="run-a",
+        model_id=web_env.model_id,
+        attempt_id="attempt-1",
+        kind="report",
+        executor="queue",
+        stages=["report"],
+    )
+    assert smoke["created_at"] <= report["created_at"]
+    assert _dependencies_settled(smoke, jobs) is True
+    assert _dependencies_settled(report, jobs) is False
+
+    # The report worker holds off rather than executing a half-attempt.
+    assert (
+        run_once(
+            root=web_env.root,
+            config_path=web_env.config,
+            jobs=jobs,
+            kinds=frozenset({"report"}),
+        )
+        is None
+    )
+
+    jobs.cancel(smoke, "test")
+    assert _dependencies_settled(report, jobs) is True
+
+
+def test_dependency_gate_ignores_jobs_from_other_attempts(web_env) -> None:
+    """A stale job from an older attempt must not block a fresh one."""
+
+    jobs = JobStore(web_env.root)
+    jobs.create(
+        run_id="run-a",
+        model_id=web_env.model_id,
+        attempt_id="attempt-1",
+        kind="inference",
+        executor="queue",
+        stages=["runtime-smoke"],
+    )
+    report = jobs.create(
+        run_id="run-a",
+        model_id=web_env.model_id,
+        attempt_id="attempt-2",
+        kind="report",
+        executor="queue",
+        stages=["report"],
+    )
+    assert _dependencies_settled(report, jobs) is True
+
+
 def test_worker_rejects_jobs_without_stages(web_env) -> None:
     jobs = JobStore(web_env.root)
     job = jobs.create(
@@ -684,3 +809,71 @@ def test_worker_rejects_jobs_without_stages(web_env) -> None:
             jobs=jobs,
             ledger=ReservationLedger(web_env.root, capacity_gpu_hours=8.0),
         )
+
+
+def test_gpu_telemetry_reports_structured_devices_or_reason() -> None:
+    from ci.model_quality.web.ops import gpu_telemetry
+
+    report = gpu_telemetry()
+    assert set(report) >= {"generated_at", "available", "backend", "devices"}
+    assert isinstance(report["devices"], list)
+    if report["available"]:
+        assert report["device_count"] == len(report["devices"])
+        for device in report["devices"]:
+            assert "index" in device and "name" in device
+    else:
+        # A host without CUDA (e.g. CI/laptop) must explain why, not raise.
+        assert report["devices"] == []
+        assert report["reason"]
+
+
+def test_gpu_endpoint_is_readable_by_viewers(web_env) -> None:
+    from ci.model_quality.web import create_app
+
+    app = create_app(
+        RunStore(web_env.root), config_path=web_env.config, git_sha="git:abc1234"
+    )
+
+    def fetch(roles: str | None):
+        environ = {
+            "REQUEST_METHOD": "GET",
+            "PATH_INFO": "/api/ops/gpus",
+            "QUERY_STRING": "",
+            "CONTENT_LENGTH": "0",
+            "wsgi.input": io.BytesIO(b""),
+        }
+        if roles is not None:
+            environ["HTTP_X_MODEL_QUALITY_ACTOR"] = "alice"
+            environ["HTTP_X_MODEL_QUALITY_ROLES"] = roles
+        captured: dict = {}
+        body = b"".join(
+            app(environ, lambda status, headers: captured.update(status=status))
+        )
+        return captured["status"], json.loads(body)
+
+    # Read-only observability must work without elevated roles, and even for the
+    # anonymous dashboard viewer, so the Operations page is not all errors.
+    for roles in ("viewer", "operator", None):
+        status, payload = fetch(roles)
+        assert status.startswith("200"), roles
+        assert "available" in payload and "devices" in payload
+
+
+def test_stage_artifact_fingerprint_prefers_the_input_manifest(web_env) -> None:
+    """The smoke must record the finalized identity, not the planner one."""
+
+    job = {
+        "run_id": "run-a",
+        "model_id": web_env.model_id,
+        "artifact_fingerprint": "planner-fingerprint",
+    }
+    # No manifest yet: fall back to whatever the job carries.
+    assert _stage_artifact_fingerprint(job, web_env.root) == "planner-fingerprint"
+
+    run_dir = web_env.root / "run-a" / web_env.model_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(
+        run_dir / "input-manifest.json",
+        {"finalized_artifact_fingerprint": "finalized-fingerprint"},
+    )
+    assert _stage_artifact_fingerprint(job, web_env.root) == "finalized-fingerprint"
