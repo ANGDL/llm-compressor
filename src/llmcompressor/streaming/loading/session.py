@@ -228,7 +228,9 @@ class SubgraphWeightSession:
                 attribute_name = str(node.target)
                 owner_name, separator, _ = attribute_name.rpartition(".")
                 value = self._get_attribute(attribute_name)
-                if isinstance(value, torch.Tensor) and value.is_meta:
+                if isinstance(value, torch.nn.Module):
+                    name = attribute_name
+                elif isinstance(value, torch.Tensor) and value.is_meta:
                     if not separator:
                         raise ValueError(
                             "A root-level checkpoint tensor cannot be loaded as a "

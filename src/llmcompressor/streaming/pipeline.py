@@ -999,9 +999,7 @@ def run_subgraph_streaming_pipeline(
                             # modified full-precision output (or an algorithm's
                             # in-place weight update), without adding fake-quant
                             # QDQ to every quantized module.
-                            consumed_names = adapter.plan.subgraphs[
-                                adapter.plan.target_subgraph_indices[target_index]
-                            ].consumed_names
+                            consumed_names = subgraph.consumed_names
                             with (
                                 HooksMixin.disable_hooks(),
                                 DisableQuantization(adapter.model),

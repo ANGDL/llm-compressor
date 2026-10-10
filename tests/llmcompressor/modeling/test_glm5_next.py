@@ -1,58 +1,64 @@
-from types import SimpleNamespace
-
 import torch
-from torch import nn
+from transformers.models.glm5_next.configuration_glm5_next import Glm5NextTextConfig
+from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextExperts
 
 import llmcompressor.modeling.glm5_next as glm5_next
+from llmcompressor.modeling.moe.context import moe_calibration_context
+from llmcompressor.modeling.moe.linear_experts import LinearExperts2D
+from llmcompressor.modeling.moe.linearize import linearize_moe
 
 
-class _MetaRoutedExpertMLP(nn.Module):
-    def __init__(self, config, intermediate_size):
+class _Model(torch.nn.Module):
+    def __init__(self, config, experts):
         super().__init__()
-        self.gate_proj = nn.Linear(
-            config.hidden_size,
-            intermediate_size,
-            bias=False,
-            device="meta",
-        )
-        self.up_proj = nn.Linear(
-            config.hidden_size,
-            intermediate_size,
-            bias=False,
-            device="meta",
-        )
-        self.down_proj = nn.Linear(
-            intermediate_size,
-            config.hidden_size,
-            bias=False,
-            device="meta",
-        )
+        self.config = config
+        self.experts = experts
 
 
-def test_sequential_glm5_experts_materialize_meta_weights(monkeypatch):
-    monkeypatch.setattr(
-        glm5_next, "Glm5NextTextRoutedExpertMLP", _MetaRoutedExpertMLP
+def test_linearize_glm5_meta_experts():
+    config = Glm5NextTextConfig(
+        hidden_size=16,
+        moe_intermediate_size=8,
+        n_routed_experts=4,
+        num_experts_per_tok=2,
+        linear_num_heads=2,
+        linear_head_dim=4,
     )
-    monkeypatch.setattr(glm5_next, "_require_transformers_glm5", lambda: None)
-    config = SimpleNamespace(hidden_size=3, moe_intermediate_size=2)
-    gate_up_proj = torch.arange(24, dtype=torch.float32).reshape(2, 4, 3)
-    down_proj = torch.arange(12, dtype=torch.float32).reshape(2, 3, 2)
-    original = SimpleNamespace(
-        gate_up_proj=gate_up_proj,
-        down_proj=down_proj,
+    with torch.device("meta"):
+        model = _Model(config, Glm5NextTextExperts(config))
+
+    linearize_moe(model)
+
+    assert isinstance(model.experts, LinearExperts2D)
+    assert model.experts.num_experts == config.n_routed_experts
+    assert all(parameter.is_meta for parameter in model.experts.parameters())
+
+
+def test_linearize_glm5_preserves_expert_outputs():
+    config = Glm5NextTextConfig(
+        hidden_size=16,
+        moe_intermediate_size=8,
+        n_routed_experts=4,
+        num_experts_per_tok=2,
+        linear_num_heads=2,
+        linear_head_dim=4,
     )
+    experts = Glm5NextTextExperts(config)
+    model = _Model(config, experts)
+    torch.nn.init.normal_(experts.gate_up_proj)
+    torch.nn.init.normal_(experts.down_proj)
+    hidden_states = torch.randn(6, config.hidden_size)
+    top_k_index = torch.tensor([[0, 1], [1, 2], [2, 3], [3, 0], [0, 2], [1, 3]])
+    top_k_weights = torch.rand(6, config.num_experts_per_tok)
+    expected = experts(hidden_states, top_k_index, top_k_weights)
 
-    experts = glm5_next.SequentialGlm5NextExperts(config, original)
+    linearize_moe(model)
+    actual = model.experts(hidden_states, top_k_index, top_k_weights)
+    with moe_calibration_context():
+        calibrated = model.experts(hidden_states, top_k_index, top_k_weights)
 
-    assert len(experts) == 2
-    for index, expert in enumerate(experts):
-        gate, up = gate_up_proj[index].chunk(2, dim=0)
-        assert expert.gate_proj.weight.device.type == "cpu"
-        assert isinstance(expert.gate_proj.weight, nn.Parameter)
-        assert expert.gate_proj.weight.requires_grad
-        torch.testing.assert_close(expert.gate_proj.weight, gate)
-        torch.testing.assert_close(expert.up_proj.weight, up)
-        torch.testing.assert_close(expert.down_proj.weight, down_proj[index])
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(calibrated, expected)
 
 
 def test_kda_backend_choice_honors_env(monkeypatch):

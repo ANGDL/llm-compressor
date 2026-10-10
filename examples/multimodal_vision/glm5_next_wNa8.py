@@ -36,7 +36,7 @@ Example::
         --text_dataset_id HuggingFaceH4/ultrachat_200k \
         --text_dataset_split train_sft --text_calibration_samples 256 \
         --pipeline sequential
-    
+
 """
 
 import argparse
@@ -69,13 +69,8 @@ from datasets import load_dataset
 from llmcompressor import oneshot
 from llmcompressor.core import active_session
 from llmcompressor.logger import LoggerConfig, configure_logger
-from llmcompressor.modeling.glm5_next import (
-    CalibrationGlm5NextTextMoE,  # noqa: F401 - registers the calibration adapter
-    attach_mtp_layer,
-)
-from llmcompressor.modeling.moe_context import (
-    moe_calibration_context as replace_moe_calibration_modules,
-)
+from llmcompressor.modeling.glm5_next import attach_mtp_layer
+from llmcompressor.modeling.moe.linearize import linearize_moe
 from llmcompressor.modifiers.gptq import GPTQModifier
 from llmcompressor.modifiers.quantization import QuantizationModifier
 from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
@@ -800,19 +795,14 @@ def data_collator(batch):
 # ``model.language_model.layers.<num_hidden_layers>.*``.
 attach_mtp_layer(model, args.model_id)
 
-# The generic oneshot entrypoint linearizes any packed expert implementation before
-# calibration. Replace GLM-5.3's MoE blocks first so its registered
-# ``MoECalibrationModule`` adapter owns expert unpacking and routing instead.
-with replace_moe_calibration_modules(
-    model, calibrate_all_experts=args.moe_calibrate_all_experts
-):
-    # CalibrationGlm5NextTextMoE is permanent, so the replacements remain on
-    # ``model`` after this block and are seen by the subsequent oneshot call.
-    # The W8A8 difference set is computed afterwards from the unpacked modules.
-    logger.info(
-        "Targeting routed GLM-5.3 experts with W4A8 and the remaining "
-        "quantizable Linear modules with W8A8",
-    )
+# Linearize before deriving the W8A8 difference set so routed expert projections
+# can be targeted individually. The oneshot entrypoint recognizes the resulting
+# LinearExperts2D modules and calibrates all experts through the shared context.
+linearize_moe(model)
+logger.info(
+    "Targeting routed GLM-5.3 experts with W4A8 and the remaining "
+    "quantizable Linear modules with W8A8",
+)
 
 GLM5_NEXT_W8A8_TARGETS = build_glm5_next_w8a8_targets(
     model, GLM5_NEXT_W8A8_IGNORES
