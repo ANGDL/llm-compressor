@@ -36,6 +36,7 @@ from .materialization import (
     CastWeightMaterializer,
     StreamingDTypePolicy,
     WeightMaterializer,
+    apply_transformers_weight_conversions,
 )
 from .output import build_quantization_config
 from .pipeline import (
@@ -379,6 +380,10 @@ def streaming_oneshot_from_pretrained(
                 meta_model,
                 calibrate_all_experts=moe_calibrate_all_experts,
             )
+        )
+        materializer = apply_transformers_weight_conversions(
+            materializer,
+            meta_model,
         )
         sequential_targets = _quantized_sequential_targets(meta_model, schemes)
         adapter = trace_streaming_boundaries(
