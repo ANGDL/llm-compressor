@@ -19,6 +19,10 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from llmcompressor.args import DatasetArguments
 from llmcompressor.datasets import get_calibration_dataloader
 from llmcompressor.modeling.moe.context import moe_calibration_context
+from llmcompressor.modeling.moe.linearize import (
+    get_non_linearized_moes,
+    linearize_moe,
+)
 from llmcompressor.modeling.moe_context import (
     moe_calibration_context as moe_module_replacement_context,
 )
@@ -332,6 +336,10 @@ def streaming_oneshot_from_pretrained(
         keep_nonpersistent_buffers=True,
     )
     meta_model.eval()
+    model_was_linearized = len(get_non_linearized_moes(meta_model)) > 0
+    if model_was_linearized:
+        linearize_moe(meta_model)
+
     schemes = _exact_schemes(meta_model, quantizer)
     dtype_policy = dtype_policy or StreamingDTypePolicy.for_quantized_modules(
         target_dtype, schemes
@@ -371,16 +379,18 @@ def streaming_oneshot_from_pretrained(
         sample_batch = next(iter(dataloader))
     except StopIteration as error:
         raise ValueError("Streaming PTQ calibration dataset is empty") from error
+
     with ExitStack() as stack:
         stack.enter_context(norm_calibration_context(meta_model))
         if moe_calibrate_all_experts:
             stack.enter_context(moe_calibration_context())
-        stack.enter_context(
-            moe_module_replacement_context(
-                meta_model,
-                calibrate_all_experts=moe_calibrate_all_experts,
+        if not model_was_linearized:
+            stack.enter_context(
+                moe_module_replacement_context(
+                    meta_model,
+                    calibrate_all_experts=moe_calibrate_all_experts,
+                )
             )
-        )
         materializer = apply_transformers_weight_conversions(
             materializer,
             meta_model,

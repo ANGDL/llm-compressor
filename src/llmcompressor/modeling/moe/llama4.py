@@ -1,5 +1,4 @@
 import torch
-from compressed_tensors.offload import get_cache_init_kwargs, offload_module
 from transformers.activations import ACT2FN
 from transformers.models.llama4.configuration_llama4 import (
     Llama4Config,
@@ -8,7 +7,11 @@ from transformers.models.llama4.configuration_llama4 import (
 from transformers.models.llama4.modeling_llama4 import Llama4TextExperts
 
 from llmcompressor.modeling.moe.context import get_calibrate_all_experts_flag
-from llmcompressor.modeling.moe.linear_experts import ExpertMLPWithGate, LinearExperts2D
+from llmcompressor.modeling.moe.linear_experts import (
+    ExpertMLPWithGate,
+    LinearExperts2D,
+    _copy_offloading,
+)
 from llmcompressor.utils.dev import skip_weights_initialize
 
 
@@ -47,10 +50,7 @@ class Llama4LinearExperts(LinearExperts2D):
             expert: ExpertMLPWithGate = self[index]
             expert.copy_from_experts_module(experts, index)
 
-        # copy offloading from original
-        offload_kwargs = get_cache_init_kwargs(experts)
-        for module in self.modules():
-            offload_module(module, **offload_kwargs)
+        _copy_offloading(experts, list(self.modules()))
 
         return self
 

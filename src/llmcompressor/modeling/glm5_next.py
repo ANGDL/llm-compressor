@@ -1,12 +1,9 @@
-"""GLM-5.3-Flash calibration and MTP support.
+"""GLM-5.3-Flash MTP support.
 
 GLM-5.3 uses the ``glm5_next`` Transformers model.  It is not compatible with
 the older ``glm_moe_dsa`` model implementation: the text stack is nested below
 ``model.language_model``, the main stack mixes KDA and DSA blocks, and the MTP
 block is a regular DSA+MoE decoder without the main-stack mHC connections.
-Its MoE calibration is registered through the shared ``MoECalibrationModule``
-compatibility layer; the adapter below only supplies GLM-5.3's MLP class and
-configuration field names.
 """
 
 from __future__ import annotations
@@ -18,13 +15,8 @@ import re
 import types
 
 import torch
-import torch.nn.functional as F
 from safetensors import safe_open
 from torch import nn
-
-from llmcompressor.modeling.glm_moe_dsa import CalibrationGlmMoeDsaMoE
-from llmcompressor.modeling.moe_context import MoECalibrationModule
-from llmcompressor.utils.dev import skip_weights_initialize
 
 
 def _force_torch_kda_backend() -> None:
@@ -80,13 +72,11 @@ if _kda_backend_choice() == "torch":
 try:
     from transformers.models.glm5_next.modeling_glm5_next import (
         Glm5NextTextAttention,
-        Glm5NextTextMLP,
         Glm5NextTextMoE,
         Glm5NextTextRMSNorm,
     )
 except ImportError:  # pragma: no cover - depends on the installed Transformers
     Glm5NextTextAttention = None
-    Glm5NextTextMLP = None
     Glm5NextTextMoE = None
     Glm5NextTextRMSNorm = None
 
@@ -97,96 +87,6 @@ def _require_transformers_glm5() -> None:
             "GLM-5.3 support requires Transformers with the glm5_next model "
             "implementation (Transformers main or a release containing it)."
         )
-
-
-class Glm5NextTextRoutedExpertMLP(Glm5NextTextMLP):
-    """Unpacked routed expert matching ``Glm5NextTextExperts._apply_gate``."""
-
-    def forward(self, x):
-        gate = self.gate_proj(x).clamp(min=None, max=self.swiglu_limit)
-        up = self.up_proj(x).clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
-        # HF's packed routed experts intentionally use SiLU regardless of
-        # config.hidden_act; shared/dense MLPs continue to use the config value.
-        return self.down_proj(F.silu(gate) * up)
-
-
-class SequentialGlm5NextExperts(nn.ModuleList):
-    """Unpack packed 3-D tensors for the shared MoE calibration adapter."""
-
-    @staticmethod
-    def _set_weight(module: nn.Linear, weight: torch.Tensor) -> None:
-        module.weight = nn.Parameter(
-            weight.detach().contiguous(),
-            requires_grad=module.weight.requires_grad,
-        )
-
-    def __init__(self, config, original) -> None:
-        _require_transformers_glm5()
-        self.num_experts = original.gate_up_proj.shape[0]
-        with skip_weights_initialize():
-            super().__init__(
-                [
-                    Glm5NextTextRoutedExpertMLP(
-                        config,
-                        intermediate_size=config.moe_intermediate_size,
-                    )
-                    for _ in range(self.num_experts)
-                ]
-            )
-
-        for index in range(self.num_experts):
-            gate_up = original.gate_up_proj[index]
-            gate, up = gate_up.chunk(2, dim=0)
-            self._set_weight(self[index].gate_proj, gate)
-            self._set_weight(self[index].up_proj, up)
-            self._set_weight(self[index].down_proj, original.down_proj[index])
-
-
-@MoECalibrationModule.register("Glm5NextTextMoE")
-class CalibrationGlm5NextTextMoE(CalibrationGlmMoeDsaMoE):
-    """GLM-5.3 MoE replacement used when a packed expert block is calibrated."""
-
-    def _get_num_experts(self, config) -> int:
-        """Use GLM-5.3's ``n_routed_experts`` config spelling."""
-        return config.n_routed_experts
-
-    def _make_experts(self, config, original_experts) -> nn.ModuleList:
-        return SequentialGlm5NextExperts(config, original_experts)
-
-    def __init__(self, original, config, calibrate_all_experts: bool = True):
-        text_config = (
-            config.get_text_config() if hasattr(config, "get_text_config") else config
-        )
-        super().__init__(original, text_config, calibrate_all_experts)
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Match ``Glm5NextTextMoE.forward`` with unpacked routed experts."""
-        residuals = hidden_states
-        orig_shape = hidden_states.shape
-        _, topk_weights, topk_indices = self.gate(hidden_states)
-        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
-        final_hidden_states = torch.zeros_like(hidden_states)
-
-        with torch.no_grad():
-            expert_mask = torch.nn.functional.one_hot(
-                topk_indices, num_classes=self.num_experts
-            ).permute(2, 1, 0)
-            hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-
-        for expert_idx in hit:
-            expert_idx = expert_idx[0]
-            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
-            if self.calibrate_all_experts:
-                current = self.experts[expert_idx](hidden_states)[token_idx]
-            else:
-                current = self.experts[expert_idx](hidden_states[token_idx])
-            current = current * topk_weights[token_idx, top_k_pos, None]
-            final_hidden_states.index_add_(
-                0, token_idx, current.to(final_hidden_states.dtype)
-            )
-
-        hidden_states = final_hidden_states.view(*orig_shape)
-        return hidden_states + self.shared_experts(residuals)
 
 
 def _load_mtp_tensors(model_path: str, prefix: str) -> dict[str, torch.Tensor]:
@@ -538,7 +438,6 @@ except ImportError:  # pragma: no cover - imported only by the attach path
 
 
 __all__ = [
-    "CalibrationGlm5NextTextMoE",
     "Glm5NextMTPLayer",
     "attach_mtp_layer",
 ]

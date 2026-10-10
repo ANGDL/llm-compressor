@@ -2,7 +2,11 @@ from abc import ABC, abstractmethod
 from typing import Any, Callable, ClassVar
 
 import torch
-from compressed_tensors.offload import get_cache_init_kwargs, offload_module
+from compressed_tensors.offload import (
+    OffloadCache,
+    get_cache_init_kwargs,
+    offload_module,
+)
 from transformers import PreTrainedConfig
 from transformers.activations import ACT2FN
 from transformers.integrations.moe import _default_apply_gate
@@ -27,6 +31,45 @@ class ExpertMLP(torch.nn.Module, ABC):
     @abstractmethod
     def copy_from_experts_module(self, experts: FusedExpertsProtocol, index: int):
         raise NotImplementedError()
+
+
+def _set_parameter_data(
+    module: torch.nn.Module,
+    name: str,
+    tensor: torch.Tensor,
+) -> None:
+    parameter = getattr(module, name)
+    tensor = tensor.detach().contiguous()
+    if parameter.is_meta or tensor.is_meta:
+        setattr(
+            module,
+            name,
+            torch.nn.Parameter(tensor, requires_grad=parameter.requires_grad),
+        )
+    else:
+        parameter.data = tensor
+
+
+def _copy_offloading(
+    source: torch.nn.Module,
+    targets: torch.nn.Module | list[torch.nn.Module],
+) -> None:
+    module_with_cache = next(
+        (
+            module
+            for module in source.modules()
+            if isinstance(module._parameters, OffloadCache)
+        ),
+        None,
+    )
+    if module_with_cache is None:
+        return
+
+    if isinstance(targets, torch.nn.Module):
+        targets = [targets]
+    offload_kwargs = get_cache_init_kwargs(module_with_cache)
+    for module in targets:
+        offload_module(module, **offload_kwargs)
 
 
 class ExpertMLPWithGate(ExpertMLP):
@@ -74,9 +117,9 @@ class ExpertMLPWithGate(ExpertMLP):
             up_weight = experts.gate_up_proj[index, :, self.intermediate_size :].T
             down_weight = experts.down_proj[index].T
 
-        self.gate_proj.weight.data = gate_weight.contiguous()
-        self.up_proj.weight.data = up_weight.contiguous()
-        self.down_proj.weight.data = down_weight.contiguous()
+        _set_parameter_data(self.gate_proj, "weight", gate_weight)
+        _set_parameter_data(self.up_proj, "weight", up_weight)
+        _set_parameter_data(self.down_proj, "weight", down_weight)
 
         # load biases
         if experts.has_bias:
@@ -84,9 +127,9 @@ class ExpertMLPWithGate(ExpertMLP):
             up_bias = experts.gate_up_proj_bias[index, self.intermediate_size :]
             down_bias = experts.down_proj_bias[index]
 
-            self.gate_proj.bias.data = gate_bias.contiguous()
-            self.up_proj.bias.data = up_bias.contiguous()
-            self.down_proj.bias.data = down_bias.contiguous()
+            _set_parameter_data(self.gate_proj, "bias", gate_bias)
+            _set_parameter_data(self.up_proj, "bias", up_bias)
+            _set_parameter_data(self.down_proj, "bias", down_bias)
 
     def copy_to_experts_module(self, experts: FusedExpertsProtocol, index: int):
         """Inverse of :meth:`copy_from_experts_module` for weight (and bias) tensors."""
@@ -161,16 +204,16 @@ class ExpertMLPWithoutGate(ExpertMLP):
             up_weight = experts.up_proj[index].T
             down_weight = experts.down_proj[index].T
 
-        self.up_proj.weight.data = up_weight.contiguous()
-        self.down_proj.weight.data = down_weight.contiguous()
+        _set_parameter_data(self.up_proj, "weight", up_weight)
+        _set_parameter_data(self.down_proj, "weight", down_weight)
 
         # load biases
         if experts.has_bias:
             up_bias = experts.up_proj_bias[index]
             down_bias = experts.down_proj_bias[index]
 
-            self.up_proj.bias.data = up_bias.contiguous()
-            self.down_proj.bias.data = down_bias.contiguous()
+            _set_parameter_data(self.up_proj, "bias", up_bias)
+            _set_parameter_data(self.down_proj, "bias", down_bias)
 
     def copy_to_experts_module(self, experts: FusedExpertsProtocol, index: int):
         """Inverse of :meth:`copy_from_experts_module` for weight (and bias) tensors."""
@@ -263,10 +306,7 @@ class LinearExperts2D(torch.nn.ModuleList):
         self._source_experts_cls = experts.__class__
         self._source_config = config
 
-        # copy offloading from original
-        offload_kwargs = get_cache_init_kwargs(experts)
-        for module in self.modules():
-            offload_module(module, **offload_kwargs)
+        _copy_offloading(experts, list(self.modules()))
 
         return self
 
@@ -302,8 +342,7 @@ class LinearExperts2D(torch.nn.ModuleList):
 
         self._pack_weight_qparams(fused)
 
-        offload_kwargs = get_cache_init_kwargs(self)
-        offload_module(fused, **offload_kwargs)
+        _copy_offloading(self, fused)
         return fused
 
     def _pack_weight_qparams(self, fused: FusedExpertsProtocol) -> None:

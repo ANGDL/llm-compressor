@@ -1,5 +1,4 @@
 import torch
-from compressed_tensors.offload import get_cache_init_kwargs, offload_module
 from transformers.models.granitemoe.configuration_granitemoe import GraniteMoeConfig
 
 try:
@@ -12,7 +11,11 @@ except ImportError:  # pragma: no cover - depends on the installed Transformers 
     GraniteMoeParallelExperts = None
 
 from llmcompressor.modeling.moe.context import get_calibrate_all_experts_flag
-from llmcompressor.modeling.moe.linear_experts import LinearExperts2D
+from llmcompressor.modeling.moe.linear_experts import (
+    LinearExperts2D,
+    _copy_offloading,
+    _set_parameter_data,
+)
 from llmcompressor.utils.dev import skip_weights_initialize
 
 
@@ -35,14 +38,10 @@ class GraniteMoeLinearExperts(LinearExperts2D):
             )
             self.num_experts = experts.num_experts
 
-        # TODO: experiment with copying views, not values
         for i in range(experts.num_experts):
-            self[i].weight.copy_(experts.weight[i])
+            _set_parameter_data(self[i], "weight", experts.weight[i])
 
-        # copy offloading from original
-        offload_kwargs = get_cache_init_kwargs(experts)
-        for module in self.modules():
-            offload_module(module, **offload_kwargs)
+        _copy_offloading(experts, list(self.modules()))
 
         return self
 

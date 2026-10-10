@@ -44,6 +44,11 @@ The design deliberately separates four concerns:
 | Activation boundaries | `BoundaryActivationStore` | Owns complete normal-mode boundaries on CPU and serves one batch at a time |
 | Output persistence | Direct or recovery writer | Owns independent CPU snapshots |
 
+The subgraph working set includes checkpoint-backed modules called directly and
+modules obtained through FX `get_attr` nodes and passed to another module (for
+example, an embedding passed to an MTP layer). These dependencies are loaded for
+the same lifecycle as the target and restored to meta afterward.
+
 ## Class model
 
 The following class diagram is the normative implementation contract.

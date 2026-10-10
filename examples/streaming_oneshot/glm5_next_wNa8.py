@@ -1,9 +1,9 @@
 """Stream GLM-5.3-Flash calibration and mixed W4A8/W8A8 RTN quantization.
 
-This example uses the out-of-core :func:`streaming_oneshot` frontend.  The
-GLM-5.3 adapter is imported before model construction so packed routed experts
-are replaced by calibration-friendly dense experts. Routed expert projections use
-W4A8, while selected attention and dense/shared MLP projections use W8A8.
+This example uses the out-of-core :func:`streaming_oneshot` frontend. Packed
+routed experts are linearized by the frontend before recipe targets are resolved.
+Routed expert projections use W4A8, while selected attention and dense/shared MLP
+projections use W8A8.
 KDA/indexer parameters, norms, embeddings, heads, and the visual branch remain
 in their source dtype.
 
@@ -40,13 +40,7 @@ from transformers import (
 )
 
 from datasets import load_dataset
-
-# Importing the adapter registers Glm5NextTextMoE with the shared replacement
-# context used by streaming_oneshot.
-from llmcompressor.modeling.glm5_next import (
-    CalibrationGlm5NextTextMoE,  # noqa: F401
-    attach_mtp_layer,
-)
+from llmcompressor.modeling.glm5_next import attach_mtp_layer
 from llmcompressor.modifiers.quantization import QuantizationModifier
 from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
 from llmcompressor.streaming import streaming_oneshot

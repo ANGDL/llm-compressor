@@ -2,7 +2,11 @@ import torch
 from transformers.models.gpt_oss.modeling_gpt_oss import GptOssExperts
 
 from llmcompressor.modeling.moe.helpers import FusedExpertsProtocol
-from llmcompressor.modeling.moe.linear_experts import ExpertMLPWithGate, LinearExperts2D
+from llmcompressor.modeling.moe.linear_experts import (
+    ExpertMLPWithGate,
+    LinearExperts2D,
+    _set_parameter_data,
+)
 
 
 class GptOssExpertMLP(ExpertMLPWithGate):
@@ -13,14 +17,18 @@ class GptOssExpertMLP(ExpertMLPWithGate):
 
     def copy_from_experts_module(self, experts: FusedExpertsProtocol, index: int):
         gate_up = experts.gate_up_proj[index]
-        self.gate_proj.weight.copy_(gate_up[:, 0::2].T)
-        self.up_proj.weight.copy_(gate_up[:, 1::2].T)
-        self.down_proj.weight.copy_(experts.down_proj[index].T)
+        _set_parameter_data(self.gate_proj, "weight", gate_up[:, 0::2].T)
+        _set_parameter_data(self.up_proj, "weight", gate_up[:, 1::2].T)
+        _set_parameter_data(self.down_proj, "weight", experts.down_proj[index].T)
 
         gate_up_bias = experts.gate_up_proj_bias[index]
-        self.gate_proj.bias.copy_(gate_up_bias[0::2])
-        self.up_proj.bias.copy_(gate_up_bias[1::2])
-        self.down_proj.bias.copy_(experts.down_proj_bias[index])
+        _set_parameter_data(self.gate_proj, "bias", gate_up_bias[0::2])
+        _set_parameter_data(self.up_proj, "bias", gate_up_bias[1::2])
+        _set_parameter_data(
+            self.down_proj,
+            "bias",
+            experts.down_proj_bias[index],
+        )
 
 
 class GptOssLinearExperts(LinearExperts2D):

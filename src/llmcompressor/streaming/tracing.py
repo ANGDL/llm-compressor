@@ -6,14 +6,13 @@ from collections.abc import Generator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from itertools import chain
-from operator import getitem
 from typing import Any, Iterator
 
 import torch
 from torch import nn
 from torch.fx import Graph
 
-from llmcompressor.pipelines.sequential.helpers import Subgraph
+from llmcompressor.pipelines.sequential.helpers import Subgraph, trace_consumed_names
 from llmcompressor.pipelines.sequential.plan import (
     SequentialExecutionPlan,
     trace_sequential_plan,
@@ -37,37 +36,52 @@ class _PrefixDependencyDetected(RuntimeError):
         self.module_name = module_name
 
 
-def _project_through_target(subgraph: Subgraph, target_name: str) -> Subgraph:
-    """Return the original partition through its target, excluding its suffix."""
+def _project_through_target(
+    subgraph: Subgraph,
+    target_name: str,
+    required_output_names: set[str] | None = None,
+) -> Subgraph:
+    """Keep the target and dependencies needed by later streaming partitions."""
+
+    nodes_by_name = {}
+    target_node = None
+    for node in subgraph.graph.nodes:
+        if node.op == "output":
+            if required_output_names is None:
+                outputs = node.args[0]
+                required_output_names = (
+                    set(outputs) if isinstance(outputs, dict) else set()
+                )
+            break
+        nodes_by_name[node.name] = node
+        if node.op == "call_module" and str(node.target) == target_name:
+            target_node = node
+    if target_node is None:
+        raise ValueError(f"Target {target_name!r} is absent from traced partition")
+
+    output_nodes = {
+        name: node
+        for name, node in nodes_by_name.items()
+        if name in (required_output_names or ())
+    }
+    if not output_nodes:
+        output_nodes[target_node.name] = target_node
+    required_nodes = {target_node, *output_nodes.values()}
+    pending = list(required_nodes)
+    while pending:
+        for dependency in pending.pop().all_input_nodes:
+            if dependency not in required_nodes:
+                required_nodes.add(dependency)
+                pending.append(dependency)
 
     graph = Graph()
     node_map = {}
-    target_node = None
-    output_nodes = []
     for node in subgraph.graph.nodes:
-        if node.op == "output":
-            break
-        if target_node is not None:
-            if node.op != "call_function" or node.target is not getitem:
-                break
-            if any(dependency not in node_map for dependency in node.all_input_nodes):
-                break
-        copied = graph.node_copy(node, lambda dependency: node_map[dependency])
-        node_map[node] = copied
-        if node.op == "call_module" and str(node.target) == target_name:
-            target_node = copied
-            output_nodes = [(node, copied)]
-        elif target_node is not None:
-            output_nodes = [
-                pair for pair in output_nodes if pair[0] not in node.all_input_nodes
-            ]
-            output_nodes.append((node, copied))
-    if target_node is None:
-        raise ValueError(f"Target {target_name!r} is absent from traced partition")
-    graph.output({node.name: copied for node, copied in output_nodes})
-    for node in reversed(tuple(graph.nodes)):
-        if node.op in {"placeholder", "get_attr"} and not node.users:
-            graph.erase_node(node)
+        if node in required_nodes:
+            node_map[node] = graph.node_copy(
+                node, lambda dependency: node_map[dependency]
+            )
+    graph.output({name: node_map[node] for name, node in output_nodes.items()})
     graph.lint()
     return Subgraph(
         graph=graph,
@@ -269,8 +283,7 @@ class TracedBoundaryAdapter:
         finally:
             self.model.set_submodule(target_name, original)
         result = {**value, **output}
-        subgraph_index = self.plan.target_subgraph_indices[target_index]
-        for name in self.plan.subgraphs[subgraph_index].consumed_names:
+        for name in subgraph.consumed_names:
             result.pop(name, None)
         return result
 
@@ -304,12 +317,21 @@ def trace_streaming_boundaries(
         )
 
     target_subgraphs = []
-    for target_index, subgraph_index in enumerate(plan.target_subgraph_indices):
+    required_names: set[str] = set()
+    for target_index in reversed(range(len(plan.target_names))):
+        subgraph_index = plan.target_subgraph_indices[target_index]
         target_name = plan.target_names[target_index]
         target_subgraph = _project_through_target(
-            plan.subgraphs[subgraph_index], target_name
+            plan.subgraphs[subgraph_index], target_name, required_names
         )
         target_subgraphs.append(target_subgraph)
+        output_node = next(
+            node for node in target_subgraph.graph.nodes if node.op == "output"
+        )
+        required_names.difference_update(output_node.args[0])
+        required_names.update(target_subgraph.input_names)
+    target_subgraphs.reverse()
+    trace_consumed_names(target_subgraphs)
 
     loader = TargetWeightLoader(
         model, source, materializer, dtype_policy=dtype_policy

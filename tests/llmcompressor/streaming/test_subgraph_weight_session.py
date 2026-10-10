@@ -33,6 +33,49 @@ class SessionModel(nn.Module):
         self.final_norm = nn.LayerNorm(4)
 
 
+class EmbeddingConsumer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.norm = nn.LayerNorm(4)
+
+    def forward(self, input_ids, embed_tokens):
+        return self.norm(embed_tokens(input_ids))
+
+
+class ModuleArgumentModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.embed = nn.Embedding(8, 4)
+        self.consumer = EmbeddingConsumer()
+        self.unused = nn.Linear(4, 4)
+
+
+def test_loads_module_get_attr_passed_to_target(tmp_path):
+    reference = ModuleArgumentModel()
+    checkpoint = tmp_path / "model.safetensors"
+    save_file(reference.state_dict(), checkpoint)
+    model = build_meta_model(ModuleArgumentModel)
+    session = SubgraphWeightSession(model, SafetensorsWeightSource(checkpoint))
+    graph = Graph()
+    input_ids = graph.placeholder("input_ids")
+    embed_tokens = graph.get_attr("embed")
+    output = graph.call_module("consumer", (input_ids, embed_tokens))
+    graph.output({"output": output})
+    subgraph = Subgraph(graph, {"input_ids"}, {"input_ids"})
+    inputs = torch.tensor([[1, 2, 3]])
+
+    with session.loaded(subgraph, device="cpu", dtype=torch.float32) as loaded:
+        output = subgraph.forward(model, input_ids=inputs)["output"]
+        torch.testing.assert_close(output, reference.consumer(inputs, reference.embed))
+        assert loaded.module_names == ("embed", "consumer")
+        assert_all_meta(model.unused)
+
+    assert_all_meta(model)
+    assert session.working_set(subgraph, exclude_modules=("embed",)) == (
+        "consumer",
+    )
+
+
 class SharedRuntimeBufferBlock(nn.Module):
     def __init__(self, shared):
         super().__init__()
