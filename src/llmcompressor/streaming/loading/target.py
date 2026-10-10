@@ -25,6 +25,23 @@ from .host_memory import HostMemoryBudget
 _ModelT = TypeVar("_ModelT", bound=nn.Module)
 
 
+def _move_persistent_buffers_to_meta(model: nn.Module) -> None:
+    replacements: dict[int, torch.Tensor] = {}
+    for module in model.modules():
+        for name, buffer in module._buffers.items():
+            if (
+                buffer is None
+                or buffer.is_meta
+                or name in module._non_persistent_buffers_set
+            ):
+                continue
+            replacement = replacements.get(id(buffer))
+            if replacement is None:
+                replacement = torch.empty_like(buffer, device="meta")
+                replacements[id(buffer)] = replacement
+            module._buffers[name] = replacement
+
+
 def build_meta_model(
     factory: Callable[..., _ModelT],
     *args,
@@ -59,6 +76,7 @@ def build_meta_model(
         tie_weights = getattr(model, "tie_weights", None)
         if callable(tie_weights):
             tie_weights()
+        _move_persistent_buffers_to_meta(model)
     else:
         with torch.device("meta"):
             model = factory(*args, **kwargs)

@@ -26,6 +26,57 @@ from llmcompressor.modeling.glm_moe_dsa import CalibrationGlmMoeDsaMoE
 from llmcompressor.modeling.moe_context import MoECalibrationModule
 from llmcompressor.utils.dev import skip_weights_initialize
 
+
+def _force_torch_kda_backend() -> None:
+    """Make GLM-5-next use its reference PyTorch KDA instead of fla's Triton kernels.
+
+    On backends where fla's Triton KDA kernels cannot be loaded (e.g. Kunlunxin
+    P800, where launching them raises ``Triton Error [CUDA]:
+    CUDA_ERROR_NOT_SUPPORTED``), null fla's KDA entrypoints so Transformers'
+    ``use_kernel_func_from_hub_with_fallback`` decorator resolves to the built-in
+    reference PyTorch implementation of ``chunk_kimi_delta_attention`` /
+    ``recurrent_kimi_delta_attention``.
+
+    This MUST run before ``modeling_glm5_next`` is imported: the decorator binds
+    its implementation at decoration (import) time, so a later patch has no
+    effect. It is therefore called at module import, ahead of the Transformers
+    import below.
+    """
+    try:
+        import fla.ops.kda as _kda
+    except Exception:
+        return
+    for _name in ("chunk_kda", "fused_recurrent_kda"):
+        if getattr(_kda, _name, None) is not None:
+            setattr(_kda, _name, None)
+    try:
+        import fla as _fla
+
+        for _name in ("chunk_kda", "fused_recurrent_kda"):
+            if getattr(_fla, _name, None) is not None:
+                setattr(_fla, _name, None)
+    except Exception:
+        pass
+
+
+def _kda_backend_choice() -> str:
+    """Resolve the KDA backend: ``LLMCOMPRESSOR_KDA_BACKEND`` env (torch|triton),
+    else ``auto`` — which selects torch on Kunlunxin XPU (``torch_xmlir``
+    present), where fla's Triton KDA kernels fail to load, and triton elsewhere.
+    """
+    import importlib.util
+
+    choice = os.getenv("LLMCOMPRESSOR_KDA_BACKEND", "auto").strip().lower()
+    if choice in {"torch", "triton"}:
+        return choice
+    if importlib.util.find_spec("torch_xmlir") is not None:
+        return "torch"
+    return "triton"
+
+
+if _kda_backend_choice() == "torch":
+    _force_torch_kda_backend()
+
 try:
     from transformers.models.glm5_next.modeling_glm5_next import (
         Glm5NextTextAttention,
@@ -62,6 +113,13 @@ class Glm5NextTextRoutedExpertMLP(Glm5NextTextMLP):
 class SequentialGlm5NextExperts(nn.ModuleList):
     """Unpack packed 3-D tensors for the shared MoE calibration adapter."""
 
+    @staticmethod
+    def _set_weight(module: nn.Linear, weight: torch.Tensor) -> None:
+        module.weight = nn.Parameter(
+            weight.detach().contiguous(),
+            requires_grad=module.weight.requires_grad,
+        )
+
     def __init__(self, config, original) -> None:
         _require_transformers_glm5()
         self.num_experts = original.gate_up_proj.shape[0]
@@ -79,9 +137,9 @@ class SequentialGlm5NextExperts(nn.ModuleList):
         for index in range(self.num_experts):
             gate_up = original.gate_up_proj[index]
             gate, up = gate_up.chunk(2, dim=0)
-            self[index].gate_proj.weight.data = gate.contiguous()
-            self[index].up_proj.weight.data = up.contiguous()
-            self[index].down_proj.weight.data = original.down_proj[index].contiguous()
+            self._set_weight(self[index].gate_proj, gate)
+            self._set_weight(self[index].up_proj, up)
+            self._set_weight(self[index].down_proj, original.down_proj[index])
 
 
 @MoECalibrationModule.register("Glm5NextTextMoE")
@@ -243,6 +301,8 @@ class Glm5NextMTPLayer(nn.Module):
     explicitly here.
     """
 
+    _no_split_modules = ["Glm5NextMTPLayer"]
+
     def __init__(self, model, layer_idx: int, raw_tensors: dict[str, torch.Tensor]):
         super().__init__()
         _require_transformers_glm5()
@@ -332,6 +392,12 @@ class Glm5NextMTPLayer(nn.Module):
         return self.shared_head.norm(residual + hidden_states)
 
 
+def _register_mtp_no_split_module(model: nn.Module) -> None:
+    no_split_modules = list(getattr(model, "_no_split_modules", ()))
+    if "Glm5NextMTPLayer" not in no_split_modules:
+        model._no_split_modules = [*no_split_modules, "Glm5NextMTPLayer"]
+
+
 def attach_mtp_layer(model, model_path: str) -> None:
     """Attach and load ``model.language_model.layers.45`` for calibration."""
     _require_transformers_glm5()
@@ -353,6 +419,7 @@ def attach_mtp_layer(model, model_path: str) -> None:
             f"got {len(language_model.layers)}."
         )
     language_model.layers.append(mtp_layer)
+    _register_mtp_no_split_module(model)
 
     def forward(
         self,

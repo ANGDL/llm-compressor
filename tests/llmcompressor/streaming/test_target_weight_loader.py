@@ -41,6 +41,20 @@ class TinyModel(nn.Module):
         self.lm_head = nn.Linear(hidden_size, 8, bias=False)
 
 
+class MixedBufferModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.proj = nn.Linear(4, 4)
+        shared = torch.arange(4, dtype=torch.float32)
+        self.register_buffer("checkpoint_state", shared)
+        self.register_buffer("checkpoint_alias", shared)
+        self.register_buffer(
+            "runtime_state",
+            torch.arange(4, dtype=torch.float32) + 10,
+            persistent=False,
+        )
+
+
 class RemoteStyleBlock(nn.Module):
     """Fixture standing in for a checkpoint-defined modeling class."""
 
@@ -129,6 +143,31 @@ def test_build_meta_model_does_not_allocate_real_weights():
 
     _assert_all_meta(model)
     assert len(model.layers) == 20
+
+
+def test_build_meta_model_keeps_only_nonpersistent_buffers_real(tmp_path):
+    reference = MixedBufferModel()
+    path = tmp_path / "model.safetensors"
+    _write_checkpoint(reference, path)
+
+    model = build_meta_model(
+        MixedBufferModel,
+        keep_nonpersistent_buffers=True,
+    )
+
+    assert all(parameter.is_meta for parameter in model.parameters())
+    assert model.checkpoint_state.is_meta
+    assert model.checkpoint_alias is model.checkpoint_state
+    assert not model.runtime_state.is_meta
+    assert torch.equal(
+        model.runtime_state,
+        torch.arange(4, dtype=torch.float32) + 10,
+    )
+
+    loader = TargetWeightLoader(model, SafetensorsWeightSource(path))
+    plan = loader.plan("")
+    assert len(plan.buffer_groups) == 1
+    assert len(plan.runtime_buffer_groups) == 1
 
 
 def test_tiny_llama_decoder_target_runs_and_unloads(tmp_path):

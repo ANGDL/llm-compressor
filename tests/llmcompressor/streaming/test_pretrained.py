@@ -212,6 +212,31 @@ def test_sequential_targets_only_cover_quantized_model_branches():
     )
 
 
+def test_sequential_targets_include_registered_glm5_mtp_layer():
+    from llmcompressor.modeling.glm5_next import (
+        Glm5NextMTPLayer,
+        _register_mtp_no_split_module,
+    )
+
+    model = _MultimodalModel()
+    mtp = Glm5NextMTPLayer.__new__(Glm5NextMTPLayer)
+    torch.nn.Module.__init__(mtp)
+    mtp.proj = torch.nn.Linear(2, 2)
+    model.layers.append(mtp)
+    _register_mtp_no_split_module(model)
+    schemes = {
+        "layers.0.proj": Mock(),
+        "layers.1.proj": Mock(),
+        "layers.2.proj": Mock(),
+    }
+
+    assert _quantized_sequential_targets(model, schemes) == (
+        "layers.0",
+        "layers.1",
+        "layers.2",
+    )
+
+
 def test_successful_work_cleanup_preserves_unknown_files(tmp_path):
     work = tmp_path / "work"
     for name in ("artifacts", "boundaries", "publish", "staging"):

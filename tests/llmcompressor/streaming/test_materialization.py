@@ -5,17 +5,21 @@ from typing import Mapping
 import pytest
 import torch
 from safetensors.torch import save_file
+from transformers.conversion_mapping import Concatenate
+from transformers.core_model_loading import WeightConverter, WeightRenaming
 
 from llmcompressor.streaming.checkpoint import (
     SafetensorsWeightSource,
     TensorMetadata,
 )
+from llmcompressor.streaming.loading import TargetWeightLoader
 from llmcompressor.streaming.materialization import (
     CastWeightMaterializer,
     DeepSeekV4WeightMaterializer,
     KimiK3WeightMaterializer,
     KimiK3WeightSource,
     StreamingDTypePolicy,
+    TransformersWeightMaterializer,
     WeightMaterializer,
     materialize_weights,
 )
@@ -411,6 +415,111 @@ def test_deepseek_v4_materializer_disables_absent_mtp_in_output_config():
     assert output["compress_ratios"] == [0, 4]
     assert output["dspark_block_size"] == 0
     assert output["dspark_target_layer_ids"] == []
+
+
+def test_transformers_materializer_applies_registered_weight_conversions(
+    tmp_path,
+):
+    class ConvertedModel(torch.nn.Module):
+        base_model_prefix = ""
+
+        def __init__(self):
+            super().__init__()
+            self.layer = torch.nn.Module()
+            self.layer.forget_gate = torch.nn.Module()
+            self.layer.forget_gate.dt_bias = torch.nn.Parameter(torch.empty(2))
+            self.layer.conv = torch.nn.Conv1d(
+                6,
+                6,
+                kernel_size=4,
+                groups=6,
+                bias=False,
+            )
+            self.layer.experts = torch.nn.ModuleList(
+                [torch.nn.Linear(2, 2, bias=False)]
+            )
+
+    path = tmp_path / "model.safetensors"
+    query = torch.arange(8, dtype=torch.float16).reshape(2, 1, 4)
+    key = query + 10
+    value = query + 20
+    dt_bias = torch.arange(2, dtype=torch.float32)
+    expert = torch.eye(2, dtype=torch.float16)
+    save_file(
+        {
+            "layer.q_conv.weight": query,
+            "layer.k_conv.weight": key,
+            "layer.v_conv.weight": value,
+            "layer.dt_bias": dt_bias,
+            "layer.experts.0.weight": expert,
+        },
+        path,
+    )
+    conversions = [
+        WeightRenaming(
+            r"layer\.dt_bias",
+            "layer.forget_gate.dt_bias",
+        ),
+        WeightConverter(
+            source_patterns=[
+                "layer.q_conv.weight",
+                "layer.k_conv.weight",
+                "layer.v_conv.weight",
+            ],
+            target_patterns="layer.conv.weight",
+            operations=[Concatenate(dim=0)],
+        ),
+        WeightConverter(
+            source_patterns="layer.experts.*.weight",
+            target_patterns="layer.packed_experts",
+            operations=[Concatenate(dim=0)],
+        ),
+    ]
+    with torch.device("meta"):
+        model = ConvertedModel()
+    materializer = TransformersWeightMaterializer(
+        CastWeightMaterializer(), model, conversions
+    )
+    source = materializer.create_source(str(path))
+
+    assert set(source.tensor_names()) == {
+        "layer.forget_gate.dt_bias",
+        "layer.conv.weight",
+        "layer.experts.0.weight",
+    }
+    loader = TargetWeightLoader(model, source, materializer)
+    assert loader.plan("layer.forget_gate").parameter_sources
+    assert loader.plan("layer.conv").parameter_sources
+    assert loader.plan("layer.experts.0").parameter_sources
+    conv_metadata = source.metadata("layer.conv.weight")
+    assert (
+        materializer.estimate_workspace_bytes(
+            "layer.conv.weight",
+            conv_metadata,
+            torch.bfloat16,
+        )
+        >= 3 * query.numel() * torch.bfloat16.itemsize
+    )
+
+    result = materialize_weights(
+        source,
+        source.tensor_names(),
+        materializer,
+        target_dtype=torch.bfloat16,
+    )
+
+    assert torch.equal(
+        result["layer.conv.weight"],
+        torch.cat((query, key, value), dim=0).to(torch.bfloat16),
+    )
+    assert torch.equal(
+        result["layer.forget_gate.dt_bias"],
+        dt_bias.to(torch.bfloat16),
+    )
+    assert torch.equal(
+        result["layer.experts.0.weight"],
+        expert.to(torch.bfloat16),
+    )
 
 
 def test_kimi_k3_source_maps_packed_expert_to_logical_weight(tmp_path):
