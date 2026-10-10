@@ -430,6 +430,47 @@ def test_launch_writes_run_local_config(web_env) -> None:
     assert manifest["models"][0]["workflow"]["quantize"][:2] == ["python3", SCRIPT]
 
 
+def test_launch_without_inference_skips_runtime_smoke(web_env) -> None:
+    """A container-registering deployment still launches a quantize-only run.
+
+    Regression: ``start_run`` used to 400 with "inference.container_name ... are
+    required" whenever the deployment registered inference containers, so the UI
+    "Confirm and launch" button silently failed. The run now launches and the
+    runtime-smoke stage is recorded SKIPPED instead of blocking.
+    """
+
+    scripts = web_env.tmp_path / "scripts"
+    scripts.mkdir(exist_ok=True)
+    policy = LaunchPolicy(
+        gpu_hour_capacity=80.0,
+        inference_containers=("user-runtime",),
+        inference_script_roots=(scripts,),
+    )
+    control = _control(web_env, policy=policy)
+    preview = control.preview_plan(
+        {
+            "script": SCRIPT,
+            "parameters": [{"flag": "--model-id", "value": "Qwen/Qwen3-8B"}],
+            "stages": ["quantize", "validate"],
+            "resources": {"gpu_count": 1, "estimated_gpu_hours": 2},
+        },
+        OPERATOR,
+    )
+    # Missing inference is only a warning, so the launch is not blocked.
+    assert not [
+        risk
+        for risk in preview["review"]["risks"]
+        if risk["severity"] == "error"
+    ]
+    run = control.start_run({"plan_hash": preview["plan_hash"]}, STARTER)
+    # No inference/runtime-smoke job is scheduled ...
+    assert all(job["kind"] != "inference" for job in run["jobs"])
+    # ... and runtime-smoke is recorded SKIPPED for the model.
+    model_id = preview["plan"]["generated_config"]["models"][0]["id"]
+    state = web_env.root / run["run_id"] / model_id / "state" / "runtime-smoke.json"
+    assert yaml.safe_load(state.read_text(encoding="utf-8"))["status"] == "SKIPPED"
+
+
 # -------------------------------------------------------------- worker seam
 
 

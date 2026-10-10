@@ -1602,7 +1602,7 @@ class PlanService:
                     "severity": "warning",
                     "message": (
                         "no prestarted inference container was confirmed; the "
-                        "runtime smoke stage will run inside the CI executor"
+                        "runtime smoke stage will be skipped"
                     ),
                 }
             )

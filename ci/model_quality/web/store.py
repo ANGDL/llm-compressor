@@ -38,6 +38,13 @@ _STAGE_LOG_NAMES = {
     "report": ("report.log",),
     "publish": ("publish.log",),
 }
+# Reverse map (log file name -> stage) used to surface in-flight stages, whose
+# state file is not written until they terminate, from their live log file.
+_STAGE_FOR_LOG = {
+    filename: stage
+    for stage, filenames in _STAGE_LOG_NAMES.items()
+    for filename in filenames
+}
 
 
 class NotFoundError(LookupError):
@@ -252,6 +259,55 @@ class RunStore:
                     "updated_at": max(timestamps) if timestamps else None,
                 }
             )
+        # A stage writes its ``state/<stage>.json`` only when it terminates, so an
+        # in-flight stage has a growing log but no recorded state — and therefore
+        # no row above. Surface those running attempts (and any stage that has a
+        # log but no state yet) straight from the logs directory so the live log
+        # is selectable in the UI during the run instead of only appearing once
+        # the stage finishes or fails.
+        by_id = {row["attempt_id"]: row for row in rows}
+        logs_root = model_dir / "logs"
+        for log_dir in logs_root.iterdir() if logs_root.is_dir() else []:
+            if not log_dir.is_dir() or not _SAFE_COMPONENT.fullmatch(log_dir.name):
+                continue
+            newest = None
+            running_stages: dict[str, float] = {}
+            for log_path in log_dir.rglob("*.log"):
+                stage = _STAGE_FOR_LOG.get(log_path.name)
+                if stage is None:
+                    continue
+                try:
+                    mtime = log_path.stat().st_mtime
+                except OSError:
+                    continue
+                running_stages[stage] = mtime
+                newest = mtime if newest is None else max(newest, mtime)
+            if not running_stages:
+                continue
+            iso = (
+                datetime.fromtimestamp(newest, tz=timezone.utc).isoformat()
+                if newest is not None
+                else None
+            )
+            row = by_id.get(log_dir.name)
+            if row is None:
+                row = {
+                    "attempt_id": log_dir.name,
+                    "current": log_dir.name == current_id,
+                    "status": "RUNNING",
+                    "stages": {},
+                    "started_at": iso,
+                    "updated_at": iso,
+                }
+                rows.append(row)
+                by_id[log_dir.name] = row
+            # Only fill stages that have no recorded terminal state; never clobber
+            # a real status with the synthetic RUNNING marker.
+            for stage in running_stages:
+                row["stages"].setdefault(stage, "RUNNING")
+            if iso is not None:
+                row["updated_at"] = row["updated_at"] or iso
+                row["started_at"] = row["started_at"] or iso
         return sorted(
             rows,
             key=lambda item: (item["updated_at"] or "", item["attempt_id"]),
@@ -646,7 +702,6 @@ class RunStore:
                 for path in files
                 if path.name in names or stage in path.name or stage in str(path.parent)
             ]
-        lines = []
         # Order by mtime so the most recently written (actively-growing) log ends
         # up last; tailing then surfaces the running attempt instead of a stale head.
         def _sort_key(path: Path) -> tuple:
@@ -655,29 +710,35 @@ class RunStore:
             except OSError:
                 return (0.0, str(path))
 
-        for path in sorted(set(files), key=_sort_key):
+        files = sorted(set(files), key=_sort_key)
+        run_dir = self._run_dir(run_id)
+        # Tail polls re-read on a 3s timer; decoding and dict-wrapping an entire
+        # multi-MB, actively-growing log on every poll stalls the single-threaded
+        # server. In tail mode read only a bounded window from each file's end and
+        # count totals cheaply (no decode) so a poll stays O(window), not O(file).
+        window_bytes = min(8 << 20, max(limit * 256, 1 << 18)) if tail else None
+        lines: list[dict[str, Any]] = []
+        total = 0
+        for path in files:
             try:
-                content = path.read_text(encoding="utf-8", errors="replace")
+                if window_bytes is None:
+                    file_total, texts = self._all_capped_lines(path)
+                else:
+                    file_total, texts = self._tail_capped_lines(path, window_bytes)
             except OSError:
                 continue
-            relative = str(path.relative_to(self._run_dir(run_id)))
-            for line_number, text in enumerate(content.splitlines(), 1):
-                # A single pathological line (e.g. a stage that dumps a huge JSON
-                # blob or tensor) can be megabytes wide. The log viewer polls on a
-                # timer, so returning raw lines lets one monster line balloon the
-                # response to tens of MB and stall the single-threaded server.
-                # Cap each line's width; the full log is still on disk.
-                if len(text) > _MAX_LOG_LINE_CHARS:
-                    dropped = len(text) - _MAX_LOG_LINE_CHARS
-                    text = f"{text[:_MAX_LOG_LINE_CHARS]}… [{dropped} more chars truncated]"
-                lines.append({"path": relative, "line": line_number, "text": text})
-        total = len(lines)
+            relative = str(path.relative_to(run_dir))
+            base = max(0, file_total - len(texts))
+            for index, text in enumerate(texts, 1):
+                lines.append({"path": relative, "line": base + index, "text": text})
+            total += file_total
         if tail:
-            start = max(0, total - limit)
+            start = max(0, len(lines) - limit)
+            items = lines[start : start + limit]
             return {
-                "items": lines[start : start + limit],
+                "items": items,
                 "total": total,
-                "offset": start,
+                "offset": max(0, total - len(items)),
                 "limit": limit,
             }
         return {
@@ -686,6 +747,45 @@ class RunStore:
             "offset": offset,
             "limit": limit,
         }
+
+    @staticmethod
+    def _cap_line(text: str) -> str:
+        # One pathological line (a stage dumping a huge JSON blob or tensor) can
+        # be megabytes wide; cap its width so a single line cannot balloon the
+        # polled response. The full log is still on disk.
+        if len(text) > _MAX_LOG_LINE_CHARS:
+            dropped = len(text) - _MAX_LOG_LINE_CHARS
+            return f"{text[:_MAX_LOG_LINE_CHARS]}… [{dropped} more chars truncated]"
+        return text
+
+    @classmethod
+    def _all_capped_lines(cls, path: Path) -> tuple[int, list[str]]:
+        content = path.read_text(encoding="utf-8", errors="replace")
+        texts = [cls._cap_line(text) for text in content.splitlines()]
+        return len(texts), texts
+
+    @classmethod
+    def _tail_capped_lines(cls, path: Path, window_bytes: int) -> tuple[int, list[str]]:
+        size = path.stat().st_size
+        total = 0
+        last = b""
+        with path.open("rb") as handle:
+            while True:
+                buffer = handle.read(1 << 20)
+                if not buffer:
+                    break
+                total += buffer.count(b"\n")
+                last = buffer[-1:]
+            if size and last and last != b"\n":
+                total += 1  # final line without a trailing newline
+            if size > window_bytes:
+                handle.seek(size - window_bytes)
+                handle.readline()  # drop the partial leading line
+            else:
+                handle.seek(0)
+            window = handle.read()
+        texts = [cls._cap_line(text) for text in window.decode("utf-8", "replace").splitlines()]
+        return total, texts
 
     def events(self, run_id: str, *, after: int | None = None) -> list[dict[str, Any]]:
         run_dir = self._require_run(run_id)

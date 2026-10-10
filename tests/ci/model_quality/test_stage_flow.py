@@ -91,6 +91,40 @@ def test_quantize_validate_report_flow(tmp_path, monkeypatch):
     assert summary["status"] == "PASS"
 
 
+def test_quantize_carries_preflight_forward_on_rerun(tmp_path, monkeypatch):
+    """Re-running from quantize must reuse the model-level preflight.
+
+    Regression: a rerun starts quantize in a fresh attempt that never ran
+    preflight, so the attempt-scoped ``preflight.json`` is absent. ``run_quantize``
+    used to crash with FileNotFoundError; it now carries the model-level latest
+    preflight forward (fingerprint-checked), like ``run_report`` does.
+    """
+
+    monkeypatch.setenv("MODEL_QUALITY_RUNS_ROOT", str(tmp_path / "runs"))
+    model = _fake_model(tmp_path)
+    run_id = "run-a"
+    fingerprint = model_fingerprint(model)
+
+    # The first attempt ran preflight; the result is mirrored to the model level.
+    write_stage_result(
+        run_id,
+        model["id"],
+        "preflight",
+        {"status": "PASS"},
+        attempt_id="attempt-1",
+        artifact_fingerprint=fingerprint,
+    )
+
+    # The rerun owns a new attempt with no preflight of its own.
+    quantize = run_quantize(
+        model,
+        run_id,
+        attempt_id="attempt-2",
+        artifact_fingerprint=fingerprint,
+    )
+    assert quantize["status"] == "PASS"
+
+
 def test_report_carries_earlier_lanes_forward_on_partial_rerun(tmp_path, monkeypatch):
     """Re-running one node must not fail the report on the untouched lanes."""
 
