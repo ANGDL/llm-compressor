@@ -729,6 +729,8 @@ async function previewPlan(event) {
     estimated_gpu_hours: Number(form.get("estimated_gpu_hours")) || 1,
   };
   if (form.get("estimated_eval_gpu_hours")) request.resources.estimated_eval_gpu_hours = Number(form.get("estimated_eval_gpu_hours"));
+  const cudaVisibleDevices = (form.get("cuda_visible_devices") || "").trim();
+  if (cudaVisibleDevices) request.resources.cuda_visible_devices = cudaVisibleDevices;
   if (form.get("max_gpu_hours")) request.max_gpu_hours = Number(form.get("max_gpu_hours"));
 
   if (stages.includes("inference")) {
@@ -780,6 +782,7 @@ async function applyCloneRequest(req) {
   const res = req.resources || {};
   if (res.gpu_count != null) form.elements.gpu_count.value = res.gpu_count;
   if (res.estimated_gpu_hours != null) form.elements.estimated_gpu_hours.value = res.estimated_gpu_hours;
+  if (res.cuda_visible_devices != null && form.elements.cuda_visible_devices) form.elements.cuda_visible_devices.value = res.cuda_visible_devices;
   if (res.estimated_eval_gpu_hours != null) form.elements.estimated_eval_gpu_hours.value = res.estimated_eval_gpu_hours;
   if (req.max_gpu_hours != null) form.elements.max_gpu_hours.value = req.max_gpu_hours;
   const stages = new Set(req.stages || []);
