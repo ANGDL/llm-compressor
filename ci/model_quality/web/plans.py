@@ -954,6 +954,42 @@ EVAL_DATASET_PRESETS: dict[str, dict[str, dict[str, Any]]] = {
 }
 
 
+def normalize_cuda_visible_devices(value: Any) -> str | None:
+    """Validate an optional ``CUDA_VISIBLE_DEVICES`` request value.
+
+    Accepts a comma-separated string (``"0,1,3"``), a single int, or a list of
+    ints/str indices, and returns a normalized comma-separated string. Entries
+    must be non-negative integers — the value is injected into the quantize
+    subprocess environment, so anything else is rejected rather than trusted.
+    Returns ``None`` when nothing is configured.
+    """
+
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValidationError("cuda_visible_devices must be GPU indices")
+    if isinstance(value, int):
+        tokens = [str(value)]
+    elif isinstance(value, (list, tuple)):
+        tokens = [str(item).strip() for item in value]
+    elif isinstance(value, str):
+        tokens = [token.strip() for token in value.split(",")]
+    else:
+        raise ValidationError(
+            "cuda_visible_devices must be a string or a list of GPU indices"
+        )
+    tokens = [token for token in tokens if token]
+    if not tokens:
+        return None
+    for token in tokens:
+        if not re.fullmatch(r"\d+", token):
+            raise ValidationError(
+                "cuda_visible_devices entries must be non-negative integers, "
+                f"got {token!r}"
+            )
+    return ",".join(tokens)
+
+
 def build_eval_command(
     request: dict[str, Any], *, policy: LaunchPolicy, port: int
 ) -> list[str]:
@@ -1376,6 +1412,18 @@ class PlanService:
             "workflow": {"revision": revision, "quantize": list(argv)},
             "validation": {"profile": "causal_lm"},
         }
+
+        # Pin the quantize process to specific GPUs when requested. run_quantize
+        # applies ``workflow.env`` on top of the inherited environment before
+        # spawning the quant script, so the child sees CUDA_VISIBLE_DEVICES
+        # before it initializes CUDA.
+        cuda_visible_devices = normalize_cuda_visible_devices(
+            res_req.get("cuda_visible_devices")
+        )
+        if cuda_visible_devices is not None:
+            model["workflow"]["env"] = {
+                "CUDA_VISIBLE_DEVICES": cuda_visible_devices
+            }
 
         inference = None
         # The runtime-smoke here is driven by the prestarted container + the

@@ -20,6 +20,7 @@ from ci.model_quality.web import (
     introspect_script,
 )
 from ci.model_quality.web.control import _publish_is_scheduled
+from ci.model_quality.web.plans import normalize_cuda_visible_devices
 from ci.model_quality.web.worker import execution_argv
 
 OPERATOR = Principal(actor="alice", roles=frozenset({"operator"}), authenticated=True)
@@ -501,3 +502,69 @@ def test_execution_argv_prefers_run_local_config(tmp_path: Path) -> None:
     )
     assert str(run_dir / "model-config.yaml") in argv
     assert "global.yaml" not in argv
+
+
+# ----------------------------------------------------- CUDA_VISIBLE_DEVICES
+
+
+def _cuda_preview(tmp_path: Path, cuda_visible_devices) -> dict:
+    service = _service(tmp_path)
+    return service.preview(
+        {
+            "script": SCRIPT,
+            "parameters": [{"flag": "--model-id", "value": "Qwen/Qwen3-8B"}],
+            "stages": ["quantize", "validate"],
+            "resources": {
+                "gpu_count": 2,
+                "estimated_gpu_hours": 2,
+                "cuda_visible_devices": cuda_visible_devices,
+            },
+        }
+    )
+
+
+def test_preview_injects_cuda_visible_devices_into_quantize_env(tmp_path: Path) -> None:
+    preview = _cuda_preview(tmp_path, "0, 1 ,3")
+    model = preview["plan"]["generated_config"]["models"][0]
+    assert model["workflow"]["env"] == {"CUDA_VISIBLE_DEVICES": "0,1,3"}
+    # The value round-trips through source_request so a clone restores it.
+    assert (
+        preview["plan"]["source_request"]["resources"]["cuda_visible_devices"]
+        == "0, 1 ,3"
+    )
+
+
+def test_preview_accepts_cuda_visible_devices_as_list(tmp_path: Path) -> None:
+    preview = _cuda_preview(tmp_path, [0, 2, 3])
+    model = preview["plan"]["generated_config"]["models"][0]
+    assert model["workflow"]["env"]["CUDA_VISIBLE_DEVICES"] == "0,2,3"
+
+
+def test_preview_without_cuda_visible_devices_sets_no_env(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+    preview = service.preview(
+        {
+            "script": SCRIPT,
+            "parameters": [{"flag": "--model-id", "value": "Qwen/Qwen3-8B"}],
+            "stages": ["quantize", "validate"],
+            "resources": {"gpu_count": 1, "estimated_gpu_hours": 2},
+        }
+    )
+    assert "env" not in preview["plan"]["generated_config"]["models"][0]["workflow"]
+
+
+def test_preview_rejects_invalid_cuda_visible_devices(tmp_path: Path) -> None:
+    with pytest.raises(ValidationError, match="cuda_visible_devices"):
+        _cuda_preview(tmp_path, "0; rm -rf /")
+
+
+def test_normalize_cuda_visible_devices() -> None:
+    assert normalize_cuda_visible_devices(None) is None
+    assert normalize_cuda_visible_devices("") is None
+    assert normalize_cuda_visible_devices("  ") is None
+    assert normalize_cuda_visible_devices("0, 1 ,3") == "0,1,3"
+    assert normalize_cuda_visible_devices([0, 1]) == "0,1"
+    assert normalize_cuda_visible_devices(2) == "2"
+    for bad in ("a", "-1", "0.5", "1,x", True):
+        with pytest.raises(ValidationError):
+            normalize_cuda_visible_devices(bad)
