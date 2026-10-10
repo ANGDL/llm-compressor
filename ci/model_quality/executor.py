@@ -444,13 +444,32 @@ def run_quantize(
     attempt_id: str = "default",
     artifact_fingerprint: str | None = None,
 ) -> dict[str, Any]:
-    preflight = read_stage_result(
-        run_id,
-        model["id"],
-        "preflight",
-        attempt_id=attempt_id,
-        artifact_fingerprint=artifact_fingerprint,
-    )
+    try:
+        preflight = read_stage_result(
+            run_id,
+            model["id"],
+            "preflight",
+            attempt_id=attempt_id,
+            artifact_fingerprint=artifact_fingerprint,
+        )
+    except FileNotFoundError:
+        # A rerun that starts at quantize does not re-run preflight in the new
+        # attempt, so its attempt-scoped result is absent by construction. Carry
+        # the model-level latest preflight forward (same pattern as run_report),
+        # still enforcing the artifact fingerprint so a stale preflight from a
+        # different plan is rejected.
+        try:
+            preflight = read_stage_result(
+                run_id,
+                model["id"],
+                "preflight",
+                artifact_fingerprint=artifact_fingerprint,
+            )
+        except (OSError, json.JSONDecodeError) as error:
+            raise StageError(
+                "preflight result is unavailable for this attempt",
+                reason_code="DEPENDENCY_FAILED",
+            ) from error
     if preflight["status"] not in {"PASS", "WARN"}:
         raise StageError("preflight did not pass", reason_code="DEPENDENCY_FAILED")
 

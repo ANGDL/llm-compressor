@@ -228,11 +228,10 @@ class ControlPlane:
                 "plan has blocking risks: "
                 + "; ".join(risk["message"] for risk in blocking)
             )
-        if self.policy.inference_containers and not record.get("inference"):
-            raise ValidationError(
-                "inference.container_name and inference.script are required "
-                "because this deployment registers inference containers"
-            )
+        # A run without a confirmed inference container is allowed: the
+        # script-first preview already drops runtime-smoke into skip_stages when
+        # the inference stage is not selected, so quantize/validate still produce
+        # the artifact instead of the whole run being blocked here.
         if self.plan_service.git_sha not in {"local", "unknown", ""}:
             if plan.get("git_sha") != self.plan_service.git_sha:
                 raise ConflictError(

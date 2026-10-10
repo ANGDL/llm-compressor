@@ -629,10 +629,12 @@ function updateAttempts() {
   // A stage writes its state only when it finishes, so an in-flight stage has a
   // log but no recorded state yet. Always include the current (active) attempt
   // so a running stage's log is selectable, plus any attempt that recorded the
-  // stage. Current attempt first.
+  // stage. Order a stage that is actively RUNNING first (that is the live log
+  // the operator wants by default), then the current attempt, then by recency.
+  const isRunning = (attempt) => String((attempt.stages || {})[stage] || "").toUpperCase() === "RUNNING";
   const attempts = allAttempts
     .filter((attempt) => attempt.current || Object.prototype.hasOwnProperty.call(attempt.stages || {}, stage))
-    .sort((a, b) => (b.current ? 1 : 0) - (a.current ? 1 : 0));
+    .sort((a, b) => (isRunning(b) ? 1 : 0) - (isRunning(a) ? 1 : 0) || (b.current ? 1 : 0) - (a.current ? 1 : 0));
   const selectedAttempt = $("#log-attempt").value;
   $("#log-attempt").innerHTML = attempts.length ? attempts.map((attempt) => `<option>${escapeHtml(attempt.attempt_id)}</option>`).join("") : '<option value="">No recorded attempt</option>';
   if (attempts.some((attempt) => attempt.attempt_id === selectedAttempt)) $("#log-attempt").value = selectedAttempt;

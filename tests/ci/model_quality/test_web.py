@@ -115,6 +115,61 @@ def test_store_tails_logs(tmp_path: Path) -> None:
     ]
 
 
+def test_store_surfaces_running_attempt_from_live_log(tmp_path: Path) -> None:
+    """A mid-flight stage has a growing log but no state file yet; the attempt
+    must still be listed (with its stage) so the live log is selectable."""
+
+    _make_run(tmp_path)
+    model_dir = tmp_path / "20260926T000000Z_local" / "demo"
+    running = model_dir / "logs" / "attempt-2" / "quantization.log"
+    running.parent.mkdir(parents=True)
+    running.write_text("starting\n", encoding="utf-8")
+
+    store = RunStore(tmp_path)
+    model = store.get_model("20260926T000000Z_local", "demo")
+    attempts = {attempt["attempt_id"]: attempt for attempt in model["attempts"]}
+    assert "attempt-2" in attempts
+    assert "quantize" in attempts["attempt-2"]["stages"]
+
+    logs = store.get_logs(
+        "20260926T000000Z_local",
+        "demo",
+        stage="quantize",
+        attempt_id="attempt-2",
+        tail=True,
+    )
+    assert [item["text"] for item in logs["items"]] == ["starting"]
+
+
+def test_store_tails_large_log_from_window(tmp_path: Path) -> None:
+    """Tailing a log larger than the read window still returns the exact last
+    lines and the true total (the window read drops the partial leading line)."""
+
+    _make_run(tmp_path)
+    log = (
+        tmp_path
+        / "20260926T000000Z_local"
+        / "demo"
+        / "logs"
+        / "attempt-1"
+        / "quantization.log"
+    )
+    log.write_text("".join(f"line{n:05d}\n" for n in range(1, 50001)), encoding="utf-8")
+    store = RunStore(tmp_path)
+    tailed = store.get_logs(
+        "20260926T000000Z_local",
+        "demo",
+        stage="quantize",
+        attempt_id="attempt-1",
+        limit=10,
+        tail=True,
+    )
+    assert tailed["total"] == 50000
+    assert [item["text"] for item in tailed["items"]] == [
+        f"line{n:05d}" for n in range(49991, 50001)
+    ]
+
+
 
 def test_store_truncates_oversized_log_lines(tmp_path: Path) -> None:
     _make_run(tmp_path)
