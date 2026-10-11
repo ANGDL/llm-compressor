@@ -82,6 +82,21 @@ class WeightMaterializer(ABC):
         """Map an internal logical tensor name to its serialized name."""
         return tensor_name
 
+    def output_tensor_names(self, tensor_name: str) -> tuple[str, ...]:
+        """Return every serialized name produced by one logical tensor.
+
+        Most materializers preserve the one-tensor/one-name relationship.
+        Checkpoint conversions may instead expand one in-memory tensor back into
+        several checkpoint tensors (for example a fused QKV convolution).
+        """
+        return (self.output_tensor_name(tensor_name),)
+
+    def prepare_output_tensors(
+        self, tensor_name: str, tensor: torch.Tensor
+    ) -> Mapping[str, torch.Tensor]:
+        """Convert one logical tensor to its serialized tensor payloads."""
+        return {self.output_tensor_name(tensor_name): tensor}
+
     def output_module_name(self, module_name: str) -> str:
         """Map an internal logical module name to its serialized name."""
         output_weight = self.output_tensor_name(f"{module_name}.weight")

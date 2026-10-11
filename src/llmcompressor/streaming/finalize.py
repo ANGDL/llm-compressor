@@ -183,13 +183,14 @@ def finalize_streaming_checkpoint(
     source_names = set(source.tensor_names())
     output_source_names = {}
     for source_name in source_names:
-        output_name = materializer.output_tensor_name(source_name)
-        previous = output_source_names.setdefault(output_name, source_name)
-        if previous != source_name:
-            raise ValueError(
-                "Materializer output tensor names are not unique: "
-                f"{previous!r} and {source_name!r} both map to {output_name!r}"
-            )
+        for output_name in materializer.output_tensor_names(source_name):
+            previous = output_source_names.setdefault(output_name, source_name)
+            if previous != source_name:
+                raise ValueError(
+                    "Materializer output tensor names are not unique: "
+                    f"{previous!r} and {source_name!r} both map to "
+                    f"{output_name!r}"
+                )
     shards_dir = staging if publish_in_place else staging / "shards"
     states_dir = (
         staging / ".streaming-state"
@@ -284,17 +285,24 @@ def finalize_streaming_checkpoint(
         )
         for source_name in source_names:
             module_name, separator, tensor_name = source_name.rpartition(".")
-            output_name = materializer.output_tensor_name(source_name)
+            output_names = materializer.output_tensor_names(source_name)
             if separator and tensor_name == "weight":
-                output_module_name = materializer.output_module_name(module_name)
+                try:
+                    output_module_name = materializer.output_module_name(module_name)
+                except ValueError:
+                    output_module_name = None
                 if output_module_name in quantized_modules:
                     continue
-            if output_name not in weight_map:
-                if output_name in omitted_tied_weights:
-                    continue
+            missing_output_names = [
+                output_name
+                for output_name in output_names
+                if output_name not in weight_map
+                and output_name not in omitted_tied_weights
+            ]
+            if missing_output_names:
                 raise ValueError(
                     "Non-quantized source tensor is missing from output: "
-                    f"{source_name!r} -> {output_name!r}"
+                    f"{source_name!r} -> {missing_output_names!r}"
                 )
         streaming_logger.info("finalize | model metadata valid")
 
