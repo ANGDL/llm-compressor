@@ -5,13 +5,17 @@ from pathlib import Path
 import pytest
 import torch
 from compressed_tensors.utils.match import match_name, match_named_modules
-
+from transformers import PretrainedConfig
 
 SCRIPT_PATH = Path(__file__).parents[2] / "examples/multimodal_vision/glm5_next_wNa8.py"
+STREAMING_SCRIPT_PATH = (
+    Path(__file__).parents[2] / "examples/streaming_oneshot/glm5_next_wNa8.py"
+)
 
 # Keep in sync with the example's own constants via the AST loader below.
 WANTED_NAMES = {
     "_config_value",
+    "build_ignores",
     "_glm5_next_runtime_name_aliases",
     "_runtime_portable_pattern",
     "build_glm5_next_w8a8_ignores",
@@ -58,9 +62,9 @@ class TinyGlm5LinearModel(torch.nn.Module):
         )
 
 
-def _load_script_namespace() -> dict:
+def _load_script_namespace(script_path: Path = SCRIPT_PATH) -> dict:
     """Load the example's helpers without executing its argparse script body."""
-    tree = ast.parse(SCRIPT_PATH.read_text(encoding="utf-8"))
+    tree = ast.parse(script_path.read_text(encoding="utf-8"))
     body = []
     for node in tree.body:
         if isinstance(node, ast.FunctionDef) and node.name in WANTED_NAMES:
@@ -73,10 +77,134 @@ def _load_script_namespace() -> dict:
 
     namespace = {"re": re, "torch": torch, "match_name": match_name}
     exec(
-        compile(ast.Module(body=body, type_ignores=[]), str(SCRIPT_PATH), "exec"),
+        compile(ast.Module(body=body, type_ignores=[]), str(script_path), "exec"),
         namespace,
     )
     return namespace
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("root_as_dict", [False, True])
+@pytest.mark.parametrize("text_as_dict", [False, True])
+@pytest.mark.parametrize("linear_attn_as_dict", [False, True])
+@pytest.mark.parametrize("layer_type", [list, tuple])
+def test_streaming_kda_ignores_match_multimodal_layout(
+    root_as_dict, text_as_dict, linear_attn_as_dict, layer_type
+):
+    kda_layers = [index for index in range(48) if index % 4 != 3]
+    linear_attn_config = {"kda_layers": layer_type(kda_layers[::-1] + [1])}
+    if not linear_attn_as_dict:
+        linear_attn_config = PretrainedConfig(**linear_attn_config)
+    text_config = {
+        "num_hidden_layers": 48,
+        "linear_attn_config": linear_attn_config,
+    }
+    if not text_as_dict:
+        text_config = PretrainedConfig(**text_config)
+    config = {"text_config": text_config}
+    if not root_as_dict:
+        config = PretrainedConfig(**config)
+
+    streaming_ignores = _load_script_namespace(STREAMING_SCRIPT_PATH)["build_ignores"](
+        config
+    )
+    multimodal_ignores = _load_script_namespace()["build_glm5_next_w8a8_ignores"](
+        config
+    )
+    for root in ("model", "model.language_model", "language_model.model"):
+        for index in range(48):
+            for suffix in ("", ".o_proj", ".o_proj.weight_scale", ".q_a_proj"):
+                name = f"{root}.layers.{index}.self_attn{suffix}"
+                expected = index in kda_layers
+                assert (
+                    any(match_name(name, rule) for rule in streaming_ignores)
+                    == expected
+                )
+                assert (
+                    any(match_name(name, rule) for rule in multimodal_ignores)
+                    == expected
+                )
+            name = f"{root}.layers.{index}.mlp.gate_proj"
+            assert not any(match_name(name, rule) for rule in streaming_ignores)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("as_dict", [False, True])
+def test_streaming_kda_ignores_accept_unwrapped_text_config(as_dict):
+    config = {"num_hidden_layers": 4, "linear_attn_config": {"kda_layers": [2, 0, 2]}}
+    if not as_dict:
+        config = PretrainedConfig(**config)
+    ignores = _load_script_namespace(STREAMING_SCRIPT_PATH)["build_ignores"](config)
+    assert ignores[0] == r"re:.*\.layers\.(?:0|2)\.self_attn(?:\..*)?$"
+
+
+@pytest.mark.unit
+def test_streaming_w8a8_targets_exclude_kda_but_keep_dsa_and_mlp():
+    tree = ast.parse(STREAMING_SCRIPT_PATH.read_text(encoding="utf-8"))
+    main = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "main"
+    )
+    targets = next(
+        ast.literal_eval(node.value)
+        for node in main.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "other_targets"
+            for target in node.targets
+        )
+    )
+    model = TinyGlm5LinearModel()
+    model.model.language_model.layers.extend(
+        [TinyGlm5LinearModel().model.language_model.layers[0] for _ in range(3)]
+    )
+    for layer in model.model.language_model.layers:
+        layer["self_attn"] = torch.nn.ModuleDict(
+            {
+                name: torch.nn.Linear(4, 4)
+                for name in ("o_proj", "q_a_proj", "kv_b_proj")
+            }
+        )
+    ignores = _load_script_namespace(STREAMING_SCRIPT_PATH)["build_ignores"](
+        {
+            "text_config": {
+                "num_hidden_layers": 4,
+                "linear_attn_config": {"kda_layers": [0, 1, 2]},
+            }
+        }
+    )
+    matched = dict(match_named_modules(model, targets, ignores))
+    assert set(matched) == {
+        *(f"model.language_model.layers.{index}.mlp.gate_proj" for index in range(4)),
+        "model.language_model.layers.3.self_attn.o_proj",
+        "model.language_model.layers.3.self_attn.q_a_proj",
+    }
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "text_config",
+    [
+        {},
+        {"num_hidden_layers": 4},
+        {"num_hidden_layers": 4, "linear_attn_config": {}},
+        {"num_hidden_layers": 4, "linear_attn_config": {"kda_layers": None}},
+        {"num_hidden_layers": 4, "linear_attn_config": {"kda_layers": []}},
+        {"num_hidden_layers": 4, "linear_attn_config": {"kda_layers": "0,1"}},
+        {"num_hidden_layers": 4, "linear_attn_config": {"kda_layers": [0, -1]}},
+        {"num_hidden_layers": 4, "linear_attn_config": {"kda_layers": [0, 4]}},
+        {"num_hidden_layers": 4, "linear_attn_config": {"kda_layers": [0, "1"]}},
+        {"num_hidden_layers": 4, "linear_attn_config": {"kda_layers": [0, 1.5]}},
+        {"linear_attn_config": {"kda_layers": [0]}},
+        {"num_hidden_layers": "4", "linear_attn_config": {"kda_layers": [0]}},
+    ],
+)
+def test_streaming_kda_ignores_reject_invalid_layout(text_config):
+    build_ignores = _load_script_namespace(STREAMING_SCRIPT_PATH)["build_ignores"]
+    with pytest.raises(ValueError, match="GLM-5.3 text config"):
+        build_ignores(PretrainedConfig(text_config=PretrainedConfig(**text_config)))
 
 
 @pytest.mark.unit

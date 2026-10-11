@@ -392,11 +392,14 @@ def quantize_streaming(
                             target_dtype,
                         ),
                     )
-                transaction.write_tensor(
-                    materializer.output_tensor_name(name),
-                    value,
-                    output_shard=output_name,
-                )
+                for serialized_name, serialized_tensor in (
+                    materializer.prepare_output_tensors(name, value).items()
+                ):
+                    transaction.write_tensor(
+                        serialized_name,
+                        serialized_tensor,
+                        output_shard=output_name,
+                    )
                 del raw_values, value
 
             for alias, canonical in omitted_tied_weights.items():

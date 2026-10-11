@@ -403,10 +403,62 @@ class TransformersWeightMaterializer(WeightMaterializer):
         return self.materializer.output_config_updates()
 
     def output_tensor_name(self, tensor_name: str) -> str:
+        names = self.output_tensor_names(tensor_name)
+        if len(names) != 1:
+            raise ValueError(
+                f"Transformers checkpoint conversion expands {tensor_name!r} "
+                f"to multiple output tensors: {names}"
+            )
+        return names[0]
+
+    def output_tensor_names(self, tensor_name: str) -> tuple[str, ...]:
         group = self._groups.get(tensor_name)
         if group is not None and group.transformed:
-            return tensor_name
-        return self.materializer.output_tensor_name(tensor_name)
+            return tuple(source.name for source in group.sources)
+        return (self.materializer.output_tensor_name(tensor_name),)
+
+    def prepare_output_tensors(
+        self, tensor_name: str, tensor: torch.Tensor
+    ) -> Mapping[str, torch.Tensor]:
+        group = self._groups.get(tensor_name)
+        if group is None or not group.transformed:
+            return self.materializer.prepare_output_tensors(tensor_name, tensor)
+        if group.converter is None:
+            if len(group.sources) != 1:
+                raise ValueError(
+                    f"Multiple checkpoint tensors map to {tensor_name!r} "
+                    "without a reversible WeightConverter"
+                )
+            return {group.sources[0].name: tensor}
+
+        try:
+            reverse_converter = deepcopy(group.converter).reverse_transform()
+        except (AttributeError, ValueError) as error:
+            raise NotImplementedError(
+                "Streaming Transformers conversion cannot restore the original "
+                f"checkpoint tensors for {tensor_name!r}: {group.converter!r}"
+            ) from error
+        renamed_name, source_pattern = reverse_converter.rename_source_key(tensor_name)
+        if source_pattern is None:
+            raise ValueError(
+                f"Reverse Transformers converter does not match {tensor_name!r}"
+            )
+        reverse_converter.add_tensor(
+            renamed_name, tensor_name, source_pattern, tensor
+        )
+        converted = reverse_converter.convert(
+            renamed_name,
+            model=self.model,
+            config=getattr(self.model, "config", None),
+        )
+        expected = {source.name for source in group.sources}
+        if set(converted) != expected:
+            raise ValueError(
+                "Reverse Transformers converter produced unexpected tensors for "
+                f"{tensor_name!r}: expected={sorted(expected)}, "
+                f"actual={sorted(converted)}"
+            )
+        return converted
 
     def output_weight_scale_name(self, output_module_name: str) -> str:
         weight_name = f"{output_module_name}.weight"

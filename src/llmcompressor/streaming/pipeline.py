@@ -186,6 +186,18 @@ def _serialized_module_name(
     )
 
 
+def _prepared_output_tensors(
+    materializer: WeightMaterializer | None,
+    tensor_name: str,
+    tensor: torch.Tensor,
+) -> Mapping[str, torch.Tensor]:
+    return (
+        {tensor_name: tensor}
+        if materializer is None
+        else materializer.prepare_output_tensors(tensor_name, tensor)
+    )
+
+
 def _normalized_recipe_payload(recipe: Recipe) -> dict[str, Any]:
     payload = recipe.model_dump(mode="json", exclude={"modifiers"})
     payload["modifiers"] = [
@@ -310,12 +322,14 @@ def _write_loaded_target(
             formats,
             pack_to_int8=pack_to_int8,
         )
-        output_name = materializer.output_tensor_name(name)
-        transaction.write_tensor(
-            output_name,
-            tensor,
-            output_shard=_output_shard(source, name, owner_name),
-        )
+        for output_name, output_tensor in materializer.prepare_output_tensors(
+            name, tensor
+        ).items():
+            transaction.write_tensor(
+                output_name,
+                output_tensor,
+                output_shard=_output_shard(source, name, owner_name),
+            )
         written.add(name)
 
     for module_name, format_name in formats.items():
@@ -358,13 +372,20 @@ def _loaded_target_delta(
             formats,
             pack_to_int8=pack_to_int8,
         )
-        output_name = _serialized_tensor_name(materializer, name)
-        if output_name in tensors:
-            raise ValueError(f"Duplicate serialized tensor name {output_name!r}")
-        tensors[output_name] = prepared
+        output_tensors = _prepared_output_tensors(materializer, name, prepared)
+        for output_name, output_tensor in output_tensors.items():
+            if output_name in tensors:
+                raise ValueError(
+                    f"Duplicate serialized tensor name {output_name!r}"
+                )
+            tensors[output_name] = output_tensor
         written.add(name)
         if prepared is not tensor and prepared.device.type == "cpu":
-            owned_cpu_tensors.add(output_name)
+            owned_cpu_tensors.update(
+                name
+                for name, value in output_tensors.items()
+                if value.device.type == "cpu"
+            )
     output_formats = {
         _serialized_module_name(materializer, name): format_name
         for name, format_name in formats.items()
@@ -544,14 +565,22 @@ def _write_remaining_direct_shards(
             )[name]
         else:
             value = source.load_tensors_cpu((name,))[name]
-        value_bytes = value.numel() * value.element_size()
-        if tensors and tensor_bytes + value_bytes > max_shard_bytes:
+        output_tensors = materializer.prepare_output_tensors(name, value)
+        if tensors and tensor_bytes + sum(
+            output_tensor.numel() * output_tensor.element_size()
+            for output_tensor in output_tensors.values()
+        ) > max_shard_bytes:
             flush()
-        output_name = materializer.output_tensor_name(name)
-        if output_name in tensors:
-            raise ValueError(f"Duplicate serialized tensor name {output_name!r}")
-        tensors[output_name] = value
-        tensor_bytes += value_bytes
+        for output_name, output_tensor in output_tensors.items():
+            if output_name in tensors:
+                raise ValueError(
+                    f"Duplicate serialized tensor name {output_name!r}"
+                )
+            tensors[output_name] = output_tensor
+        tensor_bytes += sum(
+            output_tensor.numel() * output_tensor.element_size()
+            for output_tensor in output_tensors.values()
+        )
         written.add(name)
     flush()
 
@@ -657,11 +686,14 @@ def _copy_remaining_tensors(
         else:
             value = source.load_tensors_cpu((name,))[name]
         with writer.transaction(transaction_id) as transaction:
-            transaction.write_tensor(
-                materializer.output_tensor_name(name),
-                value,
-                output_shard=metadata.shard.name,
-            )
+            for output_name, output_tensor in materializer.prepare_output_tensors(
+                name, value
+            ).items():
+                transaction.write_tensor(
+                    output_name,
+                    output_tensor,
+                    output_shard=metadata.shard.name,
+                )
             for alias, canonical in omitted.items():
                 transaction.omit_tied_weight(
                     materializer.output_tensor_name(alias),

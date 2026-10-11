@@ -4,11 +4,12 @@ from typing import Mapping
 
 import pytest
 import torch
-from safetensors.torch import save_file
+from safetensors.torch import load_file, save_file
 from transformers.conversion_mapping import Concatenate
 from transformers.core_model_loading import WeightConverter, WeightRenaming
 
 from llmcompressor.streaming.checkpoint import (
+    DirectSafetensorsWriter,
     SafetensorsWeightSource,
     TensorMetadata,
 )
@@ -23,6 +24,7 @@ from llmcompressor.streaming.materialization import (
     WeightMaterializer,
     materialize_weights,
 )
+from llmcompressor.streaming.pipeline import _write_remaining_direct_shards
 
 
 def test_streaming_dtype_policy_preserves_control_state_by_default():
@@ -520,6 +522,150 @@ def test_transformers_materializer_applies_registered_weight_conversions(
         result["layer.experts.0.weight"],
         expert.to(torch.bfloat16),
     )
+
+
+def test_transformers_materializer_restores_checkpoint_names_on_output(tmp_path):
+    class ConvertedModel(torch.nn.Module):
+        base_model_prefix = ""
+
+        def __init__(self):
+            super().__init__()
+            self.layer = torch.nn.Module()
+            self.layer.attn_hc = torch.nn.Module()
+            self.layer.attn_hc.fn = torch.nn.Parameter(torch.empty(2))
+            self.layer.ffn_hc = torch.nn.Module()
+            self.layer.ffn_hc.scale = torch.nn.Parameter(torch.empty(3))
+            self.layer.self_attn = torch.nn.Module()
+            self.layer.self_attn.forget_gate = torch.nn.Module()
+            self.layer.self_attn.forget_gate.A_log = torch.nn.Parameter(
+                torch.empty(2)
+            )
+            self.layer.self_attn.forget_gate.dt_bias = torch.nn.Parameter(
+                torch.empty(2)
+            )
+            self.layer.self_attn.conv1d = torch.nn.Conv1d(
+                6, 6, kernel_size=4, groups=6, bias=False
+            )
+
+    q_conv = torch.arange(8, dtype=torch.float16).reshape(2, 1, 4)
+    k_conv = q_conv + 10
+    v_conv = q_conv + 20
+    hc_attn_fn = torch.arange(2, dtype=torch.float32)
+    hc_ffn_scale = torch.arange(3, dtype=torch.float32) + 40
+    a_log = hc_attn_fn + 30
+    dt_bias = hc_attn_fn + 50
+    path = tmp_path / "model.safetensors"
+    save_file(
+        {
+            "layer.hc_attn_fn": hc_attn_fn,
+            "layer.hc_ffn_scale": hc_ffn_scale,
+            "layer.self_attn.A_log": a_log,
+            "layer.self_attn.dt_bias": dt_bias,
+            "layer.self_attn.q_conv1d.weight": q_conv,
+            "layer.self_attn.k_conv1d.weight": k_conv,
+            "layer.self_attn.v_conv1d.weight": v_conv,
+        },
+        path,
+    )
+    conversions = [
+        WeightRenaming("hc_attn_fn", "attn_hc.fn"),
+        WeightRenaming("hc_ffn_scale", "ffn_hc.scale"),
+        WeightRenaming(
+            r"self_attn\.A_log", "self_attn.forget_gate.A_log"
+        ),
+        WeightRenaming(
+            r"self_attn\.dt_bias", "self_attn.forget_gate.dt_bias"
+        ),
+        WeightConverter(
+            source_patterns=[
+                "self_attn.q_conv1d.weight",
+                "self_attn.k_conv1d.weight",
+                "self_attn.v_conv1d.weight",
+            ],
+            target_patterns="self_attn.conv1d.weight",
+            operations=[Concatenate(dim=0)],
+        ),
+    ]
+    with torch.device("meta"):
+        model = ConvertedModel()
+    materializer = TransformersWeightMaterializer(
+        CastWeightMaterializer(), model, conversions
+    )
+    source = materializer.create_source(str(path))
+    values = materialize_weights(
+        source,
+        source.tensor_names(),
+        materializer,
+        target_dtype=torch.float32,
+    )
+
+    assert materializer.output_tensor_names("layer.attn_hc.fn") == (
+        "layer.hc_attn_fn",
+    )
+    hc_outputs = materializer.prepare_output_tensors(
+        "layer.attn_hc.fn", values["layer.attn_hc.fn"]
+    )
+    assert tuple(hc_outputs) == ("layer.hc_attn_fn",)
+    assert torch.equal(hc_outputs["layer.hc_attn_fn"], hc_attn_fn)
+    assert materializer.output_tensor_names("layer.ffn_hc.scale") == (
+        "layer.hc_ffn_scale",
+    )
+    assert materializer.output_tensor_names(
+        "layer.self_attn.forget_gate.A_log"
+    ) == ("layer.self_attn.A_log",)
+    a_log_outputs = materializer.prepare_output_tensors(
+        "layer.self_attn.forget_gate.A_log",
+        values["layer.self_attn.forget_gate.A_log"],
+    )
+    assert tuple(a_log_outputs) == ("layer.self_attn.A_log",)
+    assert torch.equal(a_log_outputs["layer.self_attn.A_log"], a_log)
+    assert materializer.output_tensor_names(
+        "layer.self_attn.forget_gate.dt_bias"
+    ) == ("layer.self_attn.dt_bias",)
+    conv_outputs = materializer.prepare_output_tensors(
+        "layer.self_attn.conv1d.weight",
+        values["layer.self_attn.conv1d.weight"],
+    )
+    assert tuple(conv_outputs) == (
+        "layer.self_attn.q_conv1d.weight",
+        "layer.self_attn.k_conv1d.weight",
+        "layer.self_attn.v_conv1d.weight",
+    )
+    assert torch.equal(conv_outputs["layer.self_attn.q_conv1d.weight"], q_conv)
+    assert torch.equal(conv_outputs["layer.self_attn.k_conv1d.weight"], k_conv)
+    assert torch.equal(conv_outputs["layer.self_attn.v_conv1d.weight"], v_conv)
+
+    output_dir = tmp_path / "output"
+    writer = DirectSafetensorsWriter(output_dir, run_fingerprint="test")
+    _write_remaining_direct_shards(
+        writer=writer,
+        source=source,
+        materializer=materializer,
+        dtype_policy=None,
+        target_dtype=torch.float32,
+        written=set(),
+        omitted={},
+    )
+    emitted = {}
+    for shard in output_dir.glob("*.safetensors"):
+        emitted.update(load_file(shard))
+
+    assert set(emitted) == {
+        "layer.hc_attn_fn",
+        "layer.hc_ffn_scale",
+        "layer.self_attn.A_log",
+        "layer.self_attn.dt_bias",
+        "layer.self_attn.q_conv1d.weight",
+        "layer.self_attn.k_conv1d.weight",
+        "layer.self_attn.v_conv1d.weight",
+    }
+    assert torch.equal(emitted["layer.hc_attn_fn"], hc_attn_fn)
+    assert torch.equal(emitted["layer.hc_ffn_scale"], hc_ffn_scale)
+    assert torch.equal(emitted["layer.self_attn.A_log"], a_log)
+    assert torch.equal(emitted["layer.self_attn.dt_bias"], dt_bias)
+    assert torch.equal(emitted["layer.self_attn.q_conv1d.weight"], q_conv)
+    assert torch.equal(emitted["layer.self_attn.k_conv1d.weight"], k_conv)
+    assert torch.equal(emitted["layer.self_attn.v_conv1d.weight"], v_conv)
 
 
 def test_kimi_k3_source_maps_packed_expert_to_logical_weight(tmp_path):

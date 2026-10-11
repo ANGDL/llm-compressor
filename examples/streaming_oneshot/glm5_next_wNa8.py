@@ -5,7 +5,9 @@ routed experts are linearized by the frontend before recipe targets are resolved
 Routed expert projections use W4A8, while selected attention and dense/shared MLP
 projections use W8A8.
 KDA/indexer parameters, norms, embeddings, heads, and the visual branch remain
-in their source dtype.
+in their source dtype. The text config must provide a non-empty
+``linear_attn_config.kda_layers`` layout with valid layer indices; missing or
+invalid layouts fail before calibration data is loaded.
 
 Example::
 
@@ -234,21 +236,33 @@ def data_collator(batch: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
     }
 
 
+def _config_value(config, key):
+    if isinstance(config, dict):
+        return config.get(key)
+    return getattr(config, key, None)
+
+
 def build_ignores(config) -> list[str]:
     """Modules excluded from mixed W4A8/W8A8 quantization."""
-    text_config = getattr(config, "text_config", config)
-    linear_attn_config = getattr(text_config, "linear_attn_config", None)
-    kda_layers = getattr(linear_attn_config, "kda_layers", ())
-    kda = (
-        [
-            r"re:.*\.layers\.(?:"
-            + "|".join(str(index) for index in sorted(set(kda_layers)))
-            + r")\.self_attn(?:\..*)?$"
-        ]
-        if kda_layers
-        else []
-    )
-    return kda + [
+    text_config = _config_value(config, "text_config")
+    if text_config is None:
+        text_config = config
+    linear_attn_config = _config_value(text_config, "linear_attn_config")
+    kda_layers = _config_value(linear_attn_config, "kda_layers")
+    num_hidden_layers = _config_value(text_config, "num_hidden_layers")
+    if not isinstance(kda_layers, (list, tuple)) or not kda_layers:
+        raise ValueError(
+            "GLM-5.3 text config must define linear_attn_config.kda_layers"
+        )
+    if not isinstance(num_hidden_layers, int) or any(
+        not isinstance(layer, int) or layer < 0 or layer >= num_hidden_layers
+        for layer in kda_layers
+    ):
+        raise ValueError("GLM-5.3 text config contains invalid KDA layer indices")
+
+    kda_layer_pattern = "(?:" + "|".join(map(str, sorted(set(kda_layers)))) + ")"
+    return [
+        rf"re:.*\.layers\.{kda_layer_pattern}\.self_attn(?:\..*)?$",
         "lm_head",
         r"re:.*(?:^|\.)embed_tokens$",
         r"re:.*(?:^|\.)visual(?:\..*)?$",
@@ -311,6 +325,7 @@ def main() -> None:
         parser.error("--text-calibration-samples must be non-negative")
 
     config = AutoConfig.from_pretrained(args.model_id, local_files_only=True)
+    ignores = build_ignores(config)
     processor = AutoProcessor.from_pretrained(
         args.model_id,
         local_files_only=True,
@@ -401,7 +416,6 @@ def main() -> None:
         ),
     }
 
-    ignores = build_ignores(config)
     recipe = [
         IMatrixGatherer(ignore=ignores),
         QuantizationModifier(config_groups=schemes, ignore=ignores),
