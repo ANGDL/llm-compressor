@@ -54,11 +54,14 @@ from compressed_tensors.quantization.quant_args import (
     QuantizationType,
 )
 from torch.utils.data import DataLoader
-from transformers import AutoConfig, AutoModelForCausalLM, AutoProcessor
-from transformers.dynamic_module_utils import get_class_from_dynamic_module
+from transformers import AutoProcessor
 
 from datasets import Dataset, load_dataset
-from llmcompressor.modeling.kimi_k3 import patch_kimi_k3_transformers_compat
+from llmcompressor.modeling.kimi_k3 import (
+    KimiK3Config,
+    KimiK3ForConditionalGeneration,
+    patch_kimi_k3_transformers_compat,
+)
 from llmcompressor.modifiers.quantization import QuantizationModifier
 from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
 from llmcompressor.streaming import KimiK3WeightMaterializer, streaming_oneshot
@@ -378,29 +381,13 @@ def _other_targets_from_index(
 
 
 def _register_k3_model(model_id: Path):
-    """Load K3 remote classes and make ``AutoModelForCausalLM.from_config`` work."""
+    """Load the repository-owned K3 config for the explicit local model factory."""
+
+    # Transformers 5 renamed the FA2 capability flag. Keep the compatibility
+    # shim used by the checkpoint-native loader before constructing the local
+    # vision tower, which still advertises ``_supports_flash_attn_2``.
     patch_kimi_k3_transformers_compat()
-    config = AutoConfig.from_pretrained(
-        model_id, trust_remote_code=True, local_files_only=True
-    )
-    model_ref = config.auto_map.get("AutoModelForCausalLM")
-    if not model_ref:
-        raise ValueError("Kimi K3 config has no AutoModelForCausalLM auto_map")
-    model_class = get_class_from_dynamic_module(
-        model_ref, str(model_id), local_files_only=True
-    )
-    model_class = patch_kimi_k3_transformers_compat(model_class)
-    try:
-        AutoConfig.register(config.model_type, type(config))
-    except ValueError:
-        # Re-running this example in one interpreter is harmless when the same
-        # dynamic class is already registered.
-        pass
-    try:
-        AutoModelForCausalLM.register(type(config), model_class)
-    except ValueError:
-        pass
-    return config
+    return KimiK3Config.from_pretrained(model_id, local_files_only=True)
 
 
 def _kda_num_heads(config: Any) -> int:
@@ -553,6 +540,7 @@ def main() -> None:
         result = streaming_oneshot(
             model=model_id,
             model_config=config,
+            model_factory=KimiK3ForConditionalGeneration,
             dataset=calibration_dataloader,
             tokenizer=processor,
             recipe=recipe,

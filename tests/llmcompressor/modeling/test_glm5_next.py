@@ -62,21 +62,38 @@ def test_linearize_glm5_preserves_expert_outputs():
 
 
 def test_kda_backend_choice_honors_env(monkeypatch):
+    monkeypatch.setenv("LLMCOMPRESSOR_DISABLE_TRITON", "0")
     monkeypatch.setenv("LLMCOMPRESSOR_KDA_BACKEND", "torch")
     assert glm5_next._kda_backend_choice() == "torch"
     monkeypatch.setenv("LLMCOMPRESSOR_KDA_BACKEND", "triton")
-    assert glm5_next._kda_backend_choice() == "triton"
+    assert glm5_next._kda_backend_choice() == "fla"
+
+
+def test_global_triton_switch_forces_fla_reference_kda(monkeypatch):
+    monkeypatch.setenv("LLMCOMPRESSOR_DISABLE_TRITON", "1")
+    monkeypatch.setenv("LLMCOMPRESSOR_KDA_BACKEND", "triton")
+    import pytest
+
+    with pytest.raises(RuntimeError, match="backend 'fla'.*Triton is disabled"):
+        glm5_next._kda_backend_choice()
 
 
 def test_kda_backend_choice_auto_follows_xpu(monkeypatch):
     import importlib.util
 
+    monkeypatch.setenv("LLMCOMPRESSOR_DISABLE_TRITON", "0")
     monkeypatch.delenv("LLMCOMPRESSOR_KDA_BACKEND", raising=False)
-    on_xpu = importlib.util.find_spec("torch_xmlir") is not None
-    assert glm5_next._kda_backend_choice() == ("torch" if on_xpu else "triton")
+    importlib.util.find_spec("torch_xmlir")
+    assert glm5_next._kda_backend_choice() == "default"
 
 
-def test_force_torch_kda_backend_nulls_fla_entrypoints(monkeypatch):
+def test_kda_backend_choice_auto_falls_back_to_torch_when_triton_disabled(monkeypatch):
+    monkeypatch.setenv("LLMCOMPRESSOR_DISABLE_TRITON", "1")
+    monkeypatch.delenv("LLMCOMPRESSOR_KDA_BACKEND", raising=False)
+    assert glm5_next._kda_backend_choice() == "torch"
+
+
+def test_force_fla_reference_kda_backend_replaces_fla_entrypoints(monkeypatch):
     import sys
     from types import ModuleType
 
@@ -89,7 +106,7 @@ def test_force_torch_kda_backend_nulls_fla_entrypoints(monkeypatch):
     monkeypatch.setitem(sys.modules, "fla.ops", ops)
     monkeypatch.setitem(sys.modules, "fla.ops.kda", kda)
 
-    glm5_next._force_torch_kda_backend()
+    glm5_next._force_fla_reference_kda_backend()
 
-    assert kda.chunk_kda is None
-    assert kda.fused_recurrent_kda is None
+    assert callable(kda.chunk_kda)
+    assert callable(kda.fused_recurrent_kda)

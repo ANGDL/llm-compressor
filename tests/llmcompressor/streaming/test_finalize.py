@@ -13,7 +13,10 @@ from llmcompressor.streaming import (
     finalize_streaming_checkpoint,
     quantize_streaming,
 )
-from llmcompressor.streaming.finalize import _validate_quantized_module_weights
+from llmcompressor.streaming.finalize import (
+    _validate_quantized_module_weights,
+    _validate_transformers_config,
+)
 from tests.llmcompressor.streaming.test_quantize import prepare, scheme
 
 
@@ -246,3 +249,66 @@ def test_finalize_omits_identical_declared_tied_weight(tmp_path, monkeypatch):
     )
     assert "layers.0.weight" in output_index["weight_map"]
     assert "lm_head.weight" not in output_index["weight_map"]
+
+
+def test_validate_transformers_config_passes_trust_remote_code(tmp_path, monkeypatch):
+    recorded = {}
+
+    class FakeAutoConfig:
+        @classmethod
+        def from_pretrained(cls, path, **kwargs):
+            recorded["path"] = path
+            recorded["kwargs"] = kwargs
+
+    monkeypatch.setattr(
+        "transformers.AutoConfig.from_pretrained",
+        FakeAutoConfig.from_pretrained,
+    )
+
+    _validate_transformers_config(tmp_path)
+    assert recorded["path"] == tmp_path
+    assert recorded["kwargs"] == {
+        "local_files_only": True,
+        "trust_remote_code": True,
+    }
+
+
+def test_finalize_copy_auxiliary_directory_when_destination_already_exists(
+    tmp_path,
+):
+    checkpoint, artifacts, _, _ = prepare(tmp_path)
+    extra_dir = checkpoint / "custom_module"
+    extra_dir.mkdir()
+    (extra_dir / "custom.py").write_text("# custom code\n", encoding="utf-8")
+
+    staging = tmp_path / "staging"
+    quantize_streaming(
+        checkpoint=checkpoint,
+        artifact_dir=artifacts,
+        staging_dir=staging,
+        schemes={"layers.0": scheme()},
+        target_dtype=torch.float32,
+    )
+
+    output = finalize_streaming_checkpoint(
+        checkpoint=checkpoint,
+        artifact_dir=artifacts,
+        staging_dir=staging,
+        output_dir=tmp_path / "output",
+        validate_config=False,
+    )
+    assert (output / "custom_module" / "custom.py").is_file()
+
+    # Finalize again to an output where the directory already exists
+    output2 = finalize_streaming_checkpoint(
+        checkpoint=checkpoint,
+        artifact_dir=artifacts,
+        staging_dir=staging,
+        output_dir=output,
+        overwrite_output=True,
+        validate_config=False,
+    )
+    assert (output2 / "custom_module" / "custom.py").is_file()
+
+
+

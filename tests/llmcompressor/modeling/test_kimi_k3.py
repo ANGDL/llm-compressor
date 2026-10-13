@@ -1,11 +1,13 @@
 import ast
+import inspect
 import sys
 from types import ModuleType
 from unittest.mock import patch
 
+import pytest
 import torch
 from torch import nn
-from transformers import PreTrainedModel, PretrainedConfig
+from transformers import PretrainedConfig, PreTrainedModel
 from transformers.generation import GenerationMixin
 from transformers.utils import generic as transformers_generic
 from transformers.utils import import_utils
@@ -13,11 +15,325 @@ from transformers.utils.output_capturing import OutputRecorder
 
 from llmcompressor.modeling.kimi_k3 import (
     CalibrationKimiK3SparseMoeBlock,
+    KimiK3VisionConfig,
     _patch_flash_attn_varlen_func,
     _patch_transformers_v5_for_checkpoint_code,
     patch_kimi_k3_transformers_compat,
 )
+from llmcompressor.modeling.kimi_k3.modeling_kimi_k3 import MoonViT3dPretrainedModel
+from llmcompressor.modeling.kimi_k3.modeling_kimi_linear import (
+    _fla_reference_kda_adapter,
+    naive_chunk_kda,
+    naive_kda_gate,
+    naive_kda_lowerbound_gate,
+    naive_recurrent_kda,
+)
 from llmcompressor.pipelines.sequential.ast_utils.auto_wrapper import AutoWrapper
+
+
+def _transformers_kda_gate(raw_g, A_log, dt_bias, lower_bound=None):
+    """Mirror Transformers' forget-gate calculation for independent parity tests."""
+    heads, head_dim = raw_g.shape[-2:]
+    g = raw_g.float() + dt_bias.float().view(1, 1, heads, head_dim)
+    decay_rate = A_log.float().view(1, 1, heads, 1).exp()
+    if lower_bound is not None:
+        return lower_bound * torch.sigmoid(decay_rate * g)
+    g_softplus = torch.where(g > 20.0, g, torch.log(1.0 + torch.exp(g)))
+    return -decay_rate * g_softplus
+
+
+def test_kimi_k3_vision_config_preserves_attention_implementation():
+    assert KimiK3VisionConfig()._attn_implementation == "flash_attention_2"
+    assert (
+        KimiK3VisionConfig(_attn_implementation="eager")._attn_implementation
+        == "eager"
+    )
+    assert MoonViT3dPretrainedModel._supports_sdpa is False
+
+
+def test_kimi_k3_fla_reference_adapter_preserves_fused_contract():
+    captured = {}
+
+    def chunk_kda(**kwargs):
+        captured.update(kwargs)
+        q = kwargs["q"]
+        state = q.new_zeros(
+            q.shape[0], q.shape[2], q.shape[3], 5
+        )
+        return q, state
+
+    def recurrent_kda(**kwargs):
+        raise AssertionError("non-packed chunk input must use FLA naive chunk KDA")
+
+    def gate(g, A_log, dt_bias, output_dtype):
+        captured["gate_args"] = (A_log, dt_bias, output_dtype)
+        return g + 1
+
+    def lowerbound_gate(g, A_log, dt_bias, lower_bound, output_dtype):
+        captured["lowerbound_gate_args"] = (
+            A_log,
+            dt_bias,
+            lower_bound,
+            output_dtype,
+        )
+        return g + 2
+
+    q = torch.randn(1, 6, 2, 4)
+    g = torch.randn_like(q)
+    beta = torch.randn(1, 6, 2).sigmoid()
+    A_log = torch.ones(2)
+    dt_bias = torch.zeros(8)
+    output, state = _fla_reference_kda_adapter(
+        chunk_kda,
+        recurrent_kda,
+        gate,
+        lowerbound_gate,
+        use_chunk=True,
+    )(
+        q=q,
+        k=q,
+        v=q,
+        g=g,
+        beta=beta,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=True,
+        use_gate_in_kernel=True,
+        lower_bound=-5.0,
+        transpose_state_layout=True,
+    )
+
+    assert captured["chunk_size"] == 2
+    assert captured["scale"] == 4**-0.5
+    assert captured["lowerbound_gate_args"] == (
+        A_log,
+        dt_bias,
+        -5.0,
+        torch.float32,
+    )
+    torch.testing.assert_close(captured["beta"], beta)
+    torch.testing.assert_close(
+        captured["g"], g + 2
+    )
+    torch.testing.assert_close(
+        captured["q"].square().sum(dim=-1),
+        torch.ones_like(captured["q"][..., 0]),
+        atol=1e-5,
+        rtol=1e-5,
+    )
+    assert output is captured["q"]
+    assert state.shape == (1, 2, 5, 4)
+
+
+def test_kimi_k3_fla_reference_adapter_uses_recurrent_for_packed_sequences():
+    calls = []
+
+    def chunk_kda(**kwargs):
+        raise AssertionError("packed input must not use FLA naive chunk KDA")
+
+    def recurrent_kda(**kwargs):
+        calls.append(kwargs)
+        q = kwargs["q"]
+        state = q.new_full((1, q.shape[2], q.shape[3], 5), len(calls))
+        return q, state
+
+    def unused_gate(*args, **kwargs):
+        raise AssertionError("gate preprocessing was not requested")
+
+    q = torch.randn(1, 7, 2, 4)
+    output, state = _fla_reference_kda_adapter(
+        chunk_kda,
+        recurrent_kda,
+        unused_gate,
+        unused_gate,
+        use_chunk=True,
+    )(
+        q=q,
+        k=q,
+        v=q,
+        g=q,
+        beta=torch.randn(1, 7, 2),
+        output_final_state=True,
+        cu_seqlens=torch.tensor([0, 3, 7]),
+        transpose_state_layout=True,
+    )
+
+    assert [call["q"].shape[1] for call in calls] == [3, 4]
+    assert output.shape == q.shape
+    assert state.shape == (2, 2, 5, 4)
+
+
+@pytest.mark.skipif(naive_chunk_kda is None, reason="FLA is not installed")
+@pytest.mark.parametrize(
+    ("sequence_length", "lower_bound", "dtype"),
+    [
+        (65, -5.0, torch.float32),
+        (128, -5.0, torch.float32),
+        (65, -5.0, torch.bfloat16),
+        (64, None, torch.float32),
+    ],
+)
+def test_kimi_k3_fla_reference_adapter_matches_transformers_native(
+    sequence_length, lower_bound, dtype
+):
+    from transformers.models.glm5_next import modeling_glm5_next as glm5
+
+    torch.manual_seed(sequence_length + (0 if lower_bound is None else 1000))
+    batch, heads, key_dim, value_dim = 2, 3, 8, 5
+    q = torch.randn(batch, sequence_length, heads, key_dim, dtype=dtype)
+    k = torch.randn_like(q)
+    v = torch.randn(batch, sequence_length, heads, value_dim, dtype=dtype)
+    raw_g = torch.randn_like(q)
+    beta_logits = torch.randn(batch, sequence_length, heads)
+    # This is the caller contract from both original K3 and Transformers:
+    # beta is projected as logits and sigmoid is applied before KDA receives it.
+    beta = beta_logits.sigmoid()
+    A_log = torch.randn(heads, dtype=torch.float32)
+    dt_bias = torch.randn(heads * key_dim, dtype=torch.float32)
+    gate_function = (
+        naive_kda_lowerbound_gate if lower_bound is not None else naive_kda_gate
+    )
+    fla_gate = gate_function(
+        raw_g,
+        A_log,
+        dt_bias,
+        **({"lower_bound": lower_bound} if lower_bound is not None else {}),
+        output_dtype=torch.float32,
+    )
+    native_gate = _transformers_kda_gate(raw_g, A_log, dt_bias, lower_bound)
+    torch.testing.assert_close(fla_gate, native_gate, atol=2e-6, rtol=2e-6)
+    native_initial_state = torch.randn(
+        batch, heads, key_dim, value_dim, dtype=torch.float32
+    )
+    adapter_initial_state = native_initial_state.transpose(-1, -2).contiguous()
+    adapter = _fla_reference_kda_adapter(
+        naive_chunk_kda,
+        naive_recurrent_kda,
+        naive_kda_gate,
+        naive_kda_lowerbound_gate,
+        use_chunk=True,
+    )
+    actual, actual_state = adapter(
+        q=q,
+        k=k,
+        v=v,
+        # Pass raw gate logits and request the adapter's gate preprocessing.
+        # Passing `g` here would reproduce the old, insufficient parity test.
+        g=raw_g,
+        beta=beta,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        output_final_state=True,
+        initial_state=adapter_initial_state,
+        use_qk_l2norm_in_kernel=True,
+        use_gate_in_kernel=True,
+        lower_bound=lower_bound,
+        transpose_state_layout=True,
+    )
+    native_recurrent = inspect.unwrap(glm5.recurrent_kimi_delta_attention)
+    expected, expected_state = native_recurrent(
+        q,
+        k,
+        v,
+        native_gate,
+        beta,
+        native_initial_state,
+        True,
+        use_qk_l2norm_in_kernel=True,
+    )
+    atol = 2e-2 if dtype == torch.bfloat16 else 2e-5
+    torch.testing.assert_close(actual, expected, atol=atol, rtol=atol)
+    torch.testing.assert_close(
+        actual_state.transpose(-1, -2), expected_state, atol=atol, rtol=atol
+    )
+
+    if sequence_length in (64, 128):
+        native_chunk = inspect.unwrap(glm5.chunk_kimi_delta_attention)
+        expected, expected_state = native_chunk(
+            q,
+            k,
+            v,
+            native_gate,
+            beta,
+            chunk_size=64,
+            initial_state=native_initial_state,
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=True,
+        )
+        torch.testing.assert_close(actual, expected, atol=3e-5, rtol=3e-5)
+        torch.testing.assert_close(
+            actual_state.transpose(-1, -2), expected_state, atol=3e-5, rtol=3e-5
+        )
+
+
+@pytest.mark.skipif(naive_recurrent_kda is None, reason="FLA is not installed")
+def test_kimi_k3_fla_reference_adapter_matches_packed_native():
+    from transformers.models.glm5_next import modeling_glm5_next as glm5
+
+    torch.manual_seed(20261012)
+    heads, key_dim, value_dim = 3, 8, 5
+    q = torch.randn(1, 7, heads, key_dim)
+    k = torch.randn_like(q)
+    v = torch.randn(1, 7, heads, value_dim)
+    raw_g = torch.randn_like(q)
+    beta = torch.randn(1, 7, heads).sigmoid()
+    A_log = torch.randn(heads)
+    dt_bias = torch.randn(heads * key_dim)
+    native_gate = _transformers_kda_gate(raw_g, A_log, dt_bias, -5.0)
+    native_initial_state = torch.randn(2, heads, key_dim, value_dim)
+    adapter_initial_state = native_initial_state.transpose(-1, -2).contiguous()
+    cu_seqlens = torch.tensor([0, 3, 7], dtype=torch.int32)
+
+    adapter = _fla_reference_kda_adapter(
+        naive_chunk_kda,
+        naive_recurrent_kda,
+        naive_kda_gate,
+        naive_kda_lowerbound_gate,
+        use_chunk=True,
+    )
+    actual, actual_state = adapter(
+        q=q,
+        k=k,
+        v=v,
+        g=raw_g,
+        beta=beta,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        initial_state=adapter_initial_state,
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=True,
+        use_gate_in_kernel=True,
+        lower_bound=-5.0,
+        cu_seqlens=cu_seqlens,
+        transpose_state_layout=True,
+    )
+
+    native_recurrent = inspect.unwrap(glm5.recurrent_kimi_delta_attention)
+    outputs, states = [], []
+    for index, (start, end) in enumerate(zip(cu_seqlens[:-1], cu_seqlens[1:])):
+        output, state = native_recurrent(
+            q[:, start:end],
+            k[:, start:end],
+            v[:, start:end],
+            native_gate[:, start:end],
+            beta[:, start:end],
+            native_initial_state[index : index + 1],
+            True,
+            use_qk_l2norm_in_kernel=True,
+        )
+        outputs.append(output)
+        states.append(state)
+
+    torch.testing.assert_close(
+        actual, torch.cat(outputs, dim=1), atol=2e-5, rtol=2e-5
+    )
+    torch.testing.assert_close(
+        actual_state.transpose(-1, -2),
+        torch.cat(states, dim=0),
+        atol=2e-5,
+        rtol=2e-5,
+    )
 
 
 def test_kimi_k3_transformers_output_recorder_compat():

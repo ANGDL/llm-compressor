@@ -203,8 +203,6 @@ class KimiK3VisionConfig(PretrainedConfig):
         self.vt_intermediate_size = vt_intermediate_size
         self.merge_kernel_size = merge_kernel_size
         self.merge_type = merge_type
-        self._attn_implementation = _attn_implementation
-
         # MM Projector config
         self.mm_projector_type = mm_projector_type
         self.mm_hidden_size = (
@@ -225,6 +223,11 @@ class KimiK3VisionConfig(PretrainedConfig):
         self.pos_emb_interpolation_mode = pos_emb_interpolation_mode
 
         super().__init__(**kwargs)
+        # ``PretrainedConfig`` owns this property and initializes its internal
+        # value during ``super().__init__``.  Set it afterwards so the vision
+        # tower keeps the implementation requested by the checkpoint (FA2 by
+        # default) instead of silently becoming ``None``/``sdpa``.
+        self._attn_implementation = _attn_implementation
 
 
 class KimiK3Config(PretrainedConfig):

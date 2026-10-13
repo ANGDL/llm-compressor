@@ -676,7 +676,10 @@ class MoonViT3dPretrainedModel(PreTrainedModel):
     model_type = "moonvit3d"
     _no_split_modules = ["MoonViTEncoderLayer"]
     _supports_flash_attn_2 = True
-    _supports_sdpa = True
+    # Vision attention dispatch only implements FA2 and eager attention.
+    # Advertising SDPA lets Transformers select a backend that the dispatch
+    # table cannot execute (and fails later with a KeyError).
+    _supports_sdpa = False
 
     def __init__(self, config, *inputs, **kwargs):
         super().__init__(config, *inputs, **kwargs)
