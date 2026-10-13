@@ -76,6 +76,21 @@ def test_loads_module_get_attr_passed_to_target(tmp_path):
     )
 
 
+def test_ignores_container_module_get_attr_working_set(tmp_path):
+    reference = SessionModel()
+    checkpoint = tmp_path / "model.safetensors"
+    save_file(reference.state_dict(), checkpoint)
+    model = build_meta_model(SessionModel)
+    session = SubgraphWeightSession(model, SafetensorsWeightSource(checkpoint))
+    graph = Graph()
+    value = graph.placeholder("value")
+    layers = graph.get_attr("layers")
+    graph.output({"value": value, "layers": layers})
+    subgraph = Subgraph(graph, {"value"}, set())
+
+    assert session.working_set(subgraph) == ()
+
+
 class SharedRuntimeBufferBlock(nn.Module):
     def __init__(self, shared):
         super().__init__()

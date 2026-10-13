@@ -72,24 +72,184 @@ from transformers.utils import (
 from transformers.utils.generic import check_model_inputs
 from transformers.utils.output_capturing import OutputRecorder
 
+from llmcompressor.modeling.moe.context import get_calibrate_all_experts_flag
+from llmcompressor.utils.fusion_backend import (
+    fusion_kda_adapter,
+    requested_kda_backend,
+    require_fusion_provider,
+)
+from llmcompressor.utils.triton_backend import is_triton_disabled
+
+from .configuration_kimi_k3 import KimiLinearConfig
+
 logger = logging.get_logger(__name__)
 
 try:
     from einops import rearrange
-
     from fla.modules import FusedRMSNormGated, ShortConvolution
     from fla.ops.kda import chunk_kda, fused_recurrent_kda
+    from fla.ops.kda.gate import naive_kda_gate, naive_kda_lowerbound_gate
+    from fla.ops.kda.naive import naive_chunk_kda, naive_recurrent_kda
 
     # from fla.ops.kda.gate import fused_kda_gate  # deprecated, gate is now computed inside chunk_kda/fused_recurrent_kda
     from fla.ops.utils.index import prepare_cu_seqlens_from_mask, prepare_lens_from_mask
     from fla.utils import tensor_cache
 except ImportError:
     logger.warning("Plese run `pip install -U fla-core einops tiktoken`")
-    rearrange = FusedRMSNormGated = ShortConvolution = chunk_kda = fused_recurrent_kda = prepare_cu_seqlens_from_mask = prepare_lens_from_mask = tensor_cache = None
+    (
+        rearrange,
+        FusedRMSNormGated,
+        ShortConvolution,
+        chunk_kda,
+        fused_recurrent_kda,
+        naive_kda_gate,
+        naive_kda_lowerbound_gate,
+        naive_chunk_kda,
+        naive_recurrent_kda,
+        prepare_cu_seqlens_from_mask,
+        prepare_lens_from_mask,
+        tensor_cache,
+    ) = (None,) * 12
 
-from llmcompressor.modeling.moe.context import get_calibrate_all_experts_flag
 
-from .configuration_kimi_k3 import KimiLinearConfig
+def _fla_reference_kda_adapter(
+    chunk_function,
+    recurrent_function,
+    gate_function,
+    lowerbound_gate_function,
+    *,
+    use_chunk: bool,
+):
+    """Preserve FLA's public KDA contract using its reference implementations."""
+
+    def adapted(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        *,
+        A_log=None,
+        dt_bias=None,
+        scale=None,
+        initial_state=None,
+        output_final_state=False,
+        use_qk_l2norm_in_kernel=False,
+        use_gate_in_kernel=False,
+        lower_bound=None,
+        cu_seqlens=None,
+        transpose_state_layout=False,
+        **kwargs,
+    ):
+        del kwargs
+        if use_gate_in_kernel:
+            if A_log is None:
+                raise ValueError("A_log is required when use_gate_in_kernel=True")
+            if lower_bound is None:
+                g = gate_function(g, A_log, dt_bias, output_dtype=torch.float32)
+            else:
+                g = lowerbound_gate_function(
+                    g,
+                    A_log,
+                    dt_bias,
+                    lower_bound=lower_bound,
+                    output_dtype=torch.float32,
+                )
+        if use_qk_l2norm_in_kernel:
+            q = q.float() / torch.sqrt(
+                q.float().square().sum(dim=-1, keepdim=True) + 1e-6
+            )
+            k = k.float() / torch.sqrt(
+                k.float().square().sum(dim=-1, keepdim=True) + 1e-6
+            )
+        # Match both Transformers native KDA and FLA's documented default.
+        if scale is None:
+            scale = q.shape[-1] ** -0.5
+        if transpose_state_layout and initial_state is not None:
+            initial_state = initial_state.transpose(-1, -2)
+
+        # FLA's naive chunk implementation requires one shared, divisible
+        # sequence length. Variable-length packed batches use FLA recurrent.
+        if cu_seqlens is not None and len(cu_seqlens) > 2:
+            if q.shape[0] != 1:
+                raise ValueError("Packed FLA KDA inputs must have batch size 1")
+            boundaries = cu_seqlens.tolist()
+            outputs = []
+            states = []
+            for index, (start, end) in enumerate(
+                zip(boundaries[:-1], boundaries[1:])
+            ):
+                sequence_state = (
+                    None
+                    if initial_state is None
+                    else initial_state[index : index + 1]
+                )
+                output, state = recurrent_function(
+                    q=q[:, start:end],
+                    k=k[:, start:end],
+                    v=v[:, start:end],
+                    g=g[:, start:end],
+                    beta=beta[:, start:end],
+                    scale=scale,
+                    initial_state=sequence_state,
+                    output_final_state=output_final_state,
+                )
+                outputs.append(output)
+                if output_final_state:
+                    states.append(state)
+            output = torch.cat(outputs, dim=1)
+            state = torch.cat(states, dim=0) if output_final_state else None
+        elif use_chunk:
+            chunk_size = math.gcd(q.shape[1], 64)
+            output, state = chunk_function(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                scale=scale,
+                initial_state=initial_state,
+                output_final_state=output_final_state,
+                chunk_size=chunk_size,
+            )
+        else:
+            output, state = recurrent_function(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                scale=scale,
+                initial_state=initial_state,
+                output_final_state=output_final_state,
+            )
+        if transpose_state_layout and state is not None:
+            state = state.transpose(-1, -2)
+        return output, state
+
+    return adapted
+
+
+if is_triton_disabled() and naive_chunk_kda is not None:
+    chunk_kda = _fla_reference_kda_adapter(
+        naive_chunk_kda,
+        naive_recurrent_kda,
+        naive_kda_gate,
+        naive_kda_lowerbound_gate,
+        use_chunk=True,
+    )
+    fused_recurrent_kda = _fla_reference_kda_adapter(
+        naive_chunk_kda,
+        naive_recurrent_kda,
+        naive_kda_gate,
+        naive_kda_lowerbound_gate,
+        use_chunk=False,
+    )
+
+if requested_kda_backend() == "fusion":
+    _fusion_provider = require_fusion_provider()
+    chunk_kda = fusion_kda_adapter(_fusion_provider)
+    fused_recurrent_kda = fusion_kda_adapter(_fusion_provider, recurrent=True)
 
 assert version.parse(transformers.__version__) >= version.parse(
     "4.56.0"
@@ -692,7 +852,9 @@ class KimiDeltaAttention(nn.Module):
         )
         g = self.f_b_proj(self.f_a_proj(hidden_states))
         g = rearrange(g, "... (h d) -> ... h d", d=self.head_dim)
-        beta = self.b_proj(hidden_states).float()
+        # FLA's public KDA contract expects beta after sigmoid. The Triton
+        # and naive implementations both consume this value directly.
+        beta = self.b_proj(hidden_states).float().sigmoid()
 
         q, k = map(
             lambda x: rearrange(x, "... (h d) -> ... h d", d=self.head_k_dim), (q, k)
@@ -712,7 +874,6 @@ class KimiDeltaAttention(nn.Module):
                 output_final_state=True,
                 use_qk_l2norm_in_kernel=True,
                 use_gate_in_kernel=True,
-                use_beta_sigmoid_in_kernel=True,
                 safe_gate=self.gate_lower_bound is not None,
                 lower_bound=self.gate_lower_bound,
                 transpose_state_layout=True,
@@ -731,7 +892,6 @@ class KimiDeltaAttention(nn.Module):
                 output_final_state=True,
                 use_qk_l2norm_in_kernel=True,
                 use_gate_in_kernel=True,
-                use_beta_sigmoid_in_kernel=True,
                 lower_bound=self.gate_lower_bound,
                 transpose_state_layout=True,
                 cu_seqlens=cu_seqlens,

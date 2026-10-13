@@ -18,58 +18,65 @@ import torch
 from safetensors import safe_open
 from torch import nn
 
+from llmcompressor.utils.fusion_backend import (
+    fusion_kda_adapter,
+    require_fusion_provider,
+    select_kda_backend,
+)
+from llmcompressor.utils.triton_backend import enable_fla_reference_kda
 
-def _force_torch_kda_backend() -> None:
-    """Make GLM-5-next use its reference PyTorch KDA instead of fla's Triton kernels.
+
+def _force_fla_reference_kda_backend() -> None:
+    """Make GLM-5-next use FLA's reference KDA instead of Triton kernels.
 
     On backends where fla's Triton KDA kernels cannot be loaded (e.g. Kunlunxin
     P800, where launching them raises ``Triton Error [CUDA]:
-    CUDA_ERROR_NOT_SUPPORTED``), null fla's KDA entrypoints so Transformers'
-    ``use_kernel_func_from_hub_with_fallback`` decorator resolves to the built-in
-    reference PyTorch implementation of ``chunk_kimi_delta_attention`` /
-    ``recurrent_kimi_delta_attention``.
+    CUDA_ERROR_NOT_SUPPORTED``), replace FLA's KDA entrypoints with FLA's
+    ``naive_*`` reference implementations before Transformers binds them.
 
     This MUST run before ``modeling_glm5_next`` is imported: the decorator binds
     its implementation at decoration (import) time, so a later patch has no
     effect. It is therefore called at module import, ahead of the Transformers
     import below.
     """
-    try:
-        import fla.ops.kda as _kda
-    except Exception:
-        return
-    for _name in ("chunk_kda", "fused_recurrent_kda"):
-        if getattr(_kda, _name, None) is not None:
-            setattr(_kda, _name, None)
-    try:
-        import fla as _fla
+    enable_fla_reference_kda()
 
-        for _name in ("chunk_kda", "fused_recurrent_kda"):
-            if getattr(_fla, _name, None) is not None:
-                setattr(_fla, _name, None)
-    except Exception:
-        pass
+
+def _force_torch_kda_backend() -> None:
+    """Backward-compatible alias for the FLA reference backend."""
+
+    _force_fla_reference_kda_backend()
 
 
 def _kda_backend_choice() -> str:
-    """Resolve the KDA backend: ``LLMCOMPRESSOR_KDA_BACKEND`` env (torch|triton),
-    else ``auto`` — which selects torch on Kunlunxin XPU (``torch_xmlir``
-    present), where fla's Triton KDA kernels fail to load, and triton elsewhere.
-    """
-    import importlib.util
-
-    choice = os.getenv("LLMCOMPRESSOR_KDA_BACKEND", "auto").strip().lower()
-    if choice in {"torch", "triton"}:
-        return choice
-    if importlib.util.find_spec("torch_xmlir") is not None:
-        return "torch"
-    return "triton"
+    """Resolve the public selector without exposing a deployment backend."""
+    return select_kda_backend(default_uses_triton=True)
 
 
-if _kda_backend_choice() == "torch":
-    _force_torch_kda_backend()
+if _kda_backend_choice() == "fla_reference":
+    _force_fla_reference_kda_backend()
 
 try:
+    import transformers.models.glm5_next.modeling_glm5_next as _glm5_modeling
+
+    if _kda_backend_choice() == "fusion":
+        _fusion_provider = require_fusion_provider()
+        _glm5_modeling.chunk_kimi_delta_attention = fusion_kda_adapter(_fusion_provider)
+        _glm5_modeling.recurrent_kimi_delta_attention = fusion_kda_adapter(
+            _fusion_provider, recurrent=True
+        )
+    elif _kda_backend_choice() == "torch":
+        # The decorated functions retain the readable Transformers reference
+        # under ``__wrapped__``.  Use it only when explicitly requested.
+        import inspect
+
+        _glm5_modeling.chunk_kimi_delta_attention = inspect.unwrap(
+            _glm5_modeling.chunk_kimi_delta_attention
+        )
+        _glm5_modeling.recurrent_kimi_delta_attention = inspect.unwrap(
+            _glm5_modeling.recurrent_kimi_delta_attention
+        )
+
     from transformers.models.glm5_next.modeling_glm5_next import (
         Glm5NextTextAttention,
         Glm5NextTextMoE,

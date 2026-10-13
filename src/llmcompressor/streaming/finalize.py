@@ -100,7 +100,11 @@ def _validate_transformers_config(path: Path) -> None:
     try:
         from transformers import AutoConfig
 
-        AutoConfig.from_pretrained(path, local_files_only=True)
+        AutoConfig.from_pretrained(
+            path,
+            local_files_only=True,
+            trust_remote_code=True,
+        )
     except Exception as error:
         raise ValueError(
             f"Final config cannot be loaded by AutoConfig: {error}"
@@ -341,7 +345,7 @@ def finalize_streaming_checkpoint(
                     continue
                 destination = temporary / path.name
                 if path.is_dir():
-                    shutil.copytree(path, destination)
+                    shutil.copytree(path, destination, dirs_exist_ok=True)
                 else:
                     shutil.copy2(path, destination)
 
@@ -371,6 +375,11 @@ def finalize_streaming_checkpoint(
             if replaced:
                 shutil.rmtree(backup)
         else:
+            if overwrite_output and output.exists():
+                if any(output.iterdir()):
+                    shutil.rmtree(output)
+                else:
+                    output.rmdir()
             os.replace(temporary, output)
     except Exception:
         if not publish_in_place:

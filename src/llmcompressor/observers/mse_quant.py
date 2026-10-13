@@ -10,6 +10,7 @@ from compressed_tensors.utils.impl_backend import ImplBackend
 from compressed_tensors.utils.triton import tl, triton, triton_req
 
 from llmcompressor.observers.base import MinMaxTuple
+from llmcompressor.utils.triton_backend import is_triton_disabled
 from llmcompressor.utils.triton_utils import (
     calculate_candidate_scale,
     quantize_dequantize,
@@ -99,7 +100,7 @@ def _mse_triton_req(
     observed: torch.Tensor, args: QuantizationArgs, *unused_args, **unused_kwargs
 ) -> bool:
     """Limit the CUDA backend to formats represented by the shared QDQ helper."""
-    if not triton_req(observed) or not observed.is_cuda:
+    if is_triton_disabled() or not triton_req(observed) or not observed.is_cuda:
         return False
     if observed.dtype not in (torch.float32, torch.float16, torch.bfloat16):
         return False

@@ -228,7 +228,12 @@ class SubgraphWeightSession:
                 attribute_name = str(node.target)
                 owner_name, separator, _ = attribute_name.rpartition(".")
                 value = self._get_attribute(attribute_name)
-                if isinstance(value, torch.nn.Module):
+                # A leaf module can be passed as a runtime argument (for
+                # example an embedding callable).  Container/parent modules
+                # captured by an autowrapped forward must not become a root
+                # working set: doing so loads their entire checkpoint
+                # subtree, which defeats sequential streaming.
+                if isinstance(value, torch.nn.Module) and not value._modules:
                     name = attribute_name
                 elif isinstance(value, torch.Tensor) and value.is_meta:
                     if not separator:

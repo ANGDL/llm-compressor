@@ -22,6 +22,7 @@ from llmcompressor.modifiers.gptq.helpers import (
     make_empty_hessian,
     make_empty_gptq_statistics,
 )
+from llmcompressor.utils.triton_backend import is_triton_disabled
 
 __all__ = [
     "accumulate_hessian",
@@ -245,6 +246,7 @@ def _gptq_block_update_triton_req(
     block_width = W1.shape[-1]
     return (
         triton_req(W1)
+        and not is_triton_disabled()
         and os.environ.get("LLMCOMPRESSOR_DISABLE_GPTQ_TRITON", "0") != "1"
         and get_triton_gptq_config(quant_args) is not None
         and 0 < block_width <= 256
