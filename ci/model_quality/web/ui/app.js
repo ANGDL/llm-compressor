@@ -3,7 +3,7 @@
 const STAGES = ["preflight", "quantize", "validate", "runtime-smoke", "evaluate", "report", "publish"];
 const ACTIVE_JOB = new Set(["CREATED", "QUEUED", "ALLOCATED", "RUNNING"]);
 const TERMINAL_STAGE = new Set(["PASS", "WARN", "FAIL", "FAILED", "SUCCESS", "SUCCEEDED", "SKIPPED", "RESOURCE_TIMEOUT", "CANCELED"]);
-const state = { models: [], runs: [], run: null, jobs: [], plan: null, scriptParams: [], cloneRequest: null, eventTimer: null, logTimer: null, opsTimer: null, logFollow: true, nodeMenu: null, nodeMenuKey: null, lanesExpanded: false };
+const state = { models: [], runs: [], run: null, jobs: [], plan: null, scriptParams: [], cloneRequest: null, eventTimer: null, logTimer: null, opsTimer: null, logFollow: true, nodeMenu: null, nodeMenuKey: null, lanesExpanded: false, knownModelIds: new Set() };
 const EVAL_PRESETS = { lm_eval: ["gsm8k", "mmlu"], evalscope: ["gsm8k", "ceval"] };
 const ROLE_HELP = {
   viewer: "Viewer · read-only: browse runs, logs, and the GPU/ops dashboards. Cannot plan, launch, retry, cancel, skip, or publish.",
@@ -102,9 +102,15 @@ async function bootstrap() {
 }
 
 function modelFilterIds() {
-  const ids = new Set(state.models.map((model) => model.id));
-  for (const run of state.runs) for (const id of (run.model_ids || [])) ids.add(id);
-  return Array.from(ids).sort();
+  // Accumulate into a session-wide set that never shrinks. The runs list is
+  // filtered (by status/model) and server-capped (limit=50), so deriving the
+  // dropdown purely from state.runs would drop models whenever a filter is
+  // active — e.g. selecting one model made every other run-only model vanish,
+  // and only clearing back to "All models" refetched the full set. Keeping a
+  // union of every model id ever seen keeps the dropdown stable.
+  for (const model of state.models) state.knownModelIds.add(model.id);
+  for (const run of state.runs) for (const id of (run.model_ids || [])) state.knownModelIds.add(id);
+  return Array.from(state.knownModelIds).sort();
 }
 
 function populateModels() {
