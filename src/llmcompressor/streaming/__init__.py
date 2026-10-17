@@ -30,6 +30,11 @@ from .checkpoint import (
 )
 from .collect import collect_calibration_statistics
 from .finalize import finalize_streaming_checkpoint
+from .inference import (
+    StreamingInference,
+    compare_cached_to_recompute,
+    load_streaming_model,
+)
 from .loading import (
     HostMemoryBudget,
     HostMemoryError,
@@ -89,6 +94,7 @@ __all__ = [
     "SourceCheckpointInfo",
     "SafetensorsWeightSource",
     "StreamingRunManifest",
+    "StreamingInference",
     "StreamingDTypePolicy",
     "StreamingCheckpointWriter",
     "StatisticsCollectorGroup",
@@ -104,8 +110,10 @@ __all__ = [
     "fingerprint_json",
     "build_meta_model",
     "collect_calibration_statistics",
+    "compare_cached_to_recompute",
     "finalize_streaming_checkpoint",
     "materialize_weights",
+    "load_streaming_model",
     "quantize_streaming",
     "trace_streaming_boundaries",
     "streaming_oneshot",

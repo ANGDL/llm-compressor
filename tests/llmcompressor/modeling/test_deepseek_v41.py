@@ -11,6 +11,7 @@ from torch.utils.data import DataLoader
 from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForImageTextToText
 
 from llmcompressor.modeling.deepseekv41 import (
+    DeepseekV41Cache,
     DeepseekV41NativeForCausalLM,
     ModelConfig,
 )
@@ -32,6 +33,8 @@ from llmcompressor.streaming import (
     DeepSeekV41WeightMaterializer,
     DiskBoundaryActivationStore,
     HostMemoryBudget,
+    compare_cached_to_recompute,
+    load_streaming_model,
     streaming_oneshot,
 )
 from llmcompressor.utils import ImatrixFallbackStats
@@ -211,10 +214,158 @@ def test_csa2_forward_handles_short_and_incomplete_groups_without_state_leaks(le
     assert not hasattr(model.model.layers[4].attn.indexer, "wk")
 
 
+@pytest.mark.parametrize("prompt_length", [1, 2, 3, 5])
+def test_cached_decode_matches_recompute_across_compression_and_window(prompt_length):
+    config = tiny_config(engram=True, dspark=True)
+    config.calibrate_dspark = False
+    config.text_config.engram_max_ngram_size = 4
+    config.text_config.engram_num_embeddings = [5 + 7 + 11]
+    torch.manual_seed(13)
+    model = DeepseekV41NativeForCausalLM(
+        config, engram_token_map=list(range(32))
+    ).eval()
+    ids = torch.tensor([[3, 4, 5, 6, 7, 8, 9, 10, 11, 12]])
+    lengths = []
+    handle = model.model.layers[0].register_forward_pre_hook(
+        lambda _module, args: lengths.append(args[0].shape[1])
+    )
+    with torch.no_grad():
+        output = model(ids[:, :prompt_length], use_cache=True)
+        torch.testing.assert_close(
+            output.logits,
+            model(ids[:, :prompt_length]).logits,
+            rtol=2e-5,
+            atol=2e-6,
+        )
+        cache = output.past_key_values
+        for end in range(prompt_length + 1, ids.shape[1] + 1):
+            output = model(ids[:, end - 1 : end], past_key_values=cache, use_cache=True)
+            assert lengths[-1] == 1
+            torch.testing.assert_close(
+                output.logits,
+                model(ids[:, :end]).logits[:, -1:],
+                rtol=2e-5,
+                atol=2e-6,
+            )
+            assert cache.get_seq_length() == end
+        assert set(cache.sources) == {1, 3}
+        assert cache.states[1]["compressed"].shape[1] == 5
+        assert cache.states[3]["compressed"].shape[1] == 10
+        assert cache.history_ids.shape[1] == 3
+        for index, state in enumerate(cache.states):
+            assert state["window"].shape[1] <= 3
+            if index not in cache.sources:
+                assert "compressed" not in state and "index_k" not in state
+            for value in state.values():
+                assert value.device.type == "cpu"
+        cache.reset()
+        assert cache.get_seq_length() == 0
+        repeated = model(ids[:, :prompt_length], use_cache=True).logits
+        reset = model(
+            ids[:, :prompt_length], past_key_values=cache, use_cache=True
+        ).logits
+        torch.testing.assert_close(repeated, reset, rtol=0, atol=0)
+    handle.remove()
+
+
+def test_chunked_prefill_and_greedy_generation_use_native_cache():
+    config = tiny_config(engram=True, dspark=True)
+    config.calibrate_dspark = False
+    torch.manual_seed(3)
+    model = DeepseekV41NativeForCausalLM(
+        config, engram_token_map=list(range(32))
+    ).eval()
+    ids = torch.tensor([[3, 4, 5, 6, 7, 8, 9, 10, 11]])
+    with torch.no_grad():
+        cache = DeepseekV41Cache(config.text_config)
+        chunks = []
+        for start, end in [(0, 3), (3, 4), (4, 7), (7, 9)]:
+            chunks.append(
+                model(ids[:, start:end], past_key_values=cache, use_cache=True).logits
+            )
+        torch.testing.assert_close(
+            torch.cat(chunks, dim=1), model(ids).logits, rtol=2e-5, atol=2e-6
+        )
+        torch.testing.assert_close(
+            model.generate(ids, use_cache=True, max_new_tokens=4, do_sample=False),
+            model.generate(ids, use_cache=False, max_new_tokens=4, do_sample=False),
+        )
+
+
+def test_cached_validation_and_failure_require_reset(monkeypatch):
+    config = tiny_config(dspark=False)
+    model = DeepseekV41NativeForCausalLM(config).eval()
+    cache = DeepseekV41Cache(config.text_config)
+    ids = torch.tensor([[3, 4, 5]])
+    with pytest.raises(ValueError, match="unpadded"):
+        model(ids, attention_mask=torch.tensor([[0, 1, 1]]), use_cache=True)
+    assert not cache._active
+    original = model.model.layers[2].forward
+
+    def fail(*_args, **_kwargs):
+        raise RuntimeError("injected decode failure")
+
+    monkeypatch.setattr(model.model.layers[2], "forward", fail)
+    with pytest.raises(RuntimeError, match="injected"):
+        model(ids, past_key_values=cache, use_cache=True)
+    assert cache.get_seq_length() == 0 and cache._streaming_failed
+    monkeypatch.setattr(model.model.layers[2], "forward", original)
+    with pytest.raises(RuntimeError, match="incomplete"):
+        model(ids, past_key_values=cache, use_cache=True)
+    cache.reset()
+    assert (
+        model(
+            ids, past_key_values=cache, use_cache=True
+        ).past_key_values.get_seq_length()
+        == 3
+    )
+
+
+@pytest.mark.parametrize(
+    "preload", [[], ["DeepseekV41Block"], ["Expert", "Compressor", "Indexer"]]
+)
+def test_streaming_cached_module_groups_keep_hooks_and_state(tmp_path, preload):
+    checkpoint = tmp_path / "source"
+    write_checkpoint(checkpoint, tiny_config(engram=True, dspark=False))
+    with load_streaming_model(
+        checkpoint,
+        config=ModelConfig.from_pretrained(checkpoint, local_files_only=True),
+        model_factory=DeepseekV41NativeForCausalLM,
+        model_kwargs={
+            "engram_token_map": list(range(32)),
+            "engram_checkpoint": checkpoint,
+        },
+        materializer=DeepSeekV41WeightMaterializer(),
+        preload_module_classes=preload,
+    ) as inference:
+        result = compare_cached_to_recompute(
+            inference,
+            torch.tensor([[3, 4, 5]]),
+            torch.tensor([[6, 7, 8, 9]]),
+        )
+        assert result["passed"], result
+        assert all(p.is_meta for p in inference.model.parameters())
+
+
 def test_candidate_pool_pins_latest_block_and_limits_search():
     scores = torch.tensor([[[10.0, 9.0, 8.0, 7.0, 1.0, -torch.inf]]])
     keep = _candidate_mask(scores, torch.tensor([[[5]]]), 1, 2)
     assert keep.tolist() == [[[False, False, False, False, True, True]]]
+
+
+def test_sparse_ties_do_not_change_past_outputs_when_future_is_appended():
+    config = tiny_config(dspark=False)
+    torch.manual_seed(13)
+    model = DeepseekV41NativeForCausalLM(config).eval()
+    # Zero indexer query projections force ties, including across candidate blocks.
+    for module in model.modules():
+        if type(module).__name__ == "Indexer":
+            torch.nn.init.zeros_(module.wq_b.weight)
+    ids = torch.tensor([[3, 4, 5, 6, 7, 8, 9, 10]])
+    with torch.no_grad():
+        short = model(ids[:, :7]).logits
+        longer = model(ids).logits[:, :7]
+    torch.testing.assert_close(short, longer, rtol=2e-5, atol=2e-6)
 
 
 def test_fp4_rounds_ties_to_even_and_uses_distinct_kv_scale():
@@ -566,3 +717,25 @@ def test_streaming_quantizes_backbone_and_dspark_preserving_engram(
     assert saved["text_config"]["hidden_size"] == 32
     assert saved["engram_storage"]["group_size"] == 32
     assert AutoConfig.from_pretrained(output).text_config.n_mtp_layers == 3
+    with load_streaming_model(
+        output,
+        model_factory=DeepseekV41NativeForCausalLM,
+        config=ModelConfig.from_pretrained(output, local_files_only=True),
+        model_kwargs={
+            "engram_token_map": list(range(32)),
+            "engram_checkpoint": output,
+        },
+        materializer=DeepSeekV41WeightMaterializer(),
+    ) as inference:
+        assert inference.weights.tensor_reads == 0
+        inference.model.config.calibrate_dspark = False
+        result = compare_cached_to_recompute(
+            inference,
+            torch.tensor([[3, 4, 5]]),
+            torch.tensor([[6, 7, 8]]),
+        )
+        assert result["passed"], result
+        assert not any(
+            name.startswith("model.mtp.") for name in inference.weights.loads
+        )
+        assert all(p.is_meta for p in inference.model.parameters())

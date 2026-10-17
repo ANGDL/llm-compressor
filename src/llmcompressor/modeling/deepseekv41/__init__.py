@@ -3,6 +3,7 @@
 from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForImageTextToText
 from transformers.models.auto.configuration_auto import CONFIG_MAPPING_NAMES
 
+from .cache import DeepseekV41Cache
 from .config import (
     DeepseekV41Config,
     DeepseekV41TextConfig,
@@ -33,6 +34,7 @@ if "deepseek_v41" not in CONFIG_MAPPING_NAMES:
 __all__ = [
     "ModelConfig",
     "DeepseekV41Config",
+    "DeepseekV41Cache",
     "DeepseekV41TextConfig",
     "DeepseekV41VisionConfig",
     "DeepseekV41ForCausalLM",

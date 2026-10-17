@@ -1,4 +1,4 @@
-"""Native V4.1 forward for complete-sequence PTQ calibration.
+"""Native V4.1 complete-sequence calibration and cached reference inference.
 
 CSA2 state is passed through block outputs instead of process-global variables.
 DSpark is teacher forced explicitly; it is not assumed to run during generation.
@@ -16,6 +16,7 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from llmcompressor.modeling.deepseekv4.kernels import hc_split, sparse_attention
 from llmcompressor.modeling.deepseekv4.model import RMSNorm, precompute_freqs_cis
 
+from .cache import DeepseekV41Cache
 from .config import DeepseekV41Config, ModelConfig
 from .engram import Engram, EngramEmbedding, EngramHash
 from .quantization import Linear, fp4_qdq, fp8_qdq
@@ -44,17 +45,25 @@ def _rotate_tail(x, freqs, rope_dim, inverse=False):
     )
 
 
+def _stable_topk(scores, count):
+    """Resolve equal scores by position, independent of future masked columns."""
+    indices = scores.argsort(dim=-1, descending=True, stable=True)[..., :count]
+    return scores.gather(-1, indices), indices
+
+
 def _candidate_mask(scores, lengths, topk_blocks, block_size):
     width = scores.shape[-1]
+    if width == 0:
+        return torch.zeros_like(scores, dtype=torch.bool)
     blocks = F.pad(scores, (0, -width % block_size), value=-torch.inf)
     blocks = blocks.unflatten(-1, (-1, block_size)).amax(-1)
     last = (lengths - 1) // block_size
     blocks = blocks.masked_fill(
         torch.arange(blocks.shape[-1], device=scores.device) == last, torch.inf
     )
-    top = blocks.topk(min(topk_blocks, blocks.shape[-1]), dim=-1)
+    values, indices = _stable_topk(blocks, min(topk_blocks, blocks.shape[-1]))
     keep = torch.zeros_like(blocks, dtype=torch.bool).scatter_(
-        -1, top.indices, top.values > -torch.inf
+        -1, indices, values > -torch.inf
     )
     return keep.repeat_interleave(block_size, dim=-1)[..., :width]
 
@@ -67,7 +76,9 @@ class Compressor(nn.Module):
         self.norm = RMSNorm(config.head_dim, config.norm_eps)
         self.wgate = Linear(config.dim, config.head_dim) if self.ratio > 1 else None
 
-    def forward(self, x, mask):
+    def forward(self, x, mask, source=None):
+        if source is not None:
+            return self.forward_cached(x, mask, source.state)
         ratio = self.ratio
         if ratio == 1:
             return self.norm(self.wkv(x)), mask
@@ -79,6 +90,29 @@ class Compressor(nn.Module):
         weights = scores.softmax(2).masked_fill(~valid.unsqueeze(-1), 0)
         pooled = (values * weights).sum(2)
         return self.norm(pooled.to(x.dtype)), valid.any(-1)
+
+    def forward_cached(self, x, mask, state):
+        """Project only new tokens and carry at most ratio-1 projected tokens."""
+        if self.ratio == 1:
+            return self.forward(x, mask)
+        values, scores = self.wkv(x.float()), self.wgate(x.float())
+        if "tail_values" in state:
+            values = torch.cat((state["tail_values"].to(x.device), values), dim=1)
+            scores = torch.cat((state["tail_scores"].to(x.device), scores), dim=1)
+            mask = torch.cat((state["tail_mask"].to(x.device), mask), dim=1)
+        length = values.shape[1] - values.shape[1] % self.ratio
+        for key, value in (
+            ("tail_values", values),
+            ("tail_scores", scores),
+            ("tail_mask", mask),
+        ):
+            state[key] = value[:, length:].detach().cpu().clone()
+        values = values[:, :length].unflatten(1, (-1, self.ratio))
+        scores = scores[:, :length].unflatten(1, (-1, self.ratio))
+        valid = mask[:, :length].unflatten(1, (-1, self.ratio))
+        scores = scores.masked_fill(~valid.unsqueeze(-1), torch.finfo(scores.dtype).min)
+        weights = scores.softmax(2).masked_fill(~valid.unsqueeze(-1), 0)
+        return self.norm((values * weights).sum(2).to(x.dtype)), valid.any(-1)
 
 
 class Indexer(nn.Module):
@@ -97,7 +131,23 @@ class Indexer(nn.Module):
             self.wk = Linear(config.head_dim, config.index_head_dim)
             self.k_norm = RMSNorm(config.index_head_dim, config.norm_eps)
 
-    def forward(self, x, qr, latent, index_k, candidates, freqs, compressed_mask):
+    def forward(
+        self,
+        x,
+        qr,
+        latent,
+        index_k,
+        candidates,
+        freqs,
+        compressed_mask,
+        start_pos=None,
+        source=None,
+        group_freqs=None,
+    ):
+        if start_pos is not None:
+            return self.forward_cached(
+                x, qr, latent, candidates, freqs, start_pos, source, group_freqs
+            )
         config = self.config
         ratio = config.compress_ratios[self.layer_id]
         if self.owns_k:
@@ -131,12 +181,57 @@ class Indexer(nn.Module):
         elif 0 <= config.candidate_source_layer_id < self.layer_id:
             scores = scores.masked_fill(~candidates, -torch.inf)
         topk = min(config.index_topk, index_k.shape[1])
-        values, indices = scores.topk(topk, dim=-1, sorted=False)
+        values, indices = _stable_topk(scores, topk)
+        indices = torch.where(values > -torch.inf, indices, -1).sort(-1).values
+        return index_k, indices.int(), candidates
+
+    def forward_cached(
+        self, x, qr, latent, candidates, freqs, start_pos, source, group_freqs
+    ):
+        config = self.config
+        if self.owns_k:
+            new_index = fp4_qdq(
+                _rotate_tail(
+                    self.k_norm(self.wk(latent)), group_freqs, config.rope_head_dim
+                )
+            )
+            DeepseekV41Cache.append(source.state, "index_k", new_index)
+        index_k = source.state["index_k"]
+        mask = source.state["compressed_mask"]
+        q = self.wq_b(qr).unflatten(-1, (config.index_n_heads, config.index_head_dim))
+        q = fp4_qdq(_rotate_tail(q, freqs, config.rope_head_dim))
+        weights = self.weights_proj(x) * (
+            config.index_head_dim**-0.5 * config.index_n_heads**-0.5
+        )
+        scores = torch.einsum("bshd,btd->bsht", q, index_k.to(x.device))
+        scores = (scores.relu() * weights.unsqueeze(-1)).sum(2)
+        positions = start_pos + torch.arange(x.shape[1], device=x.device)
+        lengths = ((positions + 1) // config.compress_ratios[self.layer_id]).view(
+            1, -1, 1
+        )
+        valid = (torch.arange(index_k.shape[1], device=x.device) < lengths) & mask.to(
+            x.device
+        ).unsqueeze(1)
+        scores = scores.masked_fill(~valid, -torch.inf)
+        if self.layer_id == config.candidate_source_layer_id:
+            candidates = _candidate_mask(
+                scores,
+                lengths,
+                config.candidate_topk_blocks,
+                config.candidate_block_size,
+            )
+        elif 0 <= config.candidate_source_layer_id < self.layer_id:
+            scores = scores.masked_fill(~candidates, -torch.inf)
+        values, indices = _stable_topk(scores, min(config.index_topk, index_k.shape[1]))
         indices = torch.where(values > -torch.inf, indices, -1).sort(-1).values
         return index_k, indices.int(), candidates
 
 
 class Attention(nn.Module):
+    # The shared full-position table stays on CPU during streaming. Forward
+    # transfers only the positions needed by the current chunk/token.
+    _streaming_cpu_buffers = ("freqs_cis",)
+
     def __init__(self, config, layer_id, source_fp8):
         super().__init__()
         self.config = config
@@ -215,9 +310,11 @@ class Attention(nn.Module):
         )
         return self.wo_b(output.flatten(-2))
 
-    def forward(self, x, mask, shared):
+    def forward(self, x, mask, shared, cache=None, start_pos=0):
+        if cache is not None:
+            return self.forward_cached(x, mask, shared, cache, start_pos)
         config = self.config
-        freqs = self.freqs_cis[: x.shape[1]]
+        freqs = self.freqs_cis[: x.shape[1]].to(x.device)
         qr, q = self.project_query(x, freqs)
         window_kv = fp8_qdq(
             _rotate_tail(self.kv_norm(self.wkv(x)), freqs, config.rope_head_dim)
@@ -248,6 +345,76 @@ class Attention(nn.Module):
             shared = (compressed, index_k, topk, candidates, compressed_mask)
             kv = torch.cat((window_kv, compressed), dim=1)
             sparse = torch.where(topk >= 0, topk + x.shape[1], -1)
+            indices = torch.cat((indices, sparse.int()), dim=-1)
+        output = sparse_attention(q, kv, self.attn_sink, indices, config.head_dim**-0.5)
+        return self.project_output(output, freqs), shared
+
+    def forward_cached(self, x, mask, shared, cache, start_pos):
+        config, state = self.config, cache.states[self.layer_id]
+        freqs = self.freqs_cis[start_pos : start_pos + x.shape[1]].to(x.device)
+        qr, q = self.project_query(x, freqs)
+        current_kv = fp8_qdq(
+            _rotate_tail(self.kv_norm(self.wkv(x)), freqs, config.rope_head_dim)
+        )
+        window_kv = current_kv
+        if "window" in state:
+            window_kv = torch.cat((state["window"].to(x.device), current_kv), dim=1)
+        window_start = start_pos - (window_kv.shape[1] - x.shape[1])
+        positions = start_pos + torch.arange(x.shape[1], device=x.device)
+        indices = (
+            positions[:, None]
+            - config.window_size
+            + 1
+            + torch.arange(config.window_size, device=x.device)
+        )
+        indices = indices - window_start
+        indices = indices.masked_fill(indices < 0, -1).unsqueeze(0).int()
+        keep = max(0, config.window_size - 1)
+        state["window"] = (
+            window_kv[:, -keep:].detach().cpu().clone()
+            if keep
+            else window_kv[:, :0].detach().cpu()
+        )
+        kv = window_kv
+        if self.ratio:
+            source, _, topk, candidates, _ = shared
+            latent = group_freqs = None
+            if self.compressor is not None:
+                source = cache.sources[self.layer_id]
+                old_length = (
+                    state["compressed"].shape[1] if "compressed" in state else 0
+                )
+                latent, new_mask = self.compressor(x, mask, source=source)
+                group_positions = (
+                    old_length + torch.arange(latent.shape[1], device=x.device)
+                ) * self.ratio
+                group_freqs = self.freqs_cis[
+                    group_positions.to(self.freqs_cis.device)
+                ].to(x.device)
+                new_compressed = fp4_qdq(
+                    _rotate_tail(latent, group_freqs, config.rope_head_dim),
+                    16,
+                    e4m3_scale=True,
+                )
+                cache.append(state, "compressed", new_compressed)
+                cache.append(state, "compressed_mask", new_mask)
+            compressed = source.state["compressed"]
+            if self.indexer is not None:
+                _, topk, candidates = self.indexer(
+                    x,
+                    qr,
+                    latent,
+                    None,
+                    candidates,
+                    freqs,
+                    None,
+                    start_pos=start_pos,
+                    source=source,
+                    group_freqs=group_freqs,
+                )
+            shared = (source, None, topk, candidates, None)
+            kv = torch.cat((window_kv, compressed.to(x.device)), dim=1)
+            sparse = torch.where(topk >= 0, topk + window_kv.shape[1], -1)
             indices = torch.cat((indices, sparse.int()), dim=-1)
         output = sparse_attention(q, kv, self.attn_sink, indices, config.head_dim**-0.5)
         return self.project_output(output, freqs), shared
@@ -413,7 +580,18 @@ class DeepseekV41Block(nn.Module):
             + (comb.unsqueeze(-1) * residual.unsqueeze(-2)).sum(2)
         ).to(x.dtype)
 
-    def forward(self, x, pre_mix, shared, mask, image_mask, hashes, targets=()):
+    def forward(
+        self,
+        x,
+        pre_mix,
+        shared,
+        mask,
+        image_mask,
+        hashes,
+        targets=(),
+        cache=None,
+        start_pos=0,
+    ):
         if self.engram is not None:
             valid = mask & ~image_mask
             x = self.engram(x, hashes[:, :, self.engram.hash_index], valid)
@@ -423,7 +601,12 @@ class DeepseekV41Block(nn.Module):
             for flag, previous in zip(self._target_flags, targets)
         )
         attn_pre, attn_post, attn_comb = self.mixes(x, "attn")
-        value, shared = self.attn(self.attn_norm(self.pre(x, pre_mix)), mask, shared)
+        attn_input = self.attn_norm(self.pre(x, pre_mix))
+        value, shared = (
+            self.attn(attn_input, mask, shared)
+            if cache is None
+            else self.attn(attn_input, mask, shared, cache=cache, start_pos=start_pos)
+        )
         x = self.post(value, x, attn_post, attn_comb)
         ffn_pre, ffn_post, ffn_comb = self.mixes(x, "ffn")
         value = self.ffn(self.ffn_norm(self.pre(x, attn_pre)), image_mask)
@@ -442,10 +625,14 @@ class Head(nn.Module):
 class DSparkAttention(Attention):
     def forward(self, x, main_x, main_mask, context_positions):
         config = self.config
-        main_freqs = self.freqs_cis[context_positions.clamp_min(0)]
+        main_freqs = self.freqs_cis[
+            context_positions.clamp_min(0).to(self.freqs_cis.device)
+        ].to(x.device)
         draft_positions = context_positions[:, -1:] + 1
         draft_positions = draft_positions + torch.arange(x.shape[1], device=x.device)
-        draft_freqs = self.freqs_cis[draft_positions]
+        draft_freqs = self.freqs_cis[draft_positions.to(self.freqs_cis.device)].to(
+            x.device
+        )
         _, q = self.project_query(x, draft_freqs)
         main_kv = fp8_qdq(
             _rotate_tail(
@@ -620,8 +807,23 @@ class Transformer(nn.Module):
             self.image_newline = nn.Parameter(torch.empty(text.dim))
 
     def forward(
-        self, input_ids, attention_mask=None, inputs_embeds=None, image_mask=None
+        self,
+        input_ids,
+        attention_mask=None,
+        inputs_embeds=None,
+        image_mask=None,
+        cache=None,
+        logits_to_keep=0,
     ):
+        if cache is not None:
+            return self.forward_cached(
+                input_ids,
+                attention_mask,
+                inputs_embeds,
+                image_mask,
+                cache,
+                logits_to_keep,
+            )
         text = self.config.text_config
         mask = (
             torch.ones_like(input_ids, dtype=torch.bool)
@@ -673,6 +875,47 @@ class Transformer(nn.Module):
             logits = logits + dependency
         return logits
 
+    def forward_cached(
+        self, input_ids, mask, inputs_embeds, image_mask, cache, logits_to_keep
+    ):
+        """Use the same blocks while keeping calibration tracing stateless."""
+        text = self.config.text_config
+        image_mask = torch.zeros_like(mask) if image_mask is None else image_mask.bool()
+        hash_ids, hash_valid = input_ids, mask & ~image_mask
+        if cache.history_ids is not None:
+            hash_ids = torch.cat(
+                (cache.history_ids.to(input_ids.device), hash_ids), dim=1
+            )
+            hash_valid = torch.cat(
+                (cache.history_valid.to(input_ids.device), hash_valid), dim=1
+            )
+        hashes = (
+            self.engram_hash(hash_ids, hash_valid)[:, -input_ids.shape[1] :]
+            if self.engram_hash is not None
+            else None
+        )
+        hidden = self.embed(input_ids) if inputs_embeds is None else inputs_embeds
+        hidden = hidden.unsqueeze(2).repeat(1, 1, text.hc_mult, 1)
+        pre = F.one_hot(torch.zeros_like(input_ids), num_classes=text.hc_mult).float()
+        shared = (None, None, None, None, None)
+        targets = (None,) * len(text.dspark_target_layer_ids)
+        for layer in self.layers:
+            hidden, pre, shared, targets = layer(
+                hidden,
+                pre,
+                shared,
+                mask,
+                image_mask,
+                hashes,
+                targets,
+                cache=cache,
+                start_pos=cache.seen_tokens,
+            )
+        hidden = self.norm(DeepseekV41Block.pre(hidden, pre))
+        if isinstance(logits_to_keep, int) and logits_to_keep > 0:
+            hidden = hidden[:, -logits_to_keep:]
+        return self.lm_head(hidden)
+
 
 class DeepseekV41NativeForCausalLM(PreTrainedModel, GenerationMixin):
     config_class = ModelConfig
@@ -684,6 +927,13 @@ class DeepseekV41NativeForCausalLM(PreTrainedModel, GenerationMixin):
     ]
     _tied_weights_keys = {}
     _supports_sdpa = True
+    _skip_keys_device_placement = ["past_key_values"]
+
+    @classmethod
+    def _supports_default_dynamic_cache(cls):
+        # CSA2 has shared, compressed state and Engram history; a standard KV
+        # DynamicCache cannot describe it. Generation still uses HF's loop.
+        return False
 
     def __init__(
         self, config, *, tokenizer=None, engram_token_map=None, engram_checkpoint=None
@@ -736,9 +986,81 @@ class DeepseekV41NativeForCausalLM(PreTrainedModel, GenerationMixin):
         return self.model.lm_head
 
     def encode_image(self, patches, height, width):
+        patches = patches.to(dtype=self.model.vision.patch_embed.proj.weight.dtype)
         return self.model.aligner(
             self.model.vision(patches, height, width), height, width
         )
+
+    def _forward_cached(
+        self,
+        input_ids,
+        attention_mask,
+        inputs_embeds,
+        image_mask,
+        cache,
+        position_ids,
+        logits_to_keep,
+    ):
+        if cache is None:
+            cache = DeepseekV41Cache(self.config.text_config)
+        if not isinstance(cache, DeepseekV41Cache):
+            raise TypeError("V4.1 requires DeepseekV41Cache")
+        if attention_mask is not None:
+            expected_length = cache.seen_tokens + input_ids.shape[1]
+            if attention_mask.shape[-1] not in (
+                input_ids.shape[1],
+                expected_length,
+            ):
+                raise ValueError("V4.1 attention_mask length disagrees with cache")
+            if not attention_mask.bool().all():
+                raise ValueError("V4.1 cached inference requires unpadded inputs")
+            attention_mask = attention_mask[:, -input_ids.shape[1] :]
+        if position_ids is not None:
+            expected_positions = torch.arange(
+                cache.seen_tokens,
+                cache.seen_tokens + input_ids.shape[1],
+                device=input_ids.device,
+            ).unsqueeze(0)
+            if not torch.equal(position_ids, expected_positions):
+                raise ValueError("V4.1 position_ids disagree with committed cache")
+        mask = (
+            torch.ones_like(input_ids, dtype=torch.bool)
+            if attention_mask is None
+            else attention_mask.bool()
+        )
+        cache.begin(input_ids, mask)
+        try:
+            logits = self.model(
+                input_ids,
+                mask,
+                inputs_embeds,
+                image_mask,
+                cache=cache,
+                logits_to_keep=logits_to_keep,
+            )
+            valid = mask if image_mask is None else mask & ~image_mask.bool()
+            cache.commit(input_ids, valid)
+            return CausalLMOutputWithPast(logits=logits, past_key_values=cache)
+        except BaseException:
+            cache._streaming_failed = True
+            cache._active = False
+            raise
+
+    def prepare_inputs_for_generation(self, input_ids, inputs_embeds=None, **kwargs):
+        prepared = super().prepare_inputs_for_generation(
+            input_ids, inputs_embeds=inputs_embeds, **kwargs
+        )
+        if prepared.get("input_ids") is None:
+            length = prepared["inputs_embeds"].shape[1]
+            prepared["input_ids"] = input_ids[:, -length:]
+        cache = prepared.get("past_key_values")
+        if cache is not None and cache.get_seq_length() > 0:
+            # Image embeddings belong to prefill. Newly generated tokens are text.
+            if prepared.get("image_mask") is not None:
+                prepared["image_mask"] = torch.zeros_like(
+                    prepared["input_ids"], dtype=torch.bool
+                )
+        return prepared
 
     def forward(
         self,
@@ -748,11 +1070,28 @@ class DeepseekV41NativeForCausalLM(PreTrainedModel, GenerationMixin):
         image_mask=None,
         labels=None,
         logits_to_keep=0,
+        past_key_values=None,
+        use_cache=False,
+        position_ids=None,
         **kwargs,
     ):
         if input_ids is None:
             raise ValueError(
                 "V4.1 requires input_ids for deterministic Engram addressing"
+            )
+        if past_key_values is not None and not use_cache:
+            raise ValueError("past_key_values requires use_cache=True")
+        if use_cache:
+            if labels is not None:
+                raise ValueError("Use full-sequence forward for training labels")
+            return self._forward_cached(
+                input_ids,
+                attention_mask,
+                inputs_embeds,
+                image_mask,
+                past_key_values,
+                position_ids,
+                logits_to_keep,
             )
         logits = self.model(input_ids, attention_mask, inputs_embeds, image_mask)
         if isinstance(logits_to_keep, int) and logits_to_keep > 0:
