@@ -28,3 +28,19 @@ def test_reference_sparse_attention_restores_fp32_sink(monkeypatch):
 
     assert output is q
     assert observed["sink_dtype"] == torch.float32
+
+
+def test_all_masked_reference_queries_have_zero_output_and_finite_gradients(
+    monkeypatch,
+):
+    monkeypatch.setattr(kernels, "_load_reference_kernel_module", lambda: None)
+    q = torch.randn(1, 2, 2, 4, requires_grad=True)
+    kv = torch.randn(1, 3, 4, requires_grad=True)
+    sink = torch.randn(2, requires_grad=True)
+    indices = torch.tensor([[[-1, -1], [0, 1]]])
+    output = kernels.sparse_attention(q, kv, sink, indices, 0.5)
+    torch.testing.assert_close(output[:, 0], torch.zeros_like(output[:, 0]))
+    output.sum().backward()
+    for tensor in (q, kv, sink):
+        assert tensor.grad is not None
+        assert torch.isfinite(tensor.grad).all()

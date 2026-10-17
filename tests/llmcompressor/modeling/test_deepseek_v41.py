@@ -1,0 +1,568 @@
+import importlib.util
+import json
+from functools import partial
+from pathlib import Path
+
+import pytest
+import torch
+from safetensors import safe_open
+from safetensors.torch import load_file, save_file
+from torch.utils.data import DataLoader
+from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForImageTextToText
+
+from llmcompressor.modeling.deepseekv41 import (
+    DeepseekV41NativeForCausalLM,
+    ModelConfig,
+)
+from llmcompressor.modeling.deepseekv41.engram import (
+    CheckpointEngramLookup,
+    EngramHash,
+)
+from llmcompressor.modeling.deepseekv41.model import (
+    DeepseekV41Block,
+    _candidate_mask,
+    _draft_inputs,
+)
+from llmcompressor.modeling.deepseekv41.quantization import fp4_qdq
+from llmcompressor.modeling.moe_context import moe_calibration_context
+from llmcompressor.modifiers.quantization import QuantizationModifier
+from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
+from llmcompressor.pipelines.sequential.plan import trace_sequential_plan
+from llmcompressor.streaming import (
+    DeepSeekV41WeightMaterializer,
+    DiskBoundaryActivationStore,
+    HostMemoryBudget,
+    streaming_oneshot,
+)
+from llmcompressor.utils import ImatrixFallbackStats
+
+EXAMPLE_PATH = (
+    Path(__file__).parents[3] / "examples/streaming_oneshot/deepseek_v41_wNa8.py"
+)
+EXAMPLE_SPEC = importlib.util.spec_from_file_location(
+    "deepseek_v41_example", EXAMPLE_PATH
+)
+EXAMPLE = importlib.util.module_from_spec(EXAMPLE_SPEC)
+EXAMPLE_SPEC.loader.exec_module(EXAMPLE)
+
+
+def tiny_config(*, engram=False, vision=False, dspark=True):
+    stages = 3 if dspark else 0
+    return ModelConfig(
+        text_config=dict(
+            vocab_size=32,
+            hidden_size=32,
+            moe_intermediate_size=32,
+            num_hidden_layers=5,
+            num_nextn_predict_layers=stages,
+            num_attention_heads=2,
+            n_routed_experts=4,
+            num_experts_per_tok=2,
+            q_lora_rank=32,
+            head_dim=32,
+            qk_rope_head_dim=8,
+            o_groups=2,
+            o_lora_rank=16,
+            sliding_window=4,
+            max_position_embeddings=64,
+            max_seq_len=64,
+            index_n_heads=2,
+            index_head_dim=32,
+            index_topk=2,
+            hc_mult=2,
+            compress_ratios=[0, 2, 2, 1, 1] + [0] * stages,
+            kv_source_layer_ids=[1, 3],
+            index_source_layer_ids=[1, 3, 4],
+            candidate_source_layer_id=3,
+            candidate_topk_blocks=2,
+            candidate_block_size=2,
+            engram_layer_ids=[1] if engram else [],
+            engram_num_embeddings=[5] if engram else [],
+            engram_vocab_size=5,
+            engram_n_heads=1,
+            engram_head_dim=32,
+            engram_max_ngram_size=2,
+            engram_compressed_vocab_size=32,
+            dspark_block_size=3 if dspark else 0,
+            dspark_noise_token_id=31,
+            dspark_target_layer_ids=[2, 3, 4] if dspark else [],
+            dspark_markov_rank=8,
+            dspark_n_routed_experts=2,
+            dspark_num_experts_per_tok=1,
+        ),
+        vision_config=dict(
+            num_hidden_layers=1 if vision else 0,
+            hidden_size=32,
+            num_attention_heads=2,
+            intermediate_size=32,
+            patch_size=2,
+            downsample_ratio=2,
+        ),
+    )
+
+
+def write_checkpoint(root, config):
+    root.mkdir()
+    model = DeepseekV41NativeForCausalLM(config, engram_token_map=list(range(32)))
+    tensors = {}
+    for name, tensor in model.state_dict().items():
+        name = name.removeprefix("model.")
+        if name.startswith("lm_head."):
+            name = "head." + name.removeprefix("lm_head.")
+        if ".engram.embed.weight" in name:
+            tensors[name] = tensor.to(torch.float8_e4m3fn)
+            tensors[name.replace(".weight", ".scale")] = torch.ones(
+                tensor.shape[0], tensor.shape[1] // 32
+            ).to(torch.float8_e8m0fnu)
+        else:
+            tensors[name] = tensor.contiguous()
+    save_file(tensors, root / "model.safetensors")
+    (root / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "metadata": {
+                    "total_size": sum(
+                        tensor.numel() * tensor.element_size()
+                        for tensor in tensors.values()
+                    )
+                },
+                "weight_map": {name: "model.safetensors" for name in tensors},
+            }
+        )
+    )
+    value = config.to_dict()
+    value.update(model_type="deepseek_v41", architectures=["DeepseekV41ForCausalLM"])
+    (root / "config.json").write_text(json.dumps(value))
+    return tensors
+
+
+def test_native_and_raw_autoconfig_dispatch_roundtrip(tmp_path):
+    config = tiny_config()
+    config.save_pretrained(tmp_path)
+    loaded = AutoConfig.from_pretrained(tmp_path, local_files_only=True)
+    assert loaded.text_config.hidden_size == 32
+    assert loaded.text_config.n_mtp_layers == 3
+    assert isinstance(
+        AutoModelForCausalLM.from_config(loaded), DeepseekV41NativeForCausalLM
+    )
+    value = config.to_dict()
+    value["model_type"] = "deepseek_v41"
+    (tmp_path / "config.json").write_text(json.dumps(value))
+    raw = AutoConfig.from_pretrained(tmp_path, local_files_only=True)
+    assert raw.model_type == "deepseek_v41"
+    assert raw.text_config.num_hash_layers == 0
+
+
+def test_native_checkpoint_reload_restores_hash_and_rope_buffers(tmp_path):
+    config = tiny_config(engram=True, vision=True)
+    model = AutoModelForImageTextToText.from_config(
+        config, engram_token_map=list(range(32))
+    ).eval()
+    ids = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8]])
+    expected = model(ids).logits.detach()
+    model.save_pretrained(tmp_path)
+    loaded = AutoModelForImageTextToText.from_pretrained(
+        tmp_path, local_files_only=True, engram_token_map=list(range(32))
+    ).eval()
+    for name, buffer in model.named_buffers(remove_duplicate=False):
+        torch.testing.assert_close(
+            loaded.get_buffer(name), buffer, rtol=0, atol=0, msg=name
+        )
+    torch.testing.assert_close(loaded(ids).logits, expected, rtol=0, atol=0)
+
+
+def test_nested_source_quantization_does_not_trigger_generic_fp8_loader():
+    value = tiny_config().to_dict()
+    value["quantization_config"] = {
+        "quant_method": "fp8",
+        "expert_dtype": "fp4",
+        "weight_block_size": [32, 32],
+    }
+    config = ModelConfig.from_dict(value)
+    assert not hasattr(config, "quantization_config")
+    assert config.source_quantization_config["expert_dtype"] == "fp4"
+    assert config.text_config.hidden_size == 32
+    reloaded = ModelConfig.from_dict(config.to_dict())
+    assert reloaded.source_quantization_config == config.source_quantization_config
+    value = reloaded.to_dict()
+    value["quantization_config"] = {
+        "quant_method": "compressed-tensors",
+        "quantization_status": "compressed",
+    }
+    exported = ModelConfig.from_dict(value)
+    assert exported.quantization_config["quant_method"] == "compressed-tensors"
+    assert exported.source_quantization_config == config.source_quantization_config
+
+
+@pytest.mark.parametrize("length", [1, 2, 3, 8, 9])
+def test_csa2_forward_handles_short_and_incomplete_groups_without_state_leaks(length):
+    torch.manual_seed(4)
+    model = DeepseekV41NativeForCausalLM(tiny_config(dspark=False)).eval()
+    ids = torch.arange(length).remainder(32).unsqueeze(0)
+    with torch.no_grad():
+        first = model(ids).logits
+        model((ids + 1).remainder(32))
+        repeated = model(ids).logits
+    assert first.shape == (1, length, 32)
+    assert torch.isfinite(first).all()
+    torch.testing.assert_close(first, repeated, rtol=0, atol=0)
+    assert model.model.layers[2].attn.compressor is None
+    assert model.model.layers[4].attn.indexer is not None
+    assert not hasattr(model.model.layers[4].attn.indexer, "wk")
+
+
+def test_candidate_pool_pins_latest_block_and_limits_search():
+    scores = torch.tensor([[[10.0, 9.0, 8.0, 7.0, 1.0, -torch.inf]]])
+    keep = _candidate_mask(scores, torch.tensor([[[5]]]), 1, 2)
+    assert keep.tolist() == [[[False, False, False, False, True, True]]]
+
+
+def test_fp4_rounds_ties_to_even_and_uses_distinct_kv_scale():
+    x = torch.tensor([[0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0, 6.0]])
+    expected = torch.tensor([[0, 1, 1, 2, 2, 4, 4, 6]], dtype=torch.float32)
+    torch.testing.assert_close(fp4_qdq(x, 8), expected)
+    scaled = x * 1.3
+    assert not torch.equal(fp4_qdq(scaled, 8), fp4_qdq(scaled, 8, e4m3_scale=True))
+
+
+def test_single_pass_mhc_consumes_previous_pre_mix(monkeypatch):
+    config = tiny_config(dspark=False).text_config
+    block = DeepseekV41Block(config, 0, False, vision=False)
+    block.attn_norm = block.ffn_norm = torch.nn.Identity()
+    observed = {}
+
+    class Attention(torch.nn.Module):
+        def forward(self, x, mask, shared):
+            observed["attention_input"] = x
+            return torch.zeros_like(x), shared
+
+    class FFN(torch.nn.Module):
+        def forward(self, x, image_mask):
+            observed["ffn_input"] = x
+            return torch.zeros_like(x)
+
+    block.attn, block.ffn = Attention(), FFN()
+    x = torch.stack((torch.ones(32), torch.full((32,), 3.0))).view(1, 1, 2, 32)
+    identity = torch.eye(2).view(1, 1, 2, 2)
+    next_pre = torch.tensor([[[0.0, 1.0]]])
+    monkeypatch.setattr(
+        block,
+        "mixes",
+        lambda _x, _kind: (next_pre, torch.zeros_like(next_pre), identity),
+    )
+    block(
+        x,
+        torch.tensor([[[1.0, 0.0]]]),
+        (None,) * 5,
+        torch.ones(1, 1, dtype=torch.bool),
+        torch.zeros(1, 1, dtype=torch.bool),
+        None,
+    )
+    torch.testing.assert_close(observed["attention_input"], torch.ones(1, 1, 32))
+    torch.testing.assert_close(observed["ffn_input"], torch.full((1, 1, 32), 3.0))
+
+
+def test_dspark_uses_target_inputs_and_observes_all_draft_experts():
+    config = tiny_config()
+    model = DeepseekV41NativeForCausalLM(config)
+    observed, targets, counts = {}, {}, {}
+    handles = []
+    for index in config.text_config.dspark_target_layer_ids:
+        handles.append(
+            model.model.layers[index].register_forward_pre_hook(
+                lambda _module, args, i=index: targets.update(
+                    {i: args[0].mean(2).clone()}
+                )
+            )
+        )
+    handles.append(
+        model.model.mtp[0].main_proj.register_forward_pre_hook(
+            lambda _module, args: observed.update(context=args[0].clone())
+        )
+    )
+    for stage, block in enumerate(model.model.mtp):
+        assert block.ffn.n_routed_experts == 2
+        assert block.ffn.gate.topk == 1
+        for index, expert in enumerate(block.ffn.experts):
+            key = (stage, index)
+            counts[key] = 0
+
+            def record(_module, _args, _output, key=key):
+                counts[key] += 1
+
+            handles.append(expert.w2.register_forward_hook(record))
+    heads = []
+    for head in (model.model.mtp[-1].markov_head, model.model.mtp[-1].confidence_head):
+        handles.append(
+            head.register_forward_hook(
+                lambda _module, _args, _output: heads.append(True)
+            )
+        )
+    ids = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8, 0, 0]])
+    mask = torch.tensor([[1] * 8 + [0, 0]])
+    with moe_calibration_context(model, calibrate_all_experts=False):
+        output = model(ids, attention_mask=mask).logits
+    expected = torch.cat(
+        [targets[index][:, :4] for index in config.text_config.dspark_target_layer_ids],
+        -1,
+    )
+    torch.testing.assert_close(observed["context"], expected)
+    assert len(heads) == 2
+    assert all(count == 1 for count in counts.values())
+    assert output.shape == (1, 10, 32)
+    assert torch.isfinite(output).all()
+    for handle in handles:
+        handle.remove()
+
+
+def test_engram_hash_resets_at_padding_and_image_boundaries():
+    config = tiny_config(engram=True, dspark=False).text_config
+    hashes = EngramHash(config, token_map=list(range(32)))
+    ids = torch.tensor([[3, 4, 5]])
+    full = hashes(ids, torch.ones_like(ids, dtype=torch.bool))
+    blocked = hashes(ids, torch.tensor([[True, False, True]]))
+    standalone = hashes(ids[:, 2:], torch.ones(1, 1, dtype=torch.bool))
+    torch.testing.assert_close(blocked[:, 2:], standalone)
+    assert not torch.equal(full[:, 2:], standalone)
+
+
+def test_dspark_keeps_absolute_context_positions_with_mixed_padding():
+    ids = torch.arange(1, 13).expand(2, -1)
+    mask = torch.tensor([[1] * 12, [0] * 3 + [1] * 6 + [0] * 3]).bool()
+    hidden = ids.float().unsqueeze(-1)
+    context, valid, draft, teacher, positions = _draft_inputs(
+        ids, mask, (hidden, hidden + 100), 4, 3, 31
+    )
+    assert positions.tolist() == [[4, 5, 6, 7], [1, 2, 3, 4]]
+    assert valid.tolist() == [[True] * 4, [False, False, True, True]]
+    assert teacher.tolist() == [[9, 10, 11], [6, 7, 8]]
+    assert draft.tolist() == [[9, 31, 31], [6, 31, 31]]
+    torch.testing.assert_close(
+        context,
+        torch.tensor(
+            [
+                [[5, 105], [6, 106], [7, 107], [8, 108]],
+                [[2, 102], [3, 103], [4, 104], [5, 105]],
+            ]
+        ).float(),
+    )
+
+
+def test_engram_preservation_and_bounded_lookup(tmp_path):
+    checkpoint = tmp_path / "source"
+    tensors = write_checkpoint(checkpoint, tiny_config(engram=True, dspark=False))
+    name = "layers.1.engram.embed.weight"
+    lookup = CheckpointEngramLookup(checkpoint, 1, (5, 32))
+    ids = torch.tensor([[[0, 4, 0], [2, 1, 4]]])
+    actual = lookup(ids)
+    expected = tensors[name].float()[ids].bfloat16()
+    torch.testing.assert_close(actual, expected)
+    materializer = DeepSeekV41WeightMaterializer()
+    source = materializer.create_source(str(checkpoint))
+    assert not any(".engram.embed." in name for name in source.tensor_names())
+    output = tmp_path / "output"
+    output.mkdir()
+    mapping = materializer.save_preserved_tensors(checkpoint, output)
+    assert materializer.save_preserved_tensors(checkpoint, output) == mapping
+    # Source shares this shard with ordinary weights: preserve only the table.
+    assert set(mapping) == {name, name.replace(".weight", ".scale")}
+    for output_name, filename in mapping.items():
+        with safe_open(output / filename, framework="pt") as shard:
+            assert torch.equal(
+                shard.get_tensor(output_name).view(torch.uint8),
+                tensors[output_name].view(torch.uint8),
+            )
+
+
+def test_block32_and_row32_source_scales_decode_independently():
+    materializer = DeepSeekV41WeightMaterializer(preserve_engram=False)
+    weight = torch.arange(64 * 96).reshape(64, 96).remainder(7).float()
+    scales = torch.tensor([[0.5, 1, 2], [4, 2, 0.5]])
+    name = "model.layers.0.attn.wq_a.weight"
+    actual = materializer.materialize_cpu(
+        name,
+        {
+            name: weight.to(torch.float8_e4m3fn),
+            name.replace(".weight", ".scale"): scales.to(torch.float8_e8m0fnu),
+        },
+        target_dtype=torch.float32,
+    )
+    expected = weight * scales.repeat_interleave(32, 0).repeat_interleave(32, 1)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    name = "model.layers.1.engram.embed.weight"
+    rows = torch.ones(3, 64, dtype=torch.float8_e4m3fn)
+    scales = torch.tensor([[0.5, 1], [2, 4], [8, 16]])
+    actual = materializer.materialize_cpu(
+        name,
+        {
+            name: rows,
+            name.replace(".weight", ".scale"): scales.to(torch.float8_e8m0fnu),
+        },
+        target_dtype=torch.float32,
+    )
+    torch.testing.assert_close(actual, scales.repeat_interleave(32, 1))
+
+
+def test_vision_branch_and_image_routing_bias():
+    config = tiny_config(vision=True, dspark=False)
+    model = DeepseekV41NativeForCausalLM(config)
+    encoded = model.encode_image(torch.randn(4, 3, 2, 2), 2, 2)
+    assert encoded.shape == (1, 32)
+    assert torch.isfinite(encoded).all()
+    gate = model.model.layers[0].ffn.gate
+    with torch.no_grad():
+        gate.weight.zero_()
+        gate.bias.copy_(torch.tensor([100.0, 90.0, 0.0, 0.0]))
+        gate.bias_vl.copy_(torch.tensor([0.0, 0.0, 100.0, 90.0]))
+    _, selected = gate(torch.ones(2, 32), torch.tensor([False, True]))
+    assert selected.tolist() == [[0, 1], [2, 3]]
+
+
+def test_image_boundary_embeddings_are_initialized():
+    model = DeepseekV41NativeForCausalLM(tiny_config(vision=True))
+    for name in ("image_start", "image_end", "image_newline"):
+        weight = getattr(model.model, name)
+        assert torch.isfinite(weight).all()
+        assert weight.count_nonzero() == weight.numel()
+        assert weight.abs().max() < 1
+
+
+def test_padded_text_training_has_finite_gradients():
+    model = DeepseekV41NativeForCausalLM(
+        tiny_config(engram=True, dspark=False), engram_token_map=list(range(32))
+    )
+    ids = torch.tensor([[1, 2, 3] + [0] * 13])
+    mask = torch.tensor([[1] * 3 + [0] * 13]).bool()
+    loss = model(ids, attention_mask=mask, labels=ids.masked_fill(~mask, -100)).loss
+    loss.backward()
+    assert torch.isfinite(loss)
+    for name, parameter in model.named_parameters():
+        if parameter.grad is not None:
+            assert torch.isfinite(parameter.grad).all(), name
+
+
+def test_disk_boundaries_preserve_shared_csa2_tensor_identity(tmp_path):
+    budget = HostMemoryBudget(
+        safety_reserve_bytes=0, system_available=lambda: 1_000_000
+    )
+    store = DiskBoundaryActivationStore(tmp_path / "boundaries", host_budget=budget)
+    tensor = torch.ones(16)
+    store.put(0, 0, {"shared": (tensor, None), "consumer": tensor})
+    loaded = store.get(0, 0)
+    assert loaded["shared"][0] is loaded["consumer"]
+
+
+def test_sequential_trace_matches_eager_backbone_and_draft_inputs():
+    model = DeepseekV41NativeForCausalLM(
+        tiny_config(engram=True), engram_token_map=list(range(32))
+    ).eval()
+    sample = {
+        "input_ids": torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8, 0]]),
+        "attention_mask": torch.tensor([[1] * 8 + [0]]),
+    }
+    plan = trace_sequential_plan(model, sample)
+    draft_contexts, confidence = [], []
+    handles = [
+        model.model.mtp[0].main_proj.register_forward_pre_hook(
+            lambda _m, args: draft_contexts.append(args[0].clone())
+        ),
+        model.model.mtp[-1].confidence_head.register_forward_hook(
+            lambda _m, _args, out: confidence.append(out.clone())
+        ),
+    ]
+    try:
+        with torch.no_grad():
+            expected = model(**sample).logits
+            values = dict(sample)
+            for subgraph in plan.subgraphs:
+                output = subgraph.forward(
+                    model, **{name: values[name] for name in subgraph.input_names}
+                )
+                values.update(output)
+        torch.testing.assert_close(output["logits"], expected, rtol=0, atol=0)
+        assert len(draft_contexts) == len(confidence) == 2
+        torch.testing.assert_close(draft_contexts[0], draft_contexts[1], rtol=0, atol=0)
+        torch.testing.assert_close(confidence[0], confidence[1], rtol=0, atol=0)
+    finally:
+        for handle in handles:
+            handle.remove()
+
+
+@pytest.mark.parametrize(
+    ("checkpoint_progress", "mode"),
+    [(False, "wna8"), (True, "w8a8"), (False, "w4a8")],
+)
+def test_streaming_quantizes_backbone_and_dspark_preserving_engram(
+    tmp_path, checkpoint_progress, mode
+):
+    config = tiny_config(engram=True)
+    checkpoint = tmp_path / "source"
+    source_tensors = write_checkpoint(checkpoint, config)
+    config = ModelConfig.from_pretrained(checkpoint, local_files_only=True)
+    factory = partial(
+        DeepseekV41NativeForCausalLM,
+        engram_token_map=list(range(32)),
+        engram_checkpoint=checkpoint,
+    )
+    schemes, ignored = EXAMPLE._schemes(mode)
+    data = DataLoader(
+        [
+            {
+                "input_ids": torch.tensor([1, 2, 3, 4, 5, 6, 7, 8]),
+                "attention_mask": torch.ones(8, dtype=torch.long),
+            }
+        ],
+        batch_size=1,
+    )
+    stats = ImatrixFallbackStats()
+    stats.install_hooks()
+    with stats:
+        output = streaming_oneshot(
+            model=checkpoint,
+            model_config=config,
+            model_factory=factory,
+            dataset=data,
+            dataset_fingerprint="a" * 64,
+            recipe=[
+                IMatrixGatherer(ignore=ignored),
+                QuantizationModifier(
+                    config_groups=schemes,
+                    ignore=ignored,
+                ),
+            ],
+            output_dir=tmp_path / "output",
+            work_dir=tmp_path / "work",
+            num_calibration_samples=1,
+            max_seq_length=8,
+            target_dtype=torch.float32,
+            device="cpu",
+            moe_calibrate_all_experts=True,
+            materializer=DeepSeekV41WeightMaterializer(),
+            checkpoint_progress=checkpoint_progress,
+        )
+    assert (output / "FINALIZED").exists()
+    index = json.loads((output / "model.safetensors.index.json").read_text())
+    mapping = index["weight_map"]
+    for name in (
+        "mtp.0.main_proj.weight",
+        "mtp.1.ffn.experts.1.w2.weight",
+        "mtp.2.attn.wq_a.weight",
+    ):
+        assert name in mapping
+    name = "mtp.1.ffn.experts.1.w2.weight"
+    expert = load_file(output / mapping[name])[name]
+    assert expert.dtype == torch.int8
+    assert expert.shape == (32, 32 if mode == "w8a8" else 16)
+    assert not {
+        name for name in stats.no_importance_counter if name.startswith("model.mtp.")
+    }
+    for name in ("layers.1.engram.embed.weight", "layers.1.engram.embed.scale"):
+        actual = load_file(output / mapping[name])[name]
+        assert torch.equal(
+            actual.view(torch.uint8), source_tensors[name].view(torch.uint8)
+        )
+    saved = json.loads((output / "config.json").read_text())
+    assert saved["model_type"] == "deepseek_v41"
+    assert saved["text_config"]["hidden_size"] == 32
+    assert saved["engram_storage"]["group_size"] == 32
+    assert AutoConfig.from_pretrained(output).text_config.n_mtp_layers == 3

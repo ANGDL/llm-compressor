@@ -88,15 +88,13 @@ class _TransformersConversionSource(CheckpointWeightSource):
         raw_names = [self._raw_name(name) for name in requested]
         raw_values = self._source.load_tensors_cpu(raw_names)
         return {
-            name: raw_values[raw_name]
-            for name, raw_name in zip(requested, raw_names)
+            name: raw_values[raw_name] for name, raw_name in zip(requested, raw_names)
         }
 
     def iter_tensor_groups_cpu(self, groups):
         logical_groups = [tuple(dict.fromkeys(group)) for group in groups]
         raw_groups = [
-            tuple(self._raw_name(name) for name in group)
-            for group in logical_groups
+            tuple(self._raw_name(name) for name in group) for group in logical_groups
         ]
         for logical, raw, raw_values in zip(
             logical_groups,
@@ -124,8 +122,7 @@ class TransformersWeightMaterializer(WeightMaterializer):
         self._groups: dict[str, _ConversionGroup] = {}
         self._source: CheckpointWeightSource | None = None
         self._target_shapes = {
-            name: tuple(tensor.shape)
-            for name, tensor in model.state_dict().items()
+            name: tuple(tensor.shape) for name, tensor in model.state_dict().items()
         }
 
     def configuration(self) -> Mapping[str, Any]:
@@ -138,6 +135,9 @@ class TransformersWeightMaterializer(WeightMaterializer):
                 repr(conversion) for conversion in self.conversions
             ],
         }
+
+    def save_preserved_tensors(self, checkpoint, output_dir):
+        return self.materializer.save_preserved_tensors(checkpoint, output_dir)
 
     def create_source(self, checkpoint: str) -> CheckpointWeightSource:
         source = self.materializer.create_source(checkpoint)
@@ -257,9 +257,7 @@ class TransformersWeightMaterializer(WeightMaterializer):
             raise RuntimeError("create_source() must be called before materialization")
         return self._source.metadata(name)
 
-    def dependencies(
-        self, tensor_name: str, metadata: TensorMetadata
-    ) -> list[str]:
+    def dependencies(self, tensor_name: str, metadata: TensorMetadata) -> list[str]:
         group = self._group(tensor_name)
         dependencies = []
         for index, source_tensor in enumerate(group.sources):
@@ -443,9 +441,7 @@ class TransformersWeightMaterializer(WeightMaterializer):
             raise ValueError(
                 f"Reverse Transformers converter does not match {tensor_name!r}"
             )
-        reverse_converter.add_tensor(
-            renamed_name, tensor_name, source_pattern, tensor
-        )
+        reverse_converter.add_tensor(renamed_name, tensor_name, source_pattern, tensor)
         converted = reverse_converter.convert(
             renamed_name,
             model=self.model,
@@ -467,9 +463,7 @@ class TransformersWeightMaterializer(WeightMaterializer):
             return f"{output_module_name}.weight_scale"
         return self.materializer.output_weight_scale_name(output_module_name)
 
-    def transform_output_config(
-        self, config: Mapping[str, Any]
-    ) -> Mapping[str, Any]:
+    def transform_output_config(self, config: Mapping[str, Any]) -> Mapping[str, Any]:
         return self.materializer.transform_output_config(config)
 
 

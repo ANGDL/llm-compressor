@@ -1,0 +1,137 @@
+# DeepSeek-V4.1-Flash 流式量化
+
+本地 Transformers 5.19.0 未提供 `deepseek_v41` 配置和模型实现，因此采用与
+native V4 相同的接入方式：独立模型、MoE 校准 wrapper、按需权重解码器及流式示例。
+实现位于 `src/llmcompressor/modeling/deepseekv41`，复用 V4 的基础参考算子。
+原始类型的 AutoConfig fallback 仅在上游未注册 `deepseek_v41` 时生效。
+
+## 当前工作流
+
+```bash
+python examples/streaming_oneshot/deepseek_v41_wNa8.py \
+  --model-id /path/to/DeepSeek-V4.1-Flash \
+  --dataset-id /path/to/calibration.jsonl \
+  --output-dir /path/to/DeepSeek-V4.1-Flash-WNa8 \
+  --quant-mode wna8 \
+  --num-calibration-samples 128 \
+  --max-sequence-length 2048 \
+  --batch-size 1 \
+  --moe-calibrate-all-experts
+```
+
+模型目录须包含索引引用的全部真实分片。2026-10-17 检查的本地目录只有配置、
+索引及参考代码，尚不能运行完整模型量化。数据接受 `messages`、`text` 或
+`input_ids`；messages 优先使用模型目录的 `encoding/encoding.py`。
+`--reasoning-effort` 范围为 1..100，默认 75。
+`--device cpu` 或 `--device cuda:0` 可显式选择校准设备。
+
+量化范围：
+
+| 模式 | routed experts | attention、shared experts、DSpark main_proj |
+|---|---|---|
+| `wna8` | INT4 权重 / 动态 INT8 激活 | INT8 权重 / 动态 INT8 激活 |
+| `w8a8` | INT8 权重 / 动态 INT8 激活 | INT8 权重 / 动态 INT8 激活 |
+| `w4a8` | INT4 权重 / 动态 INT8 激活 | INT4 权重 / 动态 INT8 激活 |
+
+具体 target/ignore 以示例 `_schemes` 为准。这里的 INT4 是源 E2M1 FP4 解码后
+再次量化；不能将二者的存储字节或数值格式互换。
+
+Vision/aligner、Engram 投影、router、norm/mHC、compressor、indexer 控制投影、
+grouped `wo_a`、embedding/head、Markov/confidence 头不做额外 PTQ。
+普通源 FP8/FP4 权重由 materializer 解码为执行精度；这些未选模块不保证维持
+原始存储 dtype。只有 Engram 巨表及其行级 scale 逐字节保留，读取时先按行 gather
+再转浮点。若源分片只含待保留表，会优先创建硬链接；否则使用有界缓冲复制。
+最终配置分别记录目标 `quantization_config`、原始 `source_quantization_config`
+以及 `engram_storage`。
+
+## DSpark 专用校准
+
+普通参考生成路径不会自动执行 DSpark。native forward 显式执行 3 层草稿网络，
+从目标主干层执行前的 residual 均值构建上下文，并采用各样本的绝对 RoPE 位置。
+窗口、padding 和 Single-Pass pre-mix 均作为输入/输出明确传递。
+
+每条样本预留一段末尾真实 token 作为 teacher tokens。草稿输入为一个真实 seed
+和配置中的 noise tokens；Markov/confidence 头使用对应 teacher token。
+草稿 MoE 按 128 experts/top-3 独立构造，校准时始终覆盖所有草稿专家。
+这条路径用于收集 PTQ 统计，不实现生产 speculative decoding 的接受/拒绝逻辑。
+
+## 验证与限制
+
+常规测试：
+
+```bash
+python -m pytest tests/llmcompressor/modeling/test_deepseek_v41.py -q
+```
+
+可选的独立参考对齐测试：
+
+```bash
+DEEPSEEK_V41_REFERENCE_DIR=/path/to/DeepSeek-V4.1-Flash/inference \
+python -m pytest tests/llmcompressor/modeling/test_deepseek_v41_reference.py -q
+```
+
+参考对齐使用相同的随机缩小 BF16 权重，以 CPU 等价算子替换 GPU kernel，
+对比主干、DSpark 各层、草稿 logits 和 confidence；包括短序列、ratio=2 的
+不完整分组及 DSpark 窗口回绕。Engram/vision 不包含在这项参考数值比较中，
+另有 hash、按行解码/保留、视觉形状及 image routing 单元检查。
+常规测试还检查 FX 分段执行与直接执行一致、三种量化模式的 INT4/INT8 实际导出，
+以及有/无 checkpoint-progress 的流式路径。
+
+2026-10-17 本地验证：V4.1 常规与参考对齐共 30 项通过；连同 tiny 创建工具、
+V4、materializer、boundary store、finalize 和 pretrained 回归，共 130 项通过、1 项因无 CUDA
+跳过。对本次修改范围执行的 `make style` 和 `make quality` 均通过。
+
+使用本地完整尺寸配置构建 meta 模型，外置 Engram 表后，48,494 个模型张量名
+与源索引的主张量名一一对应；未分配全量权重。
+
+当前实现面向完整序列文本校准，尚未验证真实权重/GPU kernel、长上下文下的内存
+和速度、多模态统计、生产 KV-cache/replay、DSpark 接受率及目标推理引擎加载。
+模型类支持 `encode_image` 和预构建的 `inputs_embeds/image_mask`，示例不负责
+自动图像预处理。导出保留原始键名和 Engram FP8 表；目标引擎仍需支持该架构、
+目标 INT4/INT8 布局及混合格式。AutoConfig 能解析输出不等于已验证推理可加载。
+
+## 完整层分布的 tiny 模型
+
+已生成 32,202,678 参数的本地 fixture：
+`.cache/tiny-models/DeepSeek-V4.1-Flash-Tiny/`。保留 40 层主干、32 层 ViT、
+3 层 DSpark、两处 Engram、全部 CSA2 来源/重索引/复用分布及 129,280 词表。
+缩小 hidden size、专家数、Engram 桶和运行时序列长度，以适合 CPU 测试。
+
+创建新 fixture：
+
+```bash
+python tools/create_tiny_dsv41.py \
+  --source /Users/ang/models/DeepSeek-V4.1-Flash \
+  --output /path/to/new-tiny-fixture
+```
+
+执行完整校验及三种量化：
+
+```bash
+python tools/validate_tiny_dsv41.py \
+  .cache/tiny-models/DeepSeek-V4.1-Flash-Tiny
+```
+
+目录包含 `native-finetuned/`、7 分片的 `source-fp8-fp4/`、
+`wna8/`、`w8a8/`、`w4a8/`、校准数据、README、`creation.json`、
+`validation.json` 和各量化日志。已有 `FINALIZED` 的量化输出会复用并重新校验。
+raw/量化产物通过工具中的 CPU reference loader 解码，native checkpoint 可用
+`AutoModelForImageTextToText` 加载，需传入对应 tokenizer 以重建 Engram 哈希。
+
+文本微调 275 步后，保存并重载的训练集困惑度为 1.6875。CPU 参考校验结果：
+
+| Checkpoint | Toy 困惑度 | 量化 Linear 数 |
+|---|---:|---:|
+| 源 FP8/FP4 | 1.6904 | — |
+| WNa8 | 1.6913 | 1,306 |
+| W8A8 | 1.6898 | 1,306 |
+| W4A8 | 1.6916 | 1,306 |
+
+前向 hooks 确认 40/32/3 层、332 个 routed experts、两处 Engram、4 个
+compressor、8 个 indexer 和两个草稿头均被执行。改变合成图像输入会改变模型
+logits。三个量化输出均完成重新加载、动态 INT8 激活 Q/DQ、完整前向、Engram
+字节比较及视觉权重保留检查；W8A8 还覆盖 checkpoint-progress，W4A8 覆盖 async-save。
+
+微调与困惑度使用同一份 8 条 toy 文本，仅验证模型可学习和量化流程可运行。
+视觉和 DSpark 没有微调；图像路径为合成 patches 和预构建 embeddings。
+这些结果不替代真实模型、GPU kernel、生产引擎或量化质量验证。
