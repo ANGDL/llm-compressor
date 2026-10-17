@@ -49,8 +49,8 @@ def _snapshot(
 ) -> Any:
     """Detach supported values and reject opaque or KV-cache objects."""
 
+    memo = memo if memo is not None else {}
     if isinstance(value, torch.Tensor):
-        memo = memo if memo is not None else {}
         identity = id(value)
         if identity in memo:
             return memo[identity]
@@ -144,8 +144,8 @@ def _move(
 ) -> Any:
     """Rebuild a stored value with tensors moved to the consumer device."""
 
+    memo = memo if memo is not None else {}
     if isinstance(value, torch.Tensor):
-        memo = memo if memo is not None else {}
         identity = id(value)
         if identity not in memo:
             moved = value.to(device=device)
@@ -179,8 +179,7 @@ def _tensor_bytes(value: Any, seen: set[int] | None = None) -> int:
         return value.numel() * value.element_size()
     if is_dataclass(value) and not isinstance(value, type):
         return sum(
-            _tensor_bytes(getattr(value, field.name), seen)
-            for field in fields(value)
+            _tensor_bytes(getattr(value, field.name), seen) for field in fields(value)
         )
     if isinstance(value, (list, tuple)):
         return sum(_tensor_bytes(item, seen) for item in value)
@@ -255,9 +254,7 @@ class InMemoryBoundaryActivationStore(BoundaryActivationStore):
         self.deduplicate_tensors = deduplicate_tensors
         self.host_budget = host_budget
         self._boundaries: dict[int, dict[int, Any]] = {}
-        self._reservations: dict[
-            int, dict[int, HostMemoryReservation]
-        ] = {}
+        self._reservations: dict[int, dict[int, HostMemoryReservation]] = {}
 
     def put(self, boundary: int, batch: int, value: Any) -> None:
         _check_index(boundary, "boundary")

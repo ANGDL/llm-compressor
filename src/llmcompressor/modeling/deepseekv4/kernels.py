@@ -1,6 +1,5 @@
 import importlib.util
 import os
-import sys
 from contextlib import contextmanager
 from functools import lru_cache
 from pathlib import Path
@@ -59,7 +58,9 @@ def reference_kernel_available() -> bool:
 @lru_cache(1)
 def _load_reference_kernel_module() -> Optional[ModuleType]:
     if not _reference_backend_requested():
-        print("[kernels] backend not set to 'reference', skipping reference kernel module")
+        print(
+            "[kernels] backend not set to 'reference', skipping reference kernel module"
+        )
         return None
 
     path = get_reference_kernel_path()
@@ -68,12 +69,16 @@ def _load_reference_kernel_module() -> Optional[ModuleType]:
         return None
 
     print(f"[kernels] loading reference kernel module from '{path}'")
-    spec = importlib.util.spec_from_file_location("deepseek_v4_reference_kernel_backend", path)
+    spec = importlib.util.spec_from_file_location(
+        "deepseek_v4_reference_kernel_backend", path
+    )
     if spec is None or spec.loader is None:
         print(f"[kernels] failed to create spec for '{path}'")
         return None
 
-    spec = importlib.util.spec_from_file_location("deepseek_v4_reference_kernel_backend", path)
+    spec = importlib.util.spec_from_file_location(
+        "deepseek_v4_reference_kernel_backend", path
+    )
     if spec is None or spec.loader is None:
         return None
 
@@ -83,7 +88,7 @@ def _load_reference_kernel_module() -> Optional[ModuleType]:
     except Exception as e:
         print(f"[kernels] failed to load reference kernel module: {e}")
         return None
-    print(f"[kernels] reference kernel module loaded successfully")
+    print("[kernels] reference kernel module loaded successfully")
     return module
 
 
@@ -125,21 +130,33 @@ def sparse_attention(
         bsz, seqlen, -1, head_dim
     )
     # scores: [bsz, seqlen, n_heads, topk]
-    scores = torch.einsum("bshd,bskd->bshk", q.float(), gathered_kv.float()) * softmax_scale
+    scores = (
+        torch.einsum("bshd,bskd->bshk", q.float(), gathered_kv.float()) * softmax_scale
+    )
     mask = topk_idxs.unsqueeze(2) < 0  # [bsz, seqlen, 1, topk]
     scores = scores.masked_fill(mask, float("-inf"))
     # Match tilelang online softmax: max over real scores only (not including sink)
     scores_max = scores.amax(dim=-1, keepdim=True)  # [bsz, seqlen, n_heads, 1]
-    scores_max = scores_max.clamp(min=-1e30)  # avoid -inf max when all masked
+    sink_expanded = attn_sink.view(1, 1, n_heads, 1)
+    # An all-masked padding query has only its sink. Center at the sink to
+    # avoid exp(1e30), whose zero upstream gradient otherwise becomes NaN.
+    scores_max = torch.where(
+        (topk_idxs >= 0).any(-1, keepdim=True).unsqueeze(2),
+        scores_max,
+        sink_expanded,
+    )
     exp_scores = torch.exp(scores - scores_max)  # unnormalized exp
     exp_scores = exp_scores.masked_fill(mask, 0.0)
     # Cast to BF16 before value matmul (matches kernel acc_s_cast)
     exp_scores_bf16 = exp_scores.bfloat16()
     # Weighted sum: BF16 weights × BF16 values → FP32 accumulator
-    acc_o = torch.einsum("bshk,bskd->bshd", exp_scores_bf16.float(), gathered_kv.float())
+    acc_o = torch.einsum(
+        "bshk,bskd->bshd", exp_scores_bf16.float(), gathered_kv.float()
+    )
     # Total sum includes sink contribution
-    sink_expanded = attn_sink.view(1, 1, n_heads, 1)  # [1, 1, n_heads, 1]
-    sum_exp = exp_scores.sum(dim=-1, keepdim=True) + torch.exp(sink_expanded - scores_max)
+    sum_exp = exp_scores.sum(dim=-1, keepdim=True) + torch.exp(
+        sink_expanded - scores_max
+    )
     return (acc_o / sum_exp).to(output_dtype)
 
 
