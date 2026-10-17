@@ -207,3 +207,24 @@ def test_backbone_and_dspark_match_supplied_reference(
     finally:
         for handle in handles:
             handle.remove()
+
+
+@pytest.mark.parametrize("prompt_length", [2, 3, 5])
+def test_cached_decode_matches_supplied_reference(reference_pair, prompt_length):
+    _, model, native = reference_pair
+    native.config.calibrate_dspark = False
+    ids = torch.arange(1, prompt_length + 5).remainder(32).unsqueeze(0)
+    with torch.no_grad():
+        actual = native(ids[:, :prompt_length], use_cache=True)
+        _, expected, _ = model(ids[:, :prompt_length])
+        torch.testing.assert_close(actual.logits[:, -1], expected, rtol=1e-5, atol=1e-5)
+        for position in range(prompt_length, ids.shape[1]):
+            token = ids[:, position : position + 1]
+            actual = native(
+                token, past_key_values=actual.past_key_values, use_cache=True
+            )
+            _, expected, _ = model(token, start_pos=position)
+            torch.testing.assert_close(
+                actual.logits[:, -1], expected, rtol=1e-5, atol=1e-5
+            )
+            assert actual.past_key_values.get_seq_length() == position + 1

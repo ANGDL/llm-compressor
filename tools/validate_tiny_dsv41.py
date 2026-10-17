@@ -23,7 +23,6 @@ from pathlib import Path
 
 import torch
 from compressed_tensors.quantization import QuantizationScheme, QuantizationStatus
-from compressed_tensors.quantization.lifecycle.forward import forward_quantize
 from compressed_tensors.utils import match_named_modules
 from safetensors import safe_open
 from transformers import AutoModelForImageTextToText, AutoTokenizer
@@ -34,6 +33,7 @@ from llmcompressor.modeling.deepseekv41 import (
 )
 from llmcompressor.modeling.moe_context import moe_calibration_context
 from llmcompressor.streaming import DeepSeekV41WeightMaterializer, build_meta_model
+from llmcompressor.streaming.inference.quantization import reference_activation_qdq
 from llmcompressor.streaming.materialization import materialize_weights
 
 if __package__:
@@ -80,7 +80,7 @@ def unpack_int4(weight):
 
 def _input_qdq(module, args):
     return (
-        forward_quantize(
+        reference_activation_qdq(
             module, args[0], "input", module.quantization_scheme.input_activations
         ),
     )
