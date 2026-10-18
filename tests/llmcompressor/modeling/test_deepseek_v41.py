@@ -104,6 +104,24 @@ def tiny_config(*, engram=False, vision=False, dspark=True):
     )
 
 
+def test_official_fp32_parameter_exceptions_survive_bf16_default():
+    previous = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(torch.bfloat16)
+        model = DeepseekV41NativeForCausalLM(tiny_config())
+    finally:
+        torch.set_default_dtype(previous)
+    assert model.model.embed.weight.dtype == torch.bfloat16
+    assert model.model.layers[0].attn.wq_a.weight.dtype == torch.bfloat16
+    assert model.model.layers[1].attn.compressor.wkv.weight.dtype == torch.float32
+    assert model.model.layers[1].attn.compressor.wgate.weight.dtype == torch.float32
+    assert model.model.layers[3].attn.compressor.wkv.weight.dtype == torch.bfloat16
+    assert model.model.lm_head.weight.dtype == torch.float32
+    final_draft = model.model.mtp[-1]
+    assert final_draft.markov_head.head.weight.dtype == torch.float32
+    assert final_draft.confidence_head.proj.weight.dtype == torch.float32
+
+
 def write_checkpoint(root, config):
     root.mkdir()
     model = DeepseekV41NativeForCausalLM(config, engram_token_map=list(range(32)))
@@ -137,6 +155,42 @@ def write_checkpoint(root, config):
     value.update(model_type="deepseek_v41", architectures=["DeepseekV41ForCausalLM"])
     (root / "config.json").write_text(json.dumps(value))
     return tensors
+
+
+@pytest.mark.parametrize("use_auto_factory", [False, True])
+def test_streaming_keeps_official_fp32_payloads_without_bf16_roundtrip(
+    tmp_path, use_auto_factory
+):
+    checkpoint = tmp_path / "source"
+    tensors = write_checkpoint(checkpoint, tiny_config())
+    raw_names = [
+        "layers.1.attn.compressor.wkv.weight",
+        "layers.1.attn.compressor.wgate.weight",
+        "head.weight",
+        "mtp.2.markov_head.head.weight",
+        "mtp.2.confidence_head.proj.weight",
+    ]
+    # This value cannot survive FP32 -> BF16 -> FP32.
+    sentinel = 1 + 2**-16
+    for name in raw_names:
+        tensors[name].fill_(sentinel)
+    save_file(tensors, checkpoint / "model.safetensors")
+    with load_streaming_model(
+        checkpoint,
+        config=ModelConfig.from_pretrained(checkpoint, local_files_only=True),
+        model_factory=None if use_auto_factory else DeepseekV41NativeForCausalLM,
+        model_kwargs={"engram_token_map": list(range(32))},
+        materializer=DeepSeekV41WeightMaterializer(),
+    ) as inference:
+        assert inference.weights.tensor_reads == 0
+        for raw in raw_names:
+            logical = "model." + (
+                raw.replace("head.", "lm_head.", 1) if raw == "head.weight" else raw
+            )
+            actual = inference.weights[logical]
+            assert actual.dtype == torch.float32
+            torch.testing.assert_close(actual, tensors[raw], atol=0, rtol=0)
+        assert all(p.is_meta for p in inference.model.parameters())
 
 
 def test_native_and_raw_autoconfig_dispatch_roundtrip(tmp_path):

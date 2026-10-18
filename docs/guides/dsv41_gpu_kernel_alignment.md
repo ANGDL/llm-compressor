@@ -37,7 +37,7 @@ python tools/validate_dsv41_gpu_kernels.py \
 | 项目 | 比较内容 |
 | --- | --- |
 | mHC/Sinkhorn | 官方 FP32 `pre/post/comb` 与独立参考、项目实现；hc=2/4 |
-| 稀疏注意力 | 官方 64-KV 在线 softmax、BF16 权重转换、FP32 累加；额外比较项目全局 softmax 路径 |
+| 稀疏注意力 | 官方 64-KV 在线 softmax、BF16 权重转换、FP32 累加；项目路径与独立在线参考额外做严格比较 |
 | FP8 activation | FP32 scale、power-of-two FP32 scale、E8M0 scale；比较编码、scale 和 BF16 Q/DQ |
 | FP8 GEMM | 原生 FP8 × FP8，与按 group 应用 scale 的 FP32 累加参考比较 |
 | mHC 形状诊断 | 同一 token 在完整序列与单 token 投影时的系数、FP32 合并值、BF16 合并值 |
@@ -49,8 +49,14 @@ kernel**。FP4 软件检查使用 FP32 运算、查表和 FP8 scale cast，不�
 FP4 kernel 对齐。
 
 稀疏注意力覆盖随机索引、部分屏蔽、全部 `-1`、重复索引、最后一个有效
-位置、跨 64-KV 边界，以及首个 block 完全屏蔽。包含生产模型的 head_dim=512，
-并比较同一个 query 在整段执行与单独执行时的官方输出。
+位置、跨 64-KV 边界，以及首个 block 完全屏蔽。完整矩阵包含生产模型的
+64 heads、head_dim=512，以及 128/512/640 个候选（128 window + 512 index
+top-k）。官方和项目实现都比较同一个 query 在整段执行与单独执行时的输出。
+
+此前 H20 + TileLang 0.1.13 的报告中，官方 `head_dim=32` kernel 因
+8-warp GEMM 布局无法编译。默认矩阵改用 `head_dim>=64`，保留小 head 数和
+K=1；可加 `--include-small-head-dim` 显式复查 d=32。该开关直接调用原始官方
+kernel，不修改线程数或用 PyTorch 替代官方输出；编译失败仍记录为 error。
 
 只跑某些算子时使用 `--operators`：
 
@@ -80,6 +86,8 @@ relative L2、元素差异数和 `strict_allclose`。BF16 结果额外报告
 - BF16 attention/GEMM 默认预算为 `atol=0.002, rtol=0.015625`，同时保留严格
   比较结果。预算内通过不等于逐元素相等；可通过 `--bf16-atol`、
   `--bf16-rtol` 收紧预算。
+- `project_vs_online_reference` 使用严格 `atol=1e-6, rtol=1e-5`，防止项目
+  计算顺序偏差被较宽的 GPU BF16 容差掩盖。报告同时保留精确相等指标。
 - mHC 的 shape 比较属于 `diagnostic`，不是端到端 cache 验收项。
   关注 `diagnostics.bf16_hc_post_full_vs_decode` 的精确相等、
   `mismatched_elements` 和 `max_abs`；它不参与算子通过数。

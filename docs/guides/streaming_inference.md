@@ -9,6 +9,14 @@ This path is intended to check model adaptation and quantized checkpoint
 serialization with limited accelerator memory. Each decode token rereads the
 required weights, so it is not a serving engine.
 
+The pipeline is generic across architectures: it owns checkpoint access, weight
+offload, memory budgets and validation entry points. Model adapters own attention,
+precision boundaries and request cache semantics, following their official
+implementations. Architecture-specific computation belongs in the model adapter;
+an algebraically equivalent replacement is insufficient when it changes
+low-precision rounding. Shared model helpers are appropriate where the official
+models use the same algorithm.
+
 ## Native prefill, decode and generation
 
 ```python
@@ -134,6 +142,15 @@ with load_streaming_model(
 The same bridge handles this project's WNa8/W8A8/W4A8 raw-layout outputs, including
 their `.scale` names and signed nibble INT4 packing. Engram tables retain bounded
 row lookup rather than becoming full device parameters.
+
+The model declares the official FP32 compressor projections (ratio > 1), LM and
+Markov heads, confidence projection and mHC controls explicitly. The loader
+respects those declarations while ordinary computation defaults to BF16.
+The PyTorch sparse attention path follows the official 64-KV online softmax,
+with BF16 weights before each value GEMM and FP32 accumulation/rescaling.
+Fully masked padding rows retain zero output with finite calibration gradients.
+This follows the model's numerical contract without introducing model-specific
+rules into the inference pipeline.
 
 Native V4.1 now has request-owned CPU state for window history, source-owned
 compressed KV/index K, unfinished compression groups and Engram history.

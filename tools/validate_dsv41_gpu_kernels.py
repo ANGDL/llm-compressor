@@ -99,7 +99,8 @@ def sparse_reference(q, kv, sink, indices, scale):
     acc = torch.zeros((b, s, h, d), device=q.device, dtype=torch.float32)
     batches = torch.arange(b, device=q.device).view(b, 1, 1)
     for start in range(0, indices.size(-1), 64):
-        idx = indices[..., start : start + 64].long()
+        idx = indices[..., start : start + 64]
+        idx = F.pad(idx, (0, 64 - idx.shape[-1]), value=-1).long()
         values = kv[batches, idx.clamp_min(0)].float()
         values = values.masked_fill((idx < 0).unsqueeze(-1), 0)
         scores = torch.einsum("bshd,bskd->bshk", q.float(), values) * scale
@@ -114,6 +115,21 @@ def sparse_reference(q, kv, sink, indices, scale):
         maximum = new_maximum
     denominator = denominator + torch.exp(sink.view(1, 1, h, 1) - maximum)
     return (acc / denominator).to(q.dtype)
+
+
+def sparse_cases(*, quick, include_small_head_dim=False):
+    cases = [(1, 64, 4), (4, 512, 65), (16, 128, 128)]
+    if not quick:
+        cases += [
+            (h, d, k)
+            for h in (1, 2, 4, 8, 16)
+            for d, k in ((64, 1), (64, 32), (128, 64), (512, 129))
+        ]
+        # Production Flash shape, including sliding_window=128 + index_topk=512.
+        cases += [(64, 512, k) for k in (128, 512, 640)]
+    if include_small_head_dim:
+        cases += [(h, 32, 1) for h in (1, 2, 4, 8, 16)]
+    return cases
 
 
 def ceil_power2(x):
@@ -221,7 +237,8 @@ def randn(shape, device, dtype=torch.float32):
 def quant_input(m, n, group, device):
     x = randn((m, n), device)
     x *= torch.logspace(-6, 2, n // group, device=device).repeat_interleave(group)
-    x[0].zero_()
+    if m > 1:
+        x[0].zero_()
     # Every last-row group has scale 1 for FP4: anchor 6, include both signs,
     # all seven midpoints, and their adjacent BF16 values.
     ties = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0], device=device)
@@ -376,8 +393,23 @@ class Runner:
             "official_full_vs_last_query": compare(actual[:, -1:], tail, exact=True),
         }
         if self.project:
-            checks["official_vs_project"] = self.budget(
-                actual, self.project["kernels"].sparse_attention(*args)
+            project = self.project["kernels"].sparse_attention(*args)
+            checks["official_vs_project"] = self.budget(actual, project)
+            # This strict check catches algorithm/order mismatches even when
+            # both results fit within the broader official GPU BF16 budget.
+            checks["project_vs_online_reference"] = compare(project, expected)
+            checks["project_all_masked_zero"] = compare(
+                project[:, 2], torch.zeros_like(project[:, 2]), exact=True
+            )
+            project_tail = self.project["kernels"].sparse_attention(
+                q[:, -1:].contiguous(),
+                kv,
+                sink,
+                idx[:, -1:].contiguous(),
+                d**-0.5,
+            )
+            checks["project_full_vs_last_query"] = compare(
+                project[:, -1:], project_tail, exact=True
             )
         return {
             "inputs": tensors_info(q=q, kv=kv, sink=sink, indices=idx),
@@ -565,14 +597,10 @@ class Runner:
                         lambda b=b, s=s, hc=hc: self.hc(b, s, hc),
                     )
         if "sparse" in selected:
-            cases = [(1, 64, 4), (4, 512, 65), (16, 128, 128)]
-            if not self.args.quick:
-                cases += [
-                    (h, d, k)
-                    for h in (1, 2, 4, 8, 16)
-                    for d, k in ((32, 1), (64, 32), (128, 64), (512, 129))
-                ]
-            for h, d, k in cases:
+            for h, d, k in sparse_cases(
+                quick=self.args.quick,
+                include_small_head_dim=self.args.include_small_head_dim,
+            ):
                 self.case(
                     "sparse",
                     f"h{h}_d{d}_k{k}",
@@ -666,6 +694,11 @@ def parse_args(argv=None):
     parser.add_argument("--seed", type=int, default=20261017)
     parser.add_argument("--operators", nargs="+", choices=OPERATORS, default=OPERATORS)
     parser.add_argument("--quick", action="store_true", help="Smaller shape matrix")
+    parser.add_argument(
+        "--include-small-head-dim",
+        action="store_true",
+        help="Also probe d=32; known official TileLang warp-layout compile limitation",
+    )
     parser.add_argument("--fail-fast", action="store_true")
     parser.add_argument("--self-test", action="store_true", help="CPU references only")
     parser.add_argument(
@@ -700,6 +733,7 @@ def main(argv=None):
         "seed": args.seed,
         "requested_operators": list(args.operators),
         "quick": args.quick,
+        "include_small_head_dim": args.include_small_head_dim,
         "environment": {
             "torch": torch.__version__,
             "torch_cuda": torch.version.cuda,

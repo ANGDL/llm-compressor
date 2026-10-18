@@ -31,6 +31,37 @@ def test_sparse_online_maximum_rescales_previous_value_accumulator():
     torch.testing.assert_close(actual, expected.bfloat16(), atol=0, rtol=0)
 
 
+def test_project_sparse_matches_online_reference_across_block_boundary(tmp_path):
+    args = validation.parse_args(
+        ["--self-test", "--report", str(tmp_path / "report.json")]
+    )
+    modules, _ = validation.load_project(Path(__file__).resolve().parents[2])
+
+    class Official:
+        sparse_attn = staticmethod(validation.sparse_reference)
+
+    runner = validation.Runner(args, {"results": []}, Official(), modules)
+    torch.manual_seed(7243)
+    result = runner.sparse(4, 64, 129)
+    assert result["checks"]["project_vs_online_reference"]["exact"]
+    assert result["checks"]["project_all_masked_zero"]["exact"]
+    assert result["checks"]["project_full_vs_last_query"]["exact"]
+
+
+def test_default_sparse_shapes_cover_production_and_small_shape_is_explicit():
+    cases = validation.sparse_cases(quick=False)
+    assert (64, 512, 640) in cases
+    assert (64, 512, 512) in cases
+    assert all(d >= 64 for _, d, _ in cases)
+    probe = validation.sparse_cases(quick=False, include_small_head_dim=True)
+    assert (16, 32, 1) in probe
+    assert all(case in probe for case in cases)
+
+
+def test_single_row_quantization_input_is_not_trivially_zero():
+    assert validation.quant_input(1, 32, 32, "cpu").count_nonzero() > 0
+
+
 def test_bf16_step_metric_handles_signed_zero_and_one_step():
     actual = torch.tensor([-0.0, 1.0, -1.0], dtype=torch.bfloat16)
     expected = torch.tensor([0.0, 1.0078125, -1.0078125], dtype=torch.bfloat16)
