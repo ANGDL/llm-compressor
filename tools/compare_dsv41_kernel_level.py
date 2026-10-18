@@ -25,7 +25,9 @@ import torch
 
 try:
     from tools.dsv41_sparse_trace import (
+        compare_block_sum_backends,
         compare_qk_backends,
+        compare_value_gemm_backends,
         pad_official_inputs,
         reference_qk_backend,
         reference_trace,
@@ -50,7 +52,9 @@ try:
     )
 except ModuleNotFoundError:
     from dsv41_sparse_trace import (
+        compare_block_sum_backends,
         compare_qk_backends,
+        compare_value_gemm_backends,
         pad_official_inputs,
         reference_qk_backend,
         reference_trace,
@@ -414,6 +418,12 @@ class KernelComparator:
         }
         diagnostics["qk_backend_comparison"] = compare_qk_backends(
             traced, q, kv, indices, scale, requested_heads
+        )
+        diagnostics["block_sum_backend_comparison"] = compare_block_sum_backends(
+            traced, expected
+        )
+        diagnostics["value_gemm_backend_comparison"] = compare_value_gemm_backends(
+            traced, q, kv, indices
         )
         diagnostics["reference_qk_backend"] = reference_qk_backend(padded_q)
         name = f"h{q.shape[2]}_d{q.shape[-1]}_k{indices.shape[-1]}"

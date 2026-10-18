@@ -279,6 +279,17 @@ QK_BACKENDS = (
     "bf16_bmm_out_fp32",
     "bf16_bmm_default_cast",
 )
+VALUE_GEMM_BACKENDS = (
+    "fp32_einsum",
+    "bf16_bmm_out_fp32",
+    "bf16_bmm_default_cast",
+    "bf16_pairwise_fp32",
+)
+BLOCK_SUM_BACKENDS = (
+    "torch_sum",
+    "pairwise_sum",
+    "sequential_sum",
+)
 
 
 def reference_qk_backend(q):
@@ -326,6 +337,72 @@ def value_gemm_fp32(weights_bf16, values_bf16):
     )
 
 
+def _pairwise_reduce_last(values):
+    """Reduce the last dimension with an explicit adjacent-pair tree."""
+    work = values
+    while work.shape[-1] > 1:
+        if work.shape[-1] % 2:
+            work = torch.cat((work, torch.zeros_like(work[..., :1])), dim=-1)
+        work = work[..., 0::2] + work[..., 1::2]
+    return work[..., 0]
+
+
+def value_gemm_product(weights_bf16, values_bf16, backend):
+    """Evaluate one explicit value-GEMM reduction backend."""
+    batch, sequence, heads, keys = weights_bf16.shape
+    head_dim = values_bf16.shape[-1]
+    if backend == "fp32_einsum":
+        return torch.einsum(
+            "bshk,bskd->bshd",
+            weights_bf16.float(),
+            values_bf16.float(),
+        )
+    if backend == "bf16_bmm_out_fp32":
+        if (
+            weights_bf16.is_cuda
+            and weights_bf16.dtype == torch.bfloat16
+            and values_bf16.dtype == torch.bfloat16
+        ):
+            left = weights_bf16.reshape(batch * sequence, heads, keys)
+            right = values_bf16.reshape(batch * sequence, keys, head_dim)
+            return torch.bmm(left, right, out_dtype=torch.float32).reshape(
+                batch, sequence, heads, head_dim
+            )
+        return value_gemm_product(weights_bf16, values_bf16, "fp32_einsum")
+    if backend == "bf16_bmm_default_cast":
+        left = weights_bf16.reshape(batch * sequence, heads, keys)
+        right = values_bf16.reshape(batch * sequence, keys, head_dim)
+        return torch.bmm(left, right).float().reshape(batch, sequence, heads, head_dim)
+    if backend == "bf16_pairwise_fp32":
+        if keys % 2:
+            weights_bf16 = F.pad(weights_bf16, (0, 1), value=0)
+            values_bf16 = F.pad(values_bf16, (0, 0, 0, 1), value=0)
+        left_weights = weights_bf16[..., 0::2].float()
+        right_weights = weights_bf16[..., 1::2].float()
+        left_values = values_bf16[..., 0::2, :].float()
+        right_values = values_bf16[..., 1::2, :].float()
+        pair_sums = left_weights.unsqueeze(-1) * left_values.unsqueeze(
+            2
+        ) + right_weights.unsqueeze(-1) * right_values.unsqueeze(2)
+        pair_sums = torch.movedim(pair_sums, -2, -1)
+        return _pairwise_reduce_last(pair_sums)
+    raise ValueError(f"Unknown value GEMM backend: {backend}")
+
+
+def block_sum_product(values, backend):
+    """Evaluate one explicit FP32 block-sum reduction backend."""
+    if backend == "torch_sum":
+        return values.sum(-1)
+    if backend == "pairwise_sum":
+        return _pairwise_reduce_last(values)
+    if backend == "sequential_sum":
+        result = torch.zeros_like(values[..., 0])
+        for index in range(values.shape[-1]):
+            result = result + values[..., index]
+        return result
+    raise ValueError(f"Unknown block-sum backend: {backend}")
+
+
 def qk_backend_trace(q, kv, indices, backend):
     """Return masked QK blocks for one explicit PyTorch backend."""
     batch, sequence, _, _ = q.shape
@@ -343,6 +420,74 @@ def qk_backend_trace(q, kv, indices, backend):
         qk = qk.masked_fill((idx < 0).unsqueeze(2), -torch.inf)
         blocks.append(qk)
     return blocks
+
+
+def _trace_values(kv, indices, block):
+    batch = kv.shape[0]
+    batches = torch.arange(batch, device=kv.device).view(batch, 1, 1)
+    start = block * 64
+    idx = F.pad(
+        indices[..., start : start + 64],
+        (0, max(0, start + 64 - indices.shape[-1])),
+        value=-1,
+    ).long()
+    values = kv[batches, idx.clamp_min(0)]
+    return values.masked_fill((idx < 0).unsqueeze(-1), 0)
+
+
+def compare_block_sum_backends(official_trace, reference):
+    """Compare explicit block-sum reduction trees against official snapshots."""
+    reports = {}
+    for backend in BLOCK_SUM_BACKENDS:
+        checks = []
+        for block, official_block in enumerate(official_trace["blocks"]):
+            values = reference["blocks"][block]["exp"]
+            actual = block_sum_product(values, backend)
+            checks.append(
+                {
+                    "block": block,
+                    "key_offset": block * 64,
+                    "comparison": compare_stage(official_block["block_sum"], actual),
+                }
+            )
+        reports[backend] = {
+            "status": "completed",
+            "exact": all(item["comparison"]["exact"] for item in checks),
+            "max_abs": max(item["comparison"].get("max_abs", 0.0) for item in checks),
+            "blocks": checks,
+        }
+    return {"backends": reports}
+
+
+def compare_value_gemm_backends(official_trace, q, kv, indices):
+    """Isolate value GEMM reduction differences from prior accumulator state."""
+    reports = {}
+    for backend in VALUE_GEMM_BACKENDS:
+        checks = []
+        for block, official_block in enumerate(official_trace["blocks"]):
+            values = _trace_values(kv, indices, block)
+            weights = official_block["bf16_weights"]
+            candidate = value_gemm_product(weights, values, backend)
+            candidate = official_block["rescaled_accumulator"] + candidate
+            checks.append(
+                {
+                    "block": block,
+                    "key_offset": block * 64,
+                    "comparison": compare_stage(
+                        official_block["accumulator"], candidate
+                    ),
+                }
+            )
+        reports[backend] = {
+            "status": "completed",
+            "exact": all(item["comparison"]["exact"] for item in checks),
+            "strict_allclose": all(
+                item["comparison"]["strict_allclose"] for item in checks
+            ),
+            "max_abs": max(item["comparison"].get("max_abs", 0.0) for item in checks),
+            "blocks": checks,
+        }
+    return {"backends": reports}
 
 
 def reference_trace(q, kv, sink, indices, scale):
