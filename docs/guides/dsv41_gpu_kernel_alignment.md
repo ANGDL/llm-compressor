@@ -136,6 +136,15 @@ CPU `.pt` 文件；JSON 只保存指标和选中点的轨迹。可用 `--trace-d
 该诊断用于判断 QK 归约路径是否接近 TileLang `T.gemm`，不会替换项目
 生产实现，也不会改变原有通过阈值。
 
+v3 GPU 报告已经给出决定性结果：`bf16_bmm_out_fp32` 与官方 QK
+snapshot 逐元素精确一致，而 `fp32_einsum` 仍在 block 0 出现约
+`6.48e-5` 的 FP32 差异，`bf16_bmm_default_cast` 的误差更大。因此项目
+sparse attention 和独立 PyTorch reference 在 CUDA + BF16 输入时均采用
+“BF16 输入、FP32 GEMM 输出”的契约；CPU 或不支持 `out_dtype` 的后端仍
+回退到 FP32 einsum。value GEMM 继续使用 BF16 权重转换后的 FP32 累加。
+这只是根据 v3 诊断修正 QK 计算路径，尚未替代 GPU v4 复测；在复测通过前，
+原有 sparse 失败和 W8A8/W4A8 cache/recompute 失败必须继续保留。
+
 仅需本地 CPU 检查时，运行文末的 `--self-test`；它也校验 PyTorch trace
 与独立参考最终输出相等，但不执行插桩 CUDA kernel。可选 GPU 回归：
 

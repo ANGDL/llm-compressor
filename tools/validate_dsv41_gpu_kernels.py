@@ -91,6 +91,23 @@ def hc_reference(mixes, scale, base, hc, iters=20, eps=1e-6):
     return pre, post, comb
 
 
+def _qk_gemm_fp32(q, values_bf16):
+    """Match the official BF16-input/FP32-output sparse QK GEMM contract."""
+    batch, sequence, heads, dim = q.shape
+    keys = values_bf16.shape[2]
+    if q.is_cuda and q.dtype == torch.bfloat16 and values_bf16.dtype == torch.bfloat16:
+        left = q.reshape(batch * sequence, heads, dim)
+        right = values_bf16.transpose(-1, -2).reshape(batch * sequence, dim, keys)
+        return torch.bmm(left, right, out_dtype=torch.float32).reshape(
+            batch, sequence, heads, keys
+        )
+    return torch.einsum(
+        "bshd,bskd->bshk",
+        q.float(),
+        values_bf16.float(),
+    )
+
+
 def sparse_reference(q, kv, sink, indices, scale):
     """Emulate official 64-key online softmax and BF16 unnormalized weights."""
     b, s, h, d = q.shape
@@ -101,16 +118,18 @@ def sparse_reference(q, kv, sink, indices, scale):
     for start in range(0, indices.size(-1), 64):
         idx = indices[..., start : start + 64]
         idx = F.pad(idx, (0, 64 - idx.shape[-1]), value=-1).long()
-        values = kv[batches, idx.clamp_min(0)].float()
+        values = kv[batches, idx.clamp_min(0)]
         values = values.masked_fill((idx < 0).unsqueeze(-1), 0)
-        scores = torch.einsum("bshd,bskd->bshk", q.float(), values) * scale
+        scores = _qk_gemm_fp32(q, values) * scale
         scores = scores.masked_fill((idx < 0).unsqueeze(2), -torch.inf)
         new_maximum = torch.maximum(maximum, scores.amax(-1, keepdim=True))
         correction = torch.exp(maximum - new_maximum)
         weights = torch.exp(scores - new_maximum)
         denominator = denominator * correction + weights.sum(-1, keepdim=True)
         acc = acc * correction + torch.einsum(
-            "bshk,bskd->bshd", weights.bfloat16().float(), values
+            "bshk,bskd->bshd",
+            weights.bfloat16().float(),
+            values.float(),
         )
         maximum = new_maximum
     denominator = denominator + torch.exp(sink.view(1, 1, h, 1) - maximum)

@@ -281,6 +281,13 @@ QK_BACKENDS = (
 )
 
 
+def reference_qk_backend(q):
+    """Select the backend that matches the official execution contract."""
+    if q.is_cuda and q.dtype == torch.bfloat16:
+        return "bf16_bmm_out_fp32"
+    return "fp32_einsum"
+
+
 def qk_product(q, values_bf16, backend):
     """Compute QK with explicit input/accumulator choices for GPU diagnosis."""
     if backend == "fp32_einsum":
@@ -325,6 +332,7 @@ def reference_trace(q, kv, sink, indices, scale):
     acc = torch.zeros((b, s, h, d), device=q.device, dtype=torch.float32)
     batches = torch.arange(b, device=q.device).view(b, 1, 1)
     blocks = []
+    qk_backend = reference_qk_backend(q)
     for start in range(0, indices.shape[-1], 64):
         idx = F.pad(
             indices[..., start : start + 64],
@@ -333,7 +341,7 @@ def reference_trace(q, kv, sink, indices, scale):
         ).long()
         values = kv[batches, idx.clamp_min(0)]
         values = values.masked_fill((idx < 0).unsqueeze(-1), 0)
-        qk = qk_product(q, values, "fp32_einsum")
+        qk = qk_product(q, values, qk_backend)
         qk = qk.masked_fill((idx < 0).unsqueeze(2), -torch.inf)
         scores = qk * scale
         next_maximum = torch.maximum(maximum, scores.amax(-1, keepdim=True))
