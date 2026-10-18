@@ -188,6 +188,24 @@ block 2 的 `accumulator`，最大绝对差 `4.76837158203125e-6`；误差随后
 `0.0009765625`，最大 BF16 步数差 10。这个失败必须保留，不能用
 当前 `atol/rtol` 通过就标记为 bitwise 对齐完成。
 
+v7 reduction 候选对照进一步确认，生产 value GEMM 当前选择已经正确：
+
+- H64 用例中 `bf16_bmm_out_fp32` 的 value GEMM 候选最大绝对差为
+  `5.7220458984375e-6`，总不一致元素数为 `1,440,099`；
+- `fp32_einsum` 最大绝对差为 `7.62939453125e-6`，总不一致元素数为
+  `1,614,212`；
+- `bf16_pairwise_fp32` 最大绝对差同为 `7.62939453125e-6`；
+- `bf16_bmm_default_cast` 最大绝对差约 `0.03117`，10 个 block 都超过
+  严格阈值，明确不是官方路径。
+
+block sum 候选中，H64 的 `torch_sum` 总不一致元素数为 `1,650`，
+`pairwise_sum` 为 `1,837`，`sequential_sum` 为 `3,567`；三者最大绝对差
+分别为 `1.9073486328125e-6`、`1.9073486328125e-6` 和
+`5.7220458984375e-6`，都不能逐位复现官方 `T.reduce_sum`。因此当前不再
+用候选 reduction tree 猜测性替换生产实现：QK/value 的 BF16 输入、FP32
+输出 contract 已锁定，H64 剩余失败归因于 TileLang reduction tree 与
+PyTorch/CUDA bmm 的实现差异，仍需保留为未完成的 bitwise 对齐项。
+
 仅需本地 CPU 检查时，运行文末的 `--self-test`；它也校验 PyTorch trace
 与独立参考最终输出相等，但不执行插桩 CUDA kernel。可选 GPU 回归：
 
