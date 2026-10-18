@@ -25,10 +25,12 @@ import torch
 
 try:
     from tools.dsv41_sparse_trace import (
+        pad_official_inputs,
         reference_trace,
         run_official_trace,
         summarize_trace,
         to_cpu,
+        trim_trace_heads,
         write_instrumented_source,
     )
     from tools.validate_dsv41_gpu_kernels import (
@@ -46,10 +48,12 @@ try:
     )
 except ModuleNotFoundError:
     from dsv41_sparse_trace import (
+        pad_official_inputs,
         reference_trace,
         run_official_trace,
         summarize_trace,
         to_cpu,
+        trim_trace_heads,
         write_instrumented_source,
     )
     from validate_dsv41_gpu_kernels import (
@@ -336,7 +340,12 @@ class KernelComparator:
             )
             self.trace_module = load_file(path, "_dsv41_sparse_trace_official")
         traced, kernel = run_official_trace(self.trace_module, *args)
-        expected = reference_trace(*args)
+        q, kv, sink, indices, scale = args
+        padded_q, padded_sink, requested_heads = pad_official_inputs(q, sink)
+        expected = trim_trace_heads(
+            reference_trace(padded_q, kv, padded_sink, indices, scale),
+            requested_heads,
+        )
         checks["instrumented_vs_official"] = compare(
             traced["final"]["output"], official, exact=True
         )
@@ -393,11 +402,11 @@ class KernelComparator:
             "not instrumentation of the production project function. All-masked "
             "final normalization follows official 0/inf, not calibration-safe 0/1."
         )
-        q, kv, sink, indices, scale = args
         diagnostics["head_padding"] = {
-            "requested_heads": q.shape[2],
-            "official_kernel_heads": max(16, q.shape[2]),
-            "reference_heads": q.shape[2],
+            "requested_heads": requested_heads,
+            "official_kernel_heads": padded_q.shape[2],
+            "reference_heads": padded_q.shape[2],
+            "trace_trimmed_to_heads": requested_heads,
         }
         name = f"h{q.shape[2]}_d{q.shape[-1]}_k{indices.shape[-1]}"
         if self.save_trace_tensors:

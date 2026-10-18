@@ -273,3 +273,11 @@ CPU 自检通过。本地没有 CUDA，尚未确认插桩 TileLang kernel 的 GP
 prefill/decode 仍精确相等；缓存/重算最大 logit 差仍分别为
 `0.01385498046875` 和 `0.030530214309692383`，按原有验收条件失败，
 验证程序退出 1。该结果未被算子对照或诊断检查通过所替代。
+
+快速 GPU 报告 `/Users/ang/Downloads/dsv41-sparse-trace-quick.json` 已确认：
+插桩最终输出与原始官方 kernel 精确相等，trace 输出与项目及独立参考精确
+相等，诊断归因有效；首次差异出现在 block 0 的 QK 阶段，最大绝对差约
+`5.340576171875e-05`，但该次报告的 PyTorch trace 仍按公开 H=4 形状执行，
+而官方 wrapper 实际将 H=4 补齐为 H=16。后续修正将 reference 也按 H=16
+执行后裁剪，避免把 head padding 与 GEMM 归约顺序混在一起；需要在 GPU 上
+重新运行后才能确认 QK 差异是否仍存在。

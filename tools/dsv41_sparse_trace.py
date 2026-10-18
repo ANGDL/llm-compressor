@@ -254,6 +254,26 @@ def run_official_trace(module, q, kv, sink, indices, scale):
     return unpack_trace(buffers, output, heads), kernel
 
 
+def pad_official_inputs(q, sink):
+    """Match the official wrapper's head padding and return original head count."""
+    heads = q.shape[2]
+    if heads < 16:
+        q = F.pad(q, (0, 0, 0, 16 - heads)).contiguous()
+        sink = F.pad(sink, (0, 16 - heads)).contiguous()
+    return q, sink, heads
+
+
+def trim_trace_heads(trace, heads):
+    """Trim a padded reference trace back to the public input head count."""
+    blocks = []
+    for block in trace["blocks"]:
+        blocks.append({name: value[:, :, :heads] for name, value in block.items()})
+    return {
+        "blocks": blocks,
+        "final": {name: value[:, :, :heads] for name, value in trace["final"].items()},
+    }
+
+
 def reference_trace(q, kv, sink, indices, scale):
     """Snapshot the same PyTorch operation order used by the project reference."""
     b, s, h, d = q.shape
