@@ -155,6 +155,17 @@ PyTorch `torch.sum` 的归约顺序差异。v4 还显示 value accumulator 存�
 FP32 输出的 value GEMM；该修正需要下一轮 GPU trace 验证，不能用 v4 之前的
 报告替代。
 
+v5 快速报告确认 value GEMM 修正生效：block 0 的
+`rescaled_accumulator` 和 `accumulator` 均逐元素一致；block 1 的
+`rescaled_accumulator` 也精确一致，`accumulator` 仅有 127 个元素不同，
+最大绝对差 `4.76837158203125e-7`。这说明剩余差异来自第二个 block 的
+FP32 GEMM 归约顺序，而不是 BF16 权重、QK、running max 或在线 softmax
+状态错误。`block_sum` 仍是首次逐元素差异（4 个元素、最大
+`1.9073486328125e-6`），denominator 和 normalized 只继承该微小误差，
+最终 BF16 output 仍逐元素精确一致。因而 v5 的 `status=passed` 代表最终
+算子验收和严格阈值通过，不代表每个 FP32 中间张量 bitwise exact；这些
+中间差异必须继续保留在报告中，不能通过放宽阈值抹除。
+
 仅需本地 CPU 检查时，运行文末的 `--self-test`；它也校验 PyTorch trace
 与独立参考最终输出相等，但不执行插桩 CUDA kernel。可选 GPU 回归：
 
