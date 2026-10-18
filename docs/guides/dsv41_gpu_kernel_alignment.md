@@ -4,6 +4,11 @@
 Transformers。脚本直接加载指定的官方 `inference/kernel.py`，把官方 GPU
 输出与独立 PyTorch reference、仓库中的适配实现进行比较。
 
+如果只需要 kernel 级比较，可使用
+`tools/compare_dsv41_kernel_level.py`。它直接调用官方
+`hc_split_sinkhorn`、`sparse_attn`、`act_quant` 和 `fp8_gemm`，不经过
+模型 forward、权重加载、cache 或 streaming pipeline。
+
 环境要求以当前本地官方 `inference/requirements.txt` 为准：
 `torch>=2.10.0`、`tilelang==0.1.12`，以及能运行官方 kernel 的 CUDA 环境。
 脚本记录 GPU 型号、计算能力、PyTorch/CUDA/TileLang 版本和源码 SHA256。
@@ -19,6 +24,32 @@ python tools/validate_dsv41_gpu_kernels.py \
   --quick \
   --report /tmp/dsv41-gpu-quick.json
 ```
+
+kernel 级对照：
+
+```bash
+python tools/compare_dsv41_kernel_level.py \
+  --official-kernel /path/to/DeepSeek-V4.1-Flash/inference/kernel.py \
+  --project-root "$PWD" \
+  --device cuda:0 \
+  --report /tmp/dsv41-kernel-level.json
+```
+
+快速 smoke test：
+
+```bash
+python tools/compare_dsv41_kernel_level.py \
+  --official-kernel /path/to/DeepSeek-V4.1-Flash/inference/kernel.py \
+  --project-root "$PWD" \
+  --device cuda:0 \
+  --quick \
+  --report /tmp/dsv41-kernel-level-quick.json
+```
+
+该脚本的 `project_vs_order_reference` 是项目实现和独立计算顺序参考的
+严格比较；`official_vs_project` 则是官方 kernel 与项目实现的直接比较。
+FP8 GEMM 当前项目没有独立的原生 FP8 GEMM kernel，因此该项只比较官方
+kernel 与按 scale 分块累加的参考，并在报告中明确标记。
 
 完成快速检查后，去掉 `--quick` 执行完整形状矩阵：
 
