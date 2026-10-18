@@ -397,3 +397,59 @@ query 检查均通过；最终 BF16 output 为逐元素精确一致。
 下一步应运行不带 `--quick` 的完整 sparse 形状矩阵，重点覆盖
 `h64_d512_k640`；该用例可以判断 reduction 差异是否随 head 数和 block 数
 扩大。W8A8/W4A8 cache/recompute 仍独立验收。
+
+### 7.4 v6 完整 sparse 矩阵结果与 reduction 诊断
+
+报告 `/Users/ang/Downloads/dsv41-sparse-trace-full-v6.json` 的环境仍为
+H20、PyTorch `2.13.0+cu130`、CUDA `13.0`、TileLang `0.1.13`。完整矩阵
+包含两个 case：
+
+| case | 结果 | 关键指标 |
+| --- | --- | --- |
+| `h4_d512_k65` | 通过 | 最终 BF16 输出精确一致；仅保留 block 0 `block_sum` 的 4 个 FP32 微差 |
+| `h64_d512_k640` | 失败 | 56 个 BF16 输出不同，最大绝对差 `0.0009765625`，最大 BF16 步数差 10 |
+
+H64 用例的归因 gate 全部通过，且：
+
+- `project_vs_order_reference.exact = true`；
+- QK、scaled scores、running max、rescale、exp、BF16 weights 均逐元素一致；
+- 首次逐元素差异仍是 block 0 的 `block_sum`，最大绝对差
+  `1.9073486328125e-6`；
+- 首次严格分歧出现在 block 2 的 `accumulator`，最大绝对差
+  `4.76837158203125e-6`；
+- 后续 block 的 `rescaled_accumulator` 和 `accumulator` 差异逐步放大，
+  到 block 9 的 accumulator 最大绝对差约 `2.47955322265625e-5`；
+- 最终 normalized 仍在严格阈值内，但 56 个值在 BF16 cast 时跨过舍入点。
+
+最大绝对输出差坐标为 `[0, 0, 16, 55]`：
+
+```text
+official:  -0.16796875
+reference: -0.1689453125
+```
+
+该点的 FP32 normalized 值为：
+
+```text
+official:  -0.16845703125
+reference: -0.16845709085464478
+```
+
+两者只差约 `5.96e-8`，但位于两个相邻 BF16 值
+`-0.16796875` 和 `-0.1689453125` 的中点附近，因此最终 cast 结果不同。
+最大 BF16 步数差坐标为 `[0, 6, 28, 31]`，两侧最终输出分别为
+`1.909211277961731e-7` 和 `2.0023435354232788e-7`，相差 10 个 BF16
+表示步数。这个结果证明中间 FP32 reduction 差异已经足以影响最终 BF16
+舍入，不能只看 `normalized` 的相对误差。
+
+这表明 H64 失败不是 QK 或 BF16 权重转换问题，而是 block-sum/value
+GEMM 的 FP32 reduction 顺序在多 block 在线累加中积累，并在最终 BF16 cast
+时触发 midpoint/邻近舍入差异。本轮只增加诊断候选，不改生产 sparse kernel：
+
+| 诊断字段 | 候选 |
+| --- | --- |
+| `block_sum_backend_comparison` | `torch_sum`、`pairwise_sum`、`sequential_sum` |
+| `value_gemm_backend_comparison` | FP32 einsum、BF16 bmm FP32 输出、BF16 默认输出、相邻二叉树 BF16×BF16→FP32 |
+
+这些候选只用于定位官方 `T.reduce_sum/T.gemm` 的归约树，不会自动替换生产
+路径，也不会放宽现有失败条件。W8A8/W4A8 cache/recompute 继续单独验收。

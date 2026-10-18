@@ -101,6 +101,8 @@ block sum、累计分母、BF16 权重、重缩放后的 accumulator 和 value G
 | `sparse_trace.first_strict_divergence` | 首次超出原严格阈值的位置 |
 | `sparse_trace.first_bf16_weight_divergence` | 首次块内 BF16 exp 权重不相等的位置 |
 | `sparse_trace.qk_backend_comparison` | 官方 QK snapshot 与不同 PyTorch GEMM 输入/累加 dtype 路径的逐 block 比较 |
+| `sparse_trace.block_sum_backend_comparison` | 官方 block sum 与不同 FP32 reduction tree 候选的逐 block 比较 |
+| `sparse_trace.value_gemm_backend_comparison` | 固定官方 BF16 权重和重缩放 accumulator 后，对比不同 value GEMM reduction 候选 |
 | `sparse_trace.stages` | 所有 block/阶段的误差指标、最大差值坐标和轴含义 |
 | `sparse_trace.output_points` | 最大绝对差和最大 BF16 步数差输出点对应的逐块 score/权重、分母和 accumulator 轨迹 |
 | `sparse_trace.head_padding` | 项目 head 数与官方 kernel 实际补齐后的 head 数 |
@@ -136,6 +138,19 @@ CPU `.pt` 文件；JSON 只保存指标和选中点的轨迹。可用 `--trace-d
 该诊断用于判断 QK 归约路径是否接近 TileLang `T.gemm`，不会替换项目
 生产实现，也不会改变原有通过阈值。
 
+完整 sparse trace 还会记录两个隔离诊断：
+
+- `block_sum_backend_comparison`：比较 `torch_sum`、相邻二叉树
+  `pairwise_sum` 和逐元素 `sequential_sum`，用于判断官方
+  `T.reduce_sum` 更接近哪种 FP32 归约树；
+- `value_gemm_backend_comparison`：比较 FP32 einsum、BF16 输入/FP32
+  输出 bmm、BF16 输出后转换，以及相邻二叉树的 BF16×BF16→FP32
+  value GEMM。比较时固定使用官方 trace 中的 BF16 weights 和
+  `rescaled_accumulator`，只隔离当前 block 的 value GEMM。
+
+这些候选只用于定位归约顺序，不会自动替换生产实现，也不会把“误差最小”
+自动解释为官方实现等价；仍需同时满足插桩 gate 和最终输出检查。
+
 v3 GPU 报告已经给出决定性结果：`bf16_bmm_out_fp32` 与官方 QK
 snapshot 逐元素精确一致，而 `fp32_einsum` 仍在 block 0 出现约
 `6.48e-5` 的 FP32 差异，`bf16_bmm_default_cast` 的误差更大。因此项目
@@ -165,6 +180,13 @@ FP32 GEMM 归约顺序，而不是 BF16 权重、QK、running max 或在线 soft
 最终 BF16 output 仍逐元素精确一致。因而 v5 的 `status=passed` 代表最终
 算子验收和严格阈值通过，不代表每个 FP32 中间张量 bitwise exact；这些
 中间差异必须继续保留在报告中，不能通过放宽阈值抹除。
+
+v6 完整矩阵显示 H=4/K=65 仍通过，但生产形状 H=64/D=512/K=640
+失败：QK、running max、exp 和 BF16 weights 仍精确一致，首次严格分歧在
+block 2 的 `accumulator`，最大绝对差 `4.76837158203125e-6`；误差随后
+随 10 个在线 block 累积，最终有 56 个 BF16 输出元素不同，最大绝对差
+`0.0009765625`，最大 BF16 步数差 10。这个失败必须保留，不能用
+当前 `atol/rtol` 通过就标记为 bitwise 对齐完成。
 
 仅需本地 CPU 检查时，运行文末的 `--self-test`；它也校验 PyTorch trace
 与独立参考最终输出相等，但不执行插桩 CUDA kernel。可选 GPU 回归：

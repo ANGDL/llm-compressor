@@ -241,3 +241,16 @@ def test_qk_backend_diagnostic_keeps_fp32_reference_exact():
     assert reports["backends"]["fp32_einsum"]["exact"]
     assert reports["best_by_max_abs"] == "fp32_einsum"
     assert set(reports["backends"]) == set(tracing.QK_BACKENDS)
+
+
+def test_reduction_backend_diagnostics_isolate_cpu_reference_paths():
+    q, kv, sink, indices, scale = make_inputs(65)
+    reference = tracing.reference_trace(q, kv, sink, indices, scale)
+    block_sum = tracing.compare_block_sum_backends(reference, reference)
+    value_gemm = tracing.compare_value_gemm_backends(reference, q, kv, indices)
+
+    assert block_sum["backends"]["torch_sum"]["exact"]
+    assert value_gemm["backends"]["fp32_einsum"]["exact"]
+    assert value_gemm["backends"]["bf16_bmm_out_fp32"]["exact"]
+    assert set(block_sum["backends"]) == set(tracing.BLOCK_SUM_BACKENDS)
+    assert set(value_gemm["backends"]) == set(tracing.VALUE_GEMM_BACKENDS)
