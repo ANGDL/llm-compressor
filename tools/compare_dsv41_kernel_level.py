@@ -25,6 +25,7 @@ import torch
 
 try:
     from tools.dsv41_sparse_trace import (
+        compare_qk_backends,
         pad_official_inputs,
         reference_trace,
         run_official_trace,
@@ -48,6 +49,7 @@ try:
     )
 except ModuleNotFoundError:
     from dsv41_sparse_trace import (
+        compare_qk_backends,
         pad_official_inputs,
         reference_trace,
         run_official_trace,
@@ -408,6 +410,9 @@ class KernelComparator:
             "reference_heads": padded_q.shape[2],
             "trace_trimmed_to_heads": requested_heads,
         }
+        diagnostics["qk_backend_comparison"] = compare_qk_backends(
+            traced, q, kv, indices, scale, requested_heads
+        )
         name = f"h{q.shape[2]}_d{q.shape[-1]}_k{indices.shape[-1]}"
         if self.save_trace_tensors:
             path = self.trace_dir / f"{name}.pt"

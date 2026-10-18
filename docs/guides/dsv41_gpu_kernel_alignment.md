@@ -100,6 +100,7 @@ block sum、累计分母、BF16 权重、重缩放后的 accumulator 和 value G
 | `sparse_trace.first_exact_divergence` | 按 block 和实际运算顺序扫描，首次逐元素不相等的位置 |
 | `sparse_trace.first_strict_divergence` | 首次超出原严格阈值的位置 |
 | `sparse_trace.first_bf16_weight_divergence` | 首次块内 BF16 exp 权重不相等的位置 |
+| `sparse_trace.qk_backend_comparison` | 官方 QK snapshot 与不同 PyTorch GEMM 输入/累加 dtype 路径的逐 block 比较 |
 | `sparse_trace.stages` | 所有 block/阶段的误差指标、最大差值坐标和轴含义 |
 | `sparse_trace.output_points` | 最大绝对差和最大 BF16 步数差输出点对应的逐块 score/权重、分母和 accumulator 轨迹 |
 | `sparse_trace.head_padding` | 项目 head 数与官方 kernel 实际补齐后的 head 数 |
@@ -123,6 +124,17 @@ CPU `.pt` 文件；JSON 只保存指标和选中点的轨迹。可用 `--trace-d
 通过/失败结果仍保留。PyTorch 中间值来自计算顺序参考，并对项目最终输出做
 精确校验；它不是对项目生产函数的直接插桩。全屏蔽 query 的最终归一化参考
 遵循官方的 `0/inf`，项目校准路径为保持梯度有限采用 `0/1`，两者输出均为零。
+
+`qk_backend_comparison` 当前包括：
+
+- `fp32_einsum`：Q 和 KV 先转 FP32，再用 PyTorch einsum；
+- `bf16_bmm_out_fp32`：保留 BF16 输入，用 `torch.bmm(..., out_dtype=float32)`；
+- `bf16_bmm_default_cast`：BF16 bmm 输出后再转 FP32。
+
+其中 `bf16_bmm_out_fp32` 依赖当前 PyTorch/CUDA 对 BF16 输入和 FP32 输出的
+支持；不支持时只记录该 backend 的错误，不影响原始 sparse case 的状态。
+该诊断用于判断 QK 归约路径是否接近 TileLang `T.gemm`，不会替换项目
+生产实现，也不会改变原有通过阈值。
 
 仅需本地 CPU 检查时，运行文末的 `--self-test`；它也校验 PyTorch trace
 与独立参考最终输出相等，但不执行插桩 CUDA kernel。可选 GPU 回归：

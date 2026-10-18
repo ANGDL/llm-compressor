@@ -226,3 +226,18 @@ def test_padded_reference_uses_the_same_head_shape_as_official():
     assert padded_sink.shape == (16,)
     assert trimmed["final"]["output"].shape == q.shape
     assert torch.equal(trimmed["final"]["output"], original["final"]["output"])
+
+
+def test_qk_backend_diagnostic_keeps_fp32_reference_exact():
+    inputs = make_inputs(65)
+    q, kv, sink, indices, scale = inputs
+    padded_q, padded_sink, heads = tracing.pad_official_inputs(q, sink)
+    expected = tracing.trim_trace_heads(
+        tracing.reference_trace(padded_q, kv, padded_sink, indices, scale),
+        heads,
+    )
+    reports = tracing.compare_qk_backends(expected, q, kv, indices, scale, heads)
+    assert reports["backends"]["fp32_einsum"]["status"] == "completed"
+    assert reports["backends"]["fp32_einsum"]["exact"]
+    assert reports["best_by_max_abs"] == "fp32_einsum"
+    assert set(reports["backends"]) == set(tracing.QK_BACKENDS)
