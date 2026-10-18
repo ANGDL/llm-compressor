@@ -120,6 +120,27 @@ def _qk_gemm_fp32(q: torch.Tensor, kv: torch.Tensor) -> torch.Tensor:
     )
 
 
+def _value_gemm_fp32(weights: torch.Tensor, values: torch.Tensor) -> torch.Tensor:
+    """Match the official BF16-weight/BF16-value FP32 accumulator GEMM."""
+    batch, sequence, heads, keys = weights.shape
+    head_dim = values.shape[-1]
+    if (
+        weights.is_cuda
+        and weights.dtype == torch.bfloat16
+        and values.dtype == torch.bfloat16
+    ):
+        left = weights.reshape(batch * sequence, heads, keys)
+        right = values.reshape(batch * sequence, keys, head_dim)
+        return torch.bmm(left, right, out_dtype=torch.float32).reshape(
+            batch, sequence, heads, head_dim
+        )
+    return torch.einsum(
+        "bshk,bskd->bshd",
+        weights.float(),
+        values.float(),
+    )
+
+
 def sparse_attention(
     q: torch.Tensor,
     kv: torch.Tensor,
@@ -175,10 +196,9 @@ def sparse_attention(
         exp_scores = torch.exp(scores - next_max)
         sum_exp = sum_exp * correction + exp_scores.sum(-1, keepdim=True)
         # BF16 operands, FP32 value accumulation and rescaling, then BF16 output.
-        acc_o = acc_o * correction + torch.einsum(
-            "bshk,bskd->bshd",
-            exp_scores.bfloat16().float(),
-            gathered_kv.float(),
+        acc_o = acc_o * correction + _value_gemm_fp32(
+            exp_scores.bfloat16(),
+            gathered_kv,
         )
         scores_max = next_max
 

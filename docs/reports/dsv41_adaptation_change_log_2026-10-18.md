@@ -330,3 +330,44 @@ GPU 报告 `/Users/ang/Downloads/dsv41-sparse-trace-quick-v3.json` 的
 修正后是否还存在 running max、exp/BF16 权重、denominator、value
 accumulator 或最终 BF16 cast 阶段的差异。W8A8/W4A8 cache/recompute
 问题仍独立保留，未由本次 QK 修正代替。
+
+### 7.2 v4 sparse trace 结果与 value GEMM 修正
+
+快速报告 `/Users/ang/Downloads/dsv41-sparse-trace-quick-v4.json` 在 H20、
+PyTorch `2.13.0+cu130`、CUDA `13.0`、TileLang `0.1.13` 上通过。该结果
+不是放宽阈值：`official_vs_project`、`project_vs_order_reference`、
+`instrumented_vs_official` 和最终 BF16 输出均为精确一致。
+
+逐块阶段的结果为：
+
+| 阶段 | v4 结果 |
+| --- | --- |
+| QK | 精确一致 |
+| scaled scores / running max / rescale | 精确一致 |
+| exp / BF16 weights | 精确一致 |
+| block sum | 首次逐元素差异；4 个元素，最大绝对差 `1.9073486328125e-6`，严格阈值内 |
+| denominator | 继承 block sum 的同量级差异 |
+| value accumulator | 同量级 FP32 差异，最终 BF16 输出未受影响 |
+| normalized | 最大绝对差 `2.384185791015625e-7`，严格阈值内 |
+| final BF16 output | 精确一致 |
+
+`block_sum` 的差异来自官方 `T.reduce_sum` 与 PyTorch `torch.sum` 的归约
+树/顺序，不是 QK、mHC 控制系数或 BF16 权重转换差异。官方源码中的 value
+路径是 `T.copy(acc_s, acc_s_cast)` 后执行 BF16 `acc_s_cast × kv_shared`
+到 FP32 `acc_o` 的 `T.gemm`；此前项目/reference 把两侧先转成 FP32 后做
+einsum，虽然 v4 最终输出已精确一致，但中间 accumulator 不完全一致。
+本轮已修正为 CUDA 上 BF16 输入、FP32 输出的 value `torch.bmm`，CPU 回退
+FP32 einsum。
+
+本轮修改文件：
+
+| 文件 | 修改 |
+| --- | --- |
+| `src/llmcompressor/modeling/deepseekv4/kernels.py` | 增加 `_value_gemm_fp32`，对齐官方 value GEMM dtype contract |
+| `tools/validate_dsv41_gpu_kernels.py` | 独立 reference 对齐 BF16 value GEMM |
+| `tools/dsv41_sparse_trace.py` | trace reference 对齐 BF16 value GEMM |
+
+本地回归仍为 `43 passed, 1 skipped`，CPU self-test 通过。下一轮 GPU 复测
+应重点确认 `accumulator`/`rescaled_accumulator` 是否变为精确一致；即使
+这些中间值仍有归约顺序差异，只要严格阈值和最终 BF16 输出保持通过，也必须
+在报告中保留该差异，不能将其抹掉。W8A8/W4A8 cache/recompute 仍是独立问题。

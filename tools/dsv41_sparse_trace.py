@@ -305,6 +305,27 @@ def qk_product(q, values_bf16, backend):
     raise ValueError(f"Unknown QK backend: {backend}")
 
 
+def value_gemm_fp32(weights_bf16, values_bf16):
+    """Compute BF16 weight/value GEMM with an FP32 output accumulator."""
+    batch, sequence, heads, keys = weights_bf16.shape
+    head_dim = values_bf16.shape[-1]
+    if (
+        weights_bf16.is_cuda
+        and weights_bf16.dtype == torch.bfloat16
+        and values_bf16.dtype == torch.bfloat16
+    ):
+        left = weights_bf16.reshape(batch * sequence, heads, keys)
+        right = values_bf16.reshape(batch * sequence, keys, head_dim)
+        return torch.bmm(left, right, out_dtype=torch.float32).reshape(
+            batch, sequence, heads, head_dim
+        )
+    return torch.einsum(
+        "bshk,bskd->bshd",
+        weights_bf16.float(),
+        values_bf16.float(),
+    )
+
+
 def qk_backend_trace(q, kv, indices, backend):
     """Return masked QK blocks for one explicit PyTorch backend."""
     batch, sequence, _, _ = q.shape
@@ -351,9 +372,7 @@ def reference_trace(q, kv, sink, indices, scale):
         denominator = denominator * correction + block_sum
         bf16_weights = weights.bfloat16()
         rescaled = acc * correction
-        acc = rescaled + torch.einsum(
-            "bshk,bskd->bshd", bf16_weights.float(), values.float()
-        )
+        acc = rescaled + value_gemm_fp32(bf16_weights, values)
         blocks.append(
             {
                 "qk": qk,
