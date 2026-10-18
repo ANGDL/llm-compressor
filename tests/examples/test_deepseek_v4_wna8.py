@@ -1,9 +1,9 @@
 import importlib.util
 import json
+import logging
 from pathlib import Path
 
 from llmcompressor.modeling.deepseekv4.config import ModelConfig
-
 
 MODULE_PATH = (
     Path(__file__).parents[2]
@@ -15,6 +15,30 @@ MODULE_SPEC = importlib.util.spec_from_file_location("deepseek_v4_wna8", MODULE_
 assert MODULE_SPEC is not None and MODULE_SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(MODULE_SPEC)
 MODULE_SPEC.loader.exec_module(MODULE)
+
+
+def test_native_config_load_normalizes_raw_model_type_without_warning(
+    tmp_path, caplog
+):
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "deepseek_v4",
+                "num_hidden_layers": 1,
+                "num_nextn_predict_layers": 0,
+                "compress_ratios": [0],
+            }
+        )
+    )
+
+    with caplog.at_level(logging.WARNING, logger="transformers.configuration_utils"):
+        config = ModelConfig.from_pretrained(tmp_path, local_files_only=True)
+
+    assert config.model_type == "deepseek_v4_native"
+    assert not any(
+        "using a model of type `deepseek_v4`" in record.message.lower()
+        for record in caplog.records
+    )
 
 
 def test_transformers_config_schema_is_normalized_for_native_model():
