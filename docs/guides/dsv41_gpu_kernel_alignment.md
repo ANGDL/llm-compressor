@@ -107,8 +107,11 @@ block sum、累计分母、BF16 权重、重缩放后的 accumulator 和 value G
 坐标均从 0 开始，输出坐标为 `[batch, query, head, channel]`；
 块内 score/权重的最后一维为 `key_in_block`，候选序号为
 `block * 64 + key_in_block`。这与索引选中的 KV 位置有区别，后者保存在
-原始 `indices` 张量中。官方会将不足 16 个 head 补齐到 16；参考实现保留
-项目输入形状，报告会显示该形状差别。
+原始 `indices` 张量中。官方会将不足 16 个 head 补齐到 16；逐块诊断的
+PyTorch reference 也会先按 16 个 head 执行，再裁剪回公开输入 head 数，
+避免把 GEMM 的矩阵形状差异误判为算子归约顺序差异。生产项目 reference
+仍保留公开输入形状；如果 padded reference 与项目输出不再精确相等，诊断
+会将其保留为独立的 head-padding 差异。
 
 默认在 JSON 旁建立 `dsv41-sparse-trace-artifacts/`，写入插桩源码及其 hash；
 若 TileLang 提供源码导出接口，也保存生成的 CUDA 源码。使用

@@ -213,3 +213,16 @@ def test_official_head_padding_and_trace_buffer_layout():
         attribution_valid=True,
     )
     assert summary["first_exact_divergence"] is None
+
+
+def test_padded_reference_uses_the_same_head_shape_as_official():
+    inputs = make_inputs(65)
+    q, kv, sink, indices, scale = inputs
+    padded_q, padded_sink, heads = tracing.pad_official_inputs(q, sink)
+    padded = tracing.reference_trace(padded_q, kv, padded_sink, indices, scale)
+    trimmed = tracing.trim_trace_heads(padded, heads)
+    original = tracing.reference_trace(*inputs)
+    assert padded_q.shape[2] == 16
+    assert padded_sink.shape == (16,)
+    assert trimmed["final"]["output"].shape == q.shape
+    assert torch.equal(trimmed["final"]["output"], original["final"]["output"])
