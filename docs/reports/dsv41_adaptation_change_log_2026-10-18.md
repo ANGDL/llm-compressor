@@ -371,3 +371,29 @@ FP32 einsum。
 应重点确认 `accumulator`/`rescaled_accumulator` 是否变为精确一致；即使
 这些中间值仍有归约顺序差异，只要严格阈值和最终 BF16 输出保持通过，也必须
 在报告中保留该差异，不能将其抹掉。W8A8/W4A8 cache/recompute 仍是独立问题。
+
+### 7.3 v5 sparse trace 结论
+
+报告 `/Users/ang/Downloads/dsv41-sparse-trace-quick-v5.json` 在 H20、
+PyTorch `2.13.0+cu130`、CUDA `13.0`、TileLang `0.1.13` 上通过。所有基础
+检查、插桩输出 gate、项目/reference 精确比较、整段/尾 token 一致性和全屏蔽
+query 检查均通过；最终 BF16 output 为逐元素精确一致。
+
+中间阶段的最终状态：
+
+| 阶段 | v5 结果 | 结论 |
+| --- | --- | --- |
+| QK 到 BF16 weights | 全部精确一致 | QK 和 BF16 权重 contract 已对齐 |
+| block 0 accumulator | 精确一致 | value GEMM 修正生效 |
+| block 1 rescaled accumulator | 精确一致 | block 间在线重缩放一致 |
+| block 1 accumulator | 127 个元素不同，最大 `4.76837158203125e-7` | 仅剩 value GEMM 的 FP32 归约顺序差异 |
+| block sum | 4 个元素不同，最大 `1.9073486328125e-6` | 首次逐元素差异，来自 `T.reduce_sum` 与 PyTorch reduction tree |
+| denominator / normalized | 严格阈值内 | 继承 block sum 的微小误差 |
+| final BF16 output | 精确一致 | 对模型可见输出无差异 |
+
+因此当前 sparse 适配已经达到“官方 dtype contract + 最终 BF16 输出精确”
+的状态，但还没有达到“所有 FP32 中间张量逐位一致”。这两个中间 reduction
+差异必须继续保留，不能把 `status=passed` 解读成内部 bitwise 对齐完成。
+下一步应运行不带 `--quick` 的完整 sparse 形状矩阵，重点覆盖
+`h64_d512_k640`；该用例可以判断 reduction 差异是否随 head 数和 block 数
+扩大。W8A8/W4A8 cache/recompute 仍独立验收。
