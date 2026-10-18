@@ -30,7 +30,10 @@ Llama/Qwen3 复用原生 Cache，V4.1 使用其模型专有的 CPU request cache
 可行，建议在 `llmcompressor.streaming` 内增加薄推理入口，优先复用
 Transformers 原生 forward/generate/cache 和 Accelerate CPU/disk offload。
 公共入口不绑定 DeepSeek：标准 HF 模型使用 AutoConfig/AutoModel 与原生
-cache，特殊模型通过已有注册机制或小范围 adapter 扩展。
+cache，特殊模型通过已有注册机制接入各自的模型适配。
+这里的通用化针对推理 pipeline，不要求把 V4.1 或其他架构的模型计算泛化。
+模型内部允许特化，attention、mHC、DSpark、精度边界和 cache 数学应尽量
+与该模型的官方实现对齐；pipeline 只负责资源与执行生命周期。
 新增工作主要是缺失的模型增量适配、特殊 checkpoint 桥接和数值对照。
 现有 subgraph 权重 session 保留为特殊图/严格资源需求的后备能力。
 

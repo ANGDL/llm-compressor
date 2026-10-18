@@ -72,9 +72,17 @@ class Compressor(nn.Module):
     def __init__(self, config, layer_id):
         super().__init__()
         self.ratio = config.compress_ratios[layer_id]
-        self.wkv = Linear(config.dim, config.head_dim)
+        self.wkv = Linear(
+            config.dim,
+            config.head_dim,
+            dtype=torch.float32 if self.ratio > 1 else torch.bfloat16,
+        )
         self.norm = RMSNorm(config.head_dim, config.norm_eps)
-        self.wgate = Linear(config.dim, config.head_dim) if self.ratio > 1 else None
+        self.wgate = (
+            Linear(config.dim, config.head_dim, dtype=torch.float32)
+            if self.ratio > 1
+            else None
+        )
 
     def forward(self, x, mask, source=None):
         if source is not None:
@@ -616,7 +624,7 @@ class DeepseekV41Block(nn.Module):
 class Head(nn.Module):
     def __init__(self, dim, vocab):
         super().__init__()
-        self.weight = nn.Parameter(torch.empty(vocab, dim))
+        self.weight = nn.Parameter(torch.empty(vocab, dim, dtype=torch.float32))
 
     def forward(self, x):
         return F.linear(x.float(), self.weight.float())
@@ -668,7 +676,9 @@ class DSparkMarkovHead(nn.Module):
 class DSparkConfidenceHead(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.proj = Linear(config.dim + config.dspark_markov_rank, 1)
+        self.proj = Linear(
+            config.dim + config.dspark_markov_rank, 1, dtype=torch.float32
+        )
 
     def forward(self, hidden, markov):
         return self.proj(torch.cat((hidden, markov), dim=-1).float()).squeeze(-1)

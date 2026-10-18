@@ -41,14 +41,14 @@ def _linear_forward(self, x):
     return F.linear(x.float(), self.weight.float(), bias).to(x.dtype)
 
 
-def Linear(in_features, out_features, *, source_fp8=False, bias=False):
+def Linear(in_features, out_features, *, source_fp8=False, bias=False, dtype=None):
     """Create a compressible nn.Linear with the reference accumulation rules.
 
     compressed-tensors selects formats by exact module type. Keep nn.Linear,
     and bind the floating reference forward before PTQ wraps it. A PTQ scheme
     then owns activation quantization instead of the source FP8 simulation.
     """
-    module = nn.Linear(in_features, out_features, bias=bias)
+    module = nn.Linear(in_features, out_features, bias=bias, dtype=dtype)
     module.source_fp8 = source_fp8
     module.forward = MethodType(_linear_forward, module)
     return module
