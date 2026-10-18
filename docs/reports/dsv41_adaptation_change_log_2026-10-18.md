@@ -247,3 +247,29 @@ git diff --name-status 77f874751 1874bbd5f
 
 本记录新增路径为
 `docs/reports/dsv41_adaptation_change_log_2026-10-18.md`。
+
+## 7. 后续：sparse attention 逐块诊断
+
+本轮继续在 `feat/deepseek-v41-native-quantization` 分支开展，
+不改变第 1～3 节的历史提交统计。修改文件如下：
+
+| 文件 | 类型 | 修改内容 |
+| --- | --- | --- |
+| `tools/dsv41_sparse_trace.py` | 新增 | 官方源码副本的中间值写出、逐块 PyTorch trace、首次差异和选中输出点轨迹 |
+| `tools/compare_dsv41_kernel_level.py` | 修改 | 增加 `--trace-sparse`、原始/插桩输出一致性校验、原始失败结果保留和增量报告、可选张量与 CUDA 源码保存 |
+| `tools/validate_dsv41_gpu_kernels.py` | 修改 | 比较指标增加最大 BF16 步数差对应的坐标和值，最大绝对差也增加原始坐标 |
+| `tests/tools/test_dsv41_sparse_trace.py` | 新增 | 原始 AST 计算语句保持、mask、跨块 trace、首次差异定位和 head padding 检查 |
+| `tests/tools/fixtures/dsv41_sparse_kernel.py.txt` | 新增 | 官方 sparse factory 源码节选，供无需 TileLang/CUDA 的 AST 测试使用 |
+| `tests/tools/test_compare_dsv41_kernel_level.py` | 修改 | 诊断异常保留失败结果、无效插桩不得归因、可选真实 GPU 插桩验证 |
+| `docs/guides/dsv41_gpu_kernel_alignment.md` | 修改 | 逐块 GPU 命令、输出字段、归因校验、张量保存及 checkpoint 单独验证说明 |
+| `docs/reports/dsv41_adaptation_change_log_2026-10-18.md` | 修改 | 补充本节后续修改记录 |
+
+本地工具测试为 `36 passed, 1 skipped`，跳过项为真实 CUDA 插桩验证；
+CPU 自检通过。本地没有 CUDA，尚未确认插桩 TileLang kernel 的 GPU
+编译、最终输出等价性或首次官方/项目分歧。
+
+本轮另行运行已有 W8A8/W4A8 tiny checkpoint，报告为
+`/tmp/dsv41-cache-separate-2026-10-18.json`。streaming/resident 的
+prefill/decode 仍精确相等；缓存/重算最大 logit 差仍分别为
+`0.01385498046875` 和 `0.030530214309692383`，按原有验收条件失败，
+验证程序退出 1。该结果未被算子对照或诊断检查通过所替代。

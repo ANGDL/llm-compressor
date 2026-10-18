@@ -24,6 +24,13 @@ from pathlib import Path
 import torch
 
 try:
+    from tools.dsv41_sparse_trace import (
+        reference_trace,
+        run_official_trace,
+        summarize_trace,
+        to_cpu,
+        write_instrumented_source,
+    )
     from tools.validate_dsv41_gpu_kernels import (
         ceil_power2,
         compare,
@@ -38,6 +45,13 @@ try:
         sparse_reference,
     )
 except ModuleNotFoundError:
+    from dsv41_sparse_trace import (
+        reference_trace,
+        run_official_trace,
+        summarize_trace,
+        to_cpu,
+        write_instrumented_source,
+    )
     from validate_dsv41_gpu_kernels import (
         ceil_power2,
         compare,
@@ -107,13 +121,30 @@ def kernel_sparse_cases(*, quick):
 
 
 class KernelComparator:
-    def __init__(self, official, project, device, seed, quick):
+    def __init__(
+        self,
+        official,
+        project,
+        device,
+        seed,
+        quick,
+        *,
+        trace_sparse=False,
+        trace_dir=None,
+        save_trace_tensors=False,
+        progress=None,
+    ):
         self.official = official
         self.project = project
         self.device = torch.device(device)
         self.seed = seed
         self.quick = quick
         self.results = []
+        self.trace_sparse = trace_sparse
+        self.trace_dir = trace_dir
+        self.save_trace_tensors = save_trace_tensors
+        self.progress = progress
+        self.trace_module = None
 
     def _seed(self, name):
         return (
@@ -151,6 +182,8 @@ class KernelComparator:
             }
         row["elapsed_seconds"] = round(time.monotonic() - started, 3)
         self.results.append(row)
+        if self.progress:
+            self.progress(None)
         print(
             f"[{row['status'].upper()}] {operator}/{name} "
             f"({row['elapsed_seconds']:.2f}s)",
@@ -163,6 +196,25 @@ class KernelComparator:
                     f"relative_l2={check.get('relative_l2')}",
                     flush=True,
                 )
+        trace = row.get("sparse_trace")
+        if trace:
+            print(
+                f"  trace: status={trace['status']} "
+                f"attribution_valid={trace['attribution_valid']}",
+                flush=True,
+            )
+            for label in (
+                "first_exact_divergence",
+                "first_strict_divergence",
+                "first_bf16_weight_divergence",
+            ):
+                point = trace.get(label)
+                if point:
+                    print(
+                        f"  {label}: block={point['block']} stage={point['stage']} "
+                        f"max_abs={point['comparison'].get('max_abs')}",
+                        flush=True,
+                    )
 
     def hc(self, hc, b, s):
         mixes = randn((b, s, (2 + hc) * hc), self.device)
@@ -236,7 +288,7 @@ class KernelComparator:
                 project[:, 2], torch.zeros_like(project[:, 2]), exact=True
             ),
         }
-        return {
+        result = {
             "inputs": {
                 "q": {"shape": list(q.shape), "dtype": str(q.dtype)},
                 "kv": {"shape": list(kv.shape), "dtype": str(kv.dtype)},
@@ -252,6 +304,129 @@ class KernelComparator:
             },
             "checks": checks,
         }
+        if self.trace_sparse:
+            # Preserve unmodified official/project checks before diagnostic JIT.
+            if self.progress:
+                self.progress(
+                    {
+                        "operator": "sparse",
+                        "case": f"h{h}_d{d}_k{k}",
+                        "status": "tracing",
+                        **result,
+                    }
+                )
+            try:
+                result["sparse_trace"] = self.sparse_diagnostics(
+                    args, official, project, reference, checks
+                )
+            except Exception as error:
+                checks["sparse_trace_completed"] = {"passed": False}
+                result["sparse_trace"] = {
+                    "status": "error",
+                    "attribution_valid": False,
+                    "error": f"{type(error).__name__}: {error}",
+                    "traceback": traceback.format_exc(),
+                }
+        return result
+
+    def sparse_diagnostics(self, args, official, project, reference, checks):
+        if self.trace_module is None:
+            path = write_instrumented_source(
+                self.official.__file__, self.trace_dir / "official_sparse_trace.py"
+            )
+            self.trace_module = load_file(path, "_dsv41_sparse_trace_official")
+        traced, kernel = run_official_trace(self.trace_module, *args)
+        expected = reference_trace(*args)
+        checks["instrumented_vs_official"] = compare(
+            traced["final"]["output"], official, exact=True
+        )
+        checks["trace_reference_vs_order_reference"] = compare(
+            expected["final"]["output"], reference, exact=True
+        )
+        checks["trace_reference_vs_project"] = compare(
+            expected["final"]["output"], project, exact=True
+        )
+        checks["instrumented_normalized_cast_vs_output"] = compare(
+            traced["final"]["normalized"].to(args[0].dtype),
+            traced["final"]["output"],
+            exact=True,
+        )
+        nan_elements = sum(
+            int(torch.isnan(value).sum())
+            for section in [*traced["blocks"], traced["final"]]
+            for value in section.values()
+        )
+        checks["trace_snapshots_written"] = {
+            "passed": nan_elements == 0,
+            "nan_elements": nan_elements,
+        }
+        trusted = all(
+            checks[label]["passed"]
+            for label in (
+                "instrumented_vs_official",
+                "trace_reference_vs_order_reference",
+                "trace_reference_vs_project",
+                "instrumented_normalized_cast_vs_output",
+                "trace_snapshots_written",
+            )
+        )
+        diagnostics = summarize_trace(
+            traced,
+            expected,
+            checks["official_vs_project"],
+            attribution_valid=trusted,
+        )
+        diagnostics["instrumented_source"] = source_info(
+            Path(self.trace_module.__file__)
+        )
+        diagnostics["trace_helper_source"] = source_info(
+            Path(reference_trace.__code__.co_filename)
+        )
+        diagnostics["original_kernel_unchanged"] = True
+        diagnostics["gate"] = (
+            "Attribute intermediate differences only if instrumented output exactly "
+            "matches official output and the PyTorch trace exactly matches both "
+            "project and independent-reference outputs."
+        )
+        diagnostics["reference_scope"] = (
+            "PyTorch operation-order reference, checked against project output; "
+            "not instrumentation of the production project function. All-masked "
+            "final normalization follows official 0/inf, not calibration-safe 0/1."
+        )
+        q, kv, sink, indices, scale = args
+        diagnostics["head_padding"] = {
+            "requested_heads": q.shape[2],
+            "official_kernel_heads": max(16, q.shape[2]),
+            "reference_heads": q.shape[2],
+        }
+        name = f"h{q.shape[2]}_d{q.shape[-1]}_k{indices.shape[-1]}"
+        if self.save_trace_tensors:
+            path = self.trace_dir / f"{name}.pt"
+            torch.save(
+                to_cpu(
+                    {
+                        "q": q,
+                        "kv": kv,
+                        "sink": sink,
+                        "indices": indices,
+                        "scale": scale,
+                        "official": official,
+                        "project": project,
+                        "official_trace": traced,
+                        "reference_trace": expected,
+                    }
+                ),
+                path,
+            )
+            diagnostics["tensor_artifact"] = str(path.resolve())
+        if hasattr(kernel, "get_kernel_source"):
+            try:
+                path = self.trace_dir / f"{name}.cu"
+                path.write_text(kernel.get_kernel_source())
+                diagnostics["generated_kernel_source"] = source_info(path)
+            except Exception as error:
+                diagnostics["kernel_source_export_error"] = str(error)
+        return diagnostics
 
     def fp8(self, m, n, group):
         x = quant_input(m, n, group, self.device)
@@ -395,6 +570,12 @@ def cpu_self_test(project):
             sparse_reference(q, kv, sink, indices, 64**-0.5),
         )
     }
+    traced = reference_trace(q, kv, sink, indices, 64**-0.5)
+    sparse_checks["trace_vs_reference"] = compare(
+        traced["final"]["output"],
+        sparse_reference(q, kv, sink, indices, 64**-0.5),
+        exact=True,
+    )
     x = quant_input(5, 128, 32, device)
     fp8_checks = {
         "project_vs_reference": compare(
@@ -430,21 +611,52 @@ def parse_args(argv=None):
     parser.add_argument("--quick", action="store_true")
     parser.add_argument("--seed", type=int, default=20261018)
     parser.add_argument("--self-test", action="store_true")
+    parser.add_argument(
+        "--trace-sparse",
+        action="store_true",
+        help="Instrument a copy of the official sparse kernel and compare each block",
+    )
+    parser.add_argument(
+        "--trace-dir",
+        type=Path,
+        help="Diagnostic source/tensor directory; defaults beside the JSON report",
+    )
+    parser.add_argument(
+        "--save-sparse-tensors",
+        action="store_true",
+        help="Save inputs, outputs and complete traces as CPU .pt artifacts",
+    )
     args = parser.parse_args(argv)
     if not args.self_test and args.official_kernel is None:
         parser.error("--official-kernel is required unless using --self-test")
+    if args.trace_sparse and (args.self_test or "sparse" not in args.operators):
+        parser.error("--trace-sparse requires CUDA mode and the sparse operator")
+    if (args.save_sparse_tensors or args.trace_dir) and not args.trace_sparse:
+        parser.error("--trace-dir/--save-sparse-tensors require --trace-sparse")
     return args
+
+
+def save_report(report, path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(json_safe(report), indent=2, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(path)
 
 
 def main(argv=None):
     args = parse_args(argv)
     report = {
-        "schema_version": 1,
+        "schema_version": 2,
+        "tool_source": source_info(Path(__file__)),
         "mode": "cpu_self_test" if args.self_test else "direct_official_kernel",
         "status": "running",
         "requested_operators": list(args.operators),
         "quick": args.quick,
         "seed": args.seed,
+        "sparse_trace_requested": args.trace_sparse,
         "scope": (
             "Direct official kernel API comparison only; no model, checkpoint, "
             "Transformers, cache or streaming pipeline."
@@ -492,11 +704,29 @@ def main(argv=None):
             }
             report["official_kernel"] = source_info(args.official_kernel)
             official = load_file(args.official_kernel, "_dsv41_kernel_level_official")
+
+            def progress(pending):
+                if pending is None:
+                    report.pop("in_progress", None)
+                else:
+                    report["in_progress"] = pending
+                save_report(report, args.report)
+
             comparator = KernelComparator(
-                official, project, device, args.seed, args.quick
+                official,
+                project,
+                device,
+                args.seed,
+                args.quick,
+                trace_sparse=args.trace_sparse,
+                trace_dir=args.trace_dir
+                or args.report.with_name(f"{args.report.stem}-artifacts"),
+                save_trace_tensors=args.save_sparse_tensors,
+                progress=progress,
             )
-            comparator.run(args.operators)
             report["results"] = comparator.results
+            save_report(report, args.report)
+            comparator.run(args.operators)
     except Exception as error:
         report["status"] = "error"
         report["fatal_error"] = f"{type(error).__name__}: {error}"
@@ -513,11 +743,15 @@ def main(argv=None):
         "failed": sum(row.get("status") == "failed" for row in report["results"]),
         "error": sum(row.get("status") == "error" for row in report["results"]),
     }
-    args.report.parent.mkdir(parents=True, exist_ok=True)
-    args.report.write_text(
-        json.dumps(json_safe(report), indent=2, allow_nan=False) + "\n",
-        encoding="utf-8",
-    )
+    if args.trace_sparse:
+        report["sparse_trace_summary"] = {
+            status: sum(
+                row.get("sparse_trace", {}).get("status") == status
+                for row in report["results"]
+            )
+            for status in ("completed", "untrusted", "error")
+        }
+    save_report(report, args.report)
     print(json.dumps({"status": report["status"], **report["summary"]}))
     print(f"Report: {args.report.resolve()}")
     return 2 if "fatal_error" in report else (1 if report["status"] == "failed" else 0)
