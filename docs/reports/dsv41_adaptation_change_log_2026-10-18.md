@@ -453,3 +453,37 @@ GEMM 的 FP32 reduction 顺序在多 block 在线累加中积累，并在最终 
 
 这些候选只用于定位官方 `T.reduce_sum/T.gemm` 的归约树，不会自动替换生产
 路径，也不会放宽现有失败条件。W8A8/W4A8 cache/recompute 继续单独验收。
+
+### 7.5 v7 reduction 候选结论
+
+报告 `/Users/ang/Downloads/dsv41-sparse-trace-full-v7.json` 的归因 gate
+仍全部通过，H4 case 通过，H64 生产 case 继续失败：
+
+```text
+h4_d512_k65:    final BF16 exact
+h64_d512_k640:  56 BF16 mismatches, max_abs=0.0009765625, max_bf16_steps=10
+```
+
+H64 的候选结果如下：
+
+| 类别 | 候选 | max abs | 总不一致元素 | 结论 |
+| --- | --- | ---: | ---: | --- |
+| value GEMM | `bf16_bmm_out_fp32` | `5.7220458984375e-6` | `1,440,099` | 最接近官方，保留生产路径 |
+| value GEMM | `fp32_einsum` | `7.62939453125e-6` | `1,614,212` | 更差 |
+| value GEMM | `bf16_pairwise_fp32` | `7.62939453125e-6` | `1,603,259` | 没有优于 bmm |
+| value GEMM | `bf16_bmm_default_cast` | `0.031170368194580078` | `2,555,181` | 明确错误 |
+| block sum | `torch_sum` | `1.9073486328125e-6` | `1,650` | 候选中最好 |
+| block sum | `pairwise_sum` | `1.9073486328125e-6` | `1,837` | 没有改善 |
+| block sum | `sequential_sum` | `5.7220458984375e-6` | `3,567` | 更差 |
+
+因此本轮没有继续修改生产 sparse kernel。当前已确认：
+
+1. QK：BF16 输入、FP32 输出的 bmm contract；
+2. value：BF16 权重/BF16 KV、FP32 输出的 bmm contract；
+3. 默认 BF16 输出后转换和显式 sequential/pairwise 候选都不是官方路径；
+4. block sum 的 PyTorch 候选都不能逐位重现官方 TileLang reduction tree。
+
+H64 的失败仍来自多个在线 block 中极小的 FP32 reduction 差异累积，并在
+最终 BF16 cast 时跨过舍入边界；不能按 `status=failed` 仅由 56 个元素导致
+而放宽阈值，也不能把候选中误差最小的路径声明为 bitwise 官方等价。
+W8A8/W4A8 cache/recompute 继续单独验收。
