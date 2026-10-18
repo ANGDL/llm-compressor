@@ -27,6 +27,7 @@ try:
     from tools.dsv41_sparse_trace import (
         compare_qk_backends,
         pad_official_inputs,
+        reference_qk_backend,
         reference_trace,
         run_official_trace,
         summarize_trace,
@@ -51,6 +52,7 @@ except ModuleNotFoundError:
     from dsv41_sparse_trace import (
         compare_qk_backends,
         pad_official_inputs,
+        reference_qk_backend,
         reference_trace,
         run_official_trace,
         summarize_trace,
@@ -413,6 +415,7 @@ class KernelComparator:
         diagnostics["qk_backend_comparison"] = compare_qk_backends(
             traced, q, kv, indices, scale, requested_heads
         )
+        diagnostics["reference_qk_backend"] = reference_qk_backend(padded_q)
         name = f"h{q.shape[2]}_d{q.shape[-1]}_k{indices.shape[-1]}"
         if self.save_trace_tensors:
             path = self.trace_dir / f"{name}.pt"

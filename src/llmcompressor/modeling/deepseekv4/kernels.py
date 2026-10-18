@@ -97,6 +97,29 @@ def _can_use_reference_kernels(tensor: torch.Tensor) -> bool:
     return tensor.is_cuda and _load_reference_kernel_module() is not None
 
 
+def _qk_gemm_fp32(q: torch.Tensor, kv: torch.Tensor) -> torch.Tensor:
+    """Match the official sparse QK GEMM accumulator contract.
+
+    The V4.1 TileLang kernel consumes BF16 Q/K operands but keeps the GEMM
+    accumulator and result in FP32. ``torch.bmm(..., out_dtype=...)`` exposes
+    that contract on CUDA. CPU and other backends use an FP32 einsum fallback
+    because ``out_dtype`` is not universally supported there.
+    """
+    batch, sequence, heads, head_dim = q.shape
+    keys = kv.shape[2]
+    if q.is_cuda and q.dtype == torch.bfloat16 and kv.dtype == torch.bfloat16:
+        left = q.reshape(batch * sequence, heads, head_dim)
+        right = kv.transpose(-1, -2).reshape(batch * sequence, head_dim, keys)
+        return torch.bmm(left, right, out_dtype=torch.float32).reshape(
+            batch, sequence, heads, keys
+        )
+    return torch.einsum(
+        "bshd,bskd->bshk",
+        q.float(),
+        kv.float(),
+    )
+
+
 def sparse_attention(
     q: torch.Tensor,
     kv: torch.Tensor,
@@ -143,17 +166,19 @@ def sparse_attention(
         gathered_kv = flat_kv.index_select(0, flat_indices.reshape(-1)).view(
             bsz, seqlen, block_size, head_dim
         )
-        gathered_kv = gathered_kv.float().masked_fill((indices < 0).unsqueeze(-1), 0)
-        scores = (
-            torch.einsum("bshd,bskd->bshk", q.float(), gathered_kv) * softmax_scale
-        ).masked_fill((indices < 0).unsqueeze(2), float("-inf"))
+        gathered_kv = gathered_kv.masked_fill((indices < 0).unsqueeze(-1), 0)
+        scores = (_qk_gemm_fp32(q, gathered_kv) * softmax_scale).masked_fill(
+            (indices < 0).unsqueeze(2), float("-inf")
+        )
         next_max = torch.maximum(scores_max, scores.amax(-1, keepdim=True))
         correction = torch.exp(scores_max - next_max)
         exp_scores = torch.exp(scores - next_max)
         sum_exp = sum_exp * correction + exp_scores.sum(-1, keepdim=True)
         # BF16 operands, FP32 value accumulation and rescaling, then BF16 output.
         acc_o = acc_o * correction + torch.einsum(
-            "bshk,bskd->bshd", exp_scores.bfloat16().float(), gathered_kv
+            "bshk,bskd->bshd",
+            exp_scores.bfloat16().float(),
+            gathered_kv.float(),
         )
         scores_max = next_max
 

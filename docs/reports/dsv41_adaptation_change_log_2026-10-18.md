@@ -300,3 +300,33 @@ head padding 修正后，`trace_reference_vs_project.exact` 仍为 true，官方
 
 本地工具测试更新为 `38 passed, 1 skipped`，CPU 自检通过。GPU 仍需重新运行
 以获得三种 QK backend 与官方 `T.gemm` 的相似度排序。
+
+### 7.1 v3 QK backend 结论与实现修正
+
+GPU 报告 `/Users/ang/Downloads/dsv41-sparse-trace-quick-v3.json` 的
+`h4_d512_k65` 结果确认：
+
+- `fp32_einsum`：block 0 最大绝对差
+  `0.000064849853515625`，与官方 QK snapshot 不精确；
+- `bf16_bmm_out_fp32`：两个 block 均逐元素精确一致；
+- `bf16_bmm_default_cast`：最大绝对差
+  `0.12450790405273438`，不是官方路径；
+- 官方与项目最终 BF16 输出仍有 6 个元素、最大 1 个 BF16 step 的差异，
+  但 `first_bf16_weight_divergence` 仍为 `null`，说明差异首先出现在
+  QK GEMM，而不是 exp 的 BF16 权重转换。
+
+据此，本轮将以下实现统一为官方的 QK dtype contract：
+
+| 文件 | 修改 |
+| --- | --- |
+| `src/llmcompressor/modeling/deepseekv4/kernels.py` | CUDA + BF16 输入时使用 BF16 输入、FP32 输出的 `torch.bmm`；保留 BF16 gathered KV，value 累加继续使用 FP32 |
+| `tools/validate_dsv41_gpu_kernels.py` | 独立 sparse reference 使用同一 QK contract，CPU 回退 FP32 einsum |
+| `tools/dsv41_sparse_trace.py` | GPU trace 默认选择 `bf16_bmm_out_fp32`，CPU 选择 `fp32_einsum` |
+| `tools/compare_dsv41_kernel_level.py` | 报告增加 `reference_qk_backend` 字段 |
+| `docs/guides/dsv41_gpu_kernel_alignment.md` | 记录 v3 结论和 v4 复测边界 |
+
+本地回归为 `43 passed, 1 skipped`。本地没有 CUDA，因此尚未把 sparse
+官方/项目比较标记为通过；需要在 H20 上重新运行 v4 命令，继续检查 QK
+修正后是否还存在 running max、exp/BF16 权重、denominator、value
+accumulator 或最终 BF16 cast 阶段的差异。W8A8/W4A8 cache/recompute
+问题仍独立保留，未由本次 QK 修正代替。
