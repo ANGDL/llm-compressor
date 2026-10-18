@@ -281,3 +281,22 @@ prefill/decode 仍精确相等；缓存/重算最大 logit 差仍分别为
 而官方 wrapper 实际将 H=4 补齐为 H=16。后续修正将 reference 也按 H=16
 执行后裁剪，避免把 head padding 与 GEMM 归约顺序混在一起；需要在 GPU 上
 重新运行后才能确认 QK 差异是否仍存在。
+v2 报告 `/Users/ang/Downloads/dsv41-sparse-trace-quick-v2.json` 进一步确认：
+head padding 修正后，`trace_reference_vs_project.exact` 仍为 true，官方插桩
+输出校验仍为 true，首次差异仍位于 block 0 的 QK；最大绝对差约
+`6.4849853515625e-05`。两个 block 的 `bf16_weights` 都精确相等，
+所以当前主要假设是官方 `T.gemm` 与项目 PyTorch FP32 einsum 的 QK
+归约路径差异，尚未证明是 softmax、BF16 权重转换或 value GEMM 的问题。
+后续工具将比较 BF16 输入/FP32 累加的 PyTorch bmm 变体。
+
+本轮新增 QK backend 诊断：
+
+| 文件 | 修改内容 |
+| --- | --- |
+| `tools/dsv41_sparse_trace.py` | 增加 `fp32_einsum`、`bf16_bmm_out_fp32`、`bf16_bmm_default_cast` 三种 QK 路径的逐 block 对照 |
+| `tools/compare_dsv41_kernel_level.py` | 在有效 sparse trace 中写入 `qk_backend_comparison` |
+| `tests/tools/test_dsv41_sparse_trace.py` | 增加 QK backend 参考一致性测试 |
+| `docs/guides/dsv41_gpu_kernel_alignment.md` | 记录 QK backend 字段和解释 |
+
+本地工具测试更新为 `38 passed, 1 skipped`，CPU 自检通过。GPU 仍需重新运行
+以获得三种 QK backend 与官方 `T.gemm` 的相似度排序。

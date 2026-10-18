@@ -274,6 +274,49 @@ def trim_trace_heads(trace, heads):
     }
 
 
+QK_BACKENDS = (
+    "fp32_einsum",
+    "bf16_bmm_out_fp32",
+    "bf16_bmm_default_cast",
+)
+
+
+def qk_product(q, values_bf16, backend):
+    """Compute QK with explicit input/accumulator choices for GPU diagnosis."""
+    if backend == "fp32_einsum":
+        return torch.einsum("bshd,bskd->bshk", q.float(), values_bf16.float())
+    batch, sequence, heads, dim = q.shape
+    keys = values_bf16.shape[2]
+    left = q.reshape(batch * sequence, heads, dim)
+    right = values_bf16.transpose(-1, -2).reshape(batch * sequence, dim, keys)
+    if backend == "bf16_bmm_out_fp32":
+        return torch.bmm(left, right, out_dtype=torch.float32).reshape(
+            batch, sequence, heads, keys
+        )
+    if backend == "bf16_bmm_default_cast":
+        return torch.bmm(left, right).float().reshape(batch, sequence, heads, keys)
+    raise ValueError(f"Unknown QK backend: {backend}")
+
+
+def qk_backend_trace(q, kv, indices, backend):
+    """Return masked QK blocks for one explicit PyTorch backend."""
+    batch, sequence, _, _ = q.shape
+    batches = torch.arange(batch, device=q.device).view(batch, 1, 1)
+    blocks = []
+    for start in range(0, indices.shape[-1], 64):
+        idx = F.pad(
+            indices[..., start : start + 64],
+            (0, max(0, start + 64 - indices.shape[-1])),
+            value=-1,
+        ).long()
+        values = kv[batches, idx.clamp_min(0)]
+        values = values.masked_fill((idx < 0).unsqueeze(-1), 0)
+        qk = qk_product(q, values, backend)
+        qk = qk.masked_fill((idx < 0).unsqueeze(2), -torch.inf)
+        blocks.append(qk)
+    return blocks
+
+
 def reference_trace(q, kv, sink, indices, scale):
     """Snapshot the same PyTorch operation order used by the project reference."""
     b, s, h, d = q.shape
@@ -288,9 +331,9 @@ def reference_trace(q, kv, sink, indices, scale):
             (0, max(0, start + 64 - indices.shape[-1])),
             value=-1,
         ).long()
-        values = kv[batches, idx.clamp_min(0)].float()
+        values = kv[batches, idx.clamp_min(0)]
         values = values.masked_fill((idx < 0).unsqueeze(-1), 0)
-        qk = torch.einsum("bshd,bskd->bshk", q.float(), values)
+        qk = qk_product(q, values, "fp32_einsum")
         qk = qk.masked_fill((idx < 0).unsqueeze(2), -torch.inf)
         scores = qk * scale
         next_maximum = torch.maximum(maximum, scores.amax(-1, keepdim=True))
@@ -300,7 +343,9 @@ def reference_trace(q, kv, sink, indices, scale):
         denominator = denominator * correction + block_sum
         bf16_weights = weights.bfloat16()
         rescaled = acc * correction
-        acc = rescaled + torch.einsum("bshk,bskd->bshd", bf16_weights.float(), values)
+        acc = rescaled + torch.einsum(
+            "bshk,bskd->bshd", bf16_weights.float(), values.float()
+        )
         blocks.append(
             {
                 "qk": qk,
@@ -355,6 +400,60 @@ def compare_stage(actual, expected):
             "reference": float(expected.flatten()[flat_index]),
         }
     return check
+
+
+def compare_qk_backends(official_trace, q, kv, indices, scale, heads):
+    """Compare explicit PyTorch QK backends against official block snapshots."""
+    padded_q, _, _ = pad_official_inputs(q, q.new_zeros(heads))
+    reports = {}
+    for backend in QK_BACKENDS:
+        try:
+            blocks = qk_backend_trace(padded_q, kv, indices, backend)
+            checks = []
+            for block, (actual, expected) in enumerate(
+                zip(official_trace["blocks"], blocks)
+            ):
+                checks.append(
+                    {
+                        "block": block,
+                        "key_offset": block * 64,
+                        "comparison": compare_stage(
+                            actual["qk"], expected[:, :, :heads]
+                        ),
+                    }
+                )
+            exact = all(item["comparison"]["exact"] for item in checks)
+            max_abs = max(item["comparison"].get("max_abs", 0.0) for item in checks)
+            relative_l2 = max(
+                item["comparison"].get("relative_l2", 0.0) for item in checks
+            )
+            reports[backend] = {
+                "status": "completed",
+                "exact": exact,
+                "max_abs": max_abs,
+                "max_relative_l2": relative_l2,
+                "blocks": checks,
+            }
+        except Exception as error:
+            reports[backend] = {
+                "status": "error",
+                "error": f"{type(error).__name__}: {error}",
+            }
+    completed = {
+        name: report
+        for name, report in reports.items()
+        if report["status"] == "completed"
+    }
+    best = None
+    if completed:
+        best = min(
+            completed,
+            key=lambda name: (
+                completed[name]["max_abs"],
+                completed[name]["max_relative_l2"],
+            ),
+        )
+    return {"backends": reports, "best_by_max_abs": best}
 
 
 def summarize_trace(actual, expected, output_check, *, attribution_valid):
