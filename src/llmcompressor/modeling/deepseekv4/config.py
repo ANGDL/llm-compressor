@@ -13,6 +13,72 @@ class ModelConfig(PretrainedConfig):
     model_type = "deepseek_v4_native"
 
     @classmethod
+    def _normalize_config_dict(cls, config_dict):
+        if not isinstance(config_dict, dict):
+            return config_dict
+
+        config_dict = dict(config_dict)
+        if config_dict.get("model_type") == "deepseek_v4":
+            config_dict["model_type"] = cls.model_type
+
+        # Transformers 5.12 expresses the same native architecture through
+        # layer type names instead of the reference checkpoint's numeric
+        # compression ratios. Normalize that schema before PretrainedConfig
+        # validates fields such as ``mlp_layer_types``.
+        layer_types = config_dict.pop("layer_types", None)
+        compress_rates = config_dict.pop("compress_rates", None)
+        if (
+            "compress_ratios" not in config_dict
+            and layer_types is not None
+            and compress_rates is not None
+        ):
+            config_dict["compress_ratios"] = [
+                int(compress_rates.get(layer_type, 0))
+                for layer_type in layer_types
+            ]
+
+        mlp_layer_types = config_dict.pop("mlp_layer_types", None)
+        if "num_hash_layers" not in config_dict and mlp_layer_types is not None:
+            num_hash_layers = 0
+            for layer_type in mlp_layer_types:
+                if layer_type != "hash_moe":
+                    break
+                num_hash_layers += 1
+            config_dict["num_hash_layers"] = num_hash_layers
+
+        rope_parameters = config_dict.pop("rope_parameters", None)
+        if isinstance(rope_parameters, dict):
+            main_rope = rope_parameters.get("main", {})
+            compress_rope = rope_parameters.get("compress", {})
+            if "rope_theta" in main_rope:
+                config_dict["rope_theta"] = main_rope["rope_theta"]
+            if "rope_theta" in compress_rope:
+                config_dict["compress_rope_theta"] = compress_rope["rope_theta"]
+            if "rope_scaling" not in config_dict and compress_rope:
+                config_dict["rope_scaling"] = {
+                    key: value
+                    for key, value in compress_rope.items()
+                    if key not in {"partial_rotary_factor", "rope_theta"}
+                }
+
+        return config_dict
+
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
+        """Load native config without warning on raw DeepSeek model types.
+
+        Raw DeepSeek-V4 checkpoints identify themselves as ``deepseek_v4``.
+        Normalize that identity before Transformers compares it with this
+        implementation's intentionally distinct ``deepseek_v4_native`` type.
+        """
+        config_dict, kwargs = cls.get_config_dict(
+            pretrained_model_name_or_path, **kwargs
+        )
+        if cls.base_config_key and cls.base_config_key in config_dict:
+            config_dict = config_dict[cls.base_config_key]
+        return cls.from_dict(cls._normalize_config_dict(config_dict), **kwargs)
+
+    @classmethod
     def from_dict(cls, config_dict, **kwargs):
         # Tolerate raw upstream checkpoints whose config.json carries
         # `model_type: "deepseek_v4"`. When they are loaded explicitly through
@@ -21,49 +87,7 @@ class ModelConfig(PretrainedConfig):
         # AutoConfig, which keeps returning HF's DeepseekV4Config for
         # "deepseek_v4".
         if isinstance(config_dict, dict):
-            config_dict = dict(config_dict)
-            if config_dict.get("model_type") == "deepseek_v4":
-                config_dict["model_type"] = cls.model_type
-
-            # Transformers 5.12 expresses the same native architecture through
-            # layer type names instead of the reference checkpoint's numeric
-            # compression ratios. Normalize that schema before PretrainedConfig
-            # validates fields such as ``mlp_layer_types``.
-            layer_types = config_dict.pop("layer_types", None)
-            compress_rates = config_dict.pop("compress_rates", None)
-            if (
-                "compress_ratios" not in config_dict
-                and layer_types is not None
-                and compress_rates is not None
-            ):
-                config_dict["compress_ratios"] = [
-                    int(compress_rates.get(layer_type, 0))
-                    for layer_type in layer_types
-                ]
-
-            mlp_layer_types = config_dict.pop("mlp_layer_types", None)
-            if "num_hash_layers" not in config_dict and mlp_layer_types is not None:
-                num_hash_layers = 0
-                for layer_type in mlp_layer_types:
-                    if layer_type != "hash_moe":
-                        break
-                    num_hash_layers += 1
-                config_dict["num_hash_layers"] = num_hash_layers
-
-            rope_parameters = config_dict.pop("rope_parameters", None)
-            if isinstance(rope_parameters, dict):
-                main_rope = rope_parameters.get("main", {})
-                compress_rope = rope_parameters.get("compress", {})
-                if "rope_theta" in main_rope:
-                    config_dict["rope_theta"] = main_rope["rope_theta"]
-                if "rope_theta" in compress_rope:
-                    config_dict["compress_rope_theta"] = compress_rope["rope_theta"]
-                if "rope_scaling" not in config_dict and compress_rope:
-                    config_dict["rope_scaling"] = {
-                        key: value
-                        for key, value in compress_rope.items()
-                        if key not in {"partial_rotary_factor", "rope_theta"}
-                    }
+            config_dict = cls._normalize_config_dict(config_dict)
 
         return super().from_dict(config_dict, **kwargs)
 

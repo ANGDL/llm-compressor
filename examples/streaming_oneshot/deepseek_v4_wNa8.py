@@ -44,6 +44,7 @@ from transformers import AutoTokenizer
 import llmcompressor.modeling.deepseekv4  # noqa: F401
 from datasets import Dataset, concatenate_datasets, load_dataset
 from llmcompressor.modeling.deepseekv4.config import ModelConfig
+from llmcompressor.modeling.deepseekv4.model import DeepseekV4NativeForCausalLM
 from llmcompressor.modifiers.quantization import QuantizationModifier
 from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
 from llmcompressor.streaming import DeepSeekV4WeightMaterializer, streaming_oneshot
@@ -341,7 +342,7 @@ def main() -> None:
     config.max_seq_len = args.max_sequence_length + (
         config.dspark_block_size if is_dspark else 0
     )
-    model_factory = None
+    model_factory = DeepseekV4NativeForCausalLM
     if is_dspark:
         from llmcompressor.modeling.deepseekv4.model_dspark import (
             DeepseekV4DSparkForCausalLM,
