@@ -169,13 +169,36 @@ def fp4_reference(x, group, e4m3):
     return result.flatten(-2).to(x.dtype), scale.squeeze(-1)
 
 
-def bf16_steps(actual, expected):
+def bf16_step_distances(actual, expected):
     def ordered(x):
         bits = x.contiguous().view(torch.int16).int() & 0xFFFF
         magnitude = bits & 0x7FFF
         return torch.where(bits & 0x8000 != 0, 0x8000 - magnitude, 0x8000 + bits)
 
-    return int((ordered(actual) - ordered(expected)).abs().max().item())
+    return (ordered(actual) - ordered(expected)).abs()
+
+
+def bf16_steps(actual, expected):
+    return int(bf16_step_distances(actual, expected).max().item())
+
+
+def difference_point(actual, expected, index):
+    """Describe a flattened index with its original, zero-based coordinates."""
+    index = int(index)
+    remainder = index
+    coordinate = []
+    for size in reversed(actual.shape):
+        coordinate.append(remainder % size)
+        remainder //= size
+    a = float(actual.flatten()[index])
+    e = float(expected.flatten()[index])
+    return {
+        "flat_index": index,
+        "coordinate": list(reversed(coordinate)),
+        "actual": a,
+        "reference": e,
+        "abs_difference": abs(a - e),
+    }
 
 
 def compare(actual, expected, *, atol=1e-6, rtol=1e-5, exact=False):
@@ -212,14 +235,16 @@ def compare(actual, expected, *, atol=1e-6, rtol=1e-5, exact=False):
         passed=(equal if exact else close) and actual.dtype == expected.dtype,
     )
     if actual.dtype == expected.dtype == torch.bfloat16:
-        result["max_bf16_steps"] = bf16_steps(actual, expected)
+        steps = bf16_step_distances(actual, expected)
+        result["max_bf16_steps"] = int(steps.max())
+        if mismatch.any():
+            result["largest_bf16_step_difference"] = {
+                **difference_point(actual, expected, steps.flatten().argmax()),
+                "bf16_steps": result["max_bf16_steps"],
+            }
     if mismatch.any():
         index = difference.flatten().argmax()
-        result["largest_difference"] = {
-            "flat_index": int(index),
-            "actual": float(a.flatten()[index]),
-            "reference": float(e.flatten()[index]),
-        }
+        result["largest_difference"] = difference_point(actual, expected, index)
     return result
 
 

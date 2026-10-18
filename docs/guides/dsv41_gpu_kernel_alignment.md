@@ -51,6 +51,97 @@ python tools/compare_dsv41_kernel_level.py \
 FP8 GEMM 当前项目没有独立的原生 FP8 GEMM kernel，因此该项只比较官方
 kernel 与按 scale 分块累加的参考，并在报告中明确标记。
 
+对 sparse attention 做逐块中间值对照：
+
+```bash
+python tools/compare_dsv41_kernel_level.py \
+  --official-kernel /data/DeepSeek-V4.1-Flash-1017/inference/kernel.py \
+  --project-root /data/llm-compressor \
+  --device cuda:0 \
+  --operators sparse \
+  --trace-sparse \
+  --save-sparse-tensors \
+  --report /tmp/dsv41-sparse-trace.json
+```
+
+该命令保留 H=4/D=512/K=65、H=64/D=512/K=640 两个用例，seed 与此前
+kernel 级报告相同。可加 `--quick` 只跑第一项。原有
+`official_vs_project` 等检查仍使用 `atol=1e-6, rtol=1e-5`；
+诊断输出不会覆盖失败结果或提高阈值。
+
+`--trace-sparse` 在官方源码副本中插入只读中间值的全局内存写出，保留原有
+GEMM、计算语句、线程数和 pipeline 配置；原始官方文件不修改。若官方函数
+签名、64-KV block 或预期记录边界发生变化，会报告诊断错误。
+工具逐块记录 QK、缩放后 score、running max、rescale、FP32 exp、
+block sum、累计分母、BF16 权重、重缩放后的 accumulator 和 value GEMM
+之后的 accumulator，最后记录加入 sink 的分母、转换前 FP32 输出和
+最终 BF16 输出。各阶段保留匹配的正负无穷 mask，NaN 或不一致的
+非有限值会被标记。
+
+插入写出可能影响编译决策。诊断首先要求：
+
+- `checks.instrumented_vs_official.exact` 为 true：插桩最终输出与原始官方
+  输出逐元素相等。
+- `checks.instrumented_normalized_cast_vs_output.exact` 为 true：记录的
+  FP32 最终结果转 BF16 后与插桩实际输出相同。
+- PyTorch trace 的最终输出与项目实现、独立参考分别精确相等，且记录的
+  snapshot 不含未写入的 NaN。
+
+未满足时，`sparse_trace.status` 为 `untrusted`，`attribution_valid` 为 false，
+不会给出可信的首次差异结论。编译或执行异常保留原始比较结果与 traceback。
+这些校验是使用中间值归因的必要条件；最终输出相同仍不证明插桩前后每条
+内部浮点指令完全相同，需要结合生成代码判断。
+
+重点读取：
+
+| JSON 字段 | 含义 |
+| --- | --- |
+| `checks.official_vs_project.largest_bf16_step_difference` | 最大 BF16 表示值步数差的坐标、双方数值、绝对差和步数 |
+| `sparse_trace.first_exact_divergence` | 按 block 和实际运算顺序扫描，首次逐元素不相等的位置 |
+| `sparse_trace.first_strict_divergence` | 首次超出原严格阈值的位置 |
+| `sparse_trace.first_bf16_weight_divergence` | 首次块内 BF16 exp 权重不相等的位置 |
+| `sparse_trace.stages` | 所有 block/阶段的误差指标、最大差值坐标和轴含义 |
+| `sparse_trace.output_points` | 最大绝对差和最大 BF16 步数差输出点对应的逐块 score/权重、分母和 accumulator 轨迹 |
+| `sparse_trace.head_padding` | 项目 head 数与官方 kernel 实际补齐后的 head 数 |
+
+坐标均从 0 开始，输出坐标为 `[batch, query, head, channel]`；
+块内 score/权重的最后一维为 `key_in_block`，候选序号为
+`block * 64 + key_in_block`。这与索引选中的 KV 位置有区别，后者保存在
+原始 `indices` 张量中。官方会将不足 16 个 head 补齐到 16；参考实现保留
+项目输入形状，报告会显示该形状差别。
+
+默认在 JSON 旁建立 `dsv41-sparse-trace-artifacts/`，写入插桩源码及其 hash；
+若 TileLang 提供源码导出接口，也保存生成的 CUDA 源码。使用
+`--save-sparse-tensors` 后，还会为每个用例保存包含输入、输出和完整中间值的
+CPU `.pt` 文件；JSON 只保存指标和选中点的轨迹。可用 `--trace-dir` 指定目录。
+报告在每个 case 后保存，并在诊断 JIT 前保存当前 case 的原始比较结果，
+中断后可以查看部分报告。
+诊断编译失败单独计入 `sparse_trace_summary.error`；原 case 的基础检查和
+通过/失败结果仍保留。PyTorch 中间值来自计算顺序参考，并对项目最终输出做
+精确校验；它不是对项目生产函数的直接插桩。全屏蔽 query 的最终归一化参考
+遵循官方的 `0/inf`，项目校准路径为保持梯度有限采用 `0/1`，两者输出均为零。
+
+仅需本地 CPU 检查时，运行文末的 `--self-test`；它也校验 PyTorch trace
+与独立参考最终输出相等，但不执行插桩 CUDA kernel。可选 GPU 回归：
+
+```bash
+DSV41_OFFICIAL_KERNEL=/data/DeepSeek-V4.1-Flash-1017/inference/kernel.py \
+  python -m pytest -q tests/tools/test_compare_dsv41_kernel_level.py \
+  -k official_gpu_trace
+```
+
+W8A8/W4A8 的 checkpoint cache/recompute 验证独立进行，例如：
+
+```bash
+python tools/validate_tiny_dsv41_inference.py \
+  .cache/tiny-models/DeepSeek-V4.1-Flash-Tiny \
+  --modes w8a8 w4a8 \
+  --report /tmp/dsv41-cache-separate.json
+```
+
+该验证入口使用 CPU，复用已有量化 checkpoint，不重新量化。它与
+checkpoint-free 的 GPU kernel 诊断分别出报告；当前缓存一致性失败继续保留。
+
 完成快速检查后，去掉 `--quick` 执行完整形状矩阵：
 
 ```bash
