@@ -108,6 +108,27 @@ def _qk_gemm_fp32(q, values_bf16):
     )
 
 
+def _value_gemm_fp32(weights_bf16, values_bf16):
+    """Match the official BF16-weight/BF16-value FP32 accumulator GEMM."""
+    batch, sequence, heads, keys = weights_bf16.shape
+    head_dim = values_bf16.shape[-1]
+    if (
+        weights_bf16.is_cuda
+        and weights_bf16.dtype == torch.bfloat16
+        and values_bf16.dtype == torch.bfloat16
+    ):
+        left = weights_bf16.reshape(batch * sequence, heads, keys)
+        right = values_bf16.reshape(batch * sequence, keys, head_dim)
+        return torch.bmm(left, right, out_dtype=torch.float32).reshape(
+            batch, sequence, heads, head_dim
+        )
+    return torch.einsum(
+        "bshk,bskd->bshd",
+        weights_bf16.float(),
+        values_bf16.float(),
+    )
+
+
 def sparse_reference(q, kv, sink, indices, scale):
     """Emulate official 64-key online softmax and BF16 unnormalized weights."""
     b, s, h, d = q.shape
@@ -126,10 +147,9 @@ def sparse_reference(q, kv, sink, indices, scale):
         correction = torch.exp(maximum - new_maximum)
         weights = torch.exp(scores - new_maximum)
         denominator = denominator * correction + weights.sum(-1, keepdim=True)
-        acc = acc * correction + torch.einsum(
-            "bshk,bskd->bshd",
-            weights.bfloat16().float(),
-            values.float(),
+        acc = acc * correction + _value_gemm_fp32(
+            weights.bfloat16(),
+            values,
         )
         maximum = new_maximum
     denominator = denominator + torch.exp(sink.view(1, 1, h, 1) - maximum)

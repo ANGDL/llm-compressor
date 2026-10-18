@@ -145,6 +145,16 @@ sparse attention 和独立 PyTorch reference 在 CUDA + BF16 输入时均采用
 这只是根据 v3 诊断修正 QK 计算路径，尚未替代 GPU v4 复测；在复测通过前，
 原有 sparse 失败和 W8A8/W4A8 cache/recompute 失败必须继续保留。
 
+v4 快速报告确认 QK 修正生效：QK、scaled scores、running max、rescale、
+exp 和 BF16 权重均逐元素一致，`official_vs_project` 与
+`project_vs_order_reference` 均精确通过，最终 BF16 输出也精确一致。当前
+trace 的首次逐元素差异移动到 `block_sum`，只有 4 个元素，最大绝对差
+`1.9073486328125e-6`，但仍在严格阈值内；这对应官方 `T.reduce_sum` 与
+PyTorch `torch.sum` 的归约顺序差异。v4 还显示 value accumulator 存在同量级
+的 FP32 差异，因此项目和 reference 已进一步改为 BF16 权重 × BF16 KV、
+FP32 输出的 value GEMM；该修正需要下一轮 GPU trace 验证，不能用 v4 之前的
+报告替代。
+
 仅需本地 CPU 检查时，运行文末的 `--self-test`；它也校验 PyTorch trace
 与独立参考最终输出相等，但不执行插桩 CUDA kernel。可选 GPU 回归：
 
