@@ -34,6 +34,17 @@ class _MultimodalPrefixModel(nn.Module):
         self.layers = nn.ModuleList([nn.Linear(4, 4)])
 
 
+class _DeclaredParameterPrefixModel(_MultimodalPrefixModel):
+    def __init__(self):
+        super().__init__()
+        self.prefix_bias = nn.Parameter(torch.randn(4))
+
+    def streaming_runtime_parameter_dependencies(self, stage):
+        if stage == "prefix":
+            return ("prefix_bias",)
+        return ()
+
+
 def test_target_projection_preserves_tuple_unpack_nodes():
     model = nn.Module()
     model.layer = _TupleTarget()
@@ -141,7 +152,7 @@ def test_streaming_boundaries_preserve_interleaved_tuple_and_suffix(
 
 def test_prefix_runtime_discovers_autowrapped_checkpoint_dependencies(tmp_path):
     torch.manual_seed(11)
-    reference = _MultimodalPrefixModel()
+    reference = _DeclaredParameterPrefixModel()
     checkpoint = tmp_path / "model.safetensors"
     save_file(
         {
@@ -150,12 +161,12 @@ def test_prefix_runtime_discovers_autowrapped_checkpoint_dependencies(tmp_path):
         },
         checkpoint,
     )
-    model = build_meta_model(_MultimodalPrefixModel)
+    model = build_meta_model(_DeclaredParameterPrefixModel)
 
     def hidden_prefix(input_ids, pixel_values):
         text = model.embed_tokens(input_ids)
         image = model.mm_projector(model.vision_tower(pixel_values))
-        return text + image.unsqueeze(1)
+        return text + image.unsqueeze(1) + model.prefix_bias
 
     graph = Graph()
     input_ids = graph.placeholder("input_ids")
@@ -196,9 +207,13 @@ def test_prefix_runtime_discovers_autowrapped_checkpoint_dependencies(tmp_path):
         "input_ids": torch.tensor([[1, 2]]),
         "pixel_values": torch.randn(1, 4),
     }
-    expected = reference.embed_tokens(batch["input_ids"]) + reference.mm_projector(
-        reference.vision_tower(batch["pixel_values"])
-    ).unsqueeze(1)
+    expected = (
+        reference.embed_tokens(batch["input_ids"])
+        + reference.mm_projector(
+            reference.vision_tower(batch["pixel_values"])
+        ).unsqueeze(1)
+        + reference.prefix_bias
+    )
 
     boundaries = list(adapter.calibration_boundaries(iter((batch,))))
 
@@ -208,4 +223,5 @@ def test_prefix_runtime_discovers_autowrapped_checkpoint_dependencies(tmp_path):
         "vision_tower",
         "mm_projector",
     )
+    assert adapter._prefix_runtime_parameters == ("prefix_bias",)
     assert all(parameter.is_meta for parameter in model.parameters())
