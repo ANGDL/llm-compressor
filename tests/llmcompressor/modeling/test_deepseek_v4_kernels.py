@@ -6,6 +6,24 @@ import torch
 from llmcompressor.modeling.deepseekv4 import kernels
 
 
+def test_fp32_bmm_falls_back_to_explicit_fp32_inputs(monkeypatch):
+    original_bmm = torch.bmm
+
+    def fake_bmm(left, right, **kwargs):
+        if "out_dtype" in kwargs:
+            raise NotImplementedError("aten::bmm.dtype")
+        return original_bmm(left, right, **kwargs)
+
+    monkeypatch.setattr(kernels.torch, "bmm", fake_bmm)
+    left = torch.randn(2, 3, 4, dtype=torch.bfloat16)
+    right = torch.randn(2, 4, 5, dtype=torch.bfloat16)
+
+    actual = kernels._bmm_fp32(left, right)
+    expected = original_bmm(left.float(), right.float())
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 def test_reference_sparse_attention_restores_fp32_sink(monkeypatch):
     observed = {}
 

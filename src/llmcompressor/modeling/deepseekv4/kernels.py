@@ -97,6 +97,18 @@ def _can_use_reference_kernels(tensor: torch.Tensor) -> bool:
     return tensor.is_cuda and _load_reference_kernel_module() is not None
 
 
+def _bmm_fp32(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
+    """Use an FP32 accumulator on backends without ``bmm(out_dtype=...)``."""
+
+    try:
+        return torch.bmm(left, right, out_dtype=torch.float32)
+    except (NotImplementedError, RuntimeError) as error:
+        message = str(error).lower()
+        if "bmm" not in message and "out_dtype" not in message:
+            raise
+        return torch.bmm(left.float(), right.float())
+
+
 def _qk_gemm_fp32(q: torch.Tensor, kv: torch.Tensor) -> torch.Tensor:
     """Match the official sparse QK GEMM accumulator contract.
 
@@ -110,7 +122,7 @@ def _qk_gemm_fp32(q: torch.Tensor, kv: torch.Tensor) -> torch.Tensor:
     if q.is_cuda and q.dtype == torch.bfloat16 and kv.dtype == torch.bfloat16:
         left = q.reshape(batch * sequence, heads, head_dim)
         right = kv.transpose(-1, -2).reshape(batch * sequence, head_dim, keys)
-        return torch.bmm(left, right, out_dtype=torch.float32).reshape(
+        return _bmm_fp32(left, right).reshape(
             batch, sequence, heads, keys
         )
     return torch.einsum(
@@ -131,7 +143,7 @@ def _value_gemm_fp32(weights: torch.Tensor, values: torch.Tensor) -> torch.Tenso
     ):
         left = weights.reshape(batch * sequence, heads, keys)
         right = values.reshape(batch * sequence, keys, head_dim)
-        return torch.bmm(left, right, out_dtype=torch.float32).reshape(
+        return _bmm_fp32(left, right).reshape(
             batch, sequence, heads, head_dim
         )
     return torch.einsum(
