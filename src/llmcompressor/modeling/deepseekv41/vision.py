@@ -110,5 +110,8 @@ class Aligner(nn.Module):
         ratio = self.ratio
         x = x.view(height, width, -1).permute(2, 0, 1)
         x = F.pad(x, (0, -width % ratio, 0, -height % ratio))
-        x = F.unfold(x.unsqueeze(0), ratio, stride=ratio)
+        # Some CUDA-compatible backends do not implement BF16 im2col. The
+        # operation only rearranges elements, so perform that layout step in
+        # FP32 and restore the feature dtype before the projection.
+        x = F.unfold(x.float().unsqueeze(0), ratio, stride=ratio).to(x.dtype)
         return self.w2(F.gelu(self.w1(x.squeeze(0).transpose(0, 1))))
