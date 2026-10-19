@@ -24,7 +24,11 @@ from llmcompressor.modeling.deepseekv41.model import (
     _candidate_mask,
     _draft_inputs,
 )
-from llmcompressor.modeling.deepseekv41.quantization import fp4_qdq
+from llmcompressor.modeling.deepseekv41.quantization import (
+    _fp8_e4m3_round,
+    fp4_qdq,
+    fp8_qdq,
+)
 from llmcompressor.modeling.moe_context import moe_calibration_context
 from llmcompressor.modifiers.quantization import QuantizationModifier
 from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
@@ -120,6 +124,21 @@ def test_official_fp32_parameter_exceptions_survive_bf16_default():
     final_draft = model.model.mtp[-1]
     assert final_draft.markov_head.head.weight.dtype == torch.float32
     assert final_draft.confidence_head.proj.weight.dtype == torch.float32
+
+
+def test_fp8_software_rounding_matches_native_cpu_cast():
+    torch.manual_seed(7)
+    values = torch.rand(4096, dtype=torch.float32) * 896 - 448
+    native = values.to(torch.float8_e4m3fn).float()
+    software = _fp8_e4m3_round(values)
+    torch.testing.assert_close(software, native, rtol=0, atol=0)
+
+
+def test_fp8_qdq_preserves_input_dtype():
+    values = torch.randn(2, 64, dtype=torch.bfloat16)
+    result = fp8_qdq(values)
+    assert result.dtype == values.dtype
+    assert result.shape == values.shape
 
 
 def write_checkpoint(root, config):

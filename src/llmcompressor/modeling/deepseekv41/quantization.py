@@ -1,5 +1,6 @@
 """Reference quantize/dequantize operations used by V4.1 attention."""
 
+from functools import lru_cache
 from types import MethodType
 
 import torch
@@ -7,12 +8,40 @@ from torch import nn
 from torch.nn import functional as F
 
 
+@lru_cache(maxsize=16)
+def _supports_fp8_cast(device_type: str, device_index: int | None) -> bool:
+    """Return whether a device accepts the native E4M3 cast operation."""
+
+    if device_type in {"cpu", "meta"}:
+        return True
+    try:
+        device = torch.device(device_type, device_index)
+        torch.zeros(1, device=device).to(torch.float8_e4m3fn)
+    except (NotImplementedError, RuntimeError):
+        return False
+    return True
+
+
+def _fp8_e4m3_round(x):
+    """Round finite values to E4M3FN without requiring an FP8 storage cast."""
+
+    absolute = x.abs().clamp_max(448)
+    exponent = torch.floor(torch.log2(absolute.clamp_min(2**-9))).clamp(-6, 8)
+    step = torch.exp2(exponent - 3)
+    rounded = (torch.round(absolute / step) * step).clamp_max(448)
+    return rounded.copysign(x)
+
+
 def fp8_qdq(x, group_size=32):
     groups = x.float().unflatten(-1, (-1, group_size))
     amax = groups.abs().amax(-1, keepdim=True).clamp_min(1e-4)
     scale = torch.exp2(torch.ceil(torch.log2(amax / 448)))
-    result = (groups / scale).clamp(-448, 448).to(torch.float8_e4m3fn)
-    return (result.float() * scale).flatten(-2).to(x.dtype)
+    normalized = (groups / scale).clamp(-448, 448)
+    if _supports_fp8_cast(x.device.type, x.device.index):
+        result = normalized.to(torch.float8_e4m3fn).float()
+    else:
+        result = _fp8_e4m3_round(normalized)
+    return (result * scale).flatten(-2).to(x.dtype)
 
 
 def fp4_qdq(x, group_size=32, *, e4m3_scale=False):
