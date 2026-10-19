@@ -296,6 +296,20 @@ class SubgraphWeightSession:
             yield loaded
 
     @contextmanager
+    def loaded_parameters(
+        self,
+        parameter_names: Sequence[str],
+        *,
+        device: torch.device | str,
+        dtype: torch.dtype = torch.bfloat16,
+    ) -> Generator[LoadedSubgraph, None, None]:
+        """Load selected direct parameters without loading their parent subtree."""
+
+        plan = self.plan_parameters(parameter_names)
+        with self.loaded_plan(plan, device=device, dtype=dtype) as loaded:
+            yield loaded
+
+    @contextmanager
     def loaded_plan(
         self,
         plan: SubgraphLoadPlan,
@@ -348,6 +362,18 @@ class SubgraphWeightSession:
         return self.plan_modules(
             module_names,
             allow_missing_state=True,
+        )
+
+    def plan_parameters(
+        self,
+        parameter_names: Sequence[str],
+    ) -> SubgraphLoadPlan:
+        """Resolve selected direct parameters into a streaming load plan."""
+
+        targets = self.loader.plan_parameters(parameter_names)
+        return SubgraphLoadPlan(
+            module_names=_minimal_roots(target.name for target in targets),
+            targets=targets,
         )
 
     def estimate_preparation(

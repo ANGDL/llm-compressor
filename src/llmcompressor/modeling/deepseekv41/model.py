@@ -947,6 +947,9 @@ class Transformer(nn.Module):
             image_height,
             image_width,
         ).to(h.dtype)
+        boundary_embeddings = torch.stack(
+            (self.image_start, self.image_end, self.image_newline)
+        ).to(device=h.device, dtype=h.dtype)
         image_slots = image_types.eq(1)
         image_values = torch.zeros_like(h)
         image_values = image_values.masked_scatter(
@@ -955,17 +958,17 @@ class Transformer(nn.Module):
         )
         image_values = torch.where(
             image_types.eq(0).unsqueeze(0).unsqueeze(-1),
-            self.image_start.to(h.dtype),
+            boundary_embeddings[0],
             image_values,
         )
         image_values = torch.where(
             image_types.eq(2).unsqueeze(0).unsqueeze(-1),
-            self.image_newline.to(h.dtype),
+            boundary_embeddings[2],
             image_values,
         )
         image_values = torch.where(
             image_types.eq(3).unsqueeze(0).unsqueeze(-1),
-            self.image_end.to(h.dtype),
+            boundary_embeddings[1],
             image_values,
         )
         return torch.where(image_token_types.ge(0).unsqueeze(-1), image_values, h)
@@ -1099,6 +1102,17 @@ class DeepseekV41NativeForCausalLM(PreTrainedModel, GenerationMixin):
 
     def get_input_embeddings(self):
         return self.model.embed
+
+    def streaming_runtime_parameter_dependencies(self, stage: str):
+        """Declare direct parameters used by autowrapped streaming stages."""
+
+        if stage == "prefix" and self.model.vision is not None:
+            return (
+                "model.image_start",
+                "model.image_end",
+                "model.image_newline",
+            )
+        return ()
 
     def get_output_embeddings(self):
         return self.model.lm_head

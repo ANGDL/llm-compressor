@@ -653,6 +653,16 @@ def test_raw_image_inputs_match_prebuilt_image_embeddings():
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+def test_vision_model_declares_prefix_parameter_dependencies():
+    model = DeepseekV41NativeForCausalLM(tiny_config(vision=True))
+    assert model.streaming_runtime_parameter_dependencies("prefix") == (
+        "model.image_start",
+        "model.image_end",
+        "model.image_newline",
+    )
+    assert model.streaming_runtime_parameter_dependencies("target") == ()
+
+
 def test_image_boundary_embeddings_are_initialized():
     model = DeepseekV41NativeForCausalLM(tiny_config(vision=True))
     for name in ("image_start", "image_end", "image_newline"):

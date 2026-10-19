@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Generator
+from collections.abc import Generator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Callable, TypeVar
@@ -282,6 +282,62 @@ class TargetWeightLoader:
             buffer_sources=buffer_sources,
             allow_missing_state=allow_missing_state,
         )
+
+    def plan_parameters(
+        self,
+        parameter_names: Sequence[str],
+        *,
+        allow_missing_state: bool = False,
+    ) -> tuple[TargetLoadPlan, ...]:
+        """Plan selected parameters without loading the owning module subtree."""
+
+        grouped: dict[str, dict[int, tuple[torch.Tensor, list[str]]]] = {}
+        for qualified_name in dict.fromkeys(parameter_names):
+            owner_name, separator, local_name = qualified_name.rpartition(".")
+            if not separator:
+                owner_name = ""
+            owner = self.model.get_submodule(owner_name)
+            parameter = owner._parameters.get(local_name)
+            if parameter is None:
+                raise ValueError(
+                    f"Streaming parameter dependency {qualified_name!r} is not "
+                    "a direct parameter of its declared owner"
+                )
+            owner_groups = grouped.setdefault(owner_name, {})
+            identity = id(parameter)
+            if identity not in owner_groups:
+                owner_groups[identity] = (parameter, [])
+            owner_groups[identity][1].append(local_name)
+
+        plans = []
+        for owner_name, parameter_groups_by_id in grouped.items():
+            parameter_groups = list(parameter_groups_by_id.values())
+            self._validate_meta(parameter_groups, "parameter")
+            parameter_sources = self._resolve_sources(
+                owner_name,
+                parameter_groups,
+                parameters=True,
+                allow_missing=allow_missing_state,
+            )
+            parameter_groups = [
+                group
+                for group in parameter_groups
+                if id(group[0]) in parameter_sources
+            ]
+            self._validate_shapes(parameter_sources, parameter_groups)
+            plans.append(
+                TargetLoadPlan(
+                    name=owner_name,
+                    target=self.model.get_submodule(owner_name),
+                    parameter_groups=parameter_groups,
+                    buffer_groups=[],
+                    runtime_buffer_groups=[],
+                    parameter_sources=parameter_sources,
+                    buffer_sources={},
+                    allow_missing_state=allow_missing_state,
+                )
+            )
+        return tuple(plans)
 
     def estimate_preparation(
         self, plan: TargetLoadPlan, *, dtype: torch.dtype

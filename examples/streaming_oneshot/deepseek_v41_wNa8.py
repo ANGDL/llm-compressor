@@ -67,7 +67,7 @@ def _schemes(mode):
                 num_bits=8,
                 type="int",
                 strategy="token",
-                symmetric=False,
+                symmetric=True,
                 dynamic=True,
             ),
         )
