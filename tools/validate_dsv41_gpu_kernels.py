@@ -24,7 +24,7 @@ from pathlib import Path
 import torch
 from torch.nn import functional as F
 
-OPERATORS = ("hc", "sparse", "fp8", "fp8_gemm", "mhc", "fp4_reference")
+OPERATORS = ("hc", "sparse", "fp8", "fp8_gemm", "mhc")
 
 
 def load_file(path, name):
@@ -60,7 +60,6 @@ def load_project(root):
     base = root / "src/llmcompressor/modeling"
     paths = {
         "kernels": base / "deepseekv4/kernels.py",
-        "quantization": base / "deepseekv41/quantization.py",
     }
     missing = [str(path) for path in paths.values() if not path.is_file()]
     if missing:
@@ -187,25 +186,6 @@ def fp8_reference(x, group, rounded):
     quant = (groups / scale).clamp(-448, 448).to(torch.float8_e4m3fn)
     dequant = (quant.float() * scale).flatten(-2).to(x.dtype)
     return dequant, quant.flatten(-2), scale.squeeze(-1)
-
-
-def fp4_reference(x, group, e4m3):
-    """Scalar E2M1 table with IEEE nearest-even ties; no native FP4 casts."""
-    groups = x.float().unflatten(-1, (-1, group))
-    minimum = 6 * (2**-9 if e4m3 else 2**-126)
-    amax = groups.abs().amax(-1, keepdim=True).clamp_min(minimum)
-    scale = amax / 6 if e4m3 else amax * (1.0 / 6.0)
-    scale = scale.to(torch.float8_e4m3fn).float() if e4m3 else ceil_power2(scale)
-    values = (groups / scale).clamp(-6, 6)
-    table = values.new_tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6])
-    distances = (values.abs().unsqueeze(-1) - table).abs()
-    # Choose even encodings at midpoints independently of project's bucketize.
-    nearest = distances == distances.amin(-1, keepdim=True)
-    codes = torch.arange(8, device=x.device)
-    priority = codes + (codes % 2) * 8
-    chosen = priority.expand_as(distances).masked_fill(~nearest, 32).argmin(-1)
-    result = table[chosen] * values.sign() * scale
-    return result.flatten(-2).to(x.dtype), scale.squeeze(-1)
 
 
 def bf16_step_distances(actual, expected):
@@ -521,12 +501,6 @@ class Runner:
             "official_fp8_codes": compare(encoded.float(), quant.float(), exact=True),
             "official_inplace_vs_encoded_qdq": compare(actual, encoded_qdq, exact=True),
         }
-        if rounded and self.project:
-            checks["official_vs_project"] = compare(
-                actual,
-                self.project["quantization"].fp8_qdq(x, group),
-                exact=True,
-            )
         return {"inputs": tensors_info(x=x), "scale_format": fmt, "checks": checks}
 
     def fp8_gemm(self, m, n, k, group, fmt):
@@ -620,31 +594,6 @@ class Runner:
             "scope": "random mHC inputs; no model, weights, KV cache or logits",
         }
 
-    def fp4_emulated(self, m, n, group, e4m3):
-        x = quant_input(m, n, group, self.device)
-        expected, scale = fp4_reference(x, group, e4m3)
-        checks = {}
-        if self.project:
-            checks["project_vs_independent_table_reference"] = compare(
-                self.project["quantization"].fp4_qdq(x, group, e4m3_scale=e4m3),
-                expected,
-                exact=True,
-            )
-        else:
-            return {
-                "diagnostic": True,
-                "scope": "reference only; project source unavailable",
-                "finite": bool(torch.isfinite(expected).all()),
-            }
-        return {
-            "inputs": tensors_info(x=x),
-            "scale_format": "e4m3" if e4m3 else "e8m0",
-            "min_scale": float(scale.min()),
-            "native_fp4_executed": False,
-            "scope": "software semantics only; does not validate official FP4 kernel",
-            "checks": checks,
-        }
-
     def suite(self):
         selected = set(self.args.operators)
         if "hc" in selected:
@@ -698,14 +647,6 @@ class Runner:
             dims = [5120] if self.args.quick else [128, 5120]
             for dim in dims:
                 self.case("mhc", f"dim{dim}", lambda d=dim: self.mhc(d))
-        if "fp4_reference" in selected:
-            for e4m3 in (False, True):
-                self.case(
-                    "fp4_reference",
-                    f"e4m3_scale_{e4m3}",
-                    lambda e=e4m3: self.fp4_emulated(5, 128, 32, e),
-                )
-
 
 def cpu_self_test(project):
     """Analytic checks for references, not a substitute for official GPU tests."""
@@ -731,20 +672,6 @@ def cpu_self_test(project):
     checks["hc_comb_zero"] = compare(comb, torch.full_like(comb, 1 / (4 + 4e-6)))
     boundary = torch.tensor([0.5, 1.0, 2.0, 4.0])
     checks["power2_boundaries"] = compare(ceil_power2(boundary), boundary, exact=True)
-    if project:
-        for group in (32, 128):
-            x = quant_input(5, 256, group, "cpu")
-            checks[f"fp8_project_group{group}"] = compare(
-                project["quantization"].fp8_qdq(x, group),
-                fp8_reference(x, group, True)[0],
-                exact=True,
-            )
-            for e4m3 in (False, True):
-                checks[f"fp4_project_group{group}_e4m3_{e4m3}"] = compare(
-                    project["quantization"].fp4_qdq(x, group, e4m3_scale=e4m3),
-                    fp4_reference(x, group, e4m3)[0],
-                    exact=True,
-                )
     return {"checks": checks, "native_gpu_operators_executed": False}
 
 

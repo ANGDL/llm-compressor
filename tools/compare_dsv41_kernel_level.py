@@ -3,8 +3,8 @@
 
 This tool bypasses models, checkpoints, Transformers and streaming inference.
 It calls the official TileLang kernel functions directly, then compares their
-outputs with the project's pure PyTorch implementations and independent
-operation-order references.
+outputs with the project's pure PyTorch kernels and independent operation-order
+references. Model-side activation QDQ emulation is intentionally excluded.
 
 Native FP4 kernels are intentionally excluded. The target GPU only needs native
 FP8 support for this comparison.
@@ -464,7 +464,6 @@ class KernelComparator:
         }
         official_inplace = self.official.act_quant(x.clone(), inplace=True, **options)
         encoded, scales = self.official.act_quant(x.clone(), **options)
-        project = self.project["quantization"].fp8_qdq(x, group)
         expected, codes, expected_scales = fp8_reference(x, group, True)
         encoded_qdq = (
             (encoded.float().unflatten(-1, (-1, group)) * scales.float().unsqueeze(-1))
@@ -475,7 +474,6 @@ class KernelComparator:
             "official_inplace_vs_reference": compare(
                 official_inplace, expected, exact=True
             ),
-            "official_project_vs_reference": compare(project, expected, exact=True),
             "official_codes": compare(encoded.float(), codes.float(), exact=True),
             "official_scales": compare(
                 scales.float(), expected_scales.to(scales.dtype).float(), exact=True
@@ -574,7 +572,6 @@ class KernelComparator:
 
 
 def cpu_self_test(project):
-    device = torch.device("cpu")
     torch.manual_seed(20261018)
     mixes = torch.randn(2, 4, 24)
     scale = torch.tensor([0.1, 0.2, 0.3])
@@ -603,18 +600,9 @@ def cpu_self_test(project):
         sparse_reference(q, kv, sink, indices, 64**-0.5),
         exact=True,
     )
-    x = quant_input(5, 128, 32, device)
-    fp8_checks = {
-        "project_vs_reference": compare(
-            project["quantization"].fp8_qdq(x, 32),
-            fp8_reference(x, 32, True)[0],
-            exact=True,
-        )
-    }
     checks = {
         **{f"hc/{key}": value for key, value in hc_checks.items()},
         **{f"sparse/{key}": value for key, value in sparse_checks.items()},
-        **{f"fp8/{key}": value for key, value in fp8_checks.items()},
     }
     return {
         "status": (

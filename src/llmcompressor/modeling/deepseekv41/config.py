@@ -29,9 +29,12 @@ class DeepseekV41TextConfig(V4Config):
         dspark_num_experts_per_tok=3,
         norm_topk_prob=True,
         gate_temp=1.0,
-        simulate_source_quantization=True,
         **kwargs,
     ):
+        # Older source configs carried this flag for activation QDQ
+        # simulation. The native model no longer performs source
+        # quantization in forward, so ignore it when loading old configs.
+        kwargs.pop("simulate_source_quantization", None)
         defaults = dict(
             hidden_size=5120,
             moe_intermediate_size=2304,
@@ -84,7 +87,6 @@ class DeepseekV41TextConfig(V4Config):
         self.dspark_num_experts_per_tok = dspark_num_experts_per_tok
         self.norm_topk_prob = norm_topk_prob
         self.gate_temp = gate_temp
-        self.simulate_source_quantization = simulate_source_quantization
         self.engram_checkpoint = None
 
     def validate_layout(self):

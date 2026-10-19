@@ -7,18 +7,6 @@ import torch
 from tools import validate_dsv41_gpu_kernels as validation
 
 
-def test_fp4_midpoints_choose_even_encodings_without_native_fp4():
-    # Anchor 6 fixes the E8M0 scale at 1; expected ties are explicit E2M1 values.
-    x = torch.tensor(
-        [[0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0, 6.0] * 4],
-        dtype=torch.bfloat16,
-    )
-    actual, scale = validation.fp4_reference(x, 32, False)
-    expected = torch.tensor([[0, 1, 1, 2, 2, 4, 4, 6] * 4], dtype=torch.bfloat16)
-    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
-    torch.testing.assert_close(scale, torch.ones_like(scale), atol=0, rtol=0)
-
-
 def test_sparse_online_maximum_rescales_previous_value_accumulator():
     q = torch.tensor([[[[1.0]]]], dtype=torch.bfloat16)
     kv = torch.tensor([[[0.0], [2.0]]], dtype=torch.bfloat16)
@@ -118,14 +106,13 @@ def test_initialization_failure_is_recorded(monkeypatch, tmp_path):
     assert "CUDA is required" in report["fatal_error"]
 
 
-def test_suite_never_calls_native_fp4_and_case_seed_is_stable(tmp_path):
+def test_suite_case_seed_is_stable(tmp_path):
     args = validation.parse_args(
         [
             "--self-test",
             "--quick",
             "--operators",
             "hc",
-            "fp4_reference",
             "--report",
             str(tmp_path / "report.json"),
         ]
@@ -141,7 +128,7 @@ def test_suite_never_calls_native_fp4_and_case_seed_is_stable(tmp_path):
     report = {"results": []}
     runner = validation.Runner(args, report, Official(), modules)
     runner.suite()
-    assert len(report["results"]) == 6
+    assert len(report["results"]) == 4
     assert all(row["status"] == "passed" for row in report["results"])
     first = report["results"][0]
     runner.case("hc", first["case"], lambda: runner.hc(1, 1, 2))

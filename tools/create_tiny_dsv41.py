@@ -29,7 +29,6 @@ from llmcompressor.modeling.deepseekv41 import (
 )
 from llmcompressor.modeling.deepseekv41.engram import _next_prime
 from llmcompressor.modeling.deepseekv41.model import Head
-from llmcompressor.modeling.deepseekv41.quantization import fp4_qdq
 
 # The text-only toy corpus from the create-tiny-model finetuning template.
 TOY_TEXTS = [
@@ -91,7 +90,6 @@ def build_tiny_config(source: Path) -> ModelConfig:
         dspark_n_routed_experts=4,
         dspark_num_experts_per_tok=3,
         dspark_markov_rank=32,
-        simulate_source_quantization=False,
         use_cache=False,
     )
     text["rope_scaling"] = {
@@ -233,11 +231,15 @@ def encode_fp8(weight, *, rowwise=False):
 def encode_fp4(weight):
     groups = weight.float().unflatten(-1, (-1, 32))
     scale = _power_scale(groups.abs().amax(-1), 6)
-    rounded = fp4_qdq(weight.float()).unflatten(-1, (-1, 32))
-    normalized = (rounded / scale.unsqueeze(-1)).flatten(-2)
-    table = weight.new_tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6])
-    codes = (normalized.abs().unsqueeze(-1) - table).abs().argmin(-1).byte()
-    codes |= (normalized < 0).byte() << 3
+    values = (groups / scale.unsqueeze(-1)).clamp(-6, 6)
+    table = values.new_tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6])
+    midpoints = (table[:-1] + table[1:]) / 2
+    indices = torch.bucketize(values.abs().contiguous(), midpoints)
+    lower = indices.clamp(max=6)
+    ties = (values.abs() == midpoints[lower]) & (indices.remainder(2) == 1)
+    indices = indices + ties.long()
+    codes = indices.byte().flatten(-2)
+    codes |= (values < 0).byte().flatten(-2) << 3
     packed = (codes[:, 0::2] | (codes[:, 1::2] << 4)).view(torch.int8)
     return packed.contiguous(), scale.to(torch.float8_e8m0fnu).contiguous()
 
@@ -324,7 +326,6 @@ def save_source_fixture(
         },
     )
     value.pop("source_quantization_config", None)
-    value["text_config"]["simulate_source_quantization"] = True
     (output / "config.json").write_text(json.dumps(value, indent=2) + "\n")
     (output / "model.safetensors.index.json").write_text(
         json.dumps(

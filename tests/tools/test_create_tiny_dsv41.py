@@ -8,7 +8,6 @@ from llmcompressor.modeling.deepseekv41 import (
     DeepseekV41NativeForConditionalGeneration,
     ModelConfig,
 )
-from llmcompressor.modeling.deepseekv41.quantization import fp4_qdq
 from llmcompressor.streaming import DeepSeekV41WeightMaterializer
 from llmcompressor.utils.int4_packing import pack_int4_to_int8
 from tests.llmcompressor.modeling.test_deepseek_v41 import tiny_config
@@ -104,7 +103,10 @@ def test_source_fp4_fixture_uses_e2m1_codes_and_even_ties():
         {name: packed, name.replace(".weight", ".scale"): scale},
         target_dtype=torch.float32,
     )
-    torch.testing.assert_close(decoded, fp4_qdq(weight), rtol=0, atol=0)
+    expected = torch.tensor(
+        [[0, 1, 1, 2, 2, 4, 4, 6] * 4], dtype=torch.float32
+    )
+    torch.testing.assert_close(decoded, expected, rtol=0, atol=0)
 
 
 def test_ptq_int4_unpack_uses_signed_nibbles_instead_of_fp4_table():

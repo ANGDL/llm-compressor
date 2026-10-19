@@ -211,7 +211,7 @@ class EngramEmbedding(nn.Module):
 
 
 class Engram(nn.Module):
-    def __init__(self, config, layer_id, *, checkpoint=None, source_fp8=False):
+    def __init__(self, config, layer_id, *, checkpoint=None):
         super().__init__()
         self.config = config
         self.hash_index = config.engram_layer_ids.index(layer_id)
@@ -226,9 +226,7 @@ class Engram(nn.Module):
             * config.engram_n_heads
             * config.engram_head_dim
         )
-        self.wkv = Linear(
-            width, config.dim * (config.hc_mult + 1), source_fp8=source_fp8
-        )
+        self.wkv = Linear(width, config.dim * (config.hc_mult + 1))
         self.q_weight = nn.Parameter(torch.ones(config.hc_mult, config.dim))
         self.k_weight = nn.Parameter(torch.ones(config.hc_mult, config.dim))
 

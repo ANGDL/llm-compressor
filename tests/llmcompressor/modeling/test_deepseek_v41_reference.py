@@ -16,7 +16,6 @@ import torch
 
 from llmcompressor.modeling.deepseekv4.kernels import hc_split, sparse_attention
 from llmcompressor.modeling.deepseekv41 import DeepseekV41NativeForCausalLM
-from llmcompressor.modeling.deepseekv41.quantization import fp4_qdq, fp8_qdq
 from tests.llmcompressor.modeling.test_deepseek_v41 import tiny_config
 
 
@@ -29,13 +28,11 @@ def reference_pair(monkeypatch):
 
     def act_quant(x, block_size=128, scale_fmt=None, scale_dtype=None, inplace=False):
         assert inplace
-        return x.copy_(fp8_qdq(x, block_size))
+        return x
 
     def fp4_quant(x, block_size=32, inplace=False, scale_dtype=None):
         assert inplace
-        return x.copy_(
-            fp4_qdq(x, block_size, e4m3_scale=scale_dtype == torch.float8_e4m3fn)
-        )
+        return x
 
     kernel = types.ModuleType("kernel")
     kernel.act_quant = act_quant

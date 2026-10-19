@@ -19,7 +19,7 @@ from llmcompressor.modeling.deepseekv4.model import RMSNorm, precompute_freqs_ci
 from .cache import DeepseekV41Cache
 from .config import DeepseekV41Config, ModelConfig
 from .engram import Engram, EngramEmbedding, EngramHash
-from .quantization import Linear, fp4_qdq, fp8_qdq
+from .quantization import Linear
 from .vision import Aligner, Vision
 
 
@@ -124,7 +124,7 @@ class Compressor(nn.Module):
 
 
 class Indexer(nn.Module):
-    def __init__(self, config, layer_id, source_fp8):
+    def __init__(self, config, layer_id):
         super().__init__()
         self.config = config
         self.layer_id = layer_id
@@ -132,7 +132,6 @@ class Indexer(nn.Module):
         self.wq_b = Linear(
             config.q_lora_rank,
             config.index_n_heads * config.index_head_dim,
-            source_fp8=source_fp8,
         )
         self.weights_proj = Linear(config.dim, config.index_n_heads)
         if self.owns_k:
@@ -165,9 +164,8 @@ class Indexer(nn.Module):
                 freqs[: latent.shape[1] * ratio : ratio],
                 config.rope_head_dim,
             )
-            index_k = fp4_qdq(index_k)
         q = self.wq_b(qr).unflatten(-1, (config.index_n_heads, config.index_head_dim))
-        q = fp4_qdq(_rotate_tail(q, freqs, config.rope_head_dim))
+        q = _rotate_tail(q, freqs, config.rope_head_dim)
         weights = self.weights_proj(x) * (
             config.index_head_dim**-0.5 * config.index_n_heads**-0.5
         )
@@ -198,16 +196,14 @@ class Indexer(nn.Module):
     ):
         config = self.config
         if self.owns_k:
-            new_index = fp4_qdq(
-                _rotate_tail(
-                    self.k_norm(self.wk(latent)), group_freqs, config.rope_head_dim
-                )
+            new_index = _rotate_tail(
+                self.k_norm(self.wk(latent)), group_freqs, config.rope_head_dim
             )
             DeepseekV41Cache.append(source.state, "index_k", new_index)
         index_k = source.state["index_k"]
         mask = source.state["compressed_mask"]
         q = self.wq_b(qr).unflatten(-1, (config.index_n_heads, config.index_head_dim))
-        q = fp4_qdq(_rotate_tail(q, freqs, config.rope_head_dim))
+        q = _rotate_tail(q, freqs, config.rope_head_dim)
         weights = self.weights_proj(x) * (
             config.index_head_dim**-0.5 * config.index_n_heads**-0.5
         )
@@ -240,20 +236,19 @@ class Attention(nn.Module):
     # transfers only the positions needed by the current chunk/token.
     _streaming_cpu_buffers = ("freqs_cis",)
 
-    def __init__(self, config, layer_id, source_fp8):
+    def __init__(self, config, layer_id):
         super().__init__()
         self.config = config
         self.layer_id = layer_id
         self.ratio = config.compress_ratios[layer_id]
         self.attn_sink = nn.Parameter(torch.zeros(config.n_heads, dtype=torch.float32))
-        self.wq_a = Linear(config.dim, config.q_lora_rank, source_fp8=source_fp8)
+        self.wq_a = Linear(config.dim, config.q_lora_rank)
         self.q_norm = RMSNorm(config.q_lora_rank, config.norm_eps)
         self.wq_b = Linear(
             config.q_lora_rank,
             config.n_heads * config.head_dim,
-            source_fp8=source_fp8,
         )
-        self.wkv = Linear(config.dim, config.head_dim, source_fp8=source_fp8)
+        self.wkv = Linear(config.dim, config.head_dim)
         self.kv_norm = RMSNorm(config.head_dim, config.norm_eps)
         self.wo_a = Linear(
             config.n_heads * config.head_dim // config.o_groups,
@@ -262,7 +257,6 @@ class Attention(nn.Module):
         self.wo_b = Linear(
             config.o_groups * config.o_lora_rank,
             config.dim,
-            source_fp8=source_fp8,
         )
         self.compressor = (
             Compressor(config, layer_id)
@@ -270,7 +264,7 @@ class Attention(nn.Module):
             else None
         )
         self.indexer = (
-            Indexer(config, layer_id, source_fp8)
+            Indexer(config, layer_id)
             if layer_id in config.index_source_layer_ids
             else None
         )
@@ -307,7 +301,6 @@ class Attention(nn.Module):
         output = output.unflatten(
             -2, (config.o_groups, config.n_heads // config.o_groups)
         ).flatten(-2)
-        output = fp8_qdq(output)
         # Invoke the Linear so PTQ hooks also see this grouped projection.
         all_outputs = self.wo_a(output).unflatten(
             -1, (config.o_groups, config.o_lora_rank)
@@ -324,8 +317,8 @@ class Attention(nn.Module):
         config = self.config
         freqs = self.freqs_cis[: x.shape[1]].to(x.device)
         qr, q = self.project_query(x, freqs)
-        window_kv = fp8_qdq(
-            _rotate_tail(self.kv_norm(self.wkv(x)), freqs, config.rope_head_dim)
+        window_kv = _rotate_tail(
+            self.kv_norm(self.wkv(x)), freqs, config.rope_head_dim
         )
         positions = torch.arange(x.shape[1], device=x.device)
         window = positions[:, None] - config.window_size + 1
@@ -349,7 +342,6 @@ class Attention(nn.Module):
                     freqs[: latent.shape[1] * self.ratio : self.ratio],
                     config.rope_head_dim,
                 )
-                compressed = fp4_qdq(compressed, 16, e4m3_scale=True)
             shared = (compressed, index_k, topk, candidates, compressed_mask)
             kv = torch.cat((window_kv, compressed), dim=1)
             sparse = torch.where(topk >= 0, topk + x.shape[1], -1)
@@ -361,8 +353,8 @@ class Attention(nn.Module):
         config, state = self.config, cache.states[self.layer_id]
         freqs = self.freqs_cis[start_pos : start_pos + x.shape[1]].to(x.device)
         qr, q = self.project_query(x, freqs)
-        current_kv = fp8_qdq(
-            _rotate_tail(self.kv_norm(self.wkv(x)), freqs, config.rope_head_dim)
+        current_kv = _rotate_tail(
+            self.kv_norm(self.wkv(x)), freqs, config.rope_head_dim
         )
         window_kv = current_kv
         if "window" in state:
@@ -399,10 +391,8 @@ class Attention(nn.Module):
                 group_freqs = self.freqs_cis[
                     group_positions.to(self.freqs_cis.device)
                 ].to(x.device)
-                new_compressed = fp4_qdq(
-                    _rotate_tail(latent, group_freqs, config.rope_head_dim),
-                    16,
-                    e4m3_scale=True,
+                new_compressed = _rotate_tail(
+                    latent, group_freqs, config.rope_head_dim
                 )
                 cache.append(state, "compressed", new_compressed)
                 cache.append(state, "compressed_mask", new_mask)
@@ -462,12 +452,12 @@ class Gate(nn.Module):
 
 
 class Expert(nn.Module):
-    def __init__(self, config, source_fp8):
+    def __init__(self, config):
         super().__init__()
         self.limit = config.swiglu_limit
-        self.w1 = Linear(config.dim, config.moe_inter_dim, source_fp8=source_fp8)
-        self.w2 = Linear(config.moe_inter_dim, config.dim, source_fp8=source_fp8)
-        self.w3 = Linear(config.dim, config.moe_inter_dim, source_fp8=source_fp8)
+        self.w1 = Linear(config.dim, config.moe_inter_dim)
+        self.w2 = Linear(config.moe_inter_dim, config.dim)
+        self.w3 = Linear(config.dim, config.moe_inter_dim)
 
     def forward(self, x, weights=None):
         gate, up = self.w1(x).float(), self.w3(x).float()
@@ -481,16 +471,16 @@ class Expert(nn.Module):
 
 
 class DeepseekV41MoE(nn.Module):
-    def __init__(self, config, source_fp8, *, draft=False, vision=True):
+    def __init__(self, config, *, draft=False, vision=True):
         super().__init__()
         self.config = config
         self.dim = config.dim
         self.gate = Gate(config, draft=draft, vision=vision)
         self.n_routed_experts = self.gate.weight.shape[0]
         self.experts = nn.ModuleList(
-            [Expert(config, source_fp8) for _ in range(self.n_routed_experts)]
+            [Expert(config) for _ in range(self.n_routed_experts)]
         )
-        self.shared_experts = Expert(config, source_fp8)
+        self.shared_experts = Expert(config)
         self.calibrate_all_experts = False
         self.requires_all_experts_for_calibration = draft
 
@@ -517,17 +507,17 @@ class DeepseekV41MoE(nn.Module):
 
 class DeepseekV41Block(nn.Module):
     def __init__(
-        self, config, layer_id, source_fp8, *, vision=True, engram_checkpoint=None
+        self, config, layer_id, *, vision=True, engram_checkpoint=None
     ):
         super().__init__()
         self.config = config
         self.layer_id = layer_id
-        self.attn = Attention(config, layer_id, source_fp8)
+        self.attn = Attention(config, layer_id)
         self._target_flags = tuple(
             layer_id == target for target in config.dspark_target_layer_ids
         )
         self.ffn = DeepseekV41MoE(
-            config, source_fp8, draft=layer_id >= config.n_layers, vision=vision
+            config, draft=layer_id >= config.n_layers, vision=vision
         )
         self.attn_norm = RMSNorm(config.dim, config.norm_eps)
         self.ffn_norm = RMSNorm(config.dim, config.norm_eps)
@@ -536,7 +526,6 @@ class DeepseekV41Block(nn.Module):
                 config,
                 layer_id,
                 checkpoint=engram_checkpoint,
-                source_fp8=source_fp8,
             )
             if layer_id in config.engram_layer_ids
             else None
@@ -642,13 +631,11 @@ class DSparkAttention(Attention):
             x.device
         )
         _, q = self.project_query(x, draft_freqs)
-        main_kv = fp8_qdq(
-            _rotate_tail(
-                self.kv_norm(self.wkv(main_x)), main_freqs, config.rope_head_dim
-            )
+        main_kv = _rotate_tail(
+            self.kv_norm(self.wkv(main_x)), main_freqs, config.rope_head_dim
         )
-        draft_kv = fp8_qdq(
-            _rotate_tail(self.kv_norm(self.wkv(x)), draft_freqs, config.rope_head_dim)
+        draft_kv = _rotate_tail(
+            self.kv_norm(self.wkv(x)), draft_freqs, config.rope_head_dim
         )
         kv = torch.cat((main_kv, draft_kv), dim=1)
         # A draft block is bidirectional, unlike backbone sliding attention.
@@ -724,15 +711,14 @@ def _draft_inputs(input_ids, mask, targets, window_size, block_size, noise_id):
 
 
 class DeepseekV41DSparkBlock(DeepseekV41Block):
-    def __init__(self, config, stage, source_fp8, *, vision=True):
-        super().__init__(config, config.n_layers + stage, source_fp8, vision=vision)
-        self.attn = DSparkAttention(config, config.n_layers + stage, source_fp8)
+    def __init__(self, config, stage, *, vision=True):
+        super().__init__(config, config.n_layers + stage, vision=vision)
+        self.attn = DSparkAttention(config, config.n_layers + stage)
         self.stage = stage
         if stage == 0:
             self.main_proj = Linear(
                 config.dim * len(config.dspark_target_layer_ids),
                 config.dim,
-                source_fp8=source_fp8,
             )
             self.main_norm = RMSNorm(config.dim, config.norm_eps)
         if stage == config.num_nextn_predict_layers - 1:
@@ -778,9 +764,6 @@ class Transformer(nn.Module):
         super().__init__()
         text = config.text_config
         self.config = config
-        source_fp8 = bool(config.source_quantization_config) and (
-            text.simulate_source_quantization
-        )
         self.embed = nn.Embedding(text.vocab_size, text.dim)
         self.engram_hash = (
             EngramHash(text, tokenizer=tokenizer, token_map=engram_token_map)
@@ -793,7 +776,6 @@ class Transformer(nn.Module):
                 DeepseekV41Block(
                     text,
                     index,
-                    source_fp8,
                     vision=vision,
                     engram_checkpoint=engram_checkpoint,
                 )
@@ -805,7 +787,7 @@ class Transformer(nn.Module):
         self.draft_input = DSparkInputAdapter(text)
         self.mtp = nn.ModuleList(
             [
-                DeepseekV41DSparkBlock(text, stage, source_fp8, vision=vision)
+                DeepseekV41DSparkBlock(text, stage, vision=vision)
                 for stage in range(text.num_nextn_predict_layers)
             ]
         )
