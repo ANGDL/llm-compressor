@@ -822,6 +822,10 @@ class Transformer(nn.Module):
         attention_mask=None,
         inputs_embeds=None,
         image_mask=None,
+        image_patches=None,
+        image_height=None,
+        image_width=None,
+        image_token_types=None,
         cache=None,
         logits_to_keep=0,
     ):
@@ -831,6 +835,10 @@ class Transformer(nn.Module):
                 attention_mask,
                 inputs_embeds,
                 image_mask,
+                image_patches,
+                image_height,
+                image_width,
+                image_token_types,
                 cache,
                 logits_to_keep,
             )
@@ -840,13 +848,26 @@ class Transformer(nn.Module):
             if attention_mask is None
             else attention_mask.bool()
         )
-        image_mask = torch.zeros_like(mask) if image_mask is None else image_mask.bool()
+        if image_token_types is not None:
+            image_mask = image_token_types.to(input_ids.device).ge(0)
+        else:
+            image_mask = (
+                torch.zeros_like(mask) if image_mask is None else image_mask.bool()
+            )
         hashes = (
             self.engram_hash(input_ids, mask & ~image_mask)
             if self.engram_hash is not None
             else None
         )
         h = self.embed(input_ids) if inputs_embeds is None else inputs_embeds
+        if image_token_types is not None and inputs_embeds is None:
+            h = self._merge_image_embeddings(
+                h,
+                image_token_types,
+                image_patches,
+                image_height,
+                image_width,
+            )
         h = h.unsqueeze(2).repeat(1, 1, text.hc_mult, 1)
         pre = torch.zeros_like(h[..., 0], dtype=torch.float32)
         # Build the initial one-hot without an FX-invisible in-place write.
@@ -885,12 +906,91 @@ class Transformer(nn.Module):
             logits = logits + dependency
         return logits
 
+    def _merge_image_embeddings(
+        self,
+        h,
+        image_token_types,
+        image_patches,
+        image_height,
+        image_width,
+    ):
+        """Replace one image span with the native ViT/aligner embeddings.
+
+        ``image_token_types`` follows the official V4.1 convention: ``-1`` is
+        text, while ``0..3`` represent image start, image content,
+        row separator, and image end. The streaming calibration frontend uses
+        one image per batch item and batch size one, matching the reference
+        inference path's prefill contract.
+        """
+        if self.vision is None or not hasattr(self, "aligner"):
+            raise ValueError("Image inputs require a configured V4.1 vision tower")
+        if image_patches is None or image_height is None or image_width is None:
+            raise ValueError(
+                "image_patches, image_height, and image_width are required "
+                "when image_token_types is provided"
+            )
+        if h.shape[0] != 1:
+            raise ValueError("Native V4.1 image inputs currently require batch size 1")
+
+        image_token_types = image_token_types.to(device=h.device)
+        image_patches = image_patches.to(
+            dtype=self.vision.patch_embed.proj.weight.dtype
+        )
+        if image_token_types.shape[:2] != h.shape[:2]:
+            raise ValueError(
+                "image_token_types must have the same [batch, sequence] shape "
+                "as input_ids"
+            )
+        image_types = image_token_types[0]
+        image_features = self.aligner(
+            self.vision(image_patches, image_height, image_width),
+            image_height,
+            image_width,
+        ).to(h.dtype)
+        image_slots = image_types.eq(1)
+        image_values = torch.zeros_like(h)
+        image_values = image_values.masked_scatter(
+            image_slots.unsqueeze(0).unsqueeze(-1).expand_as(image_values),
+            image_features.reshape(-1),
+        )
+        image_values = torch.where(
+            image_types.eq(0).unsqueeze(0).unsqueeze(-1),
+            self.image_start.to(h.dtype),
+            image_values,
+        )
+        image_values = torch.where(
+            image_types.eq(2).unsqueeze(0).unsqueeze(-1),
+            self.image_newline.to(h.dtype),
+            image_values,
+        )
+        image_values = torch.where(
+            image_types.eq(3).unsqueeze(0).unsqueeze(-1),
+            self.image_end.to(h.dtype),
+            image_values,
+        )
+        return torch.where(image_token_types.ge(0).unsqueeze(-1), image_values, h)
+
     def forward_cached(
-        self, input_ids, mask, inputs_embeds, image_mask, cache, logits_to_keep
+        self,
+        input_ids,
+        mask,
+        inputs_embeds,
+        image_mask,
+        image_patches,
+        image_height,
+        image_width,
+        image_token_types,
+        cache,
+        logits_to_keep,
     ):
         """Use the same blocks while keeping calibration tracing stateless."""
         text = self.config.text_config
-        image_mask = torch.zeros_like(mask) if image_mask is None else image_mask.bool()
+        if image_token_types is not None:
+            image_mask = image_token_types.to(input_ids.device).ge(0)
+        else:
+            image_mask = (
+                torch.zeros_like(mask) if image_mask is None else image_mask.bool()
+            )
         hash_ids, hash_valid = input_ids, mask & ~image_mask
         if cache.history_ids is not None:
             hash_ids = torch.cat(
@@ -905,6 +1005,14 @@ class Transformer(nn.Module):
             else None
         )
         hidden = self.embed(input_ids) if inputs_embeds is None else inputs_embeds
+        if image_token_types is not None and inputs_embeds is None:
+            hidden = self._merge_image_embeddings(
+                hidden,
+                image_token_types,
+                image_patches,
+                image_height,
+                image_width,
+            )
         hidden = hidden.unsqueeze(2).repeat(1, 1, text.hc_mult, 1)
         pre = F.one_hot(torch.zeros_like(input_ids), num_classes=text.hc_mult).float()
         shared = (None, None, None, None, None)
@@ -1007,6 +1115,10 @@ class DeepseekV41NativeForCausalLM(PreTrainedModel, GenerationMixin):
         attention_mask,
         inputs_embeds,
         image_mask,
+        image_patches,
+        image_height,
+        image_width,
+        image_token_types,
         cache,
         position_ids,
         logits_to_keep,
@@ -1045,6 +1157,10 @@ class DeepseekV41NativeForCausalLM(PreTrainedModel, GenerationMixin):
                 mask,
                 inputs_embeds,
                 image_mask,
+                image_patches,
+                image_height,
+                image_width,
+                image_token_types,
                 cache=cache,
                 logits_to_keep=logits_to_keep,
             )
@@ -1070,6 +1186,14 @@ class DeepseekV41NativeForCausalLM(PreTrainedModel, GenerationMixin):
                 prepared["image_mask"] = torch.zeros_like(
                     prepared["input_ids"], dtype=torch.bool
                 )
+            for key in (
+                "image_patches",
+                "image_height",
+                "image_width",
+                "image_token_types",
+            ):
+                if key in prepared:
+                    prepared[key] = None
         return prepared
 
     def forward(
@@ -1078,6 +1202,10 @@ class DeepseekV41NativeForCausalLM(PreTrainedModel, GenerationMixin):
         attention_mask=None,
         inputs_embeds=None,
         image_mask=None,
+        image_patches=None,
+        image_height=None,
+        image_width=None,
+        image_token_types=None,
         labels=None,
         logits_to_keep=0,
         past_key_values=None,
@@ -1099,11 +1227,24 @@ class DeepseekV41NativeForCausalLM(PreTrainedModel, GenerationMixin):
                 attention_mask,
                 inputs_embeds,
                 image_mask,
+                image_patches,
+                image_height,
+                image_width,
+                image_token_types,
                 past_key_values,
                 position_ids,
                 logits_to_keep,
             )
-        logits = self.model(input_ids, attention_mask, inputs_embeds, image_mask)
+        logits = self.model(
+            input_ids,
+            attention_mask,
+            inputs_embeds,
+            image_mask,
+            image_patches,
+            image_height,
+            image_width,
+            image_token_types,
+        )
         if isinstance(logits_to_keep, int) and logits_to_keep > 0:
             logits = logits[:, -logits_to_keep:]
         loss = (

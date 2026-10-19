@@ -10,7 +10,9 @@ native V4 相同的接入方式：独立模型、MoE 校准 wrapper、按需权�
 ```bash
 python examples/streaming_oneshot/deepseek_v41_wNa8.py \
   --model-id /path/to/DeepSeek-V4.1-Flash \
-  --dataset-id /path/to/calibration.jsonl \
+  --dataset-id lmms-lab/flickr30k \
+  --text-dataset-id HuggingFaceH4/ultrachat_200k \
+  --text-calibration-samples 128 \
   --output-dir /path/to/DeepSeek-V4.1-Flash-WNa8 \
   --quant-mode wna8 \
   --num-calibration-samples 128 \
@@ -20,10 +22,17 @@ python examples/streaming_oneshot/deepseek_v41_wNa8.py \
 ```
 
 模型目录须包含索引引用的全部真实分片。2026-10-17 检查的本地目录只有配置、
-索引及参考代码，尚不能运行完整模型量化。数据接受 `messages`、`text` 或
-`input_ids`；messages 优先使用模型目录的 `encoding/encoding.py`。
-`--reasoning-effort` 范围为 1..100，默认 75。
+索引及参考代码，尚不能运行完整模型量化。主校准源按多模态数据集处理，默认每条
+记录需要 `image` 和可选的 `caption` 字段；示例会将图像编码成 DeepSeek V4.1
+官方格式的 ViT patches、image token span 和 `image_token_types`，并通过原生
+模型的 vision/aligner 路径参与校准。可选的 `--text-dataset-id` 与
+`--text-calibration-samples` 会把文本对话追加到每个图像样本后面。没有
+`encoding/encoding.py` 时回退到本地 chat template。若模型目录包含
+`inference/image_processor.py`，示例直接复用其中的 `load_image` 和
+`image_token_types`；tiny fixture 缺少该目录时才使用兼容回退。文本数据仍接受
+`messages`、`text` 或 `input_ids`；`--reasoning-effort` 范围为 1..100，默认 75。
 `--device cpu` 或 `--device cuda:0` 可显式选择校准设备。
+多模态校准当前要求 `--batch-size 1`，每条图像样本只支持一张图片。
 
 量化范围：
 
@@ -84,11 +93,12 @@ V4、materializer、boundary store、finalize 和 pretrained 回归，共 130 �
 使用本地完整尺寸配置构建 meta 模型，外置 Engram 表后，48,494 个模型张量名
 与源索引的主张量名一一对应；未分配全量权重。
 
-当前实现面向完整序列文本校准，尚未验证真实权重/GPU kernel、长上下文下的内存
-和速度、多模态统计、生产 KV-cache/replay、DSpark 接受率及目标推理引擎加载。
-模型类支持 `encode_image` 和预构建的 `inputs_embeds/image_mask`，示例不负责
-自动图像预处理。导出保留原始键名和 Engram FP8 表；目标引擎仍需支持该架构、
-目标 INT4/INT8 布局及混合格式。AutoConfig 能解析输出不等于已验证推理可加载。
+当前实现尚未验证真实权重/GPU kernel、长上下文下的内存和速度、生产
+KV-cache/replay、DSpark 接受率及目标推理引擎加载。模型类同时支持
+`encode_image`、预构建的 `inputs_embeds/image_mask` 和校准入口使用的
+`image_patches/image_token_types`。导出保留原始键名和 Engram FP8 表；目标
+引擎仍需支持该架构、目标 INT4/INT8 布局及混合格式。AutoConfig 能解析输出
+不等于已验证推理可加载。
 
 ## 完整层分布的 tiny 模型
 

@@ -623,6 +623,36 @@ def test_vision_branch_and_image_routing_bias():
     assert selected.tolist() == [[0, 1], [2, 3]]
 
 
+def test_raw_image_inputs_match_prebuilt_image_embeddings():
+    config = tiny_config(vision=True, dspark=False)
+    model = DeepseekV41NativeForCausalLM(config).eval()
+    input_ids = torch.randint(0, config.text_config.vocab_size, (1, 9))
+    patches = torch.randn(16, 3, 2, 2)
+    image_token_types = torch.tensor([[-1, 0, 1, 1, 2, 1, 1, 2, 3]])
+
+    with torch.no_grad():
+        features = model.encode_image(patches, 4, 4)
+        inputs_embeds = model.get_input_embeddings()(input_ids).clone()
+        inputs_embeds[:, 1] = model.model.image_start
+        inputs_embeds[:, [2, 3, 5, 6]] = features
+        inputs_embeds[:, [4, 7]] = model.model.image_newline
+        inputs_embeds[:, 8] = model.model.image_end
+        expected = model(
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            image_mask=image_token_types.ge(0),
+        ).logits
+        actual = model(
+            input_ids=input_ids,
+            image_patches=patches,
+            image_height=4,
+            image_width=4,
+            image_token_types=image_token_types,
+        ).logits
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 def test_image_boundary_embeddings_are_initialized():
     model = DeepseekV41NativeForCausalLM(tiny_config(vision=True))
     for name in ("image_start", "image_end", "image_newline"):
