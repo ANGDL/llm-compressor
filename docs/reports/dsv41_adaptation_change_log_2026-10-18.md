@@ -487,3 +487,19 @@ H64 的失败仍来自多个在线 block 中极小的 FP32 reduction 差异累�
 最终 BF16 cast 时跨过舍入边界；不能按 `status=failed` 仅由 56 个元素导致
 而放宽阈值，也不能把候选中误差最小的路径声明为 bitwise 官方等价。
 W8A8/W4A8 cache/recompute 继续单独验收。
+
+### 7.6 重点未解决问题：W8A8 cache/recompute 的 BF16 舍入分叉
+
+当前 tiny 复测仍显示：W8A8 的完整序列量化误差优于 WNa8，但特定
+prefill/decode 路径的 cache/recompute 仍失败。首次分歧位于
+`model.layers.21` 的 FFN mHC residual post merge。cached 与 recompute
+的 FP32 合并值只差约 `1.91e-6`，但其中一个值落在相邻 BF16 表示值
+`13.4375` 和 `13.5` 的舍入边界附近，导致中间 residual 分叉，首次 decode
+最大 logits 差为 `0.01385498046875`。
+
+该问题反映的是不同 GEMM/reduction 形状下的路径一致性，不是 W8A8 整体
+量化质量变差。WNa8 通过当前用例也不能证明其量化精度更高。该失败状态
+必须保留，禁止通过放宽阈值、只比较 top-1 或把 streaming/resident 一致性
+代替 cache/recompute 验收。后续应继续检查 mHC projection/reduction 的
+固定归约顺序和官方 BF16 cast 时机；诊断用 FP64 或逐行 `F.linear` 结果
+不能直接视为生产修复。

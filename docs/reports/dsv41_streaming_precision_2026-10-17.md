@@ -3,6 +3,16 @@
 日期：2026-10-17。范围：已有完整拓扑 tiny checkpoint，CPU 参考执行。
 未重新量化、训练或修改 checkpoint，也未修改默认模型计算路径。
 
+> **重点未解决问题：W8A8 cache/recompute 数值分叉**
+>
+> 当前 W8A8 的整体量化 logit MSE 低于 WNa8，但在特定 prefill 长度下，
+> cache/recompute 仍会失败。已定位到第 21 层 FFN mHC residual post merge：
+> 两条执行形状产生约 `1.91e-6` 的 FP32 微差，随后跨过 BF16 中点，
+> 使 `13.4375` 与 `13.5` 两个中间值分叉，首次 decode 最大 logit 差为
+> `0.01385498046875`。该失败必须继续保留，不能通过放宽阈值或用较低的
+> WNa8 路径一致性替代验收。该问题与 vision 校准、streaming/resident
+> 一致性和 sparse attention 对齐分别验收。
+
 ## 结论与比较口径
 
 本次相同源模型对照中，W8A8 的整体 logit 误差小于 WNa8，符合精度预期。
