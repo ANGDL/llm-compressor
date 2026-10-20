@@ -729,13 +729,20 @@ def test_block32_and_row32_source_scales_decode_independently():
 
 @pytest.mark.parametrize("mode", ["wna8", "w8a8", "w4a8"])
 @pytest.mark.parametrize("quantize_engram_wkv", [False, True])
+@pytest.mark.parametrize("scale_dtype", [None, torch.float32])
 def test_raw_quantization_selectors_resolve_same_modules_as_native_recipe(
-    mode, quantize_engram_wkv
+    mode, quantize_engram_wkv, scale_dtype
 ):
     model = DeepseekV41NativeForCausalLM(
         tiny_config(engram=True, vision=True), engram_token_map=list(range(32))
     )
-    groups, ignored = EXAMPLE._schemes(mode, quantize_engram_wkv=quantize_engram_wkv)
+    groups, ignored = EXAMPLE._schemes(
+        mode, quantize_engram_wkv=quantize_engram_wkv, scale_dtype=scale_dtype
+    )
+    for name, group in groups.items():
+        expected_dtype = torch.float32 if name == "engram_w8a8" else scale_dtype
+        assert group.weights.scale_dtype == expected_dtype
+        assert group.input_activations.scale_dtype is None
     config = {
         "quantization_config": {
             "quant_method": "compressed-tensors",
@@ -906,11 +913,25 @@ def test_sequential_trace_matches_eager_backbone_and_draft_inputs():
             handle.remove()
 
 
-def test_engram_wkv_bf16_calibration_preserves_fp32_scales(tmp_path):
+@pytest.mark.parametrize("mode", ["wna8", "w8a8", "w4a8"])
+@pytest.mark.parametrize("use_float32_scale_dtype", [False, True])
+def test_bf16_calibration_preserves_requested_weight_scale_dtype(
+    tmp_path, mode, use_float32_scale_dtype
+):
     config = tiny_config(engram=True, dspark=False)
     checkpoint = tmp_path / "source"
-    source_tensors = write_checkpoint(checkpoint, config)
-    groups, ignored = EXAMPLE._schemes("w4a8", quantize_engram_wkv=True)
+    # Match the source model's BF16 embeddings and explicit FP32 exceptions.
+    previous = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(torch.bfloat16)
+        source_tensors = write_checkpoint(checkpoint, config)
+    finally:
+        torch.set_default_dtype(previous)
+    groups, ignored = EXAMPLE._schemes(
+        mode,
+        quantize_engram_wkv=True,
+        scale_dtype=torch.float32 if use_float32_scale_dtype else None,
+    )
     output = streaming_oneshot(
         model=checkpoint,
         model_config=config,
@@ -924,7 +945,7 @@ def test_engram_wkv_bf16_calibration_preserves_fp32_scales(tmp_path):
         recipe=[
             IMatrixGatherer(ignore=ignored),
             QuantizationModifier(
-                config_groups={"engram_w8a8": groups["engram_w8a8"]},
+                config_groups=groups,
                 ignore=ignored,
             ),
         ],
@@ -934,7 +955,7 @@ def test_engram_wkv_bf16_calibration_preserves_fp32_scales(tmp_path):
         max_seq_length=8,
         target_dtype=torch.bfloat16,
         device="cpu",
-        moe_calibrate_all_experts=False,
+        moe_calibrate_all_experts=True,
         materializer=DeepSeekV41WeightMaterializer(),
     )
     mapping = json.loads((output / "model.safetensors.index.json").read_text())[
@@ -948,6 +969,28 @@ def test_engram_wkv_bf16_calibration_preserves_fp32_scales(tmp_path):
     scale = load_file(output / mapping[name])[name]
     assert scale.dtype == torch.float32
     assert scale.shape == (weight.shape[0], 1)
+    quantization = json.loads((output / "config.json").read_text())[
+        "quantization_config"
+    ]
+    for name, group in quantization["config_groups"].items():
+        scheme = EXAMPLE.QuantizationScheme.model_validate(group)
+        expected_dtype = (
+            torch.float32 if use_float32_scale_dtype or name == "engram_w8a8" else None
+        )
+        assert scheme.weights.scale_dtype == expected_dtype
+    scales = [name for name in mapping if name.endswith(".scale")]
+    assert any(".ffn.experts." in name for name in scales)
+    assert any(".attn." in name for name in scales)
+    for name in scales:
+        if ".engram.embed." in name:
+            continue
+        actual = load_file(output / mapping[name])[name]
+        expected_dtype = (
+            torch.float32
+            if use_float32_scale_dtype or ".engram.wkv." in name
+            else torch.bfloat16
+        )
+        assert actual.dtype == expected_dtype, name
     for name in ("layers.1.engram.embed.weight", "layers.1.engram.embed.scale"):
         actual = load_file(output / mapping[name])[name]
         assert torch.equal(

@@ -15,6 +15,7 @@ every calibration batch exercises the vision tower, aligner, text backbone and
 DSpark. Engram lookup tables are preserved byte-for-byte.
 Pass ``--quantize-engram-wkv`` to quantize Engram projections to W8A8
 with FP32 weight scales in every quantization mode.
+Pass ``--use-float32-scale-dtype`` to use FP32 weight scales for all PTQ groups.
 Output tensor names and quantization selectors use the original checkpoint
 namespace unless ``--no-save-raw-checkpoint-format`` is set.
 """
@@ -48,7 +49,7 @@ from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
 from llmcompressor.streaming import DeepSeekV41WeightMaterializer, streaming_oneshot
 
 
-def _schemes(mode, *, quantize_engram_wkv=False):
+def _schemes(mode, *, quantize_engram_wkv=False, scale_dtype=None):
     routed = r"re:model\.(layers|mtp)\.\d+\.ffn\.experts\.\d+\.(w1|w2|w3)$"
     other = [
         r"re:model\.(layers|mtp)\.\d+\.attn\.(wq_a|wq_b|wkv|wo_b)$",
@@ -79,11 +80,15 @@ def _schemes(mode, *, quantize_engram_wkv=False):
 
     if mode == "wna8":
         groups = {
-            "routed_w4a8": scheme(4, [routed]),
-            "other_w8a8": scheme(8, other),
+            "routed_w4a8": scheme(4, [routed], scale_dtype=scale_dtype),
+            "other_w8a8": scheme(8, other, scale_dtype=scale_dtype),
         }
     else:
-        groups = {"all": scheme(8 if mode == "w8a8" else 4, [routed, *other])}
+        groups = {
+            "all": scheme(
+                8 if mode == "w8a8" else 4, [routed, *other], scale_dtype=scale_dtype
+            )
+        }
     if quantize_engram_wkv:
         groups["engram_w8a8"] = scheme(
             8,
@@ -669,6 +674,12 @@ def main():
         default=False,
         help="Quantize Engram wkv to W8A8 with FP32 weight scales in every mode.",
     )
+    parser.add_argument(
+        "--use-float32-scale-dtype",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use float32 for all PTQ weight scale tensors instead of bfloat16.",
+    )
     parser.add_argument("--num-calibration-samples", type=int, default=128)
     parser.add_argument("--text-calibration-samples", type=int, default=0)
     parser.add_argument("--max-sequence-length", type=int, default=2048)
@@ -727,7 +738,9 @@ def main():
     )
     text.max_batch_size = args.batch_size
     groups, ignores = _schemes(
-        args.quant_mode, quantize_engram_wkv=args.quantize_engram_wkv
+        args.quant_mode,
+        quantize_engram_wkv=args.quantize_engram_wkv,
+        scale_dtype=torch.float32 if args.use_float32_scale_dtype else None,
     )
     factory = partial(
         DeepseekV41NativeForCausalLM,
