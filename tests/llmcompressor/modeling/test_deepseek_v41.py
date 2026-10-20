@@ -1,5 +1,6 @@
 import importlib.util
 import json
+from copy import deepcopy
 from functools import partial
 from pathlib import Path
 
@@ -15,12 +16,14 @@ from llmcompressor.modeling.deepseekv41 import (
     DeepseekV41NativeForCausalLM,
     ModelConfig,
 )
+from llmcompressor.modeling.deepseekv41 import quantization as deepseekv41_quantization
 from llmcompressor.modeling.deepseekv41.engram import (
     CheckpointEngramLookup,
     EngramHash,
 )
 from llmcompressor.modeling.deepseekv41.model import (
     DeepseekV41Block,
+    DeepseekV41MoE,
     _candidate_mask,
     _draft_inputs,
 )
@@ -36,6 +39,7 @@ from llmcompressor.streaming import (
     load_streaming_model,
     streaming_oneshot,
 )
+from llmcompressor.streaming.inference.quantization import resolve_schemes
 from llmcompressor.utils import ImatrixFallbackStats
 
 EXAMPLE_PATH = (
@@ -101,6 +105,130 @@ def tiny_config(*, engram=False, vision=False, dspark=True):
             downsample_ratio=2,
         ),
     )
+
+
+def test_v41_linear_uses_native_gemm_for_matching_bf16_dtypes(monkeypatch):
+    module = deepseekv41_quantization.Linear(8, 4, dtype=torch.bfloat16)
+    inputs = torch.randn(3, 8, dtype=torch.bfloat16)
+    calls = []
+    original = deepseekv41_quantization.F.linear
+
+    def record_linear(input, weight, bias=None):
+        calls.append((input.dtype, weight.dtype, None if bias is None else bias.dtype))
+        return original(input, weight, bias)
+
+    monkeypatch.setattr(deepseekv41_quantization.F, "linear", record_linear)
+    output = module(inputs)
+
+    assert calls == [(torch.bfloat16, torch.bfloat16, None)]
+    assert output.dtype == torch.bfloat16
+
+
+def test_v41_linear_keeps_fp32_fallback_for_mismatched_dtypes(monkeypatch):
+    module = deepseekv41_quantization.Linear(8, 4, dtype=torch.float32)
+    inputs = torch.randn(3, 8, dtype=torch.bfloat16)
+    calls = []
+    original = deepseekv41_quantization.F.linear
+
+    def record_linear(input, weight, bias=None):
+        calls.append((input.dtype, weight.dtype, None if bias is None else bias.dtype))
+        return original(input, weight, bias)
+
+    monkeypatch.setattr(deepseekv41_quantization.F, "linear", record_linear)
+    output = module(inputs)
+
+    assert calls == [(torch.float32, torch.float32, None)]
+    assert output.dtype == torch.bfloat16
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("calibrate_all_experts", [False, True])
+def test_moe_sorted_routes_preserve_outputs_and_expert_calibration_inputs(
+    dtype, calibrate_all_experts
+):
+    from llmcompressor.observers.base import Observer
+
+    config = tiny_config(dspark=False).text_config
+    config.n_routed_experts = 6
+    torch.manual_seed(17)
+    model = DeepseekV41MoE(config).to(dtype)
+    model.calibrate_all_experts = calibrate_all_experts
+    with torch.no_grad():
+        model.gate.weight.normal_(0, 0.05)
+        model.gate.bias.copy_(torch.tensor([100, 90, 0, 0, -100, -100]))
+        model.gate.bias_vl.copy_(torch.tensor([0, 0, 100, 90, -100, -100]))
+    inputs = torch.randn(2, 5, config.dim, dtype=dtype)
+    image_mask = torch.tensor([[0, 1, 1, 0, 0], [1, 0, 0, 1, 0]]).bool()
+    linears = {
+        name: module
+        for name, module in model.named_modules()
+        if isinstance(module, torch.nn.Linear)
+    }
+    observers = {
+        name: Observer.load_from_registry(
+            "imatrix_mse",
+            base_name="weight",
+            args=EXAMPLE.QuantizationArgs(
+                num_bits=4, strategy="channel", observer="imatrix_mse"
+            ),
+        )
+        for name in linears
+    }
+    for name, observer in observers.items():
+        observer.attach(linears[name])
+
+    captured = {}
+    handles = [
+        module.register_forward_pre_hook(
+            lambda _module, args, name=name: captured.update(
+                {name: args[0].detach().clone()}
+            )
+        )
+        for name, module in linears.items()
+    ]
+    try:
+        with torch.no_grad():
+            flat = inputs.flatten(0, 1)
+            weights, indices = model.gate(flat, image_mask.flatten())
+            expected = torch.zeros_like(flat, dtype=torch.float32)
+            for expert_id, expert in enumerate(model.experts):
+                rows, slots = torch.where(indices == expert_id)
+                if calibrate_all_experts:
+                    all_weights = flat.new_ones((flat.shape[0], 1), dtype=weights.dtype)
+                    all_weights[rows, 0] = weights[rows, slots]
+                    values = expert(flat, all_weights)[rows]
+                elif rows.numel():
+                    values = expert(flat[rows], weights[rows, slots, None])
+                else:
+                    continue
+                expected.index_add_(0, rows, values.float())
+            expected = (
+                (expected + model.shared_experts(flat)).to(dtype).reshape_as(inputs)
+            )
+            expected_inputs = dict(captured)
+            expected_statistics = {
+                name: (observer._imatrix_sum.clone(), observer._imatrix_count.clone())
+                for name, observer in observers.items()
+            }
+            for observer in observers.values():
+                observer._imatrix_sum.zero_()
+                observer._imatrix_count.zero_()
+            captured.clear()
+            actual = model(inputs, image_mask)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert captured.keys() == expected_inputs.keys()
+        for name, tensor in captured.items():
+            torch.testing.assert_close(tensor, expected_inputs[name], rtol=0, atol=0)
+        for name, observer in observers.items():
+            total, count = expected_statistics[name]
+            torch.testing.assert_close(observer._imatrix_sum, total, rtol=0, atol=0)
+            torch.testing.assert_close(observer._imatrix_count, count, rtol=0, atol=0)
+        assert ("experts.5.w2" in captured) == calibrate_all_experts
+    finally:
+        for handle in handles:
+            handle.remove()
+        for name, observer in observers.items():
+            observer.detach(linears[name])
 
 
 def test_official_fp32_parameter_exceptions_survive_bf16_default():
@@ -599,6 +727,46 @@ def test_block32_and_row32_source_scales_decode_independently():
     torch.testing.assert_close(actual, scales.repeat_interleave(32, 1))
 
 
+@pytest.mark.parametrize("mode", ["wna8", "w8a8", "w4a8"])
+def test_raw_quantization_selectors_resolve_same_modules_as_native_recipe(mode):
+    model = DeepseekV41NativeForCausalLM(tiny_config(vision=True))
+    groups, ignored = EXAMPLE._schemes(mode)
+    config = {
+        "quantization_config": {
+            "quant_method": "compressed-tensors",
+            "quantization_status": "compressed",
+            "format": "int-quantized",
+            "config_groups": {
+                name: group.model_dump(mode="json") for name, group in groups.items()
+            },
+            "ignore": ignored,
+        }
+    }
+    original = deepcopy(config)
+    native_schemes, native_format = resolve_schemes(
+        model, config["quantization_config"]
+    )
+    materializer = DeepSeekV41WeightMaterializer()
+    saved = materializer.transform_output_config(config)
+    raw_schemes, raw_format = resolve_schemes(
+        model,
+        saved["quantization_config"],
+        output_module_name=materializer.output_module_name,
+    )
+
+    assert config == original
+    assert raw_format == native_format
+    assert raw_schemes.keys() == native_schemes.keys()
+    for name, scheme in raw_schemes.items():
+        assert scheme.weights == native_schemes[name].weights
+        assert scheme.input_activations == native_schemes[name].input_activations
+    assert "model.mtp.0.ffn.experts.0.w1" in raw_schemes
+    assert "model.mtp.0.main_proj" in raw_schemes
+    assert not any(
+        name.startswith(("model.vision.", "model.aligner.")) for name in raw_schemes
+    )
+
+
 def test_vision_branch_and_image_routing_bias():
     config = tiny_config(vision=True, dspark=False)
     model = DeepseekV41NativeForCausalLM(config)
@@ -725,13 +893,18 @@ def test_sequential_trace_matches_eager_backbone_and_draft_inputs():
 
 
 @pytest.mark.parametrize(
-    ("checkpoint_progress", "mode"),
-    [(False, "wna8"), (True, "w8a8"), (False, "w4a8")],
+    ("checkpoint_progress", "mode", "save_raw_checkpoint_format"),
+    [
+        (False, "wna8", True),
+        (True, "w8a8", True),
+        (False, "w4a8", True),
+        (False, "wna8", False),
+    ],
 )
 def test_streaming_quantizes_backbone_and_dspark_preserving_engram(
-    tmp_path, checkpoint_progress, mode
+    tmp_path, checkpoint_progress, mode, save_raw_checkpoint_format
 ):
-    config = tiny_config(engram=True)
+    config = tiny_config(engram=True, vision=True)
     checkpoint = tmp_path / "source"
     source_tensors = write_checkpoint(checkpoint, config)
     config = ModelConfig.from_pretrained(checkpoint, local_files_only=True)
@@ -752,6 +925,9 @@ def test_streaming_quantizes_backbone_and_dspark_preserving_engram(
     )
     stats = ImatrixFallbackStats()
     stats.install_hooks()
+    materializer = DeepSeekV41WeightMaterializer(
+        save_raw_checkpoint_format=save_raw_checkpoint_format
+    )
     with stats:
         output = streaming_oneshot(
             model=checkpoint,
@@ -773,19 +949,43 @@ def test_streaming_quantizes_backbone_and_dspark_preserving_engram(
             target_dtype=torch.float32,
             device="cpu",
             moe_calibrate_all_experts=True,
-            materializer=DeepSeekV41WeightMaterializer(),
+            materializer=materializer,
             checkpoint_progress=checkpoint_progress,
         )
     assert (output / "FINALIZED").exists()
     index = json.loads((output / "model.safetensors.index.json").read_text())
     mapping = index["weight_map"]
+    output_name = materializer.output_tensor_name
+    source_index = json.loads(
+        (checkpoint / "model.safetensors.index.json").read_text()
+    )["weight_map"]
+    # Use the original index as the oracle, independently of the materializer
+    # under test. Source quantization scales may be replaced or removed by PTQ.
+    source_weights = {name for name in source_index if not name.endswith(".scale")}
+    if save_raw_checkpoint_format:
+        expected_weights = source_weights
+    else:
+        expected_weights = {
+            "model." + ("lm_head.weight" if name == "head.weight" else name)
+            for name in source_weights
+        }
+    assert {
+        name for name in mapping if not name.endswith((".scale", ".weight_scale"))
+    } == expected_weights
+    actual_mapping = {}
+    for shard in output.glob("*.safetensors"):
+        with safe_open(shard, framework="pt", device="cpu") as file:
+            for name in file.keys():
+                assert name not in actual_mapping, name
+                actual_mapping[name] = shard.name
+    assert actual_mapping == mapping
     for name in (
         "mtp.0.main_proj.weight",
         "mtp.1.ffn.experts.1.w2.weight",
         "mtp.2.attn.wq_a.weight",
     ):
-        assert name in mapping
-    name = "mtp.1.ffn.experts.1.w2.weight"
+        assert output_name(f"model.{name}") in mapping
+    name = output_name("model.mtp.1.ffn.experts.1.w2.weight")
     expert = load_file(output / mapping[name])[name]
     assert expert.dtype == torch.int8
     assert expert.shape == (32, 32 if mode == "w8a8" else 16)
@@ -793,7 +993,8 @@ def test_streaming_quantizes_backbone_and_dspark_preserving_engram(
         name for name in stats.no_importance_counter if name.startswith("model.mtp.")
     }
     for name in ("layers.1.engram.embed.weight", "layers.1.engram.embed.scale"):
-        actual = load_file(output / mapping[name])[name]
+        saved_name = output_name(f"model.{name}")
+        actual = load_file(output / mapping[saved_name])[saved_name]
         assert torch.equal(
             actual.view(torch.uint8), source_tensors[name].view(torch.uint8)
         )
@@ -801,6 +1002,47 @@ def test_streaming_quantizes_backbone_and_dspark_preserving_engram(
     assert saved["model_type"] == "deepseek_v41"
     assert saved["text_config"]["hidden_size"] == 32
     assert saved["engram_storage"]["group_size"] == 32
+    routed_targets = saved["quantization_config"]["config_groups"][
+        "routed_w4a8" if mode == "wna8" else "all"
+    ]["targets"]
+    assert routed_targets[0].startswith(
+        "re:(layers|mtp)" if save_raw_checkpoint_format else r"re:model\.(layers|mtp)"
+    )
+    assert ("head" if save_raw_checkpoint_format else "model.lm_head") in saved[
+        "quantization_config"
+    ]["ignore"]
+    # Match selectors against physical output names, without logical-name aliases.
+    # Each INT8/packed-INT4 tensor must be covered once, with its emitted scale.
+    physical_modules = torch.nn.Module()
+    quantized_physical_names = set()
+    for name, shard_name in mapping.items():
+        if not name.endswith(".weight"):
+            continue
+        with safe_open(output / shard_name, framework="pt", device="cpu") as file:
+            if file.get_slice(name).get_dtype() != "I8":
+                continue
+        module_name = name.removesuffix(".weight")
+        quantized_physical_names.add(module_name)
+        parent = physical_modules
+        *parents, leaf = module_name.split(".")
+        for part in parents:
+            if part not in parent._modules:
+                parent.add_module(part, torch.nn.Module())
+            parent = parent._modules[part]
+        parent.add_module(leaf, torch.nn.Linear(1, 1, bias=False))
+        scale_name = f"{module_name}." + (
+            "scale" if save_raw_checkpoint_format else "weight_scale"
+        )
+        assert scale_name in mapping
+    physical_schemes, _ = resolve_schemes(
+        physical_modules, saved["quantization_config"]
+    )
+    assert set(physical_schemes) == quantized_physical_names
+    for name in ("vision.patch_embed.proj.weight", "aligner.w1.weight", "head.weight"):
+        logical = "model." + ("lm_head.weight" if name == "head.weight" else name)
+        saved_name = output_name(logical)
+        actual = load_file(output / mapping[saved_name])[saved_name]
+        torch.testing.assert_close(actual, source_tensors[name], rtol=0, atol=0)
     assert AutoConfig.from_pretrained(output).text_config.n_mtp_layers == 3
     with load_streaming_model(
         output,
@@ -810,7 +1052,7 @@ def test_streaming_quantizes_backbone_and_dspark_preserving_engram(
             "engram_token_map": list(range(32)),
             "engram_checkpoint": output,
         },
-        materializer=DeepSeekV41WeightMaterializer(),
+        materializer=materializer,
     ) as inference:
         assert inference.weights.tensor_reads == 0
         inference.model.config.calibrate_dspark = False

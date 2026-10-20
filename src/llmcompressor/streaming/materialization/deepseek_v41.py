@@ -3,6 +3,7 @@
 import json
 import os
 import struct
+from copy import deepcopy
 from pathlib import Path
 
 import torch
@@ -10,8 +11,21 @@ import torch
 from .deepseek_v4 import (
     DeepSeekV4WeightMaterializer,
     DeepSeekV4WeightSource,
+    _logical_to_raw,
     _raw_to_logical,
 )
+
+
+def _raw_quantization_target(target):
+    """Translate V4.1 recipe roots without rewriting arbitrary regex contents."""
+    if not target.startswith("re:"):
+        return _logical_to_raw(f"{target}.weight").removesuffix(".weight")
+    pattern = target.removeprefix("re:")
+    anchor = "^" if pattern.startswith("^") else ""
+    pattern = pattern.removeprefix("^").removeprefix(r"model\.")
+    if pattern == "lm_head" or pattern.startswith(("lm_head$", r"lm_head\.")):
+        pattern = "head" + pattern.removeprefix("lm_head")
+    return f"re:{anchor}{pattern}"
 
 
 def _is_engram_table(name):
@@ -87,7 +101,19 @@ class DeepSeekV41WeightMaterializer(DeepSeekV4WeightMaterializer):
         }
 
     def transform_output_config(self, config):
-        updated = dict(config)
+        updated = deepcopy(dict(config))
+        if self.save_raw_checkpoint_format:
+            quantization = updated.get("quantization_config") or {}
+            for group in (quantization.get("config_groups") or {}).values():
+                group["targets"] = [
+                    _raw_quantization_target(target)
+                    for target in group.get("targets") or []
+                ]
+            if quantization.get("ignore") is not None:
+                quantization["ignore"] = [
+                    _raw_quantization_target(target)
+                    for target in quantization["ignore"]
+                ]
         text = dict(updated.get("text_config", {}))
         if self.source_has_mtp is False:
             text["num_nextn_predict_layers"] = 0
