@@ -332,11 +332,13 @@ def load_streaming_model(
                     "the model inference adapter must reconstruct constants "
                     "and provide request-owned cache state"
                 )
-    schemes, format_name = resolve_schemes(
-        model, getattr(config, "quantization_config", None)
-    )
     materializer = apply_transformers_weight_conversions(
         materializer or CastWeightMaterializer(), model
+    )
+    schemes, format_name = resolve_schemes(
+        model,
+        getattr(config, "quantization_config", None),
+        output_module_name=materializer.output_module_name,
     )
     source = (
         source if source is not None else materializer.create_source(str(checkpoint))

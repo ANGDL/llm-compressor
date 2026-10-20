@@ -137,6 +137,20 @@ def reference_pair(monkeypatch):
         torch.set_default_dtype(previous_dtype)
 
 
+@pytest.mark.parametrize("calibrate_all_experts", [False, True])
+def test_grouped_moe_matches_official_expert_order_and_precision(
+    reference_pair, calibrate_all_experts
+):
+    _, reference, native = reference_pair
+    actual_moe = native.model.layers[0].ffn
+    actual_moe.calibrate_all_experts = calibrate_all_experts
+    inputs = torch.randn(2, 7, 32, dtype=torch.bfloat16)
+    with torch.no_grad():
+        expected = reference.layers[0].ffn(inputs)
+        actual = actual_moe(inputs)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("length", [2, 3, 6, 8, 9, 13])
 def test_backbone_and_dspark_match_supplied_reference(
     reference_pair, monkeypatch, length

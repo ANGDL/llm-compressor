@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import inspect
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from copy import deepcopy
 from typing import Any
 
@@ -13,7 +13,7 @@ from compressed_tensors.quantization import (
     QuantizationStatus,
 )
 from compressed_tensors.quantization.lifecycle.forward import forward_quantize
-from compressed_tensors.utils import match_named_modules
+from compressed_tensors.utils import is_match
 from torch import nn
 
 
@@ -31,9 +31,12 @@ def reference_activation_qdq(module, value, base_name, args):
 
 
 def resolve_schemes(
-    model: nn.Module, config: Mapping[str, Any] | None
+    model: nn.Module,
+    config: Mapping[str, Any] | None,
+    *,
+    output_module_name: Callable[[str], str] | None = None,
 ) -> tuple[dict[str, QuantizationScheme], str | None]:
-    """Resolve checkpoint schemes to exact model modules, without reading weights."""
+    """Match both logical and serialized module names, without reading weights."""
     if not config:
         return {}, None
     if config.get("quant_method") != "compressed-tensors":
@@ -50,7 +53,15 @@ def resolve_schemes(
         raise ValueError("Streaming inference does not yet support quantized KV caches")
     schemes = {}
     for group in parsed.config_groups.values():
-        matched = list(match_named_modules(model, group.targets, parsed.ignore))
+        matched = []
+        for name, module in model.named_modules():
+            names = {name}
+            if output_module_name is not None and isinstance(module, nn.Linear):
+                names.add(output_module_name(name))
+            if any(is_match(alias, module, parsed.ignore) for alias in names):
+                continue
+            if any(is_match(alias, module, group.targets) for alias in names):
+                matched.append((name, module))
         if not matched:
             raise ValueError(f"Quantization targets match no modules: {group.targets}")
         for name, module in matched:

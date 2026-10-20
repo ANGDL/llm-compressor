@@ -13,6 +13,8 @@ using the DeepSeek-V4.1 image preprocessing contract into ViT patches and
 image-span metadata. Optional text rows are appended to the same prompt so
 every calibration batch exercises the vision tower, aligner, text backbone and
 DSpark. Engram lookup tables are preserved byte-for-byte.
+Output tensor names and quantization selectors use the original checkpoint
+namespace unless ``--no-save-raw-checkpoint-format`` is set.
 """
 
 import argparse
@@ -670,6 +672,12 @@ def main():
     parser.add_argument("--moe-calibrate-all-experts", action="store_true")
     parser.add_argument("--checkpoint-progress", action="store_true")
     parser.add_argument("--async-save", action="store_true")
+    parser.add_argument(
+        "--save-raw-checkpoint-format",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use raw DeepSeek tensor names and quantization targets in the output.",
+    )
     args = parser.parse_args()
     if (
         min(args.num_calibration_samples, args.max_sequence_length, args.batch_size)
@@ -723,7 +731,10 @@ def main():
         shuffle_calibration_samples=False,
         device=args.device,
         moe_calibrate_all_experts=args.moe_calibrate_all_experts,
-        materializer=DeepSeekV41WeightMaterializer(source_has_mtp=has_mtp),
+        materializer=DeepSeekV41WeightMaterializer(
+            save_raw_checkpoint_format=args.save_raw_checkpoint_format,
+            source_has_mtp=has_mtp,
+        ),
         checkpoint_progress=args.checkpoint_progress,
         async_save=args.async_save,
         pack_to_int8=True,

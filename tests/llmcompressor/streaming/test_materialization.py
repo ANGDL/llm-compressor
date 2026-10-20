@@ -1,5 +1,6 @@
 import json
 import weakref
+from copy import deepcopy
 from typing import Mapping
 
 import pytest
@@ -17,6 +18,7 @@ from llmcompressor.streaming.loading import TargetWeightLoader
 from llmcompressor.streaming.materialization import (
     CastWeightMaterializer,
     DeepSeekV4WeightMaterializer,
+    DeepSeekV41WeightMaterializer,
     KimiK3WeightMaterializer,
     KimiK3WeightSource,
     StreamingDTypePolicy,
@@ -398,6 +400,83 @@ def test_deepseek_v4_materializer_preserves_source_model_identity(
     ).output_config_updates()
 
     assert updates == {"torch_dtype": "bfloat16"}
+
+
+@pytest.mark.parametrize(
+    "materializer_cls", [DeepSeekV4WeightMaterializer, DeepSeekV41WeightMaterializer]
+)
+@pytest.mark.parametrize("save_raw_checkpoint_format", [False, True])
+def test_deepseek_raw_selector_conversion_is_v41_only(
+    materializer_cls, save_raw_checkpoint_format
+):
+    config = {
+        "quantization_config": {
+            "config_groups": {
+                "experts": {
+                    "targets": [
+                        r"re:model\.(layers|mtp)\.\d+\.ffn\.experts\.\d+\.(w1|w2|w3)$",
+                        r"re:^model\.mtp\.0\.main_proj$",
+                        "model.layers.0.attn.wq_a",
+                        "Linear",
+                    ]
+                }
+            },
+            "ignore": [
+                "model.lm_head",
+                r"re:model\.(vision|aligner)(\..*)?$",
+                r"re:.*\.engram(\..*)?$",
+            ],
+        },
+        "source_quantization_config": {"quant_method": "fp8"},
+    }
+    original = deepcopy(config)
+    materializer = materializer_cls(
+        save_raw_checkpoint_format=save_raw_checkpoint_format
+    )
+    output = materializer.transform_output_config(config)
+
+    expected = deepcopy(original["quantization_config"])
+    if save_raw_checkpoint_format and materializer_cls is DeepSeekV41WeightMaterializer:
+        expected["config_groups"]["experts"]["targets"] = [
+            r"re:(layers|mtp)\.\d+\.ffn\.experts\.\d+\.(w1|w2|w3)$",
+            r"re:^mtp\.0\.main_proj$",
+            "layers.0.attn.wq_a",
+            "Linear",
+        ]
+        expected["ignore"][0] = "head"
+        expected["ignore"][1] = r"re:(vision|aligner)(\..*)?$"
+    assert output["quantization_config"] == expected
+    assert config == original
+    assert (
+        output["source_quantization_config"] == original["source_quantization_config"]
+    )
+    assert materializer.transform_output_config(output) == output
+
+
+def test_v41_raw_selectors_only_rename_model_root_and_top_level_head():
+    materializer = DeepSeekV41WeightMaterializer()
+    output = materializer.transform_output_config(
+        {
+            "quantization_config": {
+                "config_groups": {
+                    "group": {
+                        "targets": [
+                            r"re:^model\.lm_head$",
+                            r"re:model\.layers\.0\.lm_head_projection$",
+                            r"re:.*\.lm_head_projection$",
+                            r"re:model\.layers\.0\.(w1|w2)$",
+                        ]
+                    }
+                }
+            }
+        }
+    )
+    assert output["quantization_config"]["config_groups"]["group"]["targets"] == [
+        r"re:^head$",
+        r"re:layers\.0\.lm_head_projection$",
+        r"re:.*\.lm_head_projection$",
+        r"re:layers\.0\.(w1|w2)$",
+    ]
 
 
 def test_deepseek_v4_materializer_disables_absent_mtp_in_output_config():

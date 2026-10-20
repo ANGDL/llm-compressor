@@ -55,12 +55,19 @@ grouped `wo_a`、embedding/head、Markov/confidence 头不做额外 PTQ。
 最终配置分别记录目标 `quantization_config`、原始 `source_quantization_config`
 以及 `engram_storage`。
 
-与 V4 示例一致，`--save-raw-checkpoint-format` 默认开启：tensor 使用
+V4.1 示例的 `--save-raw-checkpoint-format` 默认开启：tensor 使用
 `layers.*`、`mtp.*`、`head.weight` 和 `.scale` 名称，`config.json` 中的
-量化 targets/ignore 同步转换到该命名空间。`--no-save-raw-checkpoint-format`
+量化 targets/ignore 由 V4.1 materializer 同步转换到该命名空间。
+这项配置转换只用于 V4.1。`--no-save-raw-checkpoint-format`
 保留 native 模型的 `model.*`、`model.lm_head` 和 `.weight_scale`。
 项目 streaming 推理可通过同一个 materializer 回载这两种格式，并兼容旧产物中
 使用 `model.*` targets 的配置。
+
+配置转换只处理选择器，不会改写 index。tensor 保存直接继承 V4 的
+`output_tensor_name()` → `_logical_to_raw()`，没有新增名称缓存或保存路径。
+最终 `model.safetensors.index.json` 从已写入 shard 的真实 header 生成。集成测试
+直接比较源 index 的非 scale 名称、输出 index 和全部输出 shard header，覆盖
+主干、MTP、vision/aligner、Engram 和 `head.weight`。
 
 raw tensor 名称和量化 targets 必须一致。否则推理引擎可能将已量化的 DSpark
 专家判为浮点模块，按完整输入宽度加载 packed INT4 权重。INT4 两个值合为一个
