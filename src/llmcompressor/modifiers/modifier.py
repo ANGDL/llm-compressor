@@ -1,4 +1,5 @@
 from abc import abstractmethod
+from typing import ClassVar
 
 import torch
 from pydantic import ConfigDict
@@ -42,6 +43,10 @@ class Modifier(ModifierInterface, HooksMixin):
     model_config = ConfigDict(extra="forbid")
 
     requires_calibration_data: bool = False
+    # Streaming can retain calibration outputs only when every modifier opts in
+    # to preserving model computation through its sequential update. Subclasses
+    # must declare this themselves; inheriting a parent promise is insufficient.
+    calibration_outputs_reusable: ClassVar[bool] = False
 
     index: int | None = None
     group: str | None = None

@@ -17,9 +17,11 @@ python examples/streaming_oneshot/deepseek_v41_wNa8.py \
   --quant-mode wna8 \
   --num-calibration-samples 128 \
   --max-sequence-length 2048 \
-  --batch-size 1 \
-  --moe-calibrate-all-experts
+  --batch-size 1
 ```
+
+示例默认使用稀疏路由；需要让每个专家看到全部 token 时，再添加
+`--moe-calibrate-all-experts`。
 
 模型目录须包含索引引用的全部真实分片。2026-10-17 检查的本地目录只有配置、
 索引及参考代码，尚不能运行完整模型量化。主校准源按多模态数据集处理，默认每条
@@ -52,6 +54,18 @@ grouped `wo_a`、embedding/head、Markov/confidence 头不做额外 PTQ。
 再转浮点。若源分片只含待保留表，会优先创建硬链接；否则使用有界缓冲复制。
 最终配置分别记录目标 `quantization_config`、原始 `source_quantization_config`
 以及 `engram_storage`。
+
+与 V4 示例一致，`--save-raw-checkpoint-format` 默认开启：tensor 使用
+`layers.*`、`mtp.*`、`head.weight` 和 `.scale` 名称，`config.json` 中的
+量化 targets/ignore 同步转换到该命名空间。`--no-save-raw-checkpoint-format`
+保留 native 模型的 `model.*`、`model.lm_head` 和 `.weight_scale`。
+项目 streaming 推理可通过同一个 materializer 回载这两种格式，并兼容旧产物中
+使用 `model.*` targets 的配置。
+
+raw tensor 名称和量化 targets 必须一致。否则推理引擎可能将已量化的 DSpark
+专家判为浮点模块，按完整输入宽度加载 packed INT4 权重。INT4 两个值合为一个
+INT8 字节后，存储形状最后一维减半属于预期行为，不能据此把存储形状改回
+浮点权重形状。该导出配置检查不代替目标推理引擎的实际启动验证。
 
 ## DSpark 专用校准
 
