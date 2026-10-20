@@ -52,6 +52,13 @@ INT8 权重、动态 token INT8 激活及 FP32 per-channel weight scale，
 两种设置均保留 FP8 `engram.embed` 及其 UE8M0 scale，不量化
 Engram 的 `q_weight`、`k_weight`。
 
+与 V4 示例一致，`--use-float32-scale-dtype` 将所有 PTQ 量化组的 weight
+scale 指定为 FP32，适用于三种主量化模式。该选项默认关闭，也可用
+`--no-use-float32-scale-dtype` 显式关闭；关闭时普通量化组沿用默认 scale
+精度，BF16 执行时通常为 BF16。已开启的 `engram_w8a8` 组仍固定使用 FP32
+scale，与参考权重格式保持一致。该参数只控制 PTQ weight scale，不改变
+校准执行精度、动态激活量化设置或 FP8 查表的 UE8M0 scale。
+
 具体 target/ignore 以示例 `_schemes` 为准。这里的 INT4 是源 E2M1 FP4 解码后
 再次量化；不能将二者的存储字节或数值格式互换。
 
