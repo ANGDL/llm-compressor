@@ -490,18 +490,50 @@ class DeepseekV41MoE(nn.Module):
         mask = None if image_mask is None else image_mask.flatten()
         weights, indices = self.gate(x, mask)
         output = torch.zeros_like(x, dtype=torch.float32)
-        for expert_id, expert in enumerate(self.experts):
-            rows, slots = torch.where(indices == expert_id)
+        flat_indices = indices.flatten()
+        # One stable grouping avoids a device/host synchronization from nonzero
+        # (torch.where) for every expert. Within each expert, preserve the same
+        # token/slot order as the official dispatch and keep each Linear call
+        # intact so its calibration hooks still observe the original inputs.
+        order = flat_indices.argsort(stable=True)
+        rows = order.div(indices.shape[-1], rounding_mode="floor")
+        route_weights = weights.flatten().index_select(0, order).unsqueeze(-1)
+        offset = 0
+        if self.calibrate_all_experts:
+            expert_ids = range(self.n_routed_experts)
+            counts = torch.bincount(
+                flat_indices, minlength=self.n_routed_experts
+            ).tolist()
+            all_weights = x.new_ones((x.shape[0], 1), dtype=weights.dtype)
+        else:
+            # The sorted route ids are already grouped, so unique_consecutive
+            # gives the active experts and segment sizes in the same ascending
+            # expert order as the reference loop. This avoids walking empty
+            # experts and avoids a second host-side list of zero counts.
+            sorted_expert_ids = flat_indices.index_select(0, order)
+            expert_ids, active_counts = torch.unique_consecutive(
+                sorted_expert_ids, return_counts=True
+            )
+            expert_ids = expert_ids.tolist()
+            counts = active_counts.tolist()
+        for expert_id, count in zip(expert_ids, counts):
+            expert = self.experts[expert_id]
+            start, offset = offset, offset + count
+            expert_rows = rows[start:offset]
+            expert_weights = route_weights[start:offset]
             if self.calibrate_all_experts:
                 # Unrouted inputs observe each expert with unit weight. Routed
                 # rows retain their actual pre-w2 routing weights.
-                all_weights = x.new_ones((x.shape[0], 1), dtype=weights.dtype)
-                all_weights[rows, 0] = weights[rows, slots]
+                all_weights.fill_(1)
+                all_weights.index_copy_(0, expert_rows, expert_weights)
                 values = expert(x, all_weights)
-                output.index_add_(0, rows, values[rows].float())
-            elif rows.numel():
-                values = expert(x[rows], weights[rows, slots, None])
-                output.index_add_(0, rows, values.float())
+                if count:
+                    output.index_add_(
+                        0, expert_rows, values.index_select(0, expert_rows).float()
+                    )
+            else:
+                values = expert(x.index_select(0, expert_rows), expert_weights)
+                output.index_add_(0, expert_rows, values.float())
         return (output + self.shared_experts(x)).to(x.dtype).reshape(shape)
 
 

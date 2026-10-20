@@ -2,11 +2,18 @@
 
 from types import MethodType
 
+import torch
 from torch import nn
 from torch.nn import functional as F
 
 
 def _linear_forward(self, x):
+    if (
+        x.dtype == self.weight.dtype
+        and x.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        and (self.bias is None or self.bias.dtype == x.dtype)
+    ):
+        return F.linear(x, self.weight, self.bias)
     bias = None if self.bias is None else self.bias.float()
     return F.linear(x.float(), self.weight.float(), bias).to(x.dtype)
 
