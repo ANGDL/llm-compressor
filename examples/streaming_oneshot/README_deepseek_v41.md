@@ -44,10 +44,18 @@ python examples/streaming_oneshot/deepseek_v41_wNa8.py \
 | `w8a8` | INT8 权重 / 动态 INT8 激活 | INT8 权重 / 动态 INT8 激活 |
 | `w4a8` | INT4 权重 / 动态 INT8 激活 | INT4 权重 / 动态 INT8 激活 |
 
+`--quantize-engram-wkv` 控制是否额外量化 Engram 的 `wkv` 投影，默认关闭。
+开启后，三种主量化模式都为它使用独立的 `engram_w8a8` 组：
+INT8 权重、动态 token INT8 激活及 FP32 per-channel weight scale，
+与参考 INT4 权重的 Engram 投影格式一致。可用
+`--no-quantize-engram-wkv` 显式关闭；关闭时保留执行精度，默认 BF16。
+两种设置均保留 FP8 `engram.embed` 及其 UE8M0 scale，不量化
+Engram 的 `q_weight`、`k_weight`。
+
 具体 target/ignore 以示例 `_schemes` 为准。这里的 INT4 是源 E2M1 FP4 解码后
 再次量化；不能将二者的存储字节或数值格式互换。
 
-Vision/aligner、Engram 投影、router、norm/mHC、compressor、indexer 控制投影、
+Vision/aligner、router、norm/mHC、compressor、indexer 控制投影、
 grouped `wo_a`、embedding/head、Markov/confidence 头不做额外 PTQ。
 普通源 FP8/FP4 权重由 materializer 解码为执行精度；这些未选模块不保证维持
 原始存储 dtype。只有 Engram 巨表及其行级 scale 逐字节保留，读取时先按行 gather
