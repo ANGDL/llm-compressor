@@ -232,7 +232,10 @@ class Engram(nn.Module):
 
     def forward(self, x, hashes, valid):
         config = self.config
-        kv = self.wkv(self.embed(hashes).flatten(-2))
+        embedding = self.embed(hashes).flatten(-2)
+        # Checkpoint rows are BF16 even during FP32 calibration. PTQ wraps the
+        # nn.Linear class forward, so match dtypes before entering that wrapper.
+        kv = self.wkv(embedding.to(self.wkv.weight.dtype)).to(embedding.dtype)
         key, value = kv.split([config.hc_mult * config.dim, config.dim], dim=-1)
         key = key.float().unflatten(-1, (config.hc_mult, config.dim))
         hidden = x.float()

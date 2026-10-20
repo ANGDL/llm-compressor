@@ -13,6 +13,8 @@ using the DeepSeek-V4.1 image preprocessing contract into ViT patches and
 image-span metadata. Optional text rows are appended to the same prompt so
 every calibration batch exercises the vision tower, aligner, text backbone and
 DSpark. Engram lookup tables are preserved byte-for-byte.
+Pass ``--quantize-engram-wkv`` to quantize Engram projections to W8A8
+with FP32 weight scales in every quantization mode.
 Output tensor names and quantization selectors use the original checkpoint
 namespace unless ``--no-save-raw-checkpoint-format`` is set.
 """
@@ -46,7 +48,7 @@ from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
 from llmcompressor.streaming import DeepSeekV41WeightMaterializer, streaming_oneshot
 
 
-def _schemes(mode):
+def _schemes(mode, *, quantize_engram_wkv=False):
     routed = r"re:model\.(layers|mtp)\.\d+\.ffn\.experts\.\d+\.(w1|w2|w3)$"
     other = [
         r"re:model\.(layers|mtp)\.\d+\.attn\.(wq_a|wq_b|wkv|wo_b)$",
@@ -55,7 +57,7 @@ def _schemes(mode):
         r"re:model\.mtp\.0\.main_proj$",
     ]
 
-    def scheme(bits, targets):
+    def scheme(bits, targets, *, scale_dtype=None):
         return QuantizationScheme(
             targets=targets,
             weights=QuantizationArgs(
@@ -64,6 +66,7 @@ def _schemes(mode):
                 strategy="channel",
                 symmetric=True,
                 observer="imatrix_mse",
+                scale_dtype=scale_dtype,
             ),
             input_activations=QuantizationArgs(
                 num_bits=8,
@@ -81,11 +84,21 @@ def _schemes(mode):
         }
     else:
         groups = {"all": scheme(8 if mode == "w8a8" else 4, [routed, *other])}
+    if quantize_engram_wkv:
+        groups["engram_w8a8"] = scheme(
+            8,
+            [r"re:model\.layers\.\d+\.engram\.wkv$"],
+            scale_dtype=torch.float32,
+        )
     ignores = [
         "model.lm_head",
         r"re:.*\.embed$",
         r"re:model\.(vision|aligner)(\..*)?$",
-        r"re:.*\.engram(\..*)?$",
+        (
+            r"re:.*\.engram\.embed(\..*)?$"
+            if quantize_engram_wkv
+            else r"re:.*\.engram(\..*)?$"
+        ),
         r"re:.*\.ffn\.gate$",
         r"re:.*\.attn\.wo_a$",
         r"re:.*\.attn\.compressor\.(wkv|wgate)$",
@@ -650,6 +663,12 @@ def main():
     parser.add_argument(
         "--quant-mode", choices=["w8a8", "w4a8", "wna8"], default="wna8"
     )
+    parser.add_argument(
+        "--quantize-engram-wkv",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Quantize Engram wkv to W8A8 with FP32 weight scales in every mode.",
+    )
     parser.add_argument("--num-calibration-samples", type=int, default=128)
     parser.add_argument("--text-calibration-samples", type=int, default=0)
     parser.add_argument("--max-sequence-length", type=int, default=2048)
@@ -707,7 +726,9 @@ def main():
         text.window_size + text.dspark_block_size,
     )
     text.max_batch_size = args.batch_size
-    groups, ignores = _schemes(args.quant_mode)
+    groups, ignores = _schemes(
+        args.quant_mode, quantize_engram_wkv=args.quantize_engram_wkv
+    )
     factory = partial(
         DeepseekV41NativeForCausalLM,
         tokenizer=tokenizer,

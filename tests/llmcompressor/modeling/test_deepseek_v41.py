@@ -728,9 +728,14 @@ def test_block32_and_row32_source_scales_decode_independently():
 
 
 @pytest.mark.parametrize("mode", ["wna8", "w8a8", "w4a8"])
-def test_raw_quantization_selectors_resolve_same_modules_as_native_recipe(mode):
-    model = DeepseekV41NativeForCausalLM(tiny_config(vision=True))
-    groups, ignored = EXAMPLE._schemes(mode)
+@pytest.mark.parametrize("quantize_engram_wkv", [False, True])
+def test_raw_quantization_selectors_resolve_same_modules_as_native_recipe(
+    mode, quantize_engram_wkv
+):
+    model = DeepseekV41NativeForCausalLM(
+        tiny_config(engram=True, vision=True), engram_token_map=list(range(32))
+    )
+    groups, ignored = EXAMPLE._schemes(mode, quantize_engram_wkv=quantize_engram_wkv)
     config = {
         "quantization_config": {
             "quant_method": "compressed-tensors",
@@ -762,6 +767,15 @@ def test_raw_quantization_selectors_resolve_same_modules_as_native_recipe(mode):
         assert scheme.input_activations == native_schemes[name].input_activations
     assert "model.mtp.0.ffn.experts.0.w1" in raw_schemes
     assert "model.mtp.0.main_proj" in raw_schemes
+    engram_name = "model.layers.1.engram.wkv"
+    assert (engram_name in raw_schemes) == quantize_engram_wkv
+    if quantize_engram_wkv:
+        engram = raw_schemes[engram_name]
+        assert engram.weights.num_bits == 8
+        assert engram.weights.scale_dtype == torch.float32
+        assert engram.input_activations.num_bits == 8
+        assert engram.input_activations.dynamic
+    assert not any(".engram.embed" in name for name in raw_schemes)
     assert not any(
         name.startswith(("model.vision.", "model.aligner.")) for name in raw_schemes
     )
@@ -892,6 +906,55 @@ def test_sequential_trace_matches_eager_backbone_and_draft_inputs():
             handle.remove()
 
 
+def test_engram_wkv_bf16_calibration_preserves_fp32_scales(tmp_path):
+    config = tiny_config(engram=True, dspark=False)
+    checkpoint = tmp_path / "source"
+    source_tensors = write_checkpoint(checkpoint, config)
+    groups, ignored = EXAMPLE._schemes("w4a8", quantize_engram_wkv=True)
+    output = streaming_oneshot(
+        model=checkpoint,
+        model_config=config,
+        model_factory=partial(
+            DeepseekV41NativeForCausalLM,
+            engram_token_map=list(range(32)),
+            engram_checkpoint=checkpoint,
+        ),
+        dataset=DataLoader([{"input_ids": torch.arange(1, 9)}], batch_size=1),
+        dataset_fingerprint="b" * 64,
+        recipe=[
+            IMatrixGatherer(ignore=ignored),
+            QuantizationModifier(
+                config_groups={"engram_w8a8": groups["engram_w8a8"]},
+                ignore=ignored,
+            ),
+        ],
+        output_dir=tmp_path / "output",
+        work_dir=tmp_path / "work",
+        num_calibration_samples=1,
+        max_seq_length=8,
+        target_dtype=torch.bfloat16,
+        device="cpu",
+        moe_calibrate_all_experts=False,
+        materializer=DeepSeekV41WeightMaterializer(),
+    )
+    mapping = json.loads((output / "model.safetensors.index.json").read_text())[
+        "weight_map"
+    ]
+    name = "layers.1.engram.wkv.weight"
+    weight = load_file(output / mapping[name])[name]
+    assert weight.dtype == torch.int8
+    assert weight.shape == source_tensors[name].shape
+    name = "layers.1.engram.wkv.scale"
+    scale = load_file(output / mapping[name])[name]
+    assert scale.dtype == torch.float32
+    assert scale.shape == (weight.shape[0], 1)
+    for name in ("layers.1.engram.embed.weight", "layers.1.engram.embed.scale"):
+        actual = load_file(output / mapping[name])[name]
+        assert torch.equal(
+            actual.view(torch.uint8), source_tensors[name].view(torch.uint8)
+        )
+
+
 @pytest.mark.parametrize(
     ("checkpoint_progress", "mode", "save_raw_checkpoint_format"),
     [
@@ -901,8 +964,13 @@ def test_sequential_trace_matches_eager_backbone_and_draft_inputs():
         (False, "wna8", False),
     ],
 )
+@pytest.mark.parametrize("quantize_engram_wkv", [False, True])
 def test_streaming_quantizes_backbone_and_dspark_preserving_engram(
-    tmp_path, checkpoint_progress, mode, save_raw_checkpoint_format
+    tmp_path,
+    checkpoint_progress,
+    mode,
+    save_raw_checkpoint_format,
+    quantize_engram_wkv,
 ):
     config = tiny_config(engram=True, vision=True)
     checkpoint = tmp_path / "source"
@@ -913,7 +981,7 @@ def test_streaming_quantizes_backbone_and_dspark_preserving_engram(
         engram_token_map=list(range(32)),
         engram_checkpoint=checkpoint,
     )
-    schemes, ignored = EXAMPLE._schemes(mode)
+    schemes, ignored = EXAMPLE._schemes(mode, quantize_engram_wkv=quantize_engram_wkv)
     data = DataLoader(
         [
             {
@@ -998,6 +1066,21 @@ def test_streaming_quantizes_backbone_and_dspark_preserving_engram(
         assert torch.equal(
             actual.view(torch.uint8), source_tensors[name].view(torch.uint8)
         )
+    engram_name = output_name("model.layers.1.engram.wkv.weight")
+    engram = load_file(output / mapping[engram_name])[engram_name]
+    assert engram.shape == source_tensors["layers.1.engram.wkv.weight"].shape
+    scale_name = materializer.output_weight_scale_name(
+        engram_name.removesuffix(".weight")
+    )
+    if quantize_engram_wkv:
+        assert engram.dtype == torch.int8
+        scale = load_file(output / mapping[scale_name])[scale_name]
+        assert scale.dtype == torch.float32
+        assert scale.shape == (engram.shape[0], 1)
+        assert "model.layers.1.engram.wkv" not in stats.no_importance_counter
+    else:
+        assert engram.dtype == torch.float32  # This test executes in FP32.
+        assert scale_name not in mapping
     saved = json.loads((output / "config.json").read_text())
     assert saved["model_type"] == "deepseek_v41"
     assert saved["text_config"]["hidden_size"] == 32
@@ -1038,7 +1121,20 @@ def test_streaming_quantizes_backbone_and_dspark_preserving_engram(
         physical_modules, saved["quantization_config"]
     )
     assert set(physical_schemes) == quantized_physical_names
-    for name in ("vision.patch_embed.proj.weight", "aligner.w1.weight", "head.weight"):
+    assert (
+        "engram_w8a8" in saved["quantization_config"]["config_groups"]
+    ) == quantize_engram_wkv
+    if quantize_engram_wkv:
+        scheme = physical_schemes[engram_name.removesuffix(".weight")]
+        assert scheme.weights.num_bits == 8
+        assert scheme.weights.scale_dtype == torch.float32
+    for name in (
+        "vision.patch_embed.proj.weight",
+        "aligner.w1.weight",
+        "head.weight",
+        "layers.1.engram.q_weight",
+        "layers.1.engram.k_weight",
+    ):
         logical = "model." + ("lm_head.weight" if name == "head.weight" else name)
         saved_name = output_name(logical)
         actual = load_file(output / mapping[saved_name])[saved_name]
