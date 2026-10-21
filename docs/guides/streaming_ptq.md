@@ -10,6 +10,11 @@ for the next target, CPU-resident activation boundaries, and an optional bounded
 asynchronous writer. The existing `pipeline_devices` API and model-specific
 deferred-expert loading path have been removed.
 
+To validate source or quantized checkpoints with cached prefill, decode and
+generation, use the separate
+[streaming reference inference entry point](streaming_inference.md).
+It reuses native Transformers inference and Accelerate weight offload.
+
 ## Design goals
 
 The pretrained streaming path must satisfy these invariants:

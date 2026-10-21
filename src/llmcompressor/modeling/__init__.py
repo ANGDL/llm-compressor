@@ -12,6 +12,7 @@ needed for efficient compression.
 # trigger registration
 from .deepseek_v32 import CalibrationDeepseekV32MoE  # noqa: F401
 from .deepseek_v4 import CalibrationDeepseekV4MoE  # noqa: F401
+from .deepseek_v41 import CalibrationDeepseekV41MoE  # noqa: F401
 from .glm_moe_dsa import CalibrationGlmMoeDsaMoE  # noqa: F401
 from .kimi_k25 import CalibrationKimiK25DeepseekV3MoE, load_kimi_k25_model
 from .kimi_k3 import CalibrationKimiK3SparseMoeBlock  # noqa: F401

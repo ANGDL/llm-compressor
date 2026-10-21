@@ -1,3 +1,5 @@
+from typing import ClassVar
+
 from loguru import logger
 from pydantic import Field
 
@@ -18,6 +20,7 @@ class IMatrixGatherer(Modifier):
     """
 
     requires_calibration_data: bool = True
+    calibration_outputs_reusable: ClassVar[bool] = True
 
     targets: str | list[str] = Field(default_factory=lambda: ["Linear"])
     ignore: list[str] = Field(default_factory=lambda: ["lm_head"])

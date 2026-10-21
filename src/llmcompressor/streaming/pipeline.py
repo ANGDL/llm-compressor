@@ -492,6 +492,14 @@ def _modifier_update(modules: Sequence[torch.nn.Module]) -> None:
             freeze_module_quantization(module)
 
 
+def _can_reuse_calibration_outputs(recipe: Recipe) -> bool:
+    """Require an explicit promise from every concrete modifier class."""
+    return bool(recipe.modifiers) and all(
+        type(modifier).__dict__.get("calibration_outputs_reusable", False)
+        for modifier in recipe.modifiers
+    )
+
+
 def _compress_modules(modules: Sequence[torch.nn.Module]) -> None:
     for module in modules:
         if is_module_quantized(module):
@@ -829,6 +837,15 @@ def run_subgraph_streaming_pipeline(
             )
             LifecycleCallbacks.calibration_start()
         streaming_logger.info("setup | modifier session ready")
+        reuse_calibration_outputs = _can_reuse_calibration_outputs(recipe)
+        streaming_logger.info(
+            "setup | activation propagation | "
+            + (
+                "reuse calibration outputs"
+                if reuse_calibration_outputs
+                else "recompute after modifier update"
+            )
+        )
         if async_save:
             if direct_writer_base is None:
                 raise RuntimeError("Asynchronous saving requires a direct writer")
@@ -1007,21 +1024,40 @@ def run_subgraph_streaming_pipeline(
                                         consumer=target_name,
                                         value=inputs,
                                     )
-                                subgraph.forward(adapter.model, **inputs)
-                                del inputs, value
+                                output = subgraph.forward(adapter.model, **inputs)
+                                if (
+                                    reuse_calibration_outputs
+                                    and target_index + 1 < target_count
+                                ):
+                                    # These modifiers only collect statistics
+                                    # and compute qparams. Snapshot the output
+                                    # now, before the next batch can mutate it,
+                                    # and consume each input batch as usual.
+                                    next_value = {**value, **output}
+                                    for consumed in subgraph.consumed_names:
+                                        next_value.pop(consumed, None)
+                                    boundaries.commit_propagated_batch(
+                                        target_index,
+                                        target_index + 1,
+                                        batch_index,
+                                        next_value,
+                                    )
+                                    del next_value
+                                del inputs, output, value
                     with _stage_logger(
                         adapter.model,
                         f"{target_label} | modifier update",
                         device,
                     ):
                         _modifier_update(resident_modules)
-                    # The propagation pass exists only to feed the next target's
-                    # boundary. The final target has no successor, so skipping it
-                    # avoids an extra full forward over the last (often large)
-                    # subgraph without changing any compressed weight: the weight
-                    # update already ran in the modifier update above, and this
-                    # pass runs with hooks and quantization disabled.
-                    if target_index + 1 < len(adapter.targets):
+                    # Algorithms that update weights need a fresh forward for
+                    # the next target. Statistics-only recipes have already
+                    # committed that boundary during calibration. The final
+                    # target has no successor and never needs propagation.
+                    if (
+                        not reuse_calibration_outputs
+                        and target_index + 1 < target_count
+                    ):
                         with _stage_logger(
                             adapter.model,
                             f"{target_label} | activation propagation",
