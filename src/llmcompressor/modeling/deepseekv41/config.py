@@ -31,6 +31,7 @@ class DeepseekV41TextConfig(V4Config):
         gate_temp=1.0,
         **kwargs,
     ):
+        kwargs = V4Config._normalize_config_dict(kwargs)
         # Older source configs carried this flag for activation QDQ
         # simulation. The native model no longer performs source
         # quantization in forward, so ignore it when loading old configs.
@@ -191,6 +192,10 @@ class ModelConfig(PretrainedConfig):
         image_token_id=129264,
         **kwargs,
     ):
+        # Recent Transformers exports duplicate derived text fields at the root.
+        # Normalize them before PretrainedConfig validates RoPE/layer schemas;
+        # the native model uses the authoritative nested text configuration.
+        kwargs = V4Config._normalize_config_dict(kwargs)
         kwargs.pop("model_type", None)
         kwargs.setdefault("tie_word_embeddings", False)
         kwargs.setdefault("pad_token_id", 2)

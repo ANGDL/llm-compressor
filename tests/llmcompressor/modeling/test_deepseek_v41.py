@@ -249,7 +249,40 @@ def test_official_fp32_parameter_exceptions_survive_bf16_default():
     assert final_draft.confidence_head.proj.weight.dtype == torch.float32
 
 
-def write_checkpoint(root, config):
+def modern_config_dict(config):
+    value = config.to_dict()
+    value["model_type"] = "deepseek_v41"
+    text = value["text_config"]
+    text["model_type"] = "deepseek_v41_text"
+    text["layer_types"] = [
+        {
+            0: "sliding_attention",
+            1: "compressed_sparse_attention",
+            2: "heavily_compressed_attention",
+        }[ratio]
+        for ratio in text["compress_ratios"][: text["num_hidden_layers"]]
+    ]
+    text["compress_rates"] = {
+        "compressed_sparse_attention": 4,
+        "heavily_compressed_attention": 128,
+    }
+    text["mlp_layer_types"] = ["moe"] * text["num_hidden_layers"]
+    text["rope_parameters"] = {
+        "main": {"rope_type": "default", "rope_theta": text["rope_theta"]},
+        "compress": {
+            **text.pop("rope_scaling", deepcopy(config.text_config.rope_scaling)),
+            "rope_theta": text["compress_rope_theta"],
+        },
+    }
+    value["rope_parameters"] = dict(text["rope_parameters"]["compress"])
+    value["layer_types"] = list(text["layer_types"])
+    value["mlp_layer_types"] = ["sparse"] * text["num_hidden_layers"]
+    return value
+
+
+def write_checkpoint(
+    root, config, *, engram_dtype=torch.float8_e4m3fn, modern_config=False
+):
     root.mkdir()
     model = DeepseekV41NativeForCausalLM(config, engram_token_map=list(range(32)))
     tensors = {}
@@ -258,10 +291,11 @@ def write_checkpoint(root, config):
         if name.startswith("lm_head."):
             name = "head." + name.removeprefix("lm_head.")
         if ".engram.embed.weight" in name:
-            tensors[name] = tensor.to(torch.float8_e4m3fn)
-            tensors[name.replace(".weight", ".scale")] = torch.ones(
-                tensor.shape[0], tensor.shape[1] // 32
-            ).to(torch.float8_e8m0fnu)
+            tensors[name] = tensor.to(engram_dtype)
+            if engram_dtype == torch.float8_e4m3fn:
+                tensors[name.replace(".weight", ".scale")] = torch.ones(
+                    tensor.shape[0], tensor.shape[1] // 32
+                ).to(torch.float8_e8m0fnu)
         else:
             tensors[name] = tensor.contiguous()
     save_file(tensors, root / "model.safetensors")
@@ -278,7 +312,7 @@ def write_checkpoint(root, config):
             }
         )
     )
-    value = config.to_dict()
+    value = modern_config_dict(config) if modern_config else config.to_dict()
     value.update(model_type="deepseek_v41", architectures=["DeepseekV41ForCausalLM"])
     (root / "config.json").write_text(json.dumps(value))
     return tensors
@@ -335,6 +369,42 @@ def test_native_and_raw_autoconfig_dispatch_roundtrip(tmp_path):
     raw = AutoConfig.from_pretrained(tmp_path, local_files_only=True)
     assert raw.model_type == "deepseek_v41"
     assert raw.text_config.num_hash_layers == 0
+
+
+@pytest.mark.parametrize("loader", ["constructor", "dict", "pretrained", "auto"])
+def test_modern_export_config_loads_without_changing_native_layout(tmp_path, loader):
+    expected = tiny_config(engram=True, vision=True)
+    value = modern_config_dict(expected)
+    original = deepcopy(value)
+    if loader == "constructor":
+        config = ModelConfig(**value)
+    elif loader == "dict":
+        config = ModelConfig.from_dict(value)
+    else:
+        (tmp_path / "config.json").write_text(json.dumps(value))
+        config_class = AutoConfig if loader == "auto" else ModelConfig
+        config = config_class.from_pretrained(tmp_path, local_files_only=True)
+    assert value == original
+    for field in (
+        "compress_ratios",
+        "rope_theta",
+        "compress_rope_theta",
+        "rope_scaling",
+        "num_hash_layers",
+        "num_nextn_predict_layers",
+        "dspark_block_size",
+        "dspark_target_layer_ids",
+        "engram_layer_ids",
+        "engram_num_embeddings",
+    ):
+        assert getattr(config.text_config, field) == getattr(
+            expected.text_config, field
+        )
+    assert config.text_config.n_mtp_layers == 3
+    config.text_config.validate_layout()
+    roundtrip = ModelConfig.from_dict(config.to_dict())
+    assert roundtrip.text_config.compress_ratios == expected.text_config.compress_ratios
+    assert roundtrip.text_config.rope_scaling == expected.text_config.rope_scaling
 
 
 def test_native_checkpoint_reload_restores_hash_and_rope_buffers(tmp_path):
@@ -672,9 +742,12 @@ def test_dspark_keeps_absolute_context_positions_with_mixed_padding():
     )
 
 
-def test_engram_preservation_and_bounded_lookup(tmp_path):
+@pytest.mark.parametrize("engram_dtype", [torch.float8_e4m3fn, torch.bfloat16])
+def test_engram_preservation_and_bounded_lookup(tmp_path, engram_dtype):
     checkpoint = tmp_path / "source"
-    tensors = write_checkpoint(checkpoint, tiny_config(engram=True, dspark=False))
+    tensors = write_checkpoint(
+        checkpoint, tiny_config(engram=True, dspark=False), engram_dtype=engram_dtype
+    )
     name = "layers.1.engram.embed.weight"
     lookup = CheckpointEngramLookup(checkpoint, 1, (5, 32))
     ids = torch.tensor([[[0, 4, 0], [2, 1, 4]]])
@@ -689,13 +762,63 @@ def test_engram_preservation_and_bounded_lookup(tmp_path):
     mapping = materializer.save_preserved_tensors(checkpoint, output)
     assert materializer.save_preserved_tensors(checkpoint, output) == mapping
     # Source shares this shard with ordinary weights: preserve only the table.
-    assert set(mapping) == {name, name.replace(".weight", ".scale")}
+    expected_names = {name}
+    if engram_dtype == torch.float8_e4m3fn:
+        expected_names.add(name.replace(".weight", ".scale"))
+    assert set(mapping) == expected_names
     for output_name, filename in mapping.items():
         with safe_open(output / filename, framework="pt") as shard:
             assert torch.equal(
                 shard.get_tensor(output_name).view(torch.uint8),
                 tensors[output_name].view(torch.uint8),
             )
+    storage = materializer.transform_output_config(tiny_config(engram=True).to_dict())[
+        "engram_storage"
+    ]
+    if engram_dtype == torch.bfloat16:
+        assert storage == {"weight_dtype": "bf16"}
+    else:
+        assert storage == {
+            "weight_dtype": "fp8_e4m3",
+            "scale_dtype": "ue8m0",
+            "group_size": 32,
+            "axis": "row",
+        }
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("prefix", ["", "model."])
+def test_unquantized_engram_lookup_needs_no_scale_or_block_padding(
+    tmp_path, dtype, prefix
+):
+    name = f"{prefix}layers.1.engram.embed.weight"
+    weight = torch.arange(35).reshape(5, 7).to(dtype) / 7
+    save_file({name: weight}, tmp_path / "table.safetensors")
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {name: "table.safetensors"}})
+    )
+    lookup = CheckpointEngramLookup(tmp_path, 1, weight.shape)
+    for ids in (
+        torch.tensor([[[4, 1, 4], [0, 2, 0]]]),
+        torch.empty(1, 0, 3, dtype=torch.long),
+    ):
+        actual = lookup(ids)
+        assert actual.dtype == torch.bfloat16
+        torch.testing.assert_close(actual, weight[ids].bfloat16(), rtol=0, atol=0)
+
+
+def test_fp8_engram_lookup_rejects_missing_scale(tmp_path):
+    name = "layers.1.engram.embed.weight"
+    save_file(
+        {name: torch.zeros(5, 32).to(torch.float8_e4m3fn)},
+        tmp_path / "table.safetensors",
+    )
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {name: "table.safetensors"}})
+    )
+    lookup = CheckpointEngramLookup(tmp_path, 1, (5, 32))
+    with pytest.raises(ValueError, match="FP8 Engram weights require row scales"):
+        lookup(torch.tensor([0, 1]))
 
 
 def test_block32_and_row32_source_scales_decode_independently():
@@ -996,6 +1119,90 @@ def test_bf16_calibration_preserves_requested_weight_scale_dtype(
         assert torch.equal(
             actual.view(torch.uint8), source_tensors[name].view(torch.uint8)
         )
+
+
+@pytest.mark.parametrize("mode", ["wna8", "w8a8", "w4a8"])
+def test_streaming_quantizes_modern_bf16_checkpoint_and_reloads_engram(tmp_path, mode):
+    config = tiny_config(engram=True, vision=True)
+    checkpoint = tmp_path / "source"
+    previous = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(torch.bfloat16)
+        source_tensors = write_checkpoint(
+            checkpoint, config, engram_dtype=torch.bfloat16, modern_config=True
+        )
+    finally:
+        torch.set_default_dtype(previous)
+    config = ModelConfig.from_pretrained(checkpoint, local_files_only=True)
+    groups, ignored = EXAMPLE._schemes(
+        mode, quantize_engram_wkv=True, scale_dtype=torch.float32
+    )
+    materializer = DeepSeekV41WeightMaterializer()
+    output = streaming_oneshot(
+        model=checkpoint,
+        model_config=config,
+        model_factory=partial(
+            DeepseekV41NativeForCausalLM,
+            engram_token_map=list(range(32)),
+            engram_checkpoint=checkpoint,
+        ),
+        dataset=DataLoader([{"input_ids": torch.arange(1, 9)}], batch_size=1),
+        dataset_fingerprint="c" * 64,
+        recipe=[
+            IMatrixGatherer(ignore=ignored),
+            QuantizationModifier(config_groups=groups, ignore=ignored),
+        ],
+        output_dir=tmp_path / "output",
+        work_dir=tmp_path / "work",
+        num_calibration_samples=1,
+        max_seq_length=8,
+        target_dtype=torch.bfloat16,
+        device="cpu",
+        materializer=materializer,
+    )
+    saved = json.loads((output / "config.json").read_text())
+    assert saved["engram_storage"] == {"weight_dtype": "bf16"}
+    assert saved["source_quantization_config"] == {}
+    index = json.loads((output / "model.safetensors.index.json").read_text())
+    mapping = index["weight_map"]
+    table = "layers.1.engram.embed.weight"
+    assert "layers.1.engram.embed.scale" not in mapping
+    actual = load_file(output / mapping[table])[table]
+    assert actual.dtype == torch.bfloat16
+    torch.testing.assert_close(actual, source_tensors[table], rtol=0, atol=0)
+    expected_names = set(source_tensors)
+    assert {name for name in mapping if not name.endswith(".scale")} == expected_names
+    for name, shape in (
+        ("layers.1.engram.wkv.weight", (96, 32)),
+        ("mtp.1.ffn.experts.0.w1.weight", (32, 32 if mode == "w8a8" else 16)),
+    ):
+        weight = load_file(output / mapping[name])[name]
+        assert weight.dtype == torch.int8
+        assert tuple(weight.shape) == shape
+    reloaded = ModelConfig.from_pretrained(output, local_files_only=True)
+    assert reloaded.text_config.n_mtp_layers == 3
+    ids = torch.tensor([[[0, 4, 0], [2, 1, 4]]])
+    torch.testing.assert_close(
+        CheckpointEngramLookup(output, 1, (5, 32))(ids),
+        source_tensors[table][ids],
+        rtol=0,
+        atol=0,
+    )
+    with load_streaming_model(
+        output,
+        config=reloaded,
+        model_factory=DeepseekV41NativeForCausalLM,
+        model_kwargs={
+            "engram_token_map": list(range(32)),
+            "engram_checkpoint": output,
+        },
+        materializer=DeepSeekV41WeightMaterializer(),
+    ) as inference:
+        inference.model.config.calibrate_dspark = False
+        result = inference.forward(torch.tensor([[3, 4, 5, 6]]))
+        assert result.logits.shape == (1, 4, 32)
+        assert torch.isfinite(result.logits).all()
+        assert all(p.is_meta for p in inference.model.parameters())
 
 
 @pytest.mark.parametrize(

@@ -1,4 +1,4 @@
-"""V4.1 block32 decoding and lossless, bounded-memory Engram preservation."""
+"""V4.1 block32 decoding and lossless BF16/FP8 Engram preservation."""
 
 import json
 import os
@@ -41,6 +41,46 @@ class DeepSeekV41WeightSource(DeepSeekV4WeightSource):
             if not (preserve_engram and _is_engram_table(name))
         )
 
+    def engram_storage(self):
+        """Describe preserved tables from shard metadata, without loading rows."""
+        storage = None
+        for name in self._logical_to_raw:
+            if not name.endswith(".engram.embed.weight"):
+                continue
+            weight = self.metadata(name)
+            scale_name = f"{name.removesuffix('.weight')}.scale"
+            if weight.dtype in {torch.float8_e4m3fn, torch.uint8}:
+                scale = self.metadata(scale_name)
+                if (
+                    scale.dtype not in {torch.float8_e8m0fnu, torch.uint8}
+                    or weight.shape[-1] % 32
+                    or scale.shape != (weight.shape[0], weight.shape[1] // 32)
+                ):
+                    raise ValueError(f"Invalid FP8 Engram row scales: {scale_name}")
+                current = {
+                    "weight_dtype": "fp8_e4m3",
+                    "scale_dtype": "ue8m0",
+                    "group_size": 32,
+                    "axis": "row",
+                }
+            else:
+                dtype = {
+                    torch.bfloat16: "bf16",
+                    torch.float16: "fp16",
+                    torch.float32: "fp32",
+                }.get(weight.dtype)
+                if dtype is None:
+                    raise TypeError(f"Unsupported Engram dtype: {weight.dtype}")
+                if scale_name in self._logical_to_raw:
+                    raise ValueError("Unquantized Engram weights must not have scales")
+                current = {"weight_dtype": dtype}
+            if storage is not None and storage != current:
+                raise ValueError(
+                    "Preserved Engram tables must use the same storage format"
+                )
+            storage = current
+        return storage
+
 
 class DeepSeekV41WeightMaterializer(DeepSeekV4WeightMaterializer):
     def __init__(
@@ -58,6 +98,7 @@ class DeepSeekV41WeightMaterializer(DeepSeekV4WeightMaterializer):
         )
         self.preserve_engram = preserve_engram
         self._source_quantization_config = {}
+        self._engram_storage = None
 
     def configuration(self):
         result = dict(super().configuration())
@@ -71,7 +112,11 @@ class DeepSeekV41WeightMaterializer(DeepSeekV4WeightMaterializer):
         self._source_quantization_config = config.get(
             "source_quantization_config", config.get("quantization_config", {})
         )
-        return DeepSeekV41WeightSource(checkpoint, preserve_engram=self.preserve_engram)
+        source = DeepSeekV41WeightSource(
+            checkpoint, preserve_engram=self.preserve_engram
+        )
+        self._engram_storage = source.engram_storage() if self.preserve_engram else None
+        return source
 
     @staticmethod
     def _decode_e8m0(scale):
@@ -123,13 +168,9 @@ class DeepSeekV41WeightMaterializer(DeepSeekV4WeightMaterializer):
                 : text["num_hidden_layers"]
             ]
         updated["text_config"] = text
-        if self.preserve_engram and text.get("engram_layer_ids"):
-            updated["engram_storage"] = {
-                "weight_dtype": "fp8_e4m3",
-                "scale_dtype": "ue8m0",
-                "group_size": 32,
-                "axis": "row",
-            }
+        updated.pop("engram_storage", None)
+        if self.preserve_engram and self._engram_storage is not None:
+            updated["engram_storage"] = dict(self._engram_storage)
         return updated
 
     def save_preserved_tensors(self, checkpoint, output_dir):
