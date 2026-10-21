@@ -142,7 +142,7 @@ class EngramHash(nn.Module):
 
 
 class CheckpointEngramLookup:
-    """Map source files and gather bytes before converting only requested rows."""
+    """Gather only requested BF16 rows or FP8 bytes and their row scales."""
 
     def __init__(self, checkpoint, layer_id, shape):
         self.root = Path(checkpoint).expanduser().resolve()
@@ -152,7 +152,9 @@ class CheckpointEngramLookup:
         prefix = f"layers.{layer_id}.engram.embed."
         if f"{prefix}weight" not in index:
             prefix = f"model.{prefix}"
-        self.names = (f"{prefix}weight", f"{prefix}scale")
+        self.names = (f"{prefix}weight",)
+        if f"{prefix}scale" in index:
+            self.names += (f"{prefix}scale",)
         self.paths = tuple((self.root / index[name]).resolve() for name in self.names)
         if any(not path.is_relative_to(self.root) for path in self.paths):
             raise ValueError("Engram shard escapes checkpoint directory")
@@ -173,19 +175,30 @@ class CheckpointEngramLookup:
                 )
                 if tuple(tensor.shape) != expected:
                     raise ValueError(f"Invalid Engram shape for {name}")
-                if tensor.dtype not in {
-                    torch.float8_e4m3fn,
-                    torch.float8_e8m0fnu,
-                    torch.uint8,
+                if name.endswith(".weight") and tensor.dtype in {
+                    torch.bfloat16,
+                    torch.float16,
+                    torch.float32,
                 }:
-                    raise TypeError(f"Expected source FP8 Engram tensor: {name}")
-                rows = tensor.view(torch.uint8).index_select(0, unique)
+                    if len(self.names) != 1:
+                        raise ValueError(
+                            "Unquantized Engram weights must not have scales"
+                        )
+                    rows = tensor.index_select(0, unique).index_select(0, inverse)
+                    return rows.reshape(*indices.shape, self.shape[1]).to(
+                        device=indices.device, dtype=torch.bfloat16
+                    )
                 dtype = (
                     torch.float8_e4m3fn
                     if name.endswith(".weight")
                     else torch.float8_e8m0fnu
                 )
+                if tensor.dtype not in {dtype, torch.uint8}:
+                    raise TypeError(f"Expected source FP8 Engram tensor: {name}")
+                rows = tensor.view(torch.uint8).index_select(0, unique)
                 values.append(rows.view(dtype).float())
+        if len(values) != 2:
+            raise ValueError("FP8 Engram weights require row scales")
         weight, scale = values
         decoded = weight.unflatten(-1, (-1, 32)) * scale.unsqueeze(-1)
         result = decoded.flatten(-2).index_select(0, inverse)
