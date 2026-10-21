@@ -33,6 +33,23 @@ class SessionModel(nn.Module):
         self.final_norm = nn.LayerNorm(4)
 
 
+class RuntimeBufferOnlyBlock(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.register_buffer(
+            "offset", torch.arange(4, dtype=torch.float32), persistent=False
+        )
+
+    def forward(self, value):
+        return value + self.offset
+
+
+class RuntimeBufferOnlyModel(SessionModel):
+    def __init__(self):
+        super().__init__()
+        self.runtime = RuntimeBufferOnlyBlock()
+
+
 class EmbeddingConsumer(nn.Module):
     def __init__(self):
         super().__init__()
@@ -181,6 +198,42 @@ def test_loads_traced_working_set_and_restores_meta(tmp_path):
         assert_all_meta(model.layers[1])
 
     assert_all_meta(model)
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("explicit_include", [False, True])
+def test_loads_runtime_only_module_and_restores_buffer(
+    tmp_path, device, explicit_include
+):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is unavailable")
+    reference = RuntimeBufferOnlyModel()
+    checkpoint = checkpoint_for(reference, tmp_path)
+    model = build_meta_model(
+        RuntimeBufferOnlyModel, keep_nonpersistent_buffers=True
+    )
+    session = SubgraphWeightSession(model, SafetensorsWeightSource(checkpoint))
+    subgraph = subgraph_for() if explicit_include else subgraph_for("runtime")
+    include_modules = ("runtime",) if explicit_include else ()
+    original = model.runtime.offset
+    inputs = torch.ones(2, 4, device=device)
+
+    with session.loaded(
+        subgraph,
+        device=device,
+        dtype=torch.float32,
+        include_modules=include_modules,
+    ) as loaded:
+        assert loaded.module_names == ("runtime",)
+        assert model.runtime.offset.device == inputs.device
+        torch.testing.assert_close(
+            model.runtime(inputs), inputs + original.to(inputs.device)
+        )
+        assert dict(loaded.state_tensors()) == {}
+        assert all(parameter.is_meta for parameter in model.parameters())
+
+    assert model.runtime.offset is original
+    assert original.device.type == "cpu"
 
 
 def test_prepares_subgraph_without_installing_it(tmp_path):

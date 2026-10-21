@@ -244,7 +244,7 @@ class SubgraphWeightSession:
                     name = owner_name
             if name is None or any(_contains(item, name) for item in excluded):
                 continue
-            if self.has_checkpoint_state(name):
+            if self._has_loadable_state(name):
                 candidates.append(name)
 
         for name in include_modules:
@@ -256,7 +256,7 @@ class SubgraphWeightSession:
                 raise ValueError(
                     f"Unknown modifier working-set module {name!r}"
                 ) from error
-            if self.has_checkpoint_state(name):
+            if self._has_loadable_state(name):
                 candidates.append(name)
         return _minimal_roots(candidates)
 
@@ -491,6 +491,11 @@ class SubgraphWeightSession:
         """Return whether a module owns any tensor exposed by the weight source."""
 
         return module_name in self._checkpoint_modules
+
+    def _has_loadable_state(self, module_name: str) -> bool:
+        return self.has_checkpoint_state(module_name) or next(
+            self.model.get_submodule(module_name).buffers(), None
+        ) is not None
 
     def _registered_state(
         self, module_names: Sequence[str]
