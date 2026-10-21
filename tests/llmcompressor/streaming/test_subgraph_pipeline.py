@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from contextlib import contextmanager
 from unittest.mock import Mock
 
@@ -35,6 +36,7 @@ from llmcompressor.streaming.loading import (
 )
 from llmcompressor.streaming.output import prepare_quantized_tensor_for_save
 from llmcompressor.streaming.pipeline import (
+    _can_reuse_calibration_outputs,
     _debug_boundary,
     _debug_value_summary,
     _empty_device_cache,
@@ -42,6 +44,25 @@ from llmcompressor.streaming.pipeline import (
     _stage_logger,
     _write_loaded_target_direct,
 )
+
+
+def test_calibration_output_reuse_requires_each_modifier_to_opt_in():
+    class CustomQuantizer(QuantizationModifier):
+        pass
+
+    assert _can_reuse_calibration_outputs(Recipe.create_instance(_imatrix_recipe()))
+    assert not _can_reuse_calibration_outputs(Recipe())
+    assert not _can_reuse_calibration_outputs(
+        Recipe.create_instance(CustomQuantizer(scheme="W8A8"))
+    )
+    assert not _can_reuse_calibration_outputs(
+        Recipe.create_instance(
+            [SmoothQuantModifier(), QuantizationModifier(scheme="W8A8")]
+        )
+    )
+    assert not _can_reuse_calibration_outputs(
+        Recipe.create_instance(GPTQModifier(scheme="W8A8"))
+    )
 
 
 def _checkpoint_tensors(path):
@@ -885,6 +906,83 @@ def test_streaming_imatrix_rtn_matches_sequential_oneshot(tmp_path, monkeypatch)
     assert set(actual) == set(expected)
     for name in expected:
         assert torch.equal(actual[name], expected[name]), name
+
+
+@pytest.mark.parametrize("checkpoint_progress", [False, True])
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            os.environ.get("LLMCOMPRESSOR_TEST_CUDA_DEVICE", "cuda:0"),
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="CUDA is unavailable"
+            ),
+        ),
+    ],
+)
+def test_rtn_reuses_calibration_forward_and_preserves_quantized_checkpoint(
+    tmp_path, monkeypatch, checkpoint_progress, device
+):
+    dtype = torch.bfloat16 if torch.device(device).type == "cuda" else torch.float32
+    config = Qwen3Config(
+        vocab_size=32,
+        hidden_size=8,
+        intermediate_size=16,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=4,
+        max_position_embeddings=32,
+        tie_word_embeddings=True,
+    )
+    torch.manual_seed(13)
+    checkpoint = tmp_path / "checkpoint"
+    Qwen3ForCausalLM(config).to(dtype).save_pretrained(
+        checkpoint, safe_serialization=True
+    )
+    calls = []
+    original_forward = Subgraph.forward
+
+    def record_forward(subgraph, model, *args, **kwargs):
+        if any(
+            hasattr(module, "quantization_scheme")
+            for module in subgraph.submodules(model)
+        ):
+            calls.append(1)
+        return original_forward(subgraph, model, *args, **kwargs)
+
+    monkeypatch.setattr(Subgraph, "forward", record_forward)
+
+    def run(name):
+        return streaming_oneshot(
+            model=checkpoint,
+            dataset=_calibration_data(),
+            dataset_fingerprint="d" * 64,
+            recipe=_imatrix_recipe(),
+            output_dir=tmp_path / name,
+            work_dir=tmp_path / f"{name}-work",
+            num_calibration_samples=2,
+            max_seq_length=4,
+            target_dtype=dtype,
+            device=device,
+            checkpoint_progress=checkpoint_progress,
+        )
+
+    reused = run("reused")
+    assert len(calls) == 4  # Two layers, two batches, one calibration pass.
+    calls.clear()
+    monkeypatch.setattr(
+        "llmcompressor.streaming.pipeline._can_reuse_calibration_outputs",
+        lambda _recipe: False,
+    )
+    recomputed = run("recomputed")
+    assert len(calls) == 6  # Calibration plus propagation for the first layer.
+    actual = _checkpoint_tensors(reused)
+    expected = _checkpoint_tensors(recomputed)
+    assert actual.keys() == expected.keys()
+    for name in expected:
+        torch.testing.assert_close(actual[name], expected[name], rtol=0, atol=0)
 
 
 def _assert_streaming_matches_oneshot(

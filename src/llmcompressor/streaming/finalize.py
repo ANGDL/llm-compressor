@@ -24,6 +24,7 @@ __all__ = ["finalize_streaming_checkpoint"]
 _INDEX_NAME = "model.safetensors.index.json"
 _FINALIZED = "FINALIZED"
 
+
 def _atomic_json(path: Path, value: Any) -> None:
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     try:
@@ -53,6 +54,7 @@ def _dtype_size(dtype_name: str) -> int:
     for _name, _dtype in (
         ("F8_E4M3", "float8_e4m3fn"),
         ("F8_E5M2", "float8_e5m2"),
+        ("F8_E8M0", "float8_e8m0fnu"),
     ):
         if hasattr(torch, _dtype):
             names[_name] = getattr(torch, _dtype)
@@ -196,13 +198,30 @@ def finalize_streaming_checkpoint(
                     f"{output_name!r}"
                 )
     shards_dir = staging if publish_in_place else staging / "shards"
-    states_dir = (
-        staging / ".streaming-state"
-        if publish_in_place
-        else staging / "state"
-    )
+    states_dir = staging / ".streaming-state" if publish_in_place else staging / "state"
     if not shards_dir.is_dir() or not states_dir.is_dir():
         raise RuntimeError("Staging directory is incomplete")
+    preserved = materializer.save_preserved_tensors(source_dir, shards_dir)
+    preserved_files = set(preserved.values())
+    for filename in preserved_files:
+        if Path(filename).name != filename:
+            raise ValueError("Preserved shard must be a filename within staging")
+        headers, size = _read_shard_headers(shards_dir / filename)
+        if set(headers) != {
+            name for name, shard_name in preserved.items() if shard_name == filename
+        }:
+            raise ValueError("Preserved tensor manifest disagrees with shard headers")
+        state_path = states_dir / f"{filename}.json"
+        if not state_path.exists():
+            _atomic_json(
+                state_path,
+                {
+                    "completed": True,
+                    "tensor_names": sorted(headers),
+                    "total_size": size,
+                    "run_fingerprint": expected_run_fingerprint,
+                },
+            )
     actual_shards = {path.name for path in shards_dir.glob("*.safetensors")}
     actual_states = {
         path.name.removesuffix(".json") for path in states_dir.glob("*.json")
@@ -215,8 +234,10 @@ def finalize_streaming_checkpoint(
         )
     expected_shards = actual_shards
 
-    temporary = staging if publish_in_place else (
-        output.parent / f".{output.name}.{uuid.uuid4().hex}.tmp"
+    temporary = (
+        staging
+        if publish_in_place
+        else (output.parent / f".{output.name}.{uuid.uuid4().hex}.tmp")
     )
     try:
         temporary.mkdir(parents=True, exist_ok=publish_in_place)

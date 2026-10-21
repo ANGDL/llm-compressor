@@ -12,6 +12,8 @@ import subprocess
 import sys
 import time
 import uuid
+from itertools import product
+from math import prod
 from pathlib import Path
 from typing import Any
 
@@ -637,6 +639,7 @@ DEFAULT_QUANTIZATION_AUXILIARY_SUFFIXES = (
     ".weight_compressed",
 )
 DEFAULT_QUANTIZATION_SCALE_SUFFIXES = (".weight_scale", ".weight_zero_point")
+_TENSOR_INSPECTION_CHUNK_ELEMENTS = 1024 * 1024
 
 
 def _name_suffixes(validation: dict[str, Any], key: str, default: tuple[str, ...]):
@@ -651,6 +654,65 @@ def _name_suffixes(validation: dict[str, Any], key: str, default: tuple[str, ...
             reason_code="CONFIG_ERROR",
         )
     return tuple(configured)
+
+
+def _inspect_tensor(
+    handle: Any, name: str, *, collect_health: bool
+) -> tuple[bool, dict[str, Any] | None]:
+    """Inspect floating payloads in bounded chunks, including FP8 and UE8M0."""
+
+    view = handle.get_slice(name)
+    if not view.get_dtype().startswith(("F", "BF")):
+        return True, None
+    shape = view.get_shape()
+
+    def chunks():
+        if not shape or 0 in shape:
+            yield handle.get_tensor(name)
+            return
+        axis = 0
+        while prod(shape[axis + 1 :]) > _TENSOR_INSPECTION_CHUNK_ELEMENTS:
+            axis += 1
+        step = max(1, _TENSOR_INSPECTION_CHUNK_ELEMENTS // prod(shape[axis + 1 :]))
+        for prefix in product(*(range(size) for size in shape[:axis])):
+            for start in range(0, shape[axis], step):
+                yield view[(*prefix, slice(start, min(start + step, shape[axis])))]
+
+    finite = True
+    count = 0
+    total = 0.0
+    zero_count = 0
+    health = None
+    for tensor in chunks():
+        # FP8 CPU isfinite is unsupported for some formats and can misclassify
+        # UE8M0 NaNs. Conversion is exact; keep FP64 values at their own precision.
+        values = tensor.float() if tensor.element_size() < 4 else tensor
+        chunk_finite = values.isfinite().all().item()
+        finite = finite and chunk_finite
+        if not collect_health:
+            continue
+        if health is None:
+            health = {
+                "name": name,
+                "dtype": str(tensor.dtype),
+                "shape": shape,
+                "min": None,
+                "max": None,
+                "mean": None,
+                "zero_fraction": None,
+            }
+        if not values.numel():
+            continue
+        low, high = values.min().item(), values.max().item()
+        health["min"] = low if health["min"] is None else min(health["min"], low)
+        health["max"] = high if health["max"] is None else max(health["max"], high)
+        count += values.numel()
+        total += values.double().sum().item()
+        zero_count += (values == 0).sum().item()
+    if health is not None and count:
+        health["mean"] = total / count
+        health["zero_fraction"] = zero_count / count
+    return finite, health
 
 
 def run_validate(model: dict[str, Any], run_id: str) -> dict[str, Any]:
@@ -733,32 +795,14 @@ def run_validate(model: dict[str, Any], run_id: str) -> dict[str, Any]:
             with safe_open(shard, framework="pt", device="cpu") as handle:
                 for name in handle.keys():
                     actual_names.add(name)
-                    tensor = handle.get_tensor(name)
                     tensor_count += 1
-                    finite = (
-                        not tensor.is_floating_point() or tensor.isfinite().all().item()
+                    finite, health = _inspect_tensor(
+                        handle, name, collect_health=name.endswith(scale_suffixes)
                     )
                     if not finite:
                         non_finite.append(name)
-                    if tensor.is_floating_point() and name.endswith(scale_suffixes):
-                        values = tensor.float()
-                        tensor_health.append(
-                            {
-                                "name": name,
-                                "dtype": str(tensor.dtype),
-                                "shape": list(tensor.shape),
-                                "min": values.min().item() if values.numel() else None,
-                                "max": values.max().item() if values.numel() else None,
-                                "mean": (
-                                    values.mean().item() if values.numel() else None
-                                ),
-                                "zero_fraction": (
-                                    (values == 0).float().mean().item()
-                                    if values.numel()
-                                    else None
-                                ),
-                            }
-                        )
+                    if health is not None:
+                        tensor_health.append(health)
         except Exception as error:
             failures.append(f"unable to inspect {shard.name}: {error}")
     if non_finite:
@@ -1512,7 +1556,9 @@ def run_publish(
         for record in _artifact_size_records(paths["output_dir"])
     }
     if manifest_sizes is not None and manifest_sizes == current_sizes:
-        current_content_fingerprint = artifact_manifest.get("artifact_content_fingerprint")
+        current_content_fingerprint = artifact_manifest.get(
+            "artifact_content_fingerprint"
+        )
     else:
         current_content_fingerprint = _artifact_content_fingerprint(
             _artifact_file_records(paths["output_dir"])

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Generator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from itertools import chain
 from typing import Any, Iterator
@@ -116,6 +116,7 @@ class TracedBoundaryAdapter:
     dtype: torch.dtype
     _target_subgraphs: tuple[Subgraph, ...]
     _prefix_runtime_modules: tuple[str, ...] | None = None
+    _prefix_runtime_parameters: tuple[str, ...] | None = None
 
     @property
     def targets(self) -> tuple[str, ...]:
@@ -141,16 +142,30 @@ class TracedBoundaryAdapter:
                 sample_batch = next(batch_iterator)
             except StopIteration as error:
                 raise ValueError("Streaming calibration batches are empty") from error
+            self._prefix_runtime_parameters = (
+                self._declared_runtime_parameters("prefix")
+            )
             self._prefix_runtime_modules = self._discover_prefix_runtime_modules(
                 prefix, sample_batch
             )
             batch_iterator = chain((sample_batch,), batch_iterator)
-        with self.weight_session.loaded(
-            prefix,
-            device=self.device,
-            dtype=self.dtype,
-            include_modules=self._prefix_runtime_modules,
-        ):
+        with ExitStack() as stack:
+            stack.enter_context(
+                self.weight_session.loaded(
+                    prefix,
+                    device=self.device,
+                    dtype=self.dtype,
+                    include_modules=self._prefix_runtime_modules,
+                )
+            )
+            if self._prefix_runtime_parameters:
+                stack.enter_context(
+                    self.weight_session.loaded_parameters(
+                        self._prefix_runtime_parameters,
+                        device=self.device,
+                        dtype=self.dtype,
+                    )
+                )
             with (
                 torch.no_grad(),
                 disable_cache(self.model),
@@ -186,12 +201,23 @@ class TracedBoundaryAdapter:
         ):
             while True:
                 pending = tuple(name for name in candidates if name not in discovered)
-                with self.weight_session.loaded(
-                    prefix,
-                    device=self.device,
-                    dtype=self.dtype,
-                    include_modules=discovered,
-                ):
+                with ExitStack() as stack:
+                    stack.enter_context(
+                        self.weight_session.loaded(
+                            prefix,
+                            device=self.device,
+                            dtype=self.dtype,
+                            include_modules=discovered,
+                        )
+                    )
+                    if self._prefix_runtime_parameters:
+                        stack.enter_context(
+                            self.weight_session.loaded_parameters(
+                                self._prefix_runtime_parameters,
+                                device=self.device,
+                                dtype=self.dtype,
+                            )
+                        )
                     try:
                         with self._detect_prefix_dependency_calls(pending):
                             prefix.forward(self.model, **inputs)
@@ -202,6 +228,34 @@ class TracedBoundaryAdapter:
                     else:
                         return tuple(discovered)
                 discovered.append(dependency)
+
+    def _declared_runtime_parameters(self, stage: str) -> tuple[str, ...]:
+        """Read model-declared direct parameter dependencies for one stage."""
+
+        hook = getattr(
+            self.model,
+            "streaming_runtime_parameter_dependencies",
+            None,
+        )
+        if hook is None:
+            return ()
+        dependencies = hook(stage)
+        if dependencies is None:
+            return ()
+        if isinstance(dependencies, str):
+            dependencies = (dependencies,)
+        result = tuple(dict.fromkeys(str(name) for name in dependencies))
+        for name in result:
+            owner_name, separator, local_name = name.rpartition(".")
+            if not separator:
+                owner_name = ""
+            owner = self.model.get_submodule(owner_name)
+            if local_name not in owner._parameters:
+                raise ValueError(
+                    f"Model-declared streaming parameter dependency {name!r} "
+                    "does not name a direct parameter"
+                )
+        return result
 
     def _prefix_dependency_candidates(self) -> tuple[str, ...]:
         target_ancestors = {""}

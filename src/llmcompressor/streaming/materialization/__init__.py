@@ -2,6 +2,7 @@
 
 from .base import WeightMaterializer, materialize_weights
 from .deepseek_v4 import DeepSeekV4WeightMaterializer, DeepSeekV4WeightSource
+from .deepseek_v41 import DeepSeekV41WeightMaterializer, DeepSeekV41WeightSource
 from .default import CastWeightMaterializer
 from .dtype import StreamingDTypePolicy
 from .kimi_k3 import KimiK3WeightMaterializer, KimiK3WeightSource
@@ -14,6 +15,8 @@ __all__ = [
     "CastWeightMaterializer",
     "DeepSeekV4WeightMaterializer",
     "DeepSeekV4WeightSource",
+    "DeepSeekV41WeightMaterializer",
+    "DeepSeekV41WeightSource",
     "KimiK3WeightMaterializer",
     "KimiK3WeightSource",
     "StreamingDTypePolicy",

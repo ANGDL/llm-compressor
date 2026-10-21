@@ -1,3 +1,5 @@
+from typing import ClassVar
+
 import torch
 import torch.distributed as dist
 from compressed_tensors.distributed import (
@@ -54,6 +56,10 @@ class QuantizationModifier(Modifier, QuantizationMixin):
         `k_proj` and `v_proj` in their names. If this is not the case
         and kv_cache_scheme != None, the quantization of kv cache will fail
     """
+
+    # Sequential updates compute qparams; floating weights are changed only by
+    # compression, after streaming has propagated the full-precision boundary.
+    calibration_outputs_reusable: ClassVar[bool] = True
 
     def on_initialize(self, state: State, **kwargs) -> bool:
         """

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from pathlib import Path
 from time import perf_counter
 from typing import TYPE_CHECKING, Any, Iterable, Mapping
 
@@ -49,9 +50,7 @@ class WeightMaterializer(ABC):
             configuration["dtype_policy"] = dtype_policy.configuration()
         return MaterializerInfo(self.identifier, fingerprint_json(configuration))
 
-    def dependencies(
-        self, tensor_name: str, metadata: TensorMetadata
-    ) -> list[str]:
+    def dependencies(self, tensor_name: str, metadata: TensorMetadata) -> list[str]:
         return []
 
     def logical_shape(
@@ -76,6 +75,17 @@ class WeightMaterializer(ABC):
 
     def output_config_updates(self) -> Mapping[str, Any]:
         """Return config fields required to reload the materialized output."""
+        return {}
+
+    def save_preserved_tensors(
+        self, checkpoint: Path, output_dir: Path
+    ) -> Mapping[str, str]:
+        """Copy externally backed state without floating materialization.
+
+        Returned names map to files in output_dir. Adapters exclude this state
+        from their regular source tensor enumeration. Finalization validates
+        every returned file and includes its tensors in the output index.
+        """
         return {}
 
     def output_tensor_name(self, tensor_name: str) -> str:
@@ -111,9 +121,7 @@ class WeightMaterializer(ABC):
         """Return the serialized weight-scale name for an output module."""
         return f"{output_module_name}.weight_scale"
 
-    def transform_output_config(
-        self, config: Mapping[str, Any]
-    ) -> Mapping[str, Any]:
+    def transform_output_config(self, config: Mapping[str, Any]) -> Mapping[str, Any]:
         """Apply checkpoint-specific cleanup after output metadata is merged."""
         return config
 
@@ -151,8 +159,7 @@ def materialize_weights(
         requests.append((name, group, group_metadata))
     requests.sort(
         key=lambda request: min(
-            (item.shard.as_posix(), item.storage_index)
-            for item in request[2]
+            (item.shard.as_posix(), item.storage_index) for item in request[2]
         )
     )
     tensor_groups = [group for _, group, _ in requests]
@@ -162,17 +169,13 @@ def materialize_weights(
     raw_groups = (
         iter_groups(tensor_groups)
         if callable(iter_groups)
-        else (
-            source.load_tensors_cpu(group) for group in tensor_groups
-        )
+        else (source.load_tensors_cpu(group) for group in tensor_groups)
     )
     raw_groups = iter(raw_groups)
     total = len(requests)
     started_at = perf_counter()
     if total >= _PROGRESS_INTERVAL:
-        streaming_logger.info(
-            f"weights | materialize | tensors={total} | device=cpu"
-        )
+        streaming_logger.info(f"weights | materialize | tensors={total} | device=cpu")
     for index, (name, _, _) in enumerate(requests, start=1):
         if total >= _PROGRESS_INTERVAL and (index - 1) % _PROGRESS_INTERVAL == 0:
             streaming_logger.debug(
@@ -191,8 +194,7 @@ def materialize_weights(
                 "Checkpoint source returned fewer tensor groups than requested"
             ) from error
         raw_bytes = sum(
-            value.numel() * value.element_size()
-            for value in raw_tensors.values()
+            value.numel() * value.element_size() for value in raw_tensors.values()
         )
         if reservation is not None:
             reservation.commit(raw_bytes)
