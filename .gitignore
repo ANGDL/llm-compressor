@@ -26,6 +26,7 @@ repos/*
 # managed by setuptools-scm
 /src/llmcompressor/version.py
 /.model-quality/
+/usage.md
 
 ### Python template
 # Byte-compiled / optimized / DLL files
