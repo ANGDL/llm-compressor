@@ -5,60 +5,66 @@ import math
 import os
 import re
 import sys
-from typing import Any, cast
 from contextlib import contextmanager
+from typing import Any, cast
 
-from datasets import load_dataset
 import torch
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
-
-from llmcompressor import oneshot
-from llmcompressor.modeling.mimo_v2_mtp import attach_mtp_layer
-from llmcompressor.pipelines.basic import pipeline as basic_pipeline
-from llmcompressor.pipelines.data_free import pipeline as data_free_pipeline
-from llmcompressor.modifiers.quantization import QuantizationModifier
-from llmcompressor.modifiers.gptq import GPTQModifier
-from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
+from compressed_tensors.entrypoints.convert import (
+    FP8BlockDequantizer,
+    convert_checkpoint,
+)
+from compressed_tensors.offload.dispatch import dispatch_model as _dispatch_model
 from compressed_tensors.quantization import QuantizationScheme
 from compressed_tensors.quantization.quant_args import (
     QuantizationArgs,
     QuantizationStrategy,
     QuantizationType,
 )
-from compressed_tensors.offload.dispatch import dispatch_model as _dispatch_model
-
-
-from compressed_tensors.entrypoints.convert import (
-    FP8BlockDequantizer,
-    convert_checkpoint,
-)
 from compressed_tensors.utils.match import match_quantizable_tensors
+from datasets import load_dataset
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
+from llmcompressor import oneshot
+from llmcompressor.modeling.mimo_v2_mtp import attach_mtp_layer
+from llmcompressor.modifiers.gptq import GPTQModifier
+from llmcompressor.modifiers.quantization import QuantizationModifier
+from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
+from llmcompressor.pipelines.basic import pipeline as basic_pipeline
+from llmcompressor.pipelines.data_free import pipeline as data_free_pipeline
 
 """
 Usage example:
 1. Convert FP8-block checkpoint to BF16:
-python mimo2_5_pro_w4a8.py  --convert-bf16 --model_id /ssd1/models/MiMo-V2.5-Pro --bf16_dir /ssd3/models/MiMo-V2.5-Pro-bf16 --max_workers 1 --tp-size 8
+python mimo2_5_pro_w4a8.py --convert-bf16 \
+    --model_id /ssd1/models/MiMo-V2.5-Pro \
+    --bf16_dir /ssd3/models/MiMo-V2.5-Pro-bf16 --max_workers 1 --tp-size 8
 2. Quantize the converted BF16 model to MoE-only W4A8:
-python mimo2_5_pro_w4a8.py --quantize --bf16_dir /ssd3/models/MiMo-V2.5-Pro-bf16/ --save_dir /ssd2/models/  \
-    --modifier RTN --dataset_id  ./ultrachat_200k --dataset_split train_sft --num_calibration_samples 256 --observer imatrix_mse  --tp-size 8
+python mimo2_5_pro_w4a8.py --quantize \
+    --bf16_dir /ssd3/models/MiMo-V2.5-Pro-bf16/ --save_dir /ssd2/models/ \
+    --modifier RTN --dataset_id ./ultrachat_200k --dataset_split train_sft \
+    --num_calibration_samples 256 --observer imatrix_mse --tp-size 8
 python -m llmcompressor.utils.pack_int4_to_int8 \
     -i /ssd2/models/MiMo-V2.5-Pro-W4A8-unpacked/ \
     -o /ssd2/models/MiMo-V2.5-Pro-W4A8
 """
 
+
 class MiMoFP8BlockDequantizer(FP8BlockDequantizer):
-    def __init__(self, model_stub: str, tp_size: int, verify_roundtrip: bool = False, **kwargs):
+    def __init__(
+        self, model_stub: str, tp_size: int, verify_roundtrip: bool = False, **kwargs
+    ):
         super().__init__(**kwargs)
         self.tp_size = tp_size
         self.verify_roundtrip = verify_roundtrip
         config = AutoConfig.from_pretrained(model_stub, trust_remote_code=True)
 
-        self.default_q_rows, self.default_k_rows, self.default_v_rows = self._get_qkv_rows(
-            num_attention_heads=getattr(config, "num_attention_heads"),
-            num_key_value_heads=getattr(config, "num_key_value_heads"),
-            head_dim=getattr(config, "head_dim"),
-            v_head_dim=getattr(config, "v_head_dim", getattr(config, "head_dim")),
+        self.default_q_rows, self.default_k_rows, self.default_v_rows = (
+            self._get_qkv_rows(
+                num_attention_heads=getattr(config, "num_attention_heads"),
+                num_key_value_heads=getattr(config, "num_key_value_heads"),
+                head_dim=getattr(config, "head_dim"),
+                v_head_dim=getattr(config, "v_head_dim", getattr(config, "head_dim")),
+            )
         )
         self.swa_q_rows, self.swa_k_rows, self.swa_v_rows = self._get_qkv_rows(
             num_attention_heads=getattr(
@@ -124,7 +130,8 @@ class MiMoFP8BlockDequantizer(FP8BlockDequantizer):
             scale_name = f"{module_name}.weight_scale_inv"
             if scale_name not in tensors:
                 raise KeyError(
-                    f"Missing required scale tensor {scale_name} for {module_name}.weight"
+                    f"Missing required scale tensor {scale_name} "
+                    f"for {module_name}.weight"
                 )
 
             if module_name.endswith("self_attn.qkv_proj"):
@@ -132,9 +139,12 @@ class MiMoFP8BlockDequantizer(FP8BlockDequantizer):
                 num_groups = self.tp_size
                 weight = tensors[f"{module_name}.weight"]
                 scale = tensors[scale_name]
-                block_height, block_width = cast(tuple[int, int], self.weight_block_size)
+                block_height, block_width = cast(
+                    tuple[int, int], self.weight_block_size
+                )
 
-                # Per-group row counts.  The checkpoint is stored in TP-interleaved order:
+                # Per-group row counts. The checkpoint is stored in
+                # TP-interleaved order:
                 #   [Q_heads[0:nq/g], K_head[0], V_head[0],
                 #    Q_heads[nq/g:2*nq/g], K_head[1], V_head[1], ...]
                 # so that chunk(num_groups)[rank] gives each TP rank exactly its
@@ -160,19 +170,21 @@ class MiMoFP8BlockDequantizer(FP8BlockDequantizer):
                 if weight.shape[0] != num_groups * chunk_rows:
                     raise ValueError(
                         f"{module_name}: weight rows {weight.shape[0]} != "
-                        f"num_groups×chunk_rows = {num_groups}×{chunk_rows}={num_groups*chunk_rows}"
+                        f"num_groups×chunk_rows = {num_groups}×{chunk_rows}="
+                        f"{num_groups * chunk_rows}"
                     )
                 total_padded_per = blocks_per_group * block_height
                 v_padded_per = total_padded_per - q_per - k_per
                 if v_padded_per < v_per:
                     raise ValueError(
-                        f"{module_name}: inferred v_padded_per={v_padded_per} < v_per={v_per}; "
+                        f"{module_name}: inferred v_padded_per={v_padded_per} "
+                        f"< v_per={v_per}; "
                         f"scale may have too few blocks"
                     )
 
                 # De-interleave: dequantize each group's slice, then cat across groups.
-                # _dequant_segment treats scale as authoritative, so padding (chunk_rows <
-                # total_padded_per) is zero-filled and trimmed back automatically.
+                # _dequant_segment treats scale as authoritative, so padding
+                # (chunk_rows < total_padded_per) is zero-filled and trimmed back.
                 q_pieces: list[torch.Tensor] = []
                 k_pieces: list[torch.Tensor] = []
                 v_pieces: list[torch.Tensor] = []
@@ -204,17 +216,23 @@ class MiMoFP8BlockDequantizer(FP8BlockDequantizer):
                     self._print_roundtrip_stats(
                         f"{attn_module}.q_proj",
                         torch.cat(fp8_q_pieces, dim=0),
-                        self._requant_segment(tensors[f"{attn_module}.q_proj.weight"], fp8_dtype),
+                        self._requant_segment(
+                            tensors[f"{attn_module}.q_proj.weight"], fp8_dtype
+                        ),
                     )
                     self._print_roundtrip_stats(
                         f"{attn_module}.k_proj",
                         torch.cat(fp8_k_pieces, dim=0),
-                        self._requant_segment(tensors[f"{attn_module}.k_proj.weight"], fp8_dtype),
+                        self._requant_segment(
+                            tensors[f"{attn_module}.k_proj.weight"], fp8_dtype
+                        ),
                     )
                     self._print_roundtrip_stats(
                         f"{attn_module}.v_proj",
                         torch.cat(fp8_v_pieces, dim=0),
-                        self._requant_segment(tensors[f"{attn_module}.v_proj.weight"], fp8_dtype),
+                        self._requant_segment(
+                            tensors[f"{attn_module}.v_proj.weight"], fp8_dtype
+                        ),
                     )
 
                 bias_name = f"{module_name}.bias"
@@ -293,14 +311,18 @@ class MiMoFP8BlockDequantizer(FP8BlockDequantizer):
             padded_weight = weight
 
         # Reshape to (Sb, block_height, Cb, block_width), transpose to (Sb, Cb, bh, bw)
-        weight_blocks = padded_weight.reshape(Sb, block_height, Cb, block_width).transpose(1, 2)
+        weight_blocks = padded_weight.reshape(
+            Sb, block_height, Cb, block_width
+        ).transpose(1, 2)
 
         dequantized_blocks = (
             weight_blocks.to(torch.float32)
             * scale.unsqueeze(-1).unsqueeze(-1).to(torch.float32)
         ).to(self.dtype)
 
-        dequantized = dequantized_blocks.transpose(1, 2).reshape(padded_rows, padded_cols)
+        dequantized = dequantized_blocks.transpose(1, 2).reshape(
+            padded_rows, padded_cols
+        )
         return dequantized[:R, :C]
 
     def _requant_segment(
@@ -322,14 +344,20 @@ class MiMoFP8BlockDequantizer(FP8BlockDequantizer):
 
         if padded_rows > R or padded_cols > C:
             padded = torch.zeros(
-                (padded_rows, padded_cols), dtype=bf16_weight.dtype, device=bf16_weight.device
+                (padded_rows, padded_cols),
+                dtype=bf16_weight.dtype,
+                device=bf16_weight.device,
             )
             padded[:R, :C] = bf16_weight
         else:
             padded = bf16_weight
 
         fp8_max = torch.finfo(fp8_dtype).max  # 448.0 for e4m3fn
-        blocks = padded.reshape(Sb, block_height, Cb, block_width).transpose(1, 2).to(torch.float32)
+        blocks = (
+            padded.reshape(Sb, block_height, Cb, block_width)
+            .transpose(1, 2)
+            .to(torch.float32)
+        )
         # (Sb, Cb, block_height, block_width)
 
         block_abs_max = blocks.abs().amax(dim=(-2, -1), keepdim=True).clamp(min=1e-12)
@@ -340,18 +368,25 @@ class MiMoFP8BlockDequantizer(FP8BlockDequantizer):
         return fp8[:R, :C]
 
     def _print_roundtrip_stats(
-        self, name: str, fp8_orig: torch.Tensor, fp8_requant: torch.Tensor,
+        self,
+        name: str,
+        fp8_orig: torch.Tensor,
+        fp8_requant: torch.Tensor,
         warn_threshold: float = 0.01,
     ) -> None:
-        """Print element-wise mismatch stats between original and re-quantized FP8 weights.
+        """Print element-wise mismatch stats between original and re-quantized FP8
+        weights.
 
         A small number of mismatches is expected when using fresh block scales (vs the
         original scale_inv), because scale_inv is stored in BF16 precision and the new
-        scale derived from the dequantized BF16 data may differ slightly at block boundaries.
-        warn_threshold (default 0.01%) distinguishes negligible precision noise from real bugs.
+        scale derived from the dequantized BF16 data may differ slightly at block
+        boundaries. warn_threshold (default 0.01%) distinguishes negligible precision
+        noise from real bugs.
         """
         total = fp8_orig.numel()
-        mismatch = (fp8_orig.view(torch.uint8) != fp8_requant.view(torch.uint8)).sum().item()
+        mismatch = (
+            (fp8_orig.view(torch.uint8) != fp8_requant.view(torch.uint8)).sum().item()
+        )
         pct = 100.0 * mismatch / total if total > 0 else 0.0
         if mismatch == 0:
             status = "OK"
@@ -359,7 +394,11 @@ class MiMoFP8BlockDequantizer(FP8BlockDequantizer):
             status = "WARN"
         else:
             status = "FAIL"
-        print(f"  [{status}] {name}: {total:,} elements, {mismatch:,} mismatches ({pct:.4f}%)")
+        print(
+            f"  [{status}] {name}: {total:,} elements, {mismatch:,} mismatches "
+            f"({pct:.4f}%)"
+        )
+
 
 @contextmanager
 def maybe_skip_from_accelerate(skip_restore: bool):
@@ -390,7 +429,10 @@ def patch_pipeline_dispatch(extra_memory_gb: float):
 patch_pipeline_dispatch(20)
 
 MODEL_ID = "/path/to/models/MiMo-V2.5-Pro"
-BFLOAT16_SAVE_DIR = os.path.join("/ssd3/models", MODEL_ID.rstrip("/").split("/")[-1] + "-bf16")
+BFLOAT16_SAVE_DIR = os.path.join(
+    "/ssd3/models", MODEL_ID.rstrip("/").split("/")[-1] + "-bf16"
+)
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -402,7 +444,9 @@ def parse_args():
     parser.add_argument("--model_id", type=str, default=MODEL_ID)
     parser.add_argument("--bf16_dir", type=str, default=BFLOAT16_SAVE_DIR)
     parser.add_argument("--save_dir", type=str, default="/ssd3/models")
-    parser.add_argument("--observer", type=str, default=None, choices=[None, "imatrix_mse"])
+    parser.add_argument(
+        "--observer", type=str, default=None, choices=[None, "imatrix_mse"]
+    )
     parser.add_argument("--modifier", type=str, default="GPTQ", choices=["GPTQ", "RTN"])
     parser.add_argument(
         "--convert-bf16",
@@ -422,7 +466,9 @@ def parse_args():
         required=True,
         help="Tensor-parallel size used when the FP8 checkpoint was created (e.g. 8).",
     )
-    parser.add_argument("--dataset_id", type=str, default="HuggingFaceH4/ultrachat_200k")
+    parser.add_argument(
+        "--dataset_id", type=str, default="HuggingFaceH4/ultrachat_200k"
+    )
     parser.add_argument("--dataset_split", type=str, default="train_sft")
     parser.add_argument("--num_calibration_samples", type=int, default=32)
     parser.add_argument("--max_sequence_length", type=int, default=8192)
@@ -495,10 +541,7 @@ def patch_mimo_mask_helpers(model):
             "position_ids",
         }
         unsupported_kwargs = mimo_kwargs - accepted_kwargs
-        if (
-            accepts_kwargs
-            or (accepts_input_embeds and not unsupported_kwargs)
-        ):
+        if accepts_kwargs or (accepts_input_embeds and not unsupported_kwargs):
             continue
 
         def compatible_helper(
@@ -511,7 +554,9 @@ def patch_mimo_mask_helpers(model):
             if _accepts_inputs_embeds and "input_embeds" in kwargs:
                 kwargs["inputs_embeds"] = kwargs.pop("input_embeds")
             kwargs = {
-                name: value for name, value in kwargs.items() if name in _accepted_kwargs
+                name: value
+                for name, value in kwargs.items()
+                if name in _accepted_kwargs
             }
             return _helper(*args, **kwargs)
 
@@ -526,7 +571,8 @@ def convert_to_bf16(args):
             model_stub=args.model_id,
             tp_size=args.tp_size,
             verify_roundtrip=args.verify_roundtrip,
-            # MiMo-V2.5 fp8-block-quantized layers, found in model.safetensors.index.json
+            # MiMo-V2.5 fp8-block-quantized layers, found in
+            # model.safetensors.index.json
             targets=[
                 r"re:.*mlp(\.experts\.\d+)?\.(gate|up|down)_proj$",
                 r"re:.*self_attn\.qkv_proj$",
@@ -549,7 +595,8 @@ def convert_to_bf16(args):
 def quantize_model(args):
     if not os.path.isdir(args.bf16_dir):
         raise FileNotFoundError(
-            f"BF16 model directory not found: {args.bf16_dir}. Run with --convert-bf16 first or pass an existing --bf16_dir."
+            f"BF16 model directory not found: {args.bf16_dir}. "
+            "Run with --convert-bf16 first or pass an existing --bf16_dir."
         )
 
     model = AutoModelForCausalLM.from_pretrained(
@@ -574,7 +621,9 @@ def quantize_model(args):
     ds = ds.map(lambda example: preprocess(example, tokenizer))
     column_names = ds.column_names
     if not isinstance(column_names, list):
-        raise TypeError(f"Expected dataset column_names to be a list, got {type(column_names)!r}")
+        raise TypeError(
+            f"Expected dataset column_names to be a list, got {type(column_names)!r}"
+        )
     ds = ds.map(
         lambda sample: tokenize(sample, tokenizer, args.max_sequence_length),
         remove_columns=column_names,

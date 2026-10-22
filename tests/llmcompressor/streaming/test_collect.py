@@ -67,9 +67,7 @@ def test_collects_each_target_and_releases_weights(tmp_path):
         built.append(model)
         return model
 
-    store = run_collect(
-        checkpoint, artifacts, batches, model_factory=model_factory
-    )
+    store = run_collect(checkpoint, artifacts, batches, model_factory=model_factory)
 
     assert store.is_target_complete(0)
     assert store.is_target_complete(1)
@@ -102,15 +100,15 @@ def test_resume_skips_completed_target_and_uses_persisted_boundary(tmp_path):
         checkpoint,
         artifacts,
         batches,
-        forward_target=lambda target, value: (
-            calls.append(target) or target(value)
-        ),
+        forward_target=lambda target, value: (calls.append(target) or target(value)),
     )
     assert len(calls) == 1
     assert ArtifactStore(artifacts).is_target_complete(1)
 
 
-@pytest.mark.parametrize("modifier", ["AWQModifier", "SmoothQuantModifier", "AutoRoundModifier"])
+@pytest.mark.parametrize(
+    "modifier", ["AWQModifier", "SmoothQuantModifier", "AutoRoundModifier"]
+)
 def test_rejects_non_reference_recipe(modifier, tmp_path):
     checkpoint, _ = checkpoint_for(tmp_path)
     with pytest.raises(ValueError, match=modifier):

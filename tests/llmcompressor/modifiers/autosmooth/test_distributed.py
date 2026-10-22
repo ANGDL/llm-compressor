@@ -100,7 +100,9 @@ def test_autosmooth_distributed_allreduce_pipeline(monkeypatch):
             1,
         )
 
-        minmax_scales = modifier._resolve_activation_scales(mapping, torch.device("cpu"))
+        minmax_scales = modifier._resolve_activation_scales(
+            mapping, torch.device("cpu")
+        )
         torch.testing.assert_close(
             minmax_scales,
             torch.tensor([4.0, 8.0, 9.0, 8.0], dtype=torch.float32),

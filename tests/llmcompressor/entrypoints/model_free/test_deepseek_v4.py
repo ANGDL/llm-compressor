@@ -16,9 +16,7 @@ def test_dequantizes_packed_fp4_weight_and_removes_source_scale():
         "layers.0.ffn.experts.0.w1.weight": torch.tensor(
             [[0x12, 0x34], [0x98, 0x76]], dtype=torch.uint8
         ).view(torch.int8),
-        "layers.0.ffn.experts.0.w1.scale": torch.full(
-            (2, 2), 127, dtype=torch.uint8
-        ),
+        "layers.0.ffn.experts.0.w1.scale": torch.full((2, 2), 127, dtype=torch.uint8),
     }
 
     assert converter.process_non_quantized(tensors, "cpu") is tensors
@@ -60,9 +58,7 @@ def test_dequantizes_fp8_block_and_bf16_target():
 
 
 def test_reports_scale_dependency_for_targeted_weights_only():
-    converter = DeepSeekV4FlashConverter(
-        [r"re:.*\.attn\.wq_a$"], source_kind="fp8"
-    )
+    converter = DeepSeekV4FlashConverter([r"re:.*\.attn\.wq_a$"], source_kind="fp8")
 
     assert converter.get_dependencies("layers.0.attn.wq_a.weight") == {
         "layers.0.attn.wq_a.scale"

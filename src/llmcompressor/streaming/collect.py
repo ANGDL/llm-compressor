@@ -98,9 +98,7 @@ def _invoke_target(target: nn.Module, value: Any) -> Any:
     return target(value)
 
 
-def _module_fingerprints(
-    source_fingerprint: str, target: nn.Module, target_name: str
-):
+def _module_fingerprints(source_fingerprint: str, target: nn.Module, target_name: str):
     names = []
     for local_name, _ in target.named_parameters(recurse=True):
         names.append(f"{target_name}.{local_name}" if local_name else target_name)
@@ -157,8 +155,7 @@ def collect_calibration_statistics(
     try:
         dataset_fingerprint = str(dataset_fingerprint)
         if len(dataset_fingerprint) != 64 or any(
-            character not in "0123456789abcdef"
-            for character in dataset_fingerprint
+            character not in "0123456789abcdef" for character in dataset_fingerprint
         ):
             raise ValueError
     except (TypeError, ValueError) as error:

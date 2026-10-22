@@ -13,7 +13,6 @@ from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 from llmcompressor import oneshot
 from llmcompressor.modifiers.quantization import GPTQModifier
 
-
 MODEL_ARTIFACT_FILES = {
     "config.json",
     "model.safetensors.index.json",
@@ -61,9 +60,7 @@ if dataset_path.is_dir():
         )
     dataset = dataset.select(range(num_calibration_samples))
 else:
-    dataset = load_dataset(
-        args.dataset_id, split=f"test[:{num_calibration_samples}]"
-    )
+    dataset = load_dataset(args.dataset_id, split=f"test[:{num_calibration_samples}]")
 dataset = dataset.shuffle(seed=42)
 
 

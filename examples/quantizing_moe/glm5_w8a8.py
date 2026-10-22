@@ -3,29 +3,29 @@ import json
 import os
 from contextlib import contextmanager
 
+from compressed_tensors.offload import get_device_map, load_offloaded_model
+from compressed_tensors.offload.dispatch import dispatch_model as _dispatch_model
+from compressed_tensors.quantization import preset_name_to_scheme
+from compressed_tensors.utils import match_modules_set
 from datasets import concatenate_datasets, load_dataset
 from loguru import logger
 from torch.utils._pytree import tree_leaves
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from llmcompressor import oneshot
+from llmcompressor.logger import LoggerConfig, configure_logger
 from llmcompressor.modeling.glm_moe_dsa import CalibrationGlmMoeDsaMoE  # noqa: F401
 from llmcompressor.modeling.glm_moe_dsa_mtp import attach_mtp_layer
+from llmcompressor.modifiers.autosmooth import AutoSmoothModifier
 from llmcompressor.modifiers.gptq import GPTQModifier
 from llmcompressor.modifiers.quantization import QuantizationModifier
-from llmcompressor.modifiers.autosmooth import AutoSmoothModifier
 from llmcompressor.modifiers.transform.awq.mappings import AWQMapping
-from llmcompressor.modifiers.transform.smoothquant import SmoothQuantModifier
 from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
+from llmcompressor.modifiers.transform.smoothquant import SmoothQuantModifier
 from llmcompressor.pipelines.basic import pipeline as basic_pipeline
 from llmcompressor.pipelines.data_free import pipeline as data_free_pipeline
-from llmcompressor.utils.pytorch.module import get_module_to_name_dict
 from llmcompressor.utils import ImatrixFallbackStats
-from compressed_tensors.offload import get_device_map, load_offloaded_model
-from compressed_tensors.offload.dispatch import dispatch_model as _dispatch_model
-from compressed_tensors.quantization import preset_name_to_scheme
-from compressed_tensors.utils import match_modules_set
-from llmcompressor.logger import LoggerConfig, configure_logger
+from llmcompressor.utils.pytorch.module import get_module_to_name_dict
 
 configure_logger(LoggerConfig(console_log_level="DEBUG"))
 
@@ -35,11 +35,14 @@ Usage example for quantizing GLM-5.1 with MoE layers to W8A8 using LLM Compresso
 1. 更改权重文件中的generation_config.json, 添加："do_sample": true
 2. 量化
 python glm5_w8a8.py --model_id /ssd4/models/GLM-5.3-BF16/ \
-    --save_dir /ssd2/models/ --transform "" --modifier RTN  \
+    --save_dir /ssd2/models/ --transform "" --modifier RTN \
     --observer imatrix_mse --num_calibration_samples 256 --max_sequence_length 8192 \
-    --dataset_id ./ultrachat_200k ./calibration_data_deepseek-v4-flash-0731.jsonl --dataset_split train_sft  \
-    --indexer-ignore-mode indexer_all --dispatch_extra_memory_gb 10 --pipeline sequential
+    --dataset_id ./ultrachat_200k \
+    ./calibration_data_deepseek-v4-flash-0731.jsonl --dataset_split train_sft \
+    --indexer-ignore-mode indexer_all --dispatch_extra_memory_gb 10 \
+    --pipeline sequential
 """
+
 
 def positive_int(value: str) -> int:
     parsed = int(value)
@@ -154,7 +157,10 @@ parser.add_argument(
     "--max-memory-cpu-gb",
     type=float,
     default=1500.0,
-    help="Max CPU memory in GB for model loading (passed as max_memory={'cpu': <value>e9}).",
+    help=(
+        "Max CPU memory in GB for model loading "
+        "(passed as max_memory={'cpu': <value>e9})."
+    ),
 )
 parser.add_argument(
     "--autosmooth-activation-scale-type",
@@ -409,13 +415,12 @@ _full_prefix = (
 )
 # shared 前缀：仅在 GLM-5.2 上非空。
 _shared_prefix = (
-    rf"^model\.layers\.{_alt(_shared_layer_idx)}\."
-    if _shared_layer_idx
-    else None
+    rf"^model\.layers\.{_alt(_shared_layer_idx)}\." if _shared_layer_idx else None
 )
 
 autosmooth_mappings: list[AWQMapping] = [
-    # ---- full 层 + MTP：input_layernorm → q_a_proj / kv_a_proj_with_mqa / indexer.wk / indexer.weights_proj
+    # ---- full 层 + MTP：input_layernorm → q_a_proj / kv_a_proj_with_mqa /
+    # indexer.wk / indexer.weights_proj
     AWQMapping(
         smooth_layer=rf"re:{_full_prefix}input_layernorm$",
         balance_layers=[
@@ -440,7 +445,8 @@ autosmooth_mappings: list[AWQMapping] = [
         smooth_layer=r"re:.*kv_a_layernorm$",
         balance_layers=[r"re:.*kv_b_proj$"],
     ),
-    # ---- 通用：up_proj → down_proj（dense MLP / shared_experts / 每个 routed expert 都覆盖）
+    # ---- 通用：up_proj → down_proj（dense MLP / shared_experts /
+    # 每个 routed expert 都覆盖）
     AWQMapping(
         smooth_layer=r"re:.*up_proj$",
         balance_layers=[r"re:.*down_proj$"],
@@ -492,7 +498,10 @@ def print_autosmooth_matches(model, mappings: list[AWQMapping]):
                 module_to_name.get(layer, "<unnamed>") for layer in balance_layers
             ]
 
-            if any(name.endswith("self_attn.indexer.weights_proj") for name in balance_names):
+            if any(
+                name.endswith("self_attn.indexer.weights_proj")
+                for name in balance_names
+            ):
                 matched_weights_proj = True
 
             print(f"  [{resolved_count}] smooth: {smooth_name}")

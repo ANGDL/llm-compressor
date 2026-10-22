@@ -3,13 +3,11 @@ import os
 import shutil
 from pathlib import Path
 
-import torch
 from datasets import Dataset, load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from llmcompressor import oneshot
 from llmcompressor.modifiers.quantization import GPTQModifier
-from llmcompressor.utils import dispatch_for_generation
 
 MODEL_ARTIFACT_FILES = {
     "config.json",

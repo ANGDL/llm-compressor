@@ -1,13 +1,12 @@
-import torch
+import os
+
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from llmcompressor import oneshot
-from llmcompressor.utils import dispatch_for_generation
-from llmcompressor.modifiers.quantization import GPTQModifier
-from llmcompressor.modifiers.autosmooth import AutoSmoothModifier
 from llmcompressor.modifiers.awq import AWQMapping
-import os
+from llmcompressor.modifiers.quantization import GPTQModifier
+from llmcompressor.utils import dispatch_for_generation
 
 # select a Mixture of Experts model for quantization
 MODEL_ID = "/ssd1/model/Qwen3-Next-80B-A3B-Instruct"
@@ -69,7 +68,8 @@ mapping = [
         [
             "re:.*block_sparse_moe.experts.*.w1$",
             "re:.*block_sparse_moe.experts.*.w3$",
-            # Balance the router to avoid changing expert routing probabilities when smoothing.
+            # Balance the router to avoid changing expert routing
+            # probabilities when smoothing.
             "re:.*block_sparse_moe.gate$",
         ],
     ),
@@ -81,16 +81,18 @@ mapping = [
 
 # Recipe
 recipe = [
-    # AutoSmoothModifier(activation_scale_type="mean", norm_func='adaptive', mappings=mapping),
+    # AutoSmoothModifier(
+    #     activation_scale_type="mean", norm_func='adaptive', mappings=mapping
+    # ),
     GPTQModifier(
         targets="Linear",
         scheme="W8A8",
         ignore=[
             "lm_head",
-             "re:.*mlp.gate$",
-             "re:.*mlp.shared_expert_gate$",
-             "re:.*linear_attn.*",
-            ],
+            "re:.*mlp.gate$",
+            "re:.*mlp.shared_expert_gate$",
+            "re:.*linear_attn.*",
+        ],
     ),
 ]
 

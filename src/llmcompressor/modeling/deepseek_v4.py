@@ -1,7 +1,9 @@
 import torch
 
 from llmcompressor.modeling.deepseekv4.config import ModelConfig
-from llmcompressor.modeling.deepseekv4.model import DeepseekV4MoE as OriginalDeepseekV4MoE
+from llmcompressor.modeling.deepseekv4.model import (
+    DeepseekV4MoE as OriginalDeepseekV4MoE,
+)
 from llmcompressor.modeling.moe_context import MoECalibrationModule
 
 
@@ -24,13 +26,17 @@ class CalibrationDeepseekV4MoE(MoECalibrationModule):
         self.shared_experts = original.shared_experts
         self.calibrate_all_experts = calibrate_all_experts
 
-    def forward(self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None
+    ) -> torch.Tensor:
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.dim)
         flat_ids = None if input_ids is None else input_ids.flatten()
         weights, indices = self.gate(hidden_states, flat_ids)
         output = torch.zeros_like(hidden_states, dtype=torch.float32)
-        expert_mask = torch.nn.functional.one_hot(indices, num_classes=self.n_routed_experts)
+        expert_mask = torch.nn.functional.one_hot(
+            indices, num_classes=self.n_routed_experts
+        )
         expert_mask = expert_mask.permute(2, 0, 1)
 
         for expert_index, expert in enumerate(self.experts):

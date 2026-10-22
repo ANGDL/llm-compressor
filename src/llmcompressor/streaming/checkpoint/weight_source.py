@@ -20,9 +20,7 @@ class CheckpointWeightSource(Protocol):
 
     def metadata(self, name: str) -> TensorMetadata: ...
 
-    def load_tensors_cpu(
-        self, names: Iterable[str]
-    ) -> dict[str, torch.Tensor]: ...
+    def load_tensors_cpu(self, names: Iterable[str]) -> dict[str, torch.Tensor]: ...
 
     def iter_tensor_groups_cpu(
         self, groups: Iterable[Iterable[str]]
@@ -41,9 +39,7 @@ class SafetensorsWeightSource:
     def metadata(self, name: str) -> TensorMetadata:
         return self.weight_map.metadata(name)
 
-    def load_tensors_cpu(
-        self, names: Iterable[str]
-    ) -> dict[str, torch.Tensor]:
+    def load_tensors_cpu(self, names: Iterable[str]) -> dict[str, torch.Tensor]:
         grouped = defaultdict(list)
         requested = list(dict.fromkeys(names))
         for name in requested:

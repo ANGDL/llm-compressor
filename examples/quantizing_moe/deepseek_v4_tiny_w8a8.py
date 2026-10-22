@@ -1,18 +1,18 @@
-from pathlib import Path
 import os
+from pathlib import Path
 
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
-import torch
-from datasets import Dataset
-from torch.utils.data import DataLoader
+import torch  # noqa: E402
+from datasets import Dataset  # noqa: E402
+from torch.utils.data import DataLoader  # noqa: E402
 
-from llmcompressor import oneshot
-from llmcompressor.modeling.deepseekv4.config import ModelConfig
-from llmcompressor.modeling.deepseekv4.model import DeepseekV4NativeForCausalLM
-from llmcompressor.modifiers.gptq import GPTQModifier
-from llmcompressor.modifiers.autosmooth import AutoSmoothModifier
-from llmcompressor.modifiers.quantization import QuantizationModifier
+from llmcompressor import oneshot  # noqa: E402
+from llmcompressor.modeling.deepseekv4.config import ModelConfig  # noqa: E402
+from llmcompressor.modeling.deepseekv4.model import (  # noqa: E402
+    DeepseekV4NativeForCausalLM,
+)
+from llmcompressor.modifiers.quantization import QuantizationModifier  # noqa: E402
 
 
 def build_tiny_config() -> ModelConfig:
@@ -76,13 +76,13 @@ def main():
             targets="Linear",
             scheme="W8A8",
             ignore=[
-                "lm_head", 
-                're:.*attn.compressor.wgate$', 
-                're:.*attn.compressor.wkv$',
-                're:.*attn.indexer.compressor.wgate$',
-                're:.*attn.indexer.compressor.wkv$',
-                're:.*attn.indexer.weights_proj$',
-                ],
+                "lm_head",
+                "re:.*attn.compressor.wgate$",
+                "re:.*attn.compressor.wkv$",
+                "re:.*attn.indexer.compressor.wgate$",
+                "re:.*attn.indexer.compressor.wkv$",
+                "re:.*attn.indexer.weights_proj$",
+            ],
         )
     ]
 
@@ -97,7 +97,9 @@ def main():
         "Explain mixture-of-experts in one paragraph.",
         "Give tips for validating compressed checkpoints.",
     ]
-    raw_text = [prompts[index % len(prompts)] for index in range(num_calibration_samples)]
+    raw_text = [
+        prompts[index % len(prompts)] for index in range(num_calibration_samples)
+    ]
     ds = Dataset.from_dict({"text": raw_text}).shuffle(seed=42)
 
     def preprocess(example):
@@ -118,8 +120,12 @@ def main():
 
     def collate_fn(batch):
         return {
-            "input_ids": torch.tensor([row["input_ids"] for row in batch], dtype=torch.long),
-            "attention_mask": torch.tensor([row["attention_mask"] for row in batch], dtype=torch.long),
+            "input_ids": torch.tensor(
+                [row["input_ids"] for row in batch], dtype=torch.long
+            ),
+            "attention_mask": torch.tensor(
+                [row["attention_mask"] for row in batch], dtype=torch.long
+            ),
         }
 
     calibration_dataloader = DataLoader(
@@ -151,6 +157,7 @@ def main():
 
     model.save_raw_format = True
     import llmcompressor.transformers.compression.compressed_tensors_utils as ct_utils
+
     original_from_accelerate = ct_utils.from_accelerate
     ct_utils.from_accelerate = lambda model: ({}, None)
     try:
@@ -159,8 +166,10 @@ def main():
         ct_utils.from_accelerate = original_from_accelerate
 
     with torch.no_grad():
-           reloaded = DeepseekV4NativeForCausalLM.from_pretrained(sym_save_dir, dtype=torch.bfloat16)
-           reloaded = reloaded.to(torch.bfloat16)
+        reloaded = DeepseekV4NativeForCausalLM.from_pretrained(
+            sym_save_dir, dtype=torch.bfloat16
+        )
+        reloaded = reloaded.to(torch.bfloat16)
     print("post-reload logits:", reloaded(input_ids=sample).logits.shape)
     print(f"saved to: {save_dir}")
 

@@ -1,7 +1,9 @@
 import torch
 
 from llmcompressor.modeling.deepseekv32.config import ModelConfig
-from llmcompressor.modeling.deepseekv32.model import DeepseekV32MoE as OriginalDeepseekV32MoE
+from llmcompressor.modeling.deepseekv32.model import (
+    DeepseekV32MoE as OriginalDeepseekV32MoE,
+)
 from llmcompressor.modeling.moe_context import MoECalibrationModule
 
 
@@ -49,7 +51,9 @@ class CalibrationDeepseekV32MoE(MoECalibrationModule):
                 expert_output = expert(hidden_states)
                 if has_tokens:
                     expert_weights = weights[token_indices, weight_indices]
-                    routed_output = expert_output[token_indices] * expert_weights.unsqueeze(-1)
+                    routed_output = expert_output[
+                        token_indices
+                    ] * expert_weights.unsqueeze(-1)
                     final_hidden_states.index_add_(0, token_indices, routed_output)
             elif has_tokens:
                 expert_input = hidden_states[token_indices]

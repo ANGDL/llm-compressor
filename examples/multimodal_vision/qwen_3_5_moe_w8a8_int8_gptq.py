@@ -6,14 +6,13 @@ from io import BytesIO
 from pathlib import Path
 
 import torch
+from compressed_tensors.utils import save_mtp_tensors_to_checkpoint
 from datasets import Dataset, load_dataset
 from qwen_vl_utils import process_vision_info
 from transformers import AutoProcessor, Qwen3_5MoeForConditionalGeneration
 
-from compressed_tensors.utils import save_mtp_tensors_to_checkpoint
 from llmcompressor import oneshot
 from llmcompressor.modifiers.quantization import GPTQModifier
-
 
 MODEL_ARTIFACT_FILES = {
     "config.json",
@@ -62,9 +61,7 @@ if dataset_path.is_dir():
         )
     dataset = dataset.select(range(num_calibration_samples))
 else:
-    dataset = load_dataset(
-        args.dataset_id, split=f"test[:{num_calibration_samples}]"
-    )
+    dataset = load_dataset(args.dataset_id, split=f"test[:{num_calibration_samples}]")
 dataset = dataset.shuffle(seed=42)
 
 

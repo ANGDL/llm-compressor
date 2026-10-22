@@ -1,21 +1,16 @@
-from llmcompressor.modeling.step3p5 import CalibrationStep3p5MoEMLP  # noqa: F401
+import argparse
+import os
 
-from compressed_tensors.offload import dispatch_model
+import torch
 from compressed_tensors.quantization import preset_name_to_scheme
 from compressed_tensors.utils import save_mtp_tensors_to_checkpoint
-
+from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from llmcompressor import oneshot
+from llmcompressor.modeling.step3p5 import CalibrationStep3p5MoEMLP  # noqa: F401
 from llmcompressor.modifiers.quantization import QuantizationModifier
 from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
-
-from datasets import load_dataset
-
-import argparse
-import os
-import torch
-
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--quantize-only-moe", action="store_true")
@@ -28,7 +23,9 @@ args = parser.parse_args()
 # Select model and load it.
 model_id = "/ssd2/models/Step-3.5-Flash"
 
-model = AutoModelForCausalLM.from_pretrained(model_id, dtype="auto", trust_remote_code=True)
+model = AutoModelForCausalLM.from_pretrained(
+    model_id, dtype="auto", trust_remote_code=True
+)
 tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
 
 # Select calibration dataset.
@@ -45,6 +42,7 @@ DATASET_SPLIT = "train_sft"
 ds = load_dataset(DATASET_ID, split=f"{DATASET_SPLIT}[:{NUM_CALIBRATION_SAMPLES}]")
 ds = ds.shuffle(seed=42)
 
+
 def preprocess(example):
     return {
         "text": tokenizer.apply_chat_template(
@@ -53,7 +51,9 @@ def preprocess(example):
         )
     }
 
+
 ds = ds.map(preprocess)
+
 
 # Tokenize inputs.
 def tokenize(sample):
@@ -134,9 +134,12 @@ SAVE_DIR = model_id.rstrip("/").split("/")[-1] + "-W8A8"
 SAVE_DIR = os.path.join("/ssd2/models", SAVE_DIR)
 tokenizer.save_pretrained(SAVE_DIR)
 try:
-    model.save_pretrained(SAVE_DIR, save_compressed=True, max_shard_size='10GB')
+    model.save_pretrained(SAVE_DIR, save_compressed=True, max_shard_size="10GB")
 except torch.OutOfMemoryError as e:
-    print(f"This error is just for accelerator dispatch, and can be ignored if it happens during saving: {e}")
+    print(
+        f"This error is just for accelerator dispatch, and can be ignored "
+        f"if it happens during saving: {e}"
+    )
 
 for i, mtp_id in enumerate(["45", "46", "47"]):
     mtp_prefix = f"model.layers.{mtp_id}"

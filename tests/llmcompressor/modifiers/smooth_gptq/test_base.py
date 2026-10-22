@@ -4,13 +4,13 @@ from typing import cast
 
 import pytest
 
+import llmcompressor.modifiers.smooth_gptq.base as smooth_gptq_base
 from llmcompressor.core import Event, EventType, State
 from llmcompressor.modifiers.awq import AWQMapping
 from llmcompressor.modifiers.smooth_gptq.base import (
     SmoothGPTQModifier,
     _backup_ignore,
 )
-import llmcompressor.modifiers.smooth_gptq.base as smooth_gptq_base
 
 
 class _FakeModel:

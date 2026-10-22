@@ -164,9 +164,7 @@ def test_finalize_refuses_existing_or_source_output(tmp_path):
 
 
 @pytest.mark.parametrize(("num_bits", "expected_columns"), [(8, 4), (4, 2)])
-def test_finalize_accepts_int_quantized_weight(
-    tmp_path, num_bits, expected_columns
-):
+def test_finalize_accepts_int_quantized_weight(tmp_path, num_bits, expected_columns):
     checkpoint, artifacts, _, _ = prepare(tmp_path)
     dense_scheme = scheme()
     dense_scheme.weights.num_bits = num_bits
@@ -244,9 +242,7 @@ def test_finalize_omits_identical_declared_tied_weight(tmp_path, monkeypatch):
         output_dir=tmp_path / "tied-output",
         validate_config=False,
     )
-    output_index = json.loads(
-        (output / "model.safetensors.index.json").read_text()
-    )
+    output_index = json.loads((output / "model.safetensors.index.json").read_text())
     assert "layers.0.weight" in output_index["weight_map"]
     assert "lm_head.weight" not in output_index["weight_map"]
 
@@ -309,6 +305,3 @@ def test_finalize_copy_auxiliary_directory_when_destination_already_exists(
         validate_config=False,
     )
     assert (output2 / "custom_module" / "custom.py").is_file()
-
-
-

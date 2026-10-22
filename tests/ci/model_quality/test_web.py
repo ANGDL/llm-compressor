@@ -170,7 +170,6 @@ def test_store_tails_large_log_from_window(tmp_path: Path) -> None:
     ]
 
 
-
 def test_store_truncates_oversized_log_lines(tmp_path: Path) -> None:
     _make_run(tmp_path)
     log = (
