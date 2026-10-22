@@ -25,9 +25,7 @@ def test_tiny_llama_streaming_checkpoint_loads_and_forwards(tmp_path):
     input_ids = torch.tensor([[1, 2, 3, 4]])
     hidden_states = reference.model.embed_tokens(input_ids)
     position_ids = torch.arange(input_ids.shape[1]).unsqueeze(0)
-    position_embeddings = reference.model.rotary_emb(
-        hidden_states, position_ids
-    )
+    position_embeddings = reference.model.rotary_emb(hidden_states, position_ids)
     batches = [
         {
             "hidden_states": hidden_states,
@@ -45,8 +43,7 @@ def test_tiny_llama_streaming_checkpoint_loads_and_forwards(tmp_path):
     module_names = [
         name
         for name, module in reference.named_modules()
-        if isinstance(module, torch.nn.Linear)
-        and name.startswith("model.layers.")
+        if isinstance(module, torch.nn.Linear) and name.startswith("model.layers.")
     ]
     schemes = {
         name: QuantizationScheme(

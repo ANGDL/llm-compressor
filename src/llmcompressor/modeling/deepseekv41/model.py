@@ -317,9 +317,7 @@ class Attention(nn.Module):
         config = self.config
         freqs = self.freqs_cis[: x.shape[1]].to(x.device)
         qr, q = self.project_query(x, freqs)
-        window_kv = _rotate_tail(
-            self.kv_norm(self.wkv(x)), freqs, config.rope_head_dim
-        )
+        window_kv = _rotate_tail(self.kv_norm(self.wkv(x)), freqs, config.rope_head_dim)
         positions = torch.arange(x.shape[1], device=x.device)
         window = positions[:, None] - config.window_size + 1
         window = window + torch.arange(config.window_size, device=x.device)
@@ -391,9 +389,7 @@ class Attention(nn.Module):
                 group_freqs = self.freqs_cis[
                     group_positions.to(self.freqs_cis.device)
                 ].to(x.device)
-                new_compressed = _rotate_tail(
-                    latent, group_freqs, config.rope_head_dim
-                )
+                new_compressed = _rotate_tail(latent, group_freqs, config.rope_head_dim)
                 cache.append(state, "compressed", new_compressed)
                 cache.append(state, "compressed_mask", new_mask)
             compressed = source.state["compressed"]
@@ -538,9 +534,7 @@ class DeepseekV41MoE(nn.Module):
 
 
 class DeepseekV41Block(nn.Module):
-    def __init__(
-        self, config, layer_id, *, vision=True, engram_checkpoint=None
-    ):
+    def __init__(self, config, layer_id, *, vision=True, engram_checkpoint=None):
         super().__init__()
         self.config = config
         self.layer_id = layer_id

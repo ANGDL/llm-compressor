@@ -53,10 +53,10 @@ from compressed_tensors.quantization.quant_args import (
     QuantizationStrategy,
     QuantizationType,
 )
+from datasets import Dataset, load_dataset
 from torch.utils.data import DataLoader
 from transformers import AutoProcessor
 
-from datasets import Dataset, load_dataset
 from llmcompressor.modeling.kimi_k3 import (
     KimiK3Config,
     KimiK3ForConditionalGeneration,
@@ -267,9 +267,7 @@ def _index_weight_map(model_id: Path) -> dict[str, str]:
     return weight_map
 
 
-def _expert_targets_from_index(
-    model_id: Path, config: Any
-) -> tuple[str, set[str]]:
+def _expert_targets_from_index(model_id: Path, config: Any) -> tuple[str, set[str]]:
     """Validate native MXFP4 expert keys and return a structural target regex."""
     weight_map = _index_weight_map(model_id)
     all_scale_keys = {key for key in weight_map if key.endswith(".weight_scale")}
@@ -551,9 +549,7 @@ def main() -> None:
             batch_size=args.batch_size,
             shuffle_calibration_samples=False,
             moe_calibrate_all_experts=args.moe_calibrate_all_experts,
-            materializer=KimiK3WeightMaterializer(
-                kda_num_heads=_kda_num_heads(config)
-            ),
+            materializer=KimiK3WeightMaterializer(kda_num_heads=_kda_num_heads(config)),
             # Keep adjacent boundaries in memory and publish final shards only.
             checkpoint_progress=False,
             # K3 downstream readers expect packed INT4 tensors in the output.

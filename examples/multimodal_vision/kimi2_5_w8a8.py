@@ -1,28 +1,30 @@
 import argparse
 import base64
-from io import BytesIO
 import os
 from contextlib import contextmanager
+from io import BytesIO
 
-from datasets import load_dataset
 import torch
+from compressed_tensors.offload import get_device_map
+from compressed_tensors.offload.dispatch import dispatch_model as _dispatch_model
+from compressed_tensors.quantization import preset_name_to_scheme
+from datasets import load_dataset
 from transformers import AutoProcessor
 
 from llmcompressor import oneshot
 from llmcompressor.modeling import load_kimi_k25_model
+from llmcompressor.modifiers.gptq import GPTQModifier
+from llmcompressor.modifiers.quantization import QuantizationModifier
+from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
 from llmcompressor.pipelines.basic import pipeline as basic_pipeline
 from llmcompressor.pipelines.data_free import pipeline as data_free_pipeline
-from llmcompressor.modifiers.quantization import QuantizationModifier
-from llmcompressor.modifiers.gptq import GPTQModifier
-from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
-from compressed_tensors.offload import get_device_map, load_offloaded_model
-from compressed_tensors.offload.dispatch import dispatch_model as _dispatch_model
-from compressed_tensors.quantization import preset_name_to_scheme
-
 
 """
 Usage:
-    python kimi2_5_w8a8.py --model_id /ssd3/models/Kimi-K2.6-bf16/ --dataset_id /data/quant/lmms-lab___flickr30k --text_calibration_samples 256 --modifier=RTN --observer imatrix_mse > k26.log 2>&1 &
+    python kimi2_5_w8a8.py --model_id /ssd3/models/Kimi-K2.6-bf16/ \
+        --dataset_id /data/quant/lmms-lab___flickr30k \
+        --text_calibration_samples 256 --modifier=RTN \
+        --observer imatrix_mse > k26.log 2>&1 &
 """
 
 parser = argparse.ArgumentParser()
@@ -106,6 +108,7 @@ MAX_SEQUENCE_LENGTH = 8192
 ds = load_dataset(DATASET_ID, split=f"{DATASET_SPLIT}[:{NUM_CALIBRATION_SAMPLES}]")
 ds = ds.shuffle(seed=42)
 
+
 # Apply chat template and tokenize inputs.
 def preprocess_and_tokenize(example):
     # preprocess
@@ -124,13 +127,8 @@ def preprocess_and_tokenize(example):
         },
         {
             "role": "assistant",
-            "content": [
-                {
-                "text": f"{example['caption'][0]}",
-                "type": "text"
-                }
-            ],
-        }
+            "content": [{"text": f"{example['caption'][0]}", "type": "text"}],
+        },
     ]
 
     return processor(
@@ -155,6 +153,7 @@ def data_collator(batch):
         )
         for key, value in batch[0].items()
     }
+
 
 ignores = [
     # Ignore the output head

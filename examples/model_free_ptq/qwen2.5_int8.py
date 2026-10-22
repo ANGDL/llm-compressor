@@ -1,4 +1,5 @@
 import os
+
 from llmcompressor import model_free_ptq
 
 MODEL_ID = "/ssd2/models/Qwen2.5-32B-Instruct"

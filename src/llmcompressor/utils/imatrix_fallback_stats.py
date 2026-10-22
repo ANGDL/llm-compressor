@@ -223,18 +223,14 @@ def _install_class_patches():
         return original_gatherer_init(self, state, **kwargs)
 
     def _attach_with_module_name(self, module):
-        self._imatrix_script_module_name = (
-            ImatrixFallbackStats._module_name_by_id.get(
-                id(module),
-                module.__class__.__name__,
-            )
+        self._imatrix_script_module_name = ImatrixFallbackStats._module_name_by_id.get(
+            id(module),
+            module.__class__.__name__,
         )
         return original_attach(self, module)
 
     def _validate_with_stats(self, observed):
-        module_name = getattr(
-            self, "_imatrix_script_module_name", "<unknown>"
-        )
+        module_name = getattr(self, "_imatrix_script_module_name", "<unknown>")
         token = ImatrixFallbackStats._current_module.set(module_name)
         try:
             return original_validate(self, observed)

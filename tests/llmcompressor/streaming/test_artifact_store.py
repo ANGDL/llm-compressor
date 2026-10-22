@@ -56,9 +56,7 @@ def initialized_store(tmp_path):
     store = ArtifactStore(tmp_path / "artifacts")
     recipe = {"GPTQModifier": {"block_size": 128}}
     manifest = make_manifest(fingerprint_checkpoint(checkpoint))
-    store.initialize(
-        manifest, normalized_recipe=recipe, targets=["model.layers.0"]
-    )
+    store.initialize(manifest, normalized_recipe=recipe, targets=["model.layers.0"])
     return store, manifest, recipe
 
 

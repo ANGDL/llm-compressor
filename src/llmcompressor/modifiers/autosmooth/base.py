@@ -1,6 +1,6 @@
-from copy import deepcopy
 import inspect
 from contextlib import ExitStack, nullcontext
+from copy import deepcopy
 from typing import Iterator, Literal
 
 import torch
@@ -22,7 +22,6 @@ from compressed_tensors.utils import (
     update_offload_parameter,
 )
 from compressed_tensors.utils.match import is_match
-
 from loguru import logger
 from pydantic import ConfigDict, PrivateAttr, field_validator
 from torch import distributed as dist
@@ -33,16 +32,16 @@ from tqdm import tqdm
 from llmcompressor._torch_accelerator_compat import accelerator_device
 from llmcompressor.core import Event, EventType, State, active_session
 from llmcompressor.modifiers import Modifier
-from llmcompressor.modifiers.transform.awq.mappings import (
-    AWQMapping,
-    ResolvedMapping,
+from llmcompressor.modifiers.quantization.calibration import (
+    observe,
+    update_qparams,
 )
 from llmcompressor.modifiers.transform.awq.dynamic_mappings import (
     get_layer_mappings_from_model,
 )
-from llmcompressor.modifiers.quantization.calibration import (
-    observe,
-    update_qparams,
+from llmcompressor.modifiers.transform.awq.mappings import (
+    AWQMapping,
+    ResolvedMapping,
 )
 from llmcompressor.modifiers.utils.hooks import HooksMixin
 from llmcompressor.modifiers.utils.pytorch_helpers import is_moe_model
@@ -55,6 +54,7 @@ from llmcompressor.utils.helpers import calibration_forward_context
 from llmcompressor.utils.pytorch.module import (
     get_module_to_name_dict,
 )
+
 __all__ = ["AutoSmoothModifier"]
 
 
@@ -175,9 +175,7 @@ class AutoSmoothModifier(Modifier):
 
     """
 
-    model_config: ConfigDict = ConfigDict(
-        arbitrary_types_allowed=True, extra="forbid"
-    )
+    model_config: ConfigDict = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
 
     requires_calibration_data: bool = True
 
@@ -212,7 +210,6 @@ class AutoSmoothModifier(Modifier):
     # List to store error metrics for each layer
     _error_metrics: list[dict] = PrivateAttr(default_factory=list)
 
-
     def on_initialize(self, state: State, **kwargs) -> bool:
         """
         Initialize AutoSmooth. This runs before quantization config has been applied.
@@ -224,7 +221,9 @@ class AutoSmoothModifier(Modifier):
         """
 
         if self.mappings is None:
-            logger.info("No AutoSmoothModifier.mappings provided, inferring from model...")
+            logger.info(
+                "No AutoSmoothModifier.mappings provided, inferring from model..."
+            )
             self.mappings = get_layer_mappings_from_model(state.model)
 
         # Set default offload_device
@@ -250,8 +249,7 @@ class AutoSmoothModifier(Modifier):
             return
 
         if any(
-            qargs is not None
-            and qargs.strategy == QuantizationStrategy.TENSOR
+            qargs is not None and qargs.strategy == QuantizationStrategy.TENSOR
             for qargs in self._autosmooth_weight_qargs.values()
         ):
             raise ValueError(
@@ -352,7 +350,7 @@ class AutoSmoothModifier(Modifier):
 
         # remove activation hooks
         self.remove_hooks()
- 
+
     def on_finalize(self, state: State, **kwargs) -> bool:
         """
         Clean up by clearing the activations and mapping data
@@ -406,13 +404,14 @@ class AutoSmoothModifier(Modifier):
             ):
                 if len(smooth_layers) > 1:
                     raise ValueError(
-                        "Smooth needs to match a single smoothlayer for each mapping but "
+                        "Smooth needs to match a single smoothlayer for each "
+                        "mapping but "
                         f"got {[module_to_name.get(s) for s in smooth_layers]}"
                         f" for mapping: {mapping}"
                     )
                 smooth_layer = smooth_layers[0]
                 smooth_name = module_to_name.get(smooth_layer)
-                if 'norm' in smooth_name.lower():
+                if "norm" in smooth_name.lower():
                     setattr(smooth_layer, "norm_bias", mapping.norm_bias)
 
                 # [[b00, b01, b02...], [b10, b11, b12,...], ...] ↓
@@ -536,7 +535,7 @@ class AutoSmoothModifier(Modifier):
                     if self.activation_scale_type == "minmax"
                     else cached_activations.abs()
                 )
-                
+
                 match self.activation_scale_type:
                     case "max":
                         self._smooth_activation_scales[smooth_name] = _accumulate_max(
@@ -647,7 +646,8 @@ class AutoSmoothModifier(Modifier):
                         "info",
                         f"Skipping smooth_layer {mapping.smooth_name}, no activations "
                         "found to scale. This can occasionally occur in MoE models "
-                        "when certain experts are not activated by calibration samples.",
+                        "when certain experts are not activated by "
+                        "calibration samples.",
                     )
                     del self._smooth_activation_scales[mapping.smooth_name]
                     continue
@@ -684,7 +684,9 @@ class AutoSmoothModifier(Modifier):
                             update_offload_parameter(
                                 module,
                                 "weight",
-                                module.weight.add_(norm_bias).div_(scales).sub_(norm_bias),
+                                module.weight.add_(norm_bias)
+                                .div_(scales)
+                                .sub_(norm_bias),
                             )
                         else:
                             # NOTE: edge case when smooth layer number of out_features
@@ -694,7 +696,9 @@ class AutoSmoothModifier(Modifier):
                             # because the desired smooth layer is v_proj
                             # https://github.com/casper-hansen/AutoAWQ/blob/main/awq/quantize/scale.py#L123
                             weight = module.weight
-                            weight[-scales.size(0) :].add_(norm_bias).div_(scales.view(-1, 1)).sub_(norm_bias)
+                            weight[-scales.size(0) :].add_(norm_bias).div_(
+                                scales.view(-1, 1)
+                            ).sub_(norm_bias)
                             update_offload_parameter(module, "weight", weight)
                         if hasattr(module, "bias") and module.bias is not None:
                             update_offload_parameter(
@@ -807,7 +811,9 @@ class AutoSmoothModifier(Modifier):
         # unscale). Both are smoothed in _apply_smoothing.
         balance_layer_info: list[tuple[Module, str, QuantizationArgs | None]] = []
 
-        for balance_layer, balance_name in zip(mapping.balance_layers, mapping.balance_names):
+        for balance_layer, balance_name in zip(
+            mapping.balance_layers, mapping.balance_names
+        ):
             w_qscheme = self._autosmooth_weight_qargs.get(balance_layer)
             balance_layer_info.append((balance_layer, balance_name, w_qscheme))
 
@@ -825,9 +831,7 @@ class AutoSmoothModifier(Modifier):
 
         if self.duo_scaling and has_quantized_layers:
             weight_scale_layers = (
-                balance_layer_info
-                if self.include_nonq_wscale
-                else quantized_layers
+                balance_layer_info if self.include_nonq_wscale else quantized_layers
             )
             w_scales = self._compute_layer_scales(
                 [bl for bl, _, _ in weight_scale_layers],
@@ -867,7 +871,9 @@ class AutoSmoothModifier(Modifier):
             if has_quantized_layers:
                 for balance_layer, _, w_qscheme in quantized_layers:
                     observe(balance_layer, "weight")
-                    weight_observer: Observer = getattr(balance_layer, "weight_observer")
+                    weight_observer: Observer = getattr(
+                        balance_layer, "weight_observer"
+                    )
                     init_qparams = weight_observer.get_qparams()
 
                     if not hasattr(balance_layer, "weight_scale"):
@@ -879,7 +885,9 @@ class AutoSmoothModifier(Modifier):
                             )
                         )
 
-                    if (not w_qscheme.symmetric) and (not hasattr(balance_layer, "weight_zero_point")):
+                    if (not w_qscheme.symmetric) and (
+                        not hasattr(balance_layer, "weight_zero_point")
+                    ):
                         zero_point_patch_layers.append(balance_layer)
                         zero_point_patch_values.append(
                             torch.nn.Parameter(
@@ -937,15 +945,17 @@ class AutoSmoothModifier(Modifier):
                 for ratio, use_duo_scaling in pbar:
                     # NOTE: s^-1 * x is fused here, according to paper
                     if use_duo_scaling and has_quantized_layers:
-                        scales = (x_scales.pow(ratio) / (w_scales.pow(1 - ratio) + 1e-4)).clamp(
-                            min=1e-4
-                        )
+                        scales = (
+                            x_scales.pow(ratio) / (w_scales.pow(1 - ratio) + 1e-4)
+                        ).clamp(min=1e-4)
                     else:
                         scales = x_scales.pow(ratio).clamp(min=1e-4).view(-1)
 
                     match self.norm_func:
                         case "adaptive":
-                            scales = _adaptive_norm(scales, **self.norm_func_param["adaptive"])
+                            scales = _adaptive_norm(
+                                scales, **self.norm_func_param["adaptive"]
+                            )
                         case "awq":
                             scales = scales / (scales.max() * scales.min()).sqrt()
 
@@ -1100,9 +1110,7 @@ class AutoSmoothModifier(Modifier):
                     for duo_scaling in [False, True]
                 ]
             case False:
-                return [
-                    (ratio, False) for ratio in self._get_ratio_grid(self.n_grid)
-                ]
+                return [(ratio, False) for ratio in self._get_ratio_grid(self.n_grid)]
             case True:
                 return [(0.0, False)] + [
                     (ratio, True)
@@ -1381,6 +1389,7 @@ def _adaptive_norm(scales: torch.Tensor, alpha=6.0, beta=0.15) -> torch.Tensor:
     scales = torch.where(below_one, push_near_one, tamed_high)
     return scales
 
+
 def _accumulate_mean(
     inp: torch.Tensor,
     prev_mean_and_count: tuple[torch.FloatTensor, int] | None,
@@ -1398,6 +1407,7 @@ def _accumulate_mean(
 
     return (prev_sum + sum_added) / new_count, new_count
 
+
 def _accumulate_max(
     inp: torch.Tensor,
     prev_max_and_count: tuple[torch.FloatTensor, int] | None,
@@ -1413,9 +1423,11 @@ def _accumulate_max(
 
     return torch.maximum(prev_max, current_max), new_count
 
+
 def _minmax(
     inp: torch.Tensor,
-    prev_minmax_and_count: tuple[tuple[torch.FloatTensor, torch.FloatTensor], int] | None,
+    prev_minmax_and_count: tuple[tuple[torch.FloatTensor, torch.FloatTensor], int]
+    | None,
 ) -> tuple[tuple[torch.FloatTensor, torch.FloatTensor], int]:
     inp_f32 = inp.to(torch.float32)
     current_min = inp_f32.amin(dim=0)
@@ -1429,4 +1441,7 @@ def _minmax(
     prev_max = prev_max.to(inp.device)
 
     new_count = prev_count + num_added
-    return (torch.minimum(prev_min, current_min), torch.maximum(prev_max, current_max)), new_count
+    return (
+        torch.minimum(prev_min, current_min),
+        torch.maximum(prev_max, current_max),
+    ), new_count

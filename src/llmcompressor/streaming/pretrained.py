@@ -57,8 +57,7 @@ _OWNED_WORK_DIR_ENTRIES = ("artifacts", "boundaries", "publish", "staging")
 
 def _recipe_quantizer(recipe: Recipe):
     if any(
-        type(modifier).__name__ == "AutoRoundModifier"
-        for modifier in recipe.modifiers
+        type(modifier).__name__ == "AutoRoundModifier" for modifier in recipe.modifiers
     ):
         raise ValueError(
             "Pretrained streaming mode does not yet support AutoRound: its "
@@ -112,9 +111,7 @@ def _exact_schemes(
                     f"got {type(module).__name__} at {name!r}"
                 )
             if name in schemes:
-                raise ValueError(
-                    f"Overlapping quantization schemes match {name!r}"
-                )
+                raise ValueError(f"Overlapping quantization schemes match {name!r}")
             exact = deepcopy(scheme)
             exact.targets = [name]
             schemes[name] = exact
@@ -133,9 +130,7 @@ def _quantized_sequential_targets(
 ) -> tuple[str, ...]:
     """Select no-split ancestors that contain an exact quantization target."""
     patterns = infer_sequential_targets(model)
-    matched_names = {
-        name for name, _ in match_named_modules(model, patterns)
-    }
+    matched_names = {name for name, _ in match_named_modules(model, patterns)}
     relevant = {
         name
         for name in matched_names
@@ -174,8 +169,7 @@ def _cleanup_successful_work_dir(work: Path) -> None:
                 shutil.rmtree(path)
         except OSError as error:
             streaming_logger.warning(
-                "finalize | work cleanup incomplete | "
-                f"path={path} | error={error}"
+                "finalize | work cleanup incomplete | " f"path={path} | error={error}"
             )
     try:
         work.rmdir()
@@ -279,11 +273,7 @@ def streaming_oneshot_from_pretrained(
             "output_dir must not be inside work_dir; use sibling directories"
         )
     output.parent.mkdir(parents=True, exist_ok=True)
-    if (
-        output.exists()
-        and (output / "FINALIZED").is_file()
-        and not overwrite_output
-    ):
+    if output.exists() and (output / "FINALIZED").is_file() and not overwrite_output:
         return output
     if output.exists() and any(output.iterdir()) and not overwrite_output:
         raise FileExistsError(
@@ -413,8 +403,7 @@ def streaming_oneshot_from_pretrained(
             name
             for name in schemes
             if any(
-                name == target or name.startswith(f"{target}.")
-                for target in targets
+                name == target or name.startswith(f"{target}.") for target in targets
             )
         )
         missing = sorted(set(schemes) - set(covered))

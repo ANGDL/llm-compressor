@@ -83,14 +83,10 @@ def pack_int4_to_int8_cpu_snapshot(
         # Extremely wide rows are split by columns to retain the workspace bound.
         for row in range(rows):
             for packed_start in range(0, packed_columns, max_packed_elements):
-                packed_end = min(
-                    packed_start + max_packed_elements, packed_columns
-                )
+                packed_end = min(packed_start + max_packed_elements, packed_columns)
                 input_start = packed_start * 2
                 input_end = packed_end * 2
-                packed = _pack_int4_block(
-                    tensor[row : row + 1, input_start:input_end]
-                )
+                packed = _pack_int4_block(tensor[row : row + 1, input_start:input_end])
                 snapshot[row : row + 1, packed_start:packed_end].copy_(packed)
 
     return snapshot

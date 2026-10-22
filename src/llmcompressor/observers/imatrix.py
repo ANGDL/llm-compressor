@@ -119,9 +119,7 @@ class IMatrixMSEObserver(Observer):
         in_features = module.in_features
         param = next(module.parameters(), None)
         device = (
-            param.device
-            if param is not None and param.device.type != "meta"
-            else "cpu"
+            param.device if param is not None and param.device.type != "meta" else "cpu"
         )
         if hasattr(module, "_imatrix_sum") and hasattr(module, "_imatrix_count"):
             self._imatrix_sum = module._imatrix_sum
@@ -424,7 +422,9 @@ def _compute_err(
     effective_chunk_size: int,
 ) -> torch.Tensor:
     if effective_chunk_size <= 0 or scales.numel() <= effective_chunk_size:
-        q = fake_quantize(observed, scales.unsqueeze(-1), zps.unsqueeze(-1), args).float()
+        q = fake_quantize(
+            observed, scales.unsqueeze(-1), zps.unsqueeze(-1), args
+        ).float()
         q.sub_(observed_f).abs_().pow_(norm)
         if importance_weights is not None:
             q.mul_(importance_weights)

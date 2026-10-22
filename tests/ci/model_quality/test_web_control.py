@@ -736,9 +736,7 @@ def test_wsgi_rerun_stage_route_enforces_roles(web_env) -> None:
     )
     path = f"/api/runs/{run_id}/models/{web_env.model_id}/stages/quantize/rerun"
 
-    status, _ = call(
-        app, "POST", path, {}, headers={"X-Model-Quality-Actor": "bob"}
-    )
+    status, _ = call(app, "POST", path, {}, headers={"X-Model-Quality-Actor": "bob"})
     assert status["status"] == "403 Forbidden"
 
     status, payload = call(
@@ -795,7 +793,9 @@ def test_launch_with_skipped_stage_omits_job_and_records_skipped(web_env) -> Non
 
     # A SKIPPED record is persisted so the pipeline shows the node as skipped.
     record = json.loads(
-        (web_env.root / run_id / web_env.model_id / "state" / "evaluate.json").read_text()
+        (
+            web_env.root / run_id / web_env.model_id / "state" / "evaluate.json"
+        ).read_text()
     )
     assert record["status"] == "SKIPPED"
     assert record["reason"] == "operator skip"
@@ -835,7 +835,9 @@ def test_skip_stage_cancels_job_and_persists(web_env) -> None:
 
     # SKIPPED record written and the plan updated for future re-runs.
     record = json.loads(
-        (web_env.root / run_id / web_env.model_id / "state" / "evaluate.json").read_text()
+        (
+            web_env.root / run_id / web_env.model_id / "state" / "evaluate.json"
+        ).read_text()
     )
     assert record["status"] == "SKIPPED"
     plan = json.loads((web_env.root / run_id / "execution-plan.json").read_text())

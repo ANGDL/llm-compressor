@@ -58,9 +58,7 @@ def w4a8_scheme(*, observer=None):
     return value
 
 
-def prepare(
-    tmp_path, *, algorithms=("gptq", "imatrix"), materializer=None
-):
+def prepare(tmp_path, *, algorithms=("gptq", "imatrix"), materializer=None):
     torch.manual_seed(8)
     model = TwoLayer()
     checkpoint = tmp_path / "checkpoint"
@@ -129,20 +127,19 @@ def test_gptq_matches_existing_quantize_and_compress_path(tmp_path):
     )
     actual = read_shard(output / "shards/model-00001-of-00002.safetensors")
 
-    reference = initialize_quantized_linear(
-        model.layers[0].weight, scheme(), "cpu"
-    )
+    reference = initialize_quantized_linear(model.layers[0].weight, scheme(), "cpu")
     initialize_observer(reference, "weight")
     apply_calibration_status(reference)
     observe(reference, "weight")
-    statistics = __import__(
-        "llmcompressor.streaming", fromlist=["ArtifactStore"]
-    ).ArtifactStore(artifacts).load_target_statistics(0)
+    statistics = (
+        __import__("llmcompressor.streaming", fromlist=["ArtifactStore"])
+        .ArtifactStore(artifacts)
+        .load_target_statistics(0)
+    )
     _, qparams = quantize_weight(
         reference,
         reference.quantization_scheme.weights,
-        statistics["layers.0.gptq_hessian"]
-        / statistics["layers.0.gptq_num_samples"],
+        statistics["layers.0.gptq_hessian"] / statistics["layers.0.gptq_num_samples"],
     )
     for name, value in qparams.items():
         setattr(reference, name, nn.Parameter(value, requires_grad=False))
@@ -174,12 +171,8 @@ def test_w4a8_is_packed_before_transaction_payload_is_written(tmp_path):
         pack_to_int8=False,
     )
 
-    packed = read_shard(
-        packed_output / "shards/model-00001-of-00002.safetensors"
-    )
-    unpacked = read_shard(
-        unpacked_output / "shards/model-00001-of-00002.safetensors"
-    )
+    packed = read_shard(packed_output / "shards/model-00001-of-00002.safetensors")
+    unpacked = read_shard(unpacked_output / "shards/model-00001-of-00002.safetensors")
     assert packed["layers.0.weight"].shape == (4, 2)
     assert unpacked["layers.0.weight"].shape == (4, 4)
     assert torch.equal(
@@ -195,9 +188,7 @@ def test_w4a8_is_packed_before_transaction_payload_is_written(tmp_path):
         ).read_text()
     )
     weight_record = next(
-        record
-        for record in metadata["records"]
-        if record["name"] == "layers.0.weight"
+        record for record in metadata["records"] if record["name"] == "layers.0.weight"
     )
     assert weight_record["shape"] == [4, 2]
     assert weight_record["size"] == 8
@@ -209,9 +200,7 @@ def test_output_tensor_names_are_mapped_before_low_level_writes(tmp_path):
             return f"serialized.{tensor_name}"
 
     materializer = PrefixMaterializer()
-    checkpoint, artifacts, _, _ = prepare(
-        tmp_path, materializer=materializer
-    )
+    checkpoint, artifacts, _, _ = prepare(tmp_path, materializer=materializer)
     output = quantize_streaming(
         checkpoint=checkpoint,
         artifact_dir=artifacts,
@@ -221,9 +210,7 @@ def test_output_tensor_names_are_mapped_before_low_level_writes(tmp_path):
         target_dtype=torch.float32,
     )
 
-    first = read_shard(
-        output / "shards/model-00001-of-00002.safetensors"
-    )
+    first = read_shard(output / "shards/model-00001-of-00002.safetensors")
     assert "serialized.layers.0.weight_packed" in first
     assert "serialized.layers.0.weight_scale" in first
     assert "serialized.layers.0.weight_shape" in first

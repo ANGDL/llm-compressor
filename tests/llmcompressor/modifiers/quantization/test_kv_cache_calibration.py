@@ -12,8 +12,8 @@ regex fails for models that name their attention differently (e.g. "attention",
 import torch.nn as nn
 from compressed_tensors.quantization import (
     QuantizationArgs,
-    QuantizationStrategy,
     QuantizationStatus,
+    QuantizationStrategy,
     apply_quantization_config,
     is_cached_attention_module,
 )
@@ -130,7 +130,9 @@ def test_attention_module_not_named_self_attn_gets_calibrated():
 
 
 def test_kv_cache_channel_strategy_is_supported_for_attention_quantization():
-    """CHANNEL kv-cache strategy should initialize without upstream validation errors."""
+    """CHANNEL kv-cache strategy should initialize without upstream validation
+    errors.
+    """
     model = _StubModel(dim=16)
     modifier = QuantizationModifier(
         targets=["Linear"],

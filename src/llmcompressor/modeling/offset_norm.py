@@ -16,8 +16,8 @@ Key components:
 - norm_calibration_context: Context manager that applies norm conversion
 """
 
-import os
 import contextlib
+import os
 from abc import ABC, abstractmethod
 from typing import Any
 
@@ -51,6 +51,7 @@ class NormCalibrationModule(ABC, torch.nn.Module, RegistryMixin):
             The original module with weights converted back to offset convention
         """
         ...
+
 
 _DISABLE_OFFSET_NORM_CALIBRATION = (
     os.getenv("DISABLE_OFFSET_NORM_CALIBRATION", "0") == "1"
@@ -126,7 +127,9 @@ def norm_calibration_context(model: PreTrainedModel):
     """
 
     if _DISABLE_OFFSET_NORM_CALIBRATION:
-        logger.info("Offset norm calibration disabled by DISABLE_OFFSET_NORM_CALIBRATION=1")
+        logger.info(
+            "Offset norm calibration disabled by DISABLE_OFFSET_NORM_CALIBRATION=1"
+        )
         yield
         return
 
@@ -165,4 +168,6 @@ def norm_calibration_context(model: PreTrainedModel):
 
 def _is_registered(name: str, subclass: type[RegistryMixin]):
     lookup = standardize_lookup_name(name)
-    return lookup in subclass.registered_names() or lookup in subclass.registered_aliases()
+    return (
+        lookup in subclass.registered_names() or lookup in subclass.registered_aliases()
+    )

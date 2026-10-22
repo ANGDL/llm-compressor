@@ -20,9 +20,7 @@ def test_build_quantization_config_coalesces_identical_exact_schemes():
     first = scheme()
     second = scheme()
 
-    config = build_quantization_config(
-        {"layers.0": first, "layers.1": second}
-    )
+    config = build_quantization_config({"layers.0": first, "layers.1": second})
 
     assert len(config["config_groups"]) == 1
     assert config["config_groups"]["group_0"]["targets"] == [
@@ -68,9 +66,7 @@ def _w4a8_scheme() -> QuantizationScheme:
 
 
 def test_prepare_quantized_tensor_packs_only_int4_int_quantized_weight():
-    tensor = torch.tensor(
-        [[-8, -1, 0, 7], [1, 2, 3, 4]], dtype=torch.int8
-    )
+    tensor = torch.tensor([[-8, -1, 0, 7], [1, 2, 3, 4]], dtype=torch.int8)
     scheme = _w4a8_scheme()
 
     packed = prepare_quantized_tensor_for_save(

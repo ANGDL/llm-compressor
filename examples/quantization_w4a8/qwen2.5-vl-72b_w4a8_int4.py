@@ -1,30 +1,23 @@
-import os
 import base64
+import os
 from io import BytesIO
 
-
 import torch
-from qwen_vl_utils import process_vision_info
-
 from compressed_tensors.quantization import QuantizationScheme
 from compressed_tensors.quantization.quant_args import (
     QuantizationArgs,
     QuantizationStrategy,
     QuantizationType,
 )
-
+from datasets import load_dataset
+from qwen_vl_utils import process_vision_info
 from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 
 from llmcompressor import oneshot
-from llmcompressor.modeling.gpt_oss import convert_model_for_quantization_gptoss
-from llmcompressor.modifiers.quantization import GPTQModifier
 from llmcompressor.modifiers.autosmooth import AutoSmoothModifier
-from llmcompressor.modifiers.quantization import QuantizationModifier
-
-from llmcompressor.utils import dispatch_for_generation
 from llmcompressor.modifiers.awq import AWQMapping
-from datasets import load_dataset
-
+from llmcompressor.modifiers.quantization import GPTQModifier
+from llmcompressor.utils import dispatch_for_generation
 
 MODEL_ID = "/data/models/Qwen2.5-VL-72B-Instruct"
 BASE_NAME = MODEL_ID.rstrip("/").split("/")[-1]
@@ -32,7 +25,9 @@ BASE_NAME = MODEL_ID.rstrip("/").split("/")[-1]
 OUTPUT_DIR = f"{BASE_NAME}-w4a8-smooth-gptq-mean"
 OUTPUT_DIR = os.path.join("/data/models", OUTPUT_DIR)
 
-model = Qwen2_5_VLForConditionalGeneration.from_pretrained(MODEL_ID, dtype="auto", device_map=None)
+model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+    MODEL_ID, dtype="auto", device_map=None
+)
 processor = AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=True)
 
 # Oneshot arguments
@@ -86,6 +81,7 @@ ds = ds.map(preprocess_and_tokenize, remove_columns=ds.column_names)
 def data_collator(batch):
     assert len(batch) == 1
     return {key: torch.tensor(value) for key, value in batch[0].items()}
+
 
 # ---- Quantization config: W4A8 (int4 weights, int8 activations) ----
 # Weights: 4-bit, channelwise, symmetric, static
@@ -146,16 +142,18 @@ mapping = [
 
 recipe = [
     AutoSmoothModifier(
-        activation_scale_type="mean", 
-        norm_func='adaptive', 
+        activation_scale_type="mean",
+        norm_func="adaptive",
         mappings=mapping,
     ),
     GPTQModifier(
-        config_groups={"group_0": scheme}, 
+        config_groups={"group_0": scheme},
         ignore=["lm_head", "re:visual.*", "re:model.visual.*"],
-    )
-    #QuantizationModifier(config_groups={"group_0": scheme}, ignore=["lm_head", "re:visual.*", "re:model.visual.*"],)
-
+    ),
+    # QuantizationModifier(
+    #     config_groups={"group_0": scheme},
+    #     ignore=["lm_head", "re:visual.*", "re:model.visual.*"],
+    # )
 ]
 
 print(f"Starting oneshot quantization → {OUTPUT_DIR}")

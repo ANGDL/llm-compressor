@@ -71,12 +71,8 @@ def _fla_reference_kda_adapter(
         if use_qk_l2norm_in_kernel:
             q_float = q.float()
             k_float = k.float()
-            q = q_float / torch.sqrt(
-                q_float.square().sum(-1, keepdim=True) + 1e-6
-            )
-            k = k_float / torch.sqrt(
-                k_float.square().sum(-1, keepdim=True) + 1e-6
-            )
+            q = q_float / torch.sqrt(q_float.square().sum(-1, keepdim=True) + 1e-6)
+            k = k_float / torch.sqrt(k_float.square().sum(-1, keepdim=True) + 1e-6)
         # Match both Transformers native KDA and FLA's documented default.
         if scale is None:
             scale = q.shape[-1] ** -0.5
@@ -88,9 +84,7 @@ def _fla_reference_kda_adapter(
                 raise ValueError("Packed FLA KDA inputs must have batch size 1")
             boundaries = cu_seqlens.tolist()
             outputs, states = [], []
-            for index, (start, end) in enumerate(
-                zip(boundaries[:-1], boundaries[1:])
-            ):
+            for index, (start, end) in enumerate(zip(boundaries[:-1], boundaries[1:])):
                 sequence_state = (
                     None if initial_state is None else initial_state[index : index + 1]
                 )

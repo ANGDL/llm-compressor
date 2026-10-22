@@ -75,9 +75,7 @@ def test_explicit_indexed_device_is_preserved(monkeypatch):
     def fail_if_called():
         raise AssertionError("indexed devices must not query current accelerator")
 
-    monkeypatch.setattr(
-        "llmcompressor.utils.dev.accelerator_device", fail_if_called
-    )
+    monkeypatch.setattr("llmcompressor.utils.dev.accelerator_device", fail_if_called)
 
     assert resolve_execution_device("cuda:3") == torch.device("cuda:3")
     assert resolve_execution_device("cpu") == torch.device("cpu")
@@ -109,9 +107,7 @@ def test_streaming_oneshot_runs_three_stages_and_resumes(tmp_path):
     )
     assert result == output
     assert (output / "FINALIZED").is_file()
-    assert yaml.safe_load((output / "recipe.yaml").read_text()) == {
-        "GPTQModifier": {}
-    }
+    assert yaml.safe_load((output / "recipe.yaml").read_text()) == {"GPTQModifier": {}}
     assert calls == ["dataset"]
 
     resumed = streaming_oneshot(

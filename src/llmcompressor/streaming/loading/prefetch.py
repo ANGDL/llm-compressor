@@ -25,9 +25,7 @@ class SubgraphPrefetcher(AbstractContextManager):
         self._executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="streaming-weight-prefetch"
         )
-        self._pending: tuple[
-            str, Future[PreparedSubgraphWeights]
-        ] | None = None
+        self._pending: tuple[str, Future[PreparedSubgraphWeights]] | None = None
         self._closed = False
 
     def _prepare(
@@ -39,9 +37,7 @@ class SubgraphPrefetcher(AbstractContextManager):
     ) -> PreparedSubgraphWeights:
         started_at = perf_counter()
         streaming_logger.info(f"{label} | started | device=cpu")
-        prepared = self.session.prepare(
-            plan, dtype=dtype, reservation=reservation
-        )
+        prepared = self.session.prepare(plan, dtype=dtype, reservation=reservation)
         streaming_logger.info(
             f"{label} | complete | device=cpu | "
             f"time={perf_counter() - started_at:.2f}s"

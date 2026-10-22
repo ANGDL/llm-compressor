@@ -1,7 +1,8 @@
+import json
 import os
 import re
-import json
 import shutil
+
 from safetensors import safe_open
 from safetensors.torch import save_file
 
@@ -40,7 +41,8 @@ def add_mpt_player(
 
     bf16_weight_map = bf16_index_map.get("weight_map", {})
 
-    # Read target quantized index and merge into it, never overwrite it with source index.
+    # Read target quantized index and merge into it, never overwrite it with
+    # source index.
     quant_index_file = os.path.join(quant_model_path, "model.safetensors.index.json")
     with open(quant_index_file, "r") as f:
         quant_index_map = json.load(f)
@@ -90,7 +92,9 @@ def add_mpt_player(
     save_file(mtp_weight, os.path.join(quant_model_path, mtp_output_file))
 
     # Backup the original quantized index before writing updates.
-    backup_index_file = os.path.join(quant_model_path, "model.safetensors.index.json.bak")
+    backup_index_file = os.path.join(
+        quant_model_path, "model.safetensors.index.json.bak"
+    )
     shutil.copy(quant_index_file, backup_index_file)
     print(f"Backed up the original index file to {backup_index_file}")
 
@@ -146,13 +150,9 @@ def update_config_ignores(quant_model_path, mtp_layer_id=None, mtp_layer_name=No
         f_out.write("\n")
 
     if updated:
-        print(
-            f"Updated config.json to ignore {layer_name} during quantization."
-        )
+        print(f"Updated config.json to ignore {layer_name} during quantization.")
     else:
-        print(
-            f"{layer_name} is already in the ignore list of config.json."
-        )
+        print(f"{layer_name} is already in the ignore list of config.json.")
 
     return config_data
 
