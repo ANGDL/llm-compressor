@@ -88,9 +88,7 @@ def test_loads_module_get_attr_passed_to_target(tmp_path):
         assert_all_meta(model.unused)
 
     assert_all_meta(model)
-    assert session.working_set(subgraph, exclude_modules=("embed",)) == (
-        "consumer",
-    )
+    assert session.working_set(subgraph, exclude_modules=("embed",)) == ("consumer",)
 
 
 def test_ignores_container_module_get_attr_working_set(tmp_path):
@@ -182,16 +180,12 @@ def test_loads_traced_working_set_and_restores_meta(tmp_path):
     reference = SessionModel()
     checkpoint = checkpoint_for(reference, tmp_path)
     model = build_meta_model(SessionModel)
-    session = SubgraphWeightSession(
-        model, SafetensorsWeightSource(checkpoint)
-    )
+    session = SubgraphWeightSession(model, SafetensorsWeightSource(checkpoint))
     subgraph = subgraph_for("layers.0")
     inputs = torch.randn(2, 4)
 
     assert session.working_set(subgraph) == ("layers.0",)
-    with session.loaded(
-        subgraph, device="cpu", dtype=torch.float32
-    ) as loaded:
+    with session.loaded(subgraph, device="cpu", dtype=torch.float32) as loaded:
         output = subgraph.forward(model, value=inputs)["output"]
         assert torch.allclose(output, reference.layers[0](inputs))
         assert loaded.module_names == ("layers.0",)
@@ -205,13 +199,11 @@ def test_loads_traced_working_set_and_restores_meta(tmp_path):
 def test_loads_runtime_only_module_and_restores_buffer(
     tmp_path, device, explicit_include
 ):
-    if device == "cuda" and not torch.cuda.is_available():
+    if device == "cuda" and not torch.accelerator.is_available():
         pytest.skip("CUDA is unavailable")
     reference = RuntimeBufferOnlyModel()
     checkpoint = checkpoint_for(reference, tmp_path)
-    model = build_meta_model(
-        RuntimeBufferOnlyModel, keep_nonpersistent_buffers=True
-    )
+    model = build_meta_model(RuntimeBufferOnlyModel, keep_nonpersistent_buffers=True)
     session = SubgraphWeightSession(model, SafetensorsWeightSource(checkpoint))
     subgraph = subgraph_for() if explicit_include else subgraph_for("runtime")
     include_modules = ("runtime",) if explicit_include else ()
@@ -240,9 +232,7 @@ def test_prepares_subgraph_without_installing_it(tmp_path):
     reference = SessionModel()
     checkpoint = checkpoint_for(reference, tmp_path)
     model = build_meta_model(SessionModel)
-    session = SubgraphWeightSession(
-        model, SafetensorsWeightSource(checkpoint)
-    )
+    session = SubgraphWeightSession(model, SafetensorsWeightSource(checkpoint))
     subgraph = subgraph_for("layers.0")
 
     plan = session.plan(subgraph)
@@ -252,9 +242,7 @@ def test_prepares_subgraph_without_installing_it(tmp_path):
         system_available=lambda: 1 << 30,
         cgroup_available=lambda: None,
     ).reserve("test", required)
-    prepared = session.prepare(
-        plan, dtype=torch.float32, reservation=reservation
-    )
+    prepared = session.prepare(plan, dtype=torch.float32, reservation=reservation)
 
     assert_all_meta(model)
     committed_bytes = reservation.committed_bytes
@@ -270,15 +258,11 @@ def test_prepares_subgraph_without_installing_it(tmp_path):
     assert_all_meta(model)
 
 
-def test_prepared_move_closes_all_storage_after_partial_failure(
-    tmp_path, monkeypatch
-):
+def test_prepared_move_closes_all_storage_after_partial_failure(tmp_path, monkeypatch):
     reference = SessionModel()
     checkpoint = checkpoint_for(reference, tmp_path)
     model = build_meta_model(SessionModel)
-    session = SubgraphWeightSession(
-        model, SafetensorsWeightSource(checkpoint)
-    )
+    session = SubgraphWeightSession(model, SafetensorsWeightSource(checkpoint))
     plan = session.plan(subgraph_for("layers.0"))
     required = session.estimate_preparation(plan, dtype=torch.float32)
     reservation = HostMemoryBudget(
@@ -286,9 +270,7 @@ def test_prepared_move_closes_all_storage_after_partial_failure(
         system_available=lambda: 1 << 30,
         cgroup_available=lambda: None,
     ).reserve("test", required)
-    prepared = session.prepare(
-        plan, dtype=torch.float32, reservation=reservation
-    )
+    prepared = session.prepare(plan, dtype=torch.float32, reservation=reservation)
     calls = 0
 
     def fail_second_move(tensor, *args, **kwargs):
@@ -373,9 +355,7 @@ def test_collapses_descendant_modules_under_target(tmp_path):
     reference = SessionModel()
     checkpoint = checkpoint_for(reference, tmp_path)
     model = build_meta_model(SessionModel)
-    session = SubgraphWeightSession(
-        model, SafetensorsWeightSource(checkpoint)
-    )
+    session = SubgraphWeightSession(model, SafetensorsWeightSource(checkpoint))
     subgraph = subgraph_for("layers.0")
 
     assert session.working_set(
@@ -387,14 +367,10 @@ def test_state_tensors_include_modifier_output_and_skip_runtime_buffers(tmp_path
     reference = SessionModel()
     checkpoint = checkpoint_for(reference, tmp_path)
     model = build_meta_model(SessionModel)
-    session = SubgraphWeightSession(
-        model, SafetensorsWeightSource(checkpoint)
-    )
+    session = SubgraphWeightSession(model, SafetensorsWeightSource(checkpoint))
     subgraph = subgraph_for("layers.0")
 
-    with session.loaded(
-        subgraph, device="cpu", dtype=torch.float32
-    ) as loaded:
+    with session.loaded(subgraph, device="cpu", dtype=torch.float32) as loaded:
         model.layers[0].proj.register_buffer(
             "weight_scale", torch.ones(4), persistent=True
         )
@@ -412,9 +388,7 @@ def test_exception_restores_every_module_in_working_set(tmp_path):
     reference = SessionModel()
     checkpoint = checkpoint_for(reference, tmp_path)
     model = build_meta_model(SessionModel)
-    session = SubgraphWeightSession(
-        model, SafetensorsWeightSource(checkpoint)
-    )
+    session = SubgraphWeightSession(model, SafetensorsWeightSource(checkpoint))
 
     with pytest.raises(RuntimeError, match="failed"):
         with session.loaded(
@@ -433,9 +407,7 @@ def test_shared_runtime_buffer_aliases_materialize_independently(tmp_path):
     checkpoint.mkdir()
     save_file(reference.state_dict(), checkpoint / "model.safetensors")
     model = build_meta_model(SharedRuntimeBufferModel)
-    session = SubgraphWeightSession(
-        model, SafetensorsWeightSource(checkpoint)
-    )
+    session = SubgraphWeightSession(model, SafetensorsWeightSource(checkpoint))
     subgraph = subgraph_for("layers.0")
 
     with session.loaded(

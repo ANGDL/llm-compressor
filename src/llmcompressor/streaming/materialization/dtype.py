@@ -10,9 +10,7 @@ from typing import Iterable
 
 import torch
 
-_PRESERVABLE_SOURCE_DTYPES = frozenset(
-    {torch.float32, torch.float16, torch.bfloat16}
-)
+_PRESERVABLE_SOURCE_DTYPES = frozenset({torch.float32, torch.float16, torch.bfloat16})
 
 
 @dataclass(frozen=True)
@@ -97,9 +95,7 @@ class StreamingDTypePolicy:
             "preserve_source_dtype": self.preserve_source_dtype,
             "compute_tensor_names_sha256": names_digest,
             "compute_tensor_count": len(self.compute_tensor_names),
-            "overrides": [
-                (pattern, str(dtype)) for pattern, dtype in self.overrides
-            ],
+            "overrides": [(pattern, str(dtype)) for pattern, dtype in self.overrides],
         }
 
     def fingerprint(self) -> str:

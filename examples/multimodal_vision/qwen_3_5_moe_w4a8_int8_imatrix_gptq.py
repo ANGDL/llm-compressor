@@ -1,28 +1,27 @@
 import base64
-import argparse
-from io import BytesIO
 import os
+from io import BytesIO
 
 import torch
-from datasets import load_dataset
-from transformers import AutoProcessor, Qwen3_5MoeForConditionalGeneration
-from qwen_vl_utils import process_vision_info
-
-from llmcompressor import oneshot
-from llmcompressor.modifiers.quantization import GPTQModifier
-from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
-
 from compressed_tensors.quantization import QuantizationScheme
 from compressed_tensors.quantization.quant_args import (
     QuantizationArgs,
     QuantizationStrategy,
     QuantizationType,
 )
+from datasets import load_dataset
+from qwen_vl_utils import process_vision_info
+from transformers import AutoProcessor, Qwen3_5MoeForConditionalGeneration
 
+from llmcompressor import oneshot
+from llmcompressor.modifiers.quantization import GPTQModifier
+from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
 
 # Load model.
 model_id = "/data/models/Qwen3.5-122B-A10B"
-model = Qwen3_5MoeForConditionalGeneration.from_pretrained(model_id, device_map=None, dtype="auto",local_files_only=True)
+model = Qwen3_5MoeForConditionalGeneration.from_pretrained(
+    model_id, device_map=None, dtype="auto", local_files_only=True
+)
 processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
 
 
@@ -56,13 +55,8 @@ def preprocess_and_tokenize(example):
         },
         {
             "role": "assistant",
-            "content": [
-                {
-                "text": f"{example['caption'][0]}",
-                "type": "text"
-                }
-            ],
-        }
+            "content": [{"text": f"{example['caption'][0]}", "type": "text"}],
+        },
     ]
     text = processor.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
@@ -94,6 +88,7 @@ def data_collator(batch):
         )
         for key, value in batch[0].items()
     }
+
 
 # ---- Quantization config: W4A8 (int4 weights, int8 activations) ----
 # Weights: 4-bit, channelwise, symmetric, static

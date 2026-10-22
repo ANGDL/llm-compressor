@@ -19,8 +19,8 @@ from llmcompressor.modifiers.gptq.helpers import (
     column_scale_window,
     factorize_hessian,
     get_triton_gptq_config,
-    make_empty_hessian,
     make_empty_gptq_statistics,
+    make_empty_hessian,
 )
 from llmcompressor.utils.triton_backend import is_triton_disabled
 

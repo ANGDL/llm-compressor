@@ -307,8 +307,8 @@ class AWQModifier(Modifier):
                     )
                 smooth_layer = smooth_layers[0]
                 smooth_name = module_to_name.get(smooth_layer)
-                
-                if 'norm' in smooth_name.lower():
+
+                if "norm" in smooth_name.lower():
                     setattr(smooth_layer, "norm_bias", mapping.norm_bias)
 
                 # [[b00, b01, b02...], [b10, b11, b12,...], ...] ↓
@@ -567,7 +567,9 @@ class AWQModifier(Modifier):
                             update_offload_parameter(
                                 module,
                                 "weight",
-                                module.weight.add_(norm_bias).div_(scales).sub_(norm_bias),
+                                module.weight.add_(norm_bias)
+                                .div_(scales)
+                                .sub_(norm_bias),
                             )
                         else:
                             # NOTE: edge case when smooth layer number of out_features
@@ -577,7 +579,9 @@ class AWQModifier(Modifier):
                             # because the desired smooth layer is v_proj
                             # https://github.com/casper-hansen/AutoAWQ/blob/main/awq/quantize/scale.py#L123
                             weight = module.weight
-                            weight[-scales.size(0) :].add_(norm_bias).div_(scales.view(-1, 1)).sub_(norm_bias)
+                            weight[-scales.size(0) :].add_(norm_bias).div_(
+                                scales.view(-1, 1)
+                            ).sub_(norm_bias)
                             update_offload_parameter(module, "weight", weight)
                         if hasattr(module, "bias") and module.bias is not None:
                             update_offload_parameter(

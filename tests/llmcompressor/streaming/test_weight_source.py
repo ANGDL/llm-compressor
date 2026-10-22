@@ -173,9 +173,7 @@ def test_reports_missing_tensor_and_index_dependency(sharded_checkpoint):
 
     index_path = sharded_checkpoint / "model.safetensors.index.json"
     index = json.loads(index_path.read_text(encoding="utf-8"))
-    index["weight_map"]["missing.weight"] = (
-        "model-00001-of-00002.safetensors"
-    )
+    index["weight_map"]["missing.weight"] = "model-00001-of-00002.safetensors"
     index_path.write_text(json.dumps(index), encoding="utf-8")
     with pytest.raises(KeyError, match="missing.weight"):
         SafetensorsWeightSource(sharded_checkpoint)

@@ -15,7 +15,7 @@ def _ensure_test_accelerator_api():
 
     class _TestAcceleratorCompat:
         def _backend(self) -> str:
-            if hasattr(torch, "cuda") and torch.cuda.is_available():
+            if hasattr(torch, "cuda") and torch.accelerator.is_available():
                 return "cuda"
             if hasattr(torch, "xpu") and torch.xpu.is_available():
                 return "xpu"
@@ -29,7 +29,7 @@ def _ensure_test_accelerator_api():
         def device_count(self):
             backend = self._backend()
             if backend == "cuda":
-                return torch.cuda.device_count()
+                return torch.accelerator.device_count()
             if backend == "xpu":
                 return torch.xpu.device_count()
             if backend == "mps":

@@ -4,13 +4,14 @@ from pathlib import Path
 
 import pytest
 
+from ci.model_quality import stage as stage_module
 from ci.model_quality.config import evaluation_fingerprint, model_fingerprint
 from ci.model_quality.executor import (
     StageError,
-    _validate_argument_constraints,
     _artifact_content_fingerprint,
     _artifact_file_records,
     _source_provenance,
+    _validate_argument_constraints,
     run_evaluate,
     run_publish,
     run_quantize,
@@ -18,7 +19,6 @@ from ci.model_quality.executor import (
     run_validate,
 )
 from ci.model_quality.state import model_run_dir, read_stage_result, write_stage_result
-from ci.model_quality import stage as stage_module
 
 
 def _fake_model(tmp_path: Path) -> dict:
@@ -316,7 +316,9 @@ def test_report_keeps_override_evaluation_fingerprint(tmp_path, monkeypatch):
     (model_dir / "input-manifest.json").write_text(
         json.dumps({"finalized_artifact_fingerprint": artifact})
     )
-    monkeypatch.setattr(stage_module, "load_model_config", lambda _path: {"models": [model]})
+    monkeypatch.setattr(
+        stage_module, "load_model_config", lambda _path: {"models": [model]}
+    )
     captured = {}
     monkeypatch.setattr(
         stage_module,
@@ -532,7 +534,14 @@ def test_publish_executes_explicit_bcecmd_upload_and_verification(
     (run_dir / "model").mkdir(parents=True)
     (run_dir / "reports").mkdir()
     (run_dir / "artifact-manifest.json").write_text(
-        json.dumps({"artifact_fingerprint": "artifact-a", "artifact_content_fingerprint": _artifact_content_fingerprint(_artifact_file_records(run_dir / "model"))})
+        json.dumps(
+            {
+                "artifact_fingerprint": "artifact-a",
+                "artifact_content_fingerprint": _artifact_content_fingerprint(
+                    _artifact_file_records(run_dir / "model")
+                ),
+            }
+        )
     )
     (run_dir / "reports/summary.json").write_text(
         json.dumps(
@@ -652,7 +661,11 @@ def test_publish_fast_path_trusts_manifest_sizes_but_catches_size_change(
     )
     (run_dir / "reports/summary.json").write_text(
         json.dumps(
-            {"status": "PASS", "attempt_id": "attempt-a", "artifact_fingerprint": "artifact-a"}
+            {
+                "status": "PASS",
+                "attempt_id": "attempt-a",
+                "artifact_fingerprint": "artifact-a",
+            }
         )
     )
     (run_dir / "current-attempt.json").write_text(
@@ -665,16 +678,26 @@ def test_publish_fast_path_trusts_manifest_sizes_but_catches_size_change(
         "enabled": True,
         "remote_prefix": "bos:/bucket/model-quality",
         "allowlist": ["model", "reports"],
-        "commands": [[str(bcecmd), "upload", "{output_dir}", "{remote_run_prefix}/model"]],
+        "commands": [
+            [str(bcecmd), "upload", "{output_dir}", "{remote_run_prefix}/model"]
+        ],
         "verify_commands": [[str(bcecmd), "verify", "{remote_run_prefix}"]],
         "success_commands": [
-            [str(bcecmd), "upload", "{run_dir}/commit-markers/SUCCESS.json", "{remote_run_prefix}/SUCCESS.json"]
+            [
+                str(bcecmd),
+                "upload",
+                "{run_dir}/commit-markers/SUCCESS.json",
+                "{remote_run_prefix}/SUCCESS.json",
+            ]
         ],
     }
 
     # Same size (even if bytes differ) takes the fast path and publishes.
     (run_dir / "model" / "model.safetensors").write_bytes(b"weights-v2")
-    assert run_publish(model, "run-a", artifact_fingerprint="artifact-a")["status"] == "PASS"
+    assert (
+        run_publish(model, "run-a", artifact_fingerprint="artifact-a")["status"]
+        == "PASS"
+    )
 
     # A size change is still caught as a changed artifact.
     (run_dir / "model" / "model.safetensors").write_bytes(b"weights-much-longer")
@@ -689,7 +712,14 @@ def test_success_marker_is_created_only_after_remote_verify(tmp_path, monkeypatc
     (run_dir / "model").mkdir(parents=True)
     (run_dir / "reports").mkdir()
     (run_dir / "artifact-manifest.json").write_text(
-        json.dumps({"artifact_fingerprint": "artifact-a", "artifact_content_fingerprint": _artifact_content_fingerprint(_artifact_file_records(run_dir / "model"))})
+        json.dumps(
+            {
+                "artifact_fingerprint": "artifact-a",
+                "artifact_content_fingerprint": _artifact_content_fingerprint(
+                    _artifact_file_records(run_dir / "model")
+                ),
+            }
+        )
     )
     (run_dir / "reports/summary.json").write_text(
         json.dumps(
@@ -734,7 +764,14 @@ def test_publish_reads_only_promoted_attempt_reports(tmp_path, monkeypatch):
     (run_dir / "model/weights.bin").write_bytes(b"weights")
     (run_dir / "reports").mkdir()
     (run_dir / "artifact-manifest.json").write_text(
-        json.dumps({"artifact_fingerprint": "artifact-a", "artifact_content_fingerprint": _artifact_content_fingerprint(_artifact_file_records(run_dir / "model"))})
+        json.dumps(
+            {
+                "artifact_fingerprint": "artifact-a",
+                "artifact_content_fingerprint": _artifact_content_fingerprint(
+                    _artifact_file_records(run_dir / "model")
+                ),
+            }
+        )
     )
     old_reports = run_dir / "attempts/attempt-old/reports"
     new_reports = run_dir / "attempts/attempt-new/reports"

@@ -69,9 +69,7 @@ def _checkpoint_tensors(path):
     tensors = {}
     for shard in path.glob("*.safetensors"):
         with safe_open(shard, framework="pt", device="cpu") as file:
-            tensors.update(
-                {name: file.get_tensor(name) for name in file.keys()}
-            )
+            tensors.update({name: file.get_tensor(name) for name in file.keys()})
     return tensors
 
 
@@ -93,9 +91,7 @@ def _calibration_data():
 
 def _imatrix_recipe():
     return [
-        IMatrixGatherer(
-            ignore=["lm_head"], attach_by_initialize=False
-        ),
+        IMatrixGatherer(ignore=["lm_head"], attach_by_initialize=False),
         QuantizationModifier(
             scheme="W8A8",
             targets=["Linear"],
@@ -129,9 +125,7 @@ def _imatrix_recipe_with_scale_dtype(scale_dtype: torch.dtype | None):
     ]
 
 
-def _seed_incompatible_run_metadata(
-    checkpoint, work_dir, *, replace_existing=False
-):
+def _seed_incompatible_run_metadata(checkpoint, work_dir, *, replace_existing=False):
     _initialize_run(
         checkpoint=checkpoint,
         artifact_dir=work_dir / "artifacts",
@@ -193,8 +187,9 @@ def test_direct_target_write_reserves_before_w4a8_cpu_snapshot(monkeypatch):
         )
 
         def state_tensors_under(self, _module_names):
-            yield "layer.weight", torch.tensor(
-                [[-8, -1, 0, 7], [1, 2, 3, 4]], dtype=torch.int8
+            yield (
+                "layer.weight",
+                torch.tensor([[-8, -1, 0, 7], [1, 2, 3, 4]], dtype=torch.int8),
             )
 
     class Writer:
@@ -206,9 +201,7 @@ def test_direct_target_write_reserves_before_w4a8_cpu_snapshot(monkeypatch):
             assert tensors["layer.weight"].device.type == "cpu"
             assert kwargs["owned_cpu_tensors"] == {"layer.weight"}
             assert kwargs["reservation"] is reservation
-            captured.update(
-                {name: value.clone() for name, value in tensors.items()}
-            )
+            captured.update({name: value.clone() for name, value in tensors.items()})
             assert kwargs["quantized_modules"] == {"layer": "int-quantized"}
 
     class Reservation:
@@ -264,9 +257,7 @@ def test_pretrained_streaming_packs_w4a8_final_shard(tmp_path, async_save):
         tie_word_embeddings=True,
     )
     checkpoint = tmp_path / "checkpoint"
-    Qwen3ForCausalLM(config).save_pretrained(
-        checkpoint, safe_serialization=True
-    )
+    Qwen3ForCausalLM(config).save_pretrained(checkpoint, safe_serialization=True)
     scheme = QuantizationScheme(
         targets=["Linear"],
         weights=QuantizationArgs(
@@ -290,9 +281,7 @@ def test_pretrained_streaming_packs_w4a8_final_shard(tmp_path, async_save):
         dataset_fingerprint="7" * 64,
         recipe=[
             IMatrixGatherer(ignore=["lm_head"]),
-            QuantizationModifier(
-                config_groups={"group_0": scheme}, ignore=["lm_head"]
-            ),
+            QuantizationModifier(config_groups={"group_0": scheme}, ignore=["lm_head"]),
         ],
         output_dir=tmp_path / "output",
         work_dir=tmp_path / "work",
@@ -313,7 +302,9 @@ def test_pretrained_streaming_packs_w4a8_final_shard(tmp_path, async_save):
 
 def test_empty_device_cache_dispatches_to_execution_backend(monkeypatch):
     calls = []
-    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: calls.append("cuda"))
+    monkeypatch.setattr(
+        torch.get_device_module(), "empty_cache", lambda: calls.append("cuda")
+    )
 
     _empty_device_cache(torch.device("cuda:0"))
     _empty_device_cache(torch.device("cpu"))
@@ -324,9 +315,7 @@ def test_empty_device_cache_dispatches_to_execution_backend(monkeypatch):
 def test_stage_logger_only_monitors_execution_device():
     model = torch.nn.Module()
 
-    assert _stage_logger(model, "cuda-stage", torch.device("cuda:3")).device_ids == (
-        3,
-    )
+    assert _stage_logger(model, "cuda-stage", torch.device("cuda:3")).device_ids == (3,)
     assert _stage_logger(model, "cpu-stage", torch.device("cpu")).device_ids == ()
 
 
@@ -388,9 +377,7 @@ def test_pretrained_streaming_writes_each_subgraph_as_final_shard(
     )
     torch.manual_seed(7)
     checkpoint = tmp_path / "checkpoint"
-    Qwen3ForCausalLM(config).save_pretrained(
-        checkpoint, safe_serialization=True
-    )
+    Qwen3ForCausalLM(config).save_pretrained(checkpoint, safe_serialization=True)
     dataset = DataLoader(
         [
             {
@@ -401,8 +388,7 @@ def test_pretrained_streaming_writes_each_subgraph_as_final_shard(
         batch_size=1,
     )
     monkeypatch.setattr(
-        "llmcompressor.streaming.pipeline.StreamingCheckpointWriter."
-        "assemble_shards",
+        "llmcompressor.streaming.pipeline.StreamingCheckpointWriter." "assemble_shards",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
             AssertionError("default streaming path must not assemble shards")
         ),
@@ -459,11 +445,7 @@ def test_pretrained_streaming_writes_each_subgraph_as_final_shard(
     output_shards = {path.name for path in output.glob("*.safetensors")}
     assert "model-subgraph-00000.safetensors" in output_shards
     assert "model-subgraph-00001.safetensors" in output_shards
-    assert not list(
-        (tmp_path / "work" / "artifacts" / "statistics").glob(
-            "target-*"
-        )
-    )
+    assert not list((tmp_path / "work" / "artifacts" / "statistics").glob("target-*"))
     assert not (tmp_path / "work" / "boundaries").exists()
     assert not staging.exists()
     assert not (tmp_path / "work" / "publish").exists()
@@ -505,9 +487,7 @@ def test_pretrained_streaming_overwrites_output_only_when_requested(tmp_path):
         tie_word_embeddings=True,
     )
     checkpoint = tmp_path / "checkpoint"
-    Qwen3ForCausalLM(config).save_pretrained(
-        checkpoint, safe_serialization=True
-    )
+    Qwen3ForCausalLM(config).save_pretrained(checkpoint, safe_serialization=True)
     output = tmp_path / "output"
     output.mkdir()
     (output / "old-file").write_text("old")
@@ -545,9 +525,7 @@ def test_normal_mode_replaces_incompatible_metadata_then_cleans_work(tmp_path):
         tie_word_embeddings=True,
     )
     checkpoint = tmp_path / "checkpoint"
-    Qwen3ForCausalLM(config).save_pretrained(
-        checkpoint, safe_serialization=True
-    )
+    Qwen3ForCausalLM(config).save_pretrained(checkpoint, safe_serialization=True)
     work = tmp_path / "work"
     _seed_incompatible_run_metadata(checkpoint, work)
 
@@ -580,9 +558,7 @@ def test_checkpoint_progress_rejects_incompatible_run_metadata(tmp_path):
         tie_word_embeddings=True,
     )
     checkpoint = tmp_path / "checkpoint"
-    Qwen3ForCausalLM(config).save_pretrained(
-        checkpoint, safe_serialization=True
-    )
+    Qwen3ForCausalLM(config).save_pretrained(checkpoint, safe_serialization=True)
     work = tmp_path / "work"
     _seed_incompatible_run_metadata(checkpoint, work)
 
@@ -601,9 +577,7 @@ def test_checkpoint_progress_rejects_incompatible_run_metadata(tmp_path):
         )
 
 
-def test_finalize_only_publishes_completed_direct_writer_shards(
-    tmp_path, monkeypatch
-):
+def test_finalize_only_publishes_completed_direct_writer_shards(tmp_path, monkeypatch):
     from llmcompressor.streaming.finalize import finalize_streaming_checkpoint
 
     config = Qwen3Config(
@@ -618,9 +592,7 @@ def test_finalize_only_publishes_completed_direct_writer_shards(
         tie_word_embeddings=True,
     )
     checkpoint = tmp_path / "checkpoint"
-    Qwen3ForCausalLM(config).save_pretrained(
-        checkpoint, safe_serialization=True
-    )
+    Qwen3ForCausalLM(config).save_pretrained(checkpoint, safe_serialization=True)
     work = tmp_path / "work"
     output = tmp_path / "output"
     kwargs = {
@@ -652,9 +624,7 @@ def test_finalize_only_publishes_completed_direct_writer_shards(
         state.unlink()
     assert not list((work / "publish").glob("model-static-*.safetensors"))
 
-    _seed_incompatible_run_metadata(
-        checkpoint, work, replace_existing=True
-    )
+    _seed_incompatible_run_metadata(checkpoint, work, replace_existing=True)
     run_pipeline = Mock(side_effect=AssertionError("pipeline must not run"))
     monkeypatch.setattr(
         "llmcompressor.streaming.pretrained.run_subgraph_streaming_pipeline",
@@ -669,9 +639,7 @@ def test_finalize_only_publishes_completed_direct_writer_shards(
         **kwargs,
         "recipe": _imatrix_recipe_with_scale_dtype(torch.float32),
     }
-    with pytest.raises(
-        ArtifactCompatibilityError, match="belongs to a different run"
-    ):
+    with pytest.raises(ArtifactCompatibilityError, match="belongs to a different run"):
         streaming_oneshot(
             dataset=_calibration_data(),
             finalize_only=True,
@@ -706,9 +674,7 @@ def test_checkpoint_progress_persists_boundaries_and_prefetches(tmp_path, monkey
         tie_word_embeddings=True,
     )
     checkpoint = tmp_path / "checkpoint"
-    Qwen3ForCausalLM(config).save_pretrained(
-        checkpoint, safe_serialization=True
-    )
+    Qwen3ForCausalLM(config).save_pretrained(checkpoint, safe_serialization=True)
     submitted = []
     original_submit = SubgraphPrefetcher.submit
 
@@ -732,9 +698,7 @@ def test_checkpoint_progress_persists_boundaries_and_prefetches(tmp_path, monkey
     )
 
     assert submitted
-    transaction = (
-        tmp_path / "work/staging/transactions/subgraph-00000/metadata.json"
-    )
+    transaction = tmp_path / "work/staging/transactions/subgraph-00000/metadata.json"
     assert '"boundary": {' in transaction.read_text()
 
 
@@ -752,9 +716,7 @@ def test_streaming_gptq_matches_sequential_oneshot(tmp_path, monkeypatch):
     )
     torch.manual_seed(11)
     checkpoint = tmp_path / "checkpoint"
-    Qwen3ForCausalLM(config).save_pretrained(
-        checkpoint, safe_serialization=True
-    )
+    Qwen3ForCausalLM(config).save_pretrained(checkpoint, safe_serialization=True)
     recipe = GPTQModifier(
         config_groups={
             "group_0": {
@@ -791,9 +753,7 @@ def test_streaming_gptq_matches_sequential_oneshot(tmp_path, monkeypatch):
 
     def record_release(self, modules):
         result = original(self, modules)
-        remaining_statistics.append(
-            (len(self._hessians), len(self._num_samples))
-        )
+        remaining_statistics.append((len(self._hessians), len(self._num_samples)))
         return result
 
     monkeypatch.setattr(GPTQModifier, "compress_module_list", record_release)
@@ -848,9 +808,7 @@ def test_streaming_imatrix_rtn_matches_sequential_oneshot(tmp_path, monkeypatch)
     )
     torch.manual_seed(13)
     checkpoint = tmp_path / "checkpoint"
-    Qwen3ForCausalLM(config).save_pretrained(
-        checkpoint, safe_serialization=True
-    )
+    Qwen3ForCausalLM(config).save_pretrained(checkpoint, safe_serialization=True)
 
     baseline = tmp_path / "baseline"
     oneshot(
@@ -895,11 +853,7 @@ def test_streaming_imatrix_rtn_matches_sequential_oneshot(tmp_path, monkeypatch)
     # the ordinary sequential pipeline. The latter propagates algorithmic
     # in-place weight changes (for example GPTQ), not simulated RTN outputs.
     assert quantization_states
-    assert all(
-        enabled is False
-        for states in quantization_states
-        for enabled in states
-    )
+    assert all(enabled is False for states in quantization_states for enabled in states)
 
     expected = _checkpoint_tensors(baseline)
     actual = _checkpoint_tensors(streamed)
@@ -916,7 +870,7 @@ def test_streaming_imatrix_rtn_matches_sequential_oneshot(tmp_path, monkeypatch)
         pytest.param(
             os.environ.get("LLMCOMPRESSOR_TEST_CUDA_DEVICE", "cuda:0"),
             marks=pytest.mark.skipif(
-                not torch.cuda.is_available(), reason="CUDA is unavailable"
+                not torch.accelerator.is_available(), reason="CUDA is unavailable"
             ),
         ),
     ],
@@ -985,9 +939,7 @@ def test_rtn_reuses_calibration_forward_and_preserves_quantized_checkpoint(
         torch.testing.assert_close(actual[name], expected[name], rtol=0, atol=0)
 
 
-def _assert_streaming_matches_oneshot(
-    tmp_path, *, transform, quantizer, fingerprint
-):
+def _assert_streaming_matches_oneshot(tmp_path, *, transform, quantizer, fingerprint):
     transform_name = type(transform()).__name__
     config = Qwen3Config(
         vocab_size=32,
@@ -1002,9 +954,7 @@ def _assert_streaming_matches_oneshot(
     )
     torch.manual_seed(17)
     checkpoint = tmp_path / "checkpoint"
-    Qwen3ForCausalLM(config).save_pretrained(
-        checkpoint, safe_serialization=True
-    )
+    Qwen3ForCausalLM(config).save_pretrained(checkpoint, safe_serialization=True)
 
     baseline = tmp_path / "baseline"
     oneshot(
@@ -1036,10 +986,7 @@ def _assert_streaming_matches_oneshot(
     for name in expected:
         assert actual[name].shape == expected[name].shape, name
         assert actual[name].dtype == expected[name].dtype, name
-        if (
-            expected[name].dtype.is_floating_point
-            and transform_name != "AWQModifier"
-        ):
+        if expected[name].dtype.is_floating_point and transform_name != "AWQModifier":
             torch.testing.assert_close(
                 actual[name],
                 expected[name],
@@ -1058,18 +1005,14 @@ def _assert_streaming_matches_oneshot(
     with torch.no_grad():
         expected_logits = expected_model(**sample).logits
         actual_logits = actual_model(**sample).logits
-    torch.testing.assert_close(
-        actual_logits, expected_logits, rtol=2e-2, atol=2e-3
-    )
+    torch.testing.assert_close(actual_logits, expected_logits, rtol=2e-2, atol=2e-3)
 
 
 def test_streaming_smoothquant_matches_sequential_oneshot(tmp_path):
     _assert_streaming_matches_oneshot(
         tmp_path,
         transform=lambda: SmoothQuantModifier(smoothing_strength=0.5),
-        quantizer=lambda: QuantizationModifier(
-            scheme="W8A8", ignore=["lm_head"]
-        ),
+        quantizer=lambda: QuantizationModifier(scheme="W8A8", ignore=["lm_head"]),
         fingerprint="6",
     )
 
@@ -1105,9 +1048,7 @@ def test_streaming_sparsegpt_composes_with_quantization(tmp_path):
             targets=["Linear"],
             ignore=["re:.*lm_head"],
         ),
-        quantizer=lambda: QuantizationModifier(
-            scheme="W8A8", ignore=["lm_head"]
-        ),
+        quantizer=lambda: QuantizationModifier(scheme="W8A8", ignore=["lm_head"]),
         fingerprint="4",
     )
 
@@ -1120,8 +1061,6 @@ def test_streaming_wanda_composes_with_quantization(tmp_path):
             targets=["Linear"],
             ignore=["re:.*lm_head"],
         ),
-        quantizer=lambda: QuantizationModifier(
-            scheme="W8A8", ignore=["lm_head"]
-        ),
+        quantizer=lambda: QuantizationModifier(scheme="W8A8", ignore=["lm_head"]),
         fingerprint="5",
     )

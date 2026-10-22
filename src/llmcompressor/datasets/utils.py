@@ -19,8 +19,8 @@ from torch import distributed as dist
 from torch.utils.data import DataLoader, RandomSampler, Sampler
 from transformers.data import DataCollatorWithPadding, default_data_collator
 
-from llmcompressor.args import DatasetArguments
 from llmcompressor._torch_accelerator_compat import accelerator_is_available
+from llmcompressor.args import DatasetArguments
 from llmcompressor.transformers.data import TextGenerationDataset
 from llmcompressor.typing import Processor
 

@@ -103,9 +103,7 @@ def test_source_fp4_fixture_uses_e2m1_codes_and_even_ties():
         {name: packed, name.replace(".weight", ".scale"): scale},
         target_dtype=torch.float32,
     )
-    expected = torch.tensor(
-        [[0, 1, 1, 2, 2, 4, 4, 6] * 4], dtype=torch.float32
-    )
+    expected = torch.tensor([[0, 1, 1, 2, 2, 4, 4, 6] * 4], dtype=torch.float32)
     torch.testing.assert_close(decoded, expected, rtol=0, atol=0)
 
 

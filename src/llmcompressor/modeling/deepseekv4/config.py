@@ -33,8 +33,7 @@ class ModelConfig(PretrainedConfig):
             and compress_rates is not None
         ):
             config_dict["compress_ratios"] = [
-                int(compress_rates.get(layer_type, 0))
-                for layer_type in layer_types
+                int(compress_rates.get(layer_type, 0)) for layer_type in layer_types
             ]
 
         mlp_layer_types = config_dict.pop("mlp_layer_types", None)
@@ -214,9 +213,7 @@ class ModelConfig(PretrainedConfig):
         # tensors are initialized before loading.
         quantization_config = dict(quantization_config or {})
         is_compressed = quantization_config.get("quantization_status") == "compressed"
-        self.source_quantization_config = (
-            {} if is_compressed else quantization_config
-        )
+        self.source_quantization_config = {} if is_compressed else quantization_config
         if is_compressed:
             kwargs["quantization_config"] = quantization_config
 
