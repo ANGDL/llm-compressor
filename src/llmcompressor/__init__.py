@@ -9,6 +9,10 @@ PyTorch and HuggingFace Transformers, allowing for quick experimentation.
 
 # ruff: noqa
 
+from llmcompressor._triton_env import configure_compressed_tensors_triton
+
+configure_compressed_tensors_triton()
+
 from llmcompressor._torch_accelerator_compat import ensure_torch_accelerator
 
 ensure_torch_accelerator()

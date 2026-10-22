@@ -3,26 +3,10 @@
 from __future__ import annotations
 
 import math
-import os
 
 import torch
 
-_DISABLE_TRITON_ENV = "LLMCOMPRESSOR_DISABLE_TRITON"
-_FALSE_VALUES = {"", "0", "false", "no", "off"}
-
-
-def is_triton_disabled() -> bool:
-    """Return whether optional Triton implementations are disabled globally.
-
-    Triton is disabled by default because the package may be importable while
-    its CUDA kernels are not launchable on the active accelerator. Set the
-    environment variable to ``0`` to explicitly force Triton.
-    """
-
-    configured = os.getenv(_DISABLE_TRITON_ENV)
-    if configured is None:
-        return True
-    return configured.strip().lower() not in _FALSE_VALUES
+from llmcompressor._triton_env import is_triton_disabled
 
 
 def _fla_reference_kda_adapter(
