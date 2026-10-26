@@ -12,7 +12,9 @@ The primary calibration dataset is multimodal. Each image row is converted
 using the DeepSeek-V4.1 image preprocessing contract into ViT patches and
 image-span metadata. Optional text rows are appended to the same prompt so
 every calibration batch exercises the vision tower, aligner, text backbone and
-DSpark. Engram lookup tables are preserved byte-for-byte.
+DSpark. Official FP8 Engram lookup tables are preserved byte-for-byte. BF16
+tables are exported in bounded chunks as FP8 E4M3 + UE8M0 row32 scales for
+runtime compatibility; q_weight/k_weight keep their original floating precision.
 Pass ``--quantize-engram-wkv`` to quantize Engram projections to W8A8
 with FP32 weight scales in every quantization mode.
 Pass ``--use-float32-scale-dtype`` to use FP32 weight scales for all PTQ groups.
