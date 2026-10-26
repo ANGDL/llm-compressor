@@ -41,6 +41,7 @@ from llmcompressor.streaming import (
 )
 from llmcompressor.streaming.inference.quantization import resolve_schemes
 from llmcompressor.utils import ImatrixFallbackStats
+from tools.create_tiny_dsv41 import encode_fp8
 
 EXAMPLE_PATH = (
     Path(__file__).parents[3] / "examples/streaming_oneshot/deepseek_v41_wNa8.py"
@@ -754,7 +755,7 @@ def test_engram_preservation_and_bounded_lookup(tmp_path, engram_dtype):
     actual = lookup(ids)
     expected = tensors[name].float()[ids].bfloat16()
     torch.testing.assert_close(actual, expected)
-    materializer = DeepSeekV41WeightMaterializer()
+    materializer = DeepSeekV41WeightMaterializer(engram_table_dtype="source")
     source = materializer.create_source(str(checkpoint))
     assert not any(".engram.embed." in name for name in source.tensor_names())
     output = tmp_path / "output"
@@ -1122,7 +1123,11 @@ def test_bf16_calibration_preserves_requested_weight_scale_dtype(
 
 
 @pytest.mark.parametrize("mode", ["wna8", "w8a8", "w4a8"])
-def test_streaming_quantizes_modern_bf16_checkpoint_and_reloads_engram(tmp_path, mode):
+@pytest.mark.parametrize("save_raw_checkpoint_format", [False, True])
+@pytest.mark.parametrize("quantize_engram_wkv", [False, True])
+def test_streaming_quantizes_modern_bf16_checkpoint_and_reloads_engram(
+    tmp_path, mode, save_raw_checkpoint_format, quantize_engram_wkv
+):
     config = tiny_config(engram=True, vision=True)
     checkpoint = tmp_path / "source"
     previous = torch.get_default_dtype()
@@ -1135,9 +1140,11 @@ def test_streaming_quantizes_modern_bf16_checkpoint_and_reloads_engram(tmp_path,
         torch.set_default_dtype(previous)
     config = ModelConfig.from_pretrained(checkpoint, local_files_only=True)
     groups, ignored = EXAMPLE._schemes(
-        mode, quantize_engram_wkv=True, scale_dtype=torch.float32
+        mode, quantize_engram_wkv=quantize_engram_wkv, scale_dtype=torch.float32
     )
-    materializer = DeepSeekV41WeightMaterializer()
+    materializer = DeepSeekV41WeightMaterializer(
+        save_raw_checkpoint_format=save_raw_checkpoint_format, engram_chunk_rows=2
+    )
     output = streaming_oneshot(
         model=checkpoint,
         model_config=config,
@@ -1161,30 +1168,77 @@ def test_streaming_quantizes_modern_bf16_checkpoint_and_reloads_engram(tmp_path,
         materializer=materializer,
     )
     saved = json.loads((output / "config.json").read_text())
-    assert saved["engram_storage"] == {"weight_dtype": "bf16"}
+    assert saved["engram_storage"] == {
+        "weight_dtype": "fp8_e4m3",
+        "scale_dtype": "ue8m0",
+        "group_size": 32,
+        "axis": "row",
+    }
     assert saved["source_quantization_config"] == {}
     index = json.loads((output / "model.safetensors.index.json").read_text())
     mapping = index["weight_map"]
-    table = "layers.1.engram.embed.weight"
-    assert "layers.1.engram.embed.scale" not in mapping
+    raw_table = "layers.1.engram.embed.weight"
+    output_name = materializer.output_tensor_name
+    table = output_name(f"model.{raw_table}")
+    scale_name = output_name("model.layers.1.engram.embed.scale")
+    assert scale_name in mapping
     actual = load_file(output / mapping[table])[table]
-    assert actual.dtype == torch.bfloat16
-    torch.testing.assert_close(actual, source_tensors[table], rtol=0, atol=0)
-    expected_names = set(source_tensors)
-    assert {name for name in mapping if not name.endswith(".scale")} == expected_names
-    for name, shape in (
-        ("layers.1.engram.wkv.weight", (96, 32)),
-        ("mtp.1.ffn.experts.0.w1.weight", (32, 32 if mode == "w8a8" else 16)),
-    ):
-        weight = load_file(output / mapping[name])[name]
-        assert weight.dtype == torch.int8
-        assert tuple(weight.shape) == shape
+    assert actual.dtype == torch.float8_e4m3fn
+    scale = load_file(output / mapping[scale_name])[scale_name]
+    assert scale.dtype == torch.float8_e8m0fnu
+    assert tuple(scale.shape) == (5, 1)
+    expected_weight, expected_scale = encode_fp8(
+        source_tensors[raw_table], rowwise=True
+    )
+    assert torch.equal(actual.view(torch.uint8), expected_weight.view(torch.uint8))
+    assert torch.equal(scale.view(torch.uint8), expected_scale.view(torch.uint8))
+    for name in ("layers.1.engram.q_weight", "layers.1.engram.k_weight"):
+        saved_name = output_name(f"model.{name}")
+        value = load_file(output / mapping[saved_name])[saved_name]
+        assert value.dtype == torch.bfloat16
+        torch.testing.assert_close(value, source_tensors[name], rtol=0, atol=0)
+    expected_names = {
+        output_name(
+            "model.lm_head.weight" if name == "head.weight" else f"model.{name}"
+        )
+        for name in source_tensors
+    }
+    assert {
+        name for name in mapping if not name.endswith((".scale", ".weight_scale"))
+    } == expected_names
+    expert_name = output_name("model.mtp.1.ffn.experts.0.w1.weight")
+    weight = load_file(output / mapping[expert_name])[expert_name]
+    assert weight.dtype == torch.int8
+    assert tuple(weight.shape) == (32, 32 if mode == "w8a8" else 16)
+    wkv_name = output_name("model.layers.1.engram.wkv.weight")
+    wkv_weight = load_file(output / mapping[wkv_name])[wkv_name]
+    assert tuple(wkv_weight.shape) == (96, 32)
+    wkv_scale = materializer.output_weight_scale_name(wkv_name.removesuffix(".weight"))
+    if quantize_engram_wkv:
+        assert wkv_weight.dtype == torch.int8
+        assert load_file(output / mapping[wkv_scale])[wkv_scale].dtype == torch.float32
+    else:
+        assert wkv_weight.dtype == torch.bfloat16
+        assert wkv_scale not in mapping
+        torch.testing.assert_close(
+            wkv_weight, source_tensors["layers.1.engram.wkv.weight"], rtol=0, atol=0
+        )
+    actual_mapping, total_size = {}, 0
+    for filename in set(mapping.values()):
+        with safe_open(output / filename, framework="pt", device="cpu") as shard:
+            for name in shard.keys():
+                assert name not in actual_mapping
+                actual_mapping[name] = filename
+                tensor = shard.get_tensor(name)
+                total_size += tensor.numel() * tensor.element_size()
+    assert actual_mapping == mapping
+    assert total_size == index["metadata"]["total_size"]
     reloaded = ModelConfig.from_pretrained(output, local_files_only=True)
     assert reloaded.text_config.n_mtp_layers == 3
     ids = torch.tensor([[[0, 4, 0], [2, 1, 4]]])
     torch.testing.assert_close(
         CheckpointEngramLookup(output, 1, (5, 32))(ids),
-        source_tensors[table][ids],
+        (actual.float() * scale.float()).bfloat16()[ids],
         rtol=0,
         atol=0,
     )

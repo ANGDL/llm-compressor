@@ -1,4 +1,4 @@
-"""V4.1 block32 decoding and lossless BF16/FP8 Engram preservation."""
+"""V4.1 block32 decoding and bounded-memory Engram checkpoint export."""
 
 import json
 import os
@@ -7,13 +7,45 @@ from copy import deepcopy
 from pathlib import Path
 
 import torch
+from safetensors import safe_open
 
+from .._logging import streaming_logger
 from .deepseek_v4 import (
     DeepSeekV4WeightMaterializer,
     DeepSeekV4WeightSource,
     _logical_to_raw,
     _raw_to_logical,
 )
+
+_ENGRAM_FP8_STORAGE = {
+    "weight_dtype": "fp8_e4m3",
+    "scale_dtype": "ue8m0",
+    "group_size": 32,
+    "axis": "row",
+}
+
+
+def _encode_engram_rows(weight):
+    """Encode row-local groups of 32; never use 32x32 linear-weight blocks."""
+    groups = weight.float().unflatten(-1, (-1, 32))
+    if not torch.isfinite(groups).all():
+        raise ValueError("Cannot encode non-finite Engram weights")
+    # Keep scales positive and normal in FP32, including all-zero groups.
+    maximum = groups.abs().amax(-1).clamp_min(448 * 2**-126)
+    raw_scale = maximum / 448
+    # frexp avoids log2 rounding down just above a power-of-two boundary.
+    mantissa, exponent = torch.frexp(raw_scale)
+    exponent = exponent - (mantissa == 0.5).int()
+    scale = torch.ldexp(torch.ones_like(raw_scale), exponent)
+    encoded = (groups / scale.unsqueeze(-1)).clamp(-448, 448)
+    encoded = encoded.to(torch.float8_e4m3fn).flatten(-2).contiguous()
+    if (maximum > 2.0**126).any():
+        # An FP8 value and its scale can each be finite while their product
+        # overflows FP32/BF16 (e.g. BF16 max rounds to 256 * 2**120).
+        decoded_max = encoded.float().unflatten(-1, (-1, 32)).abs().amax(-1) * scale
+        if not torch.isfinite(decoded_max.bfloat16()).all():
+            raise ValueError("Engram FP8 encoding would overflow BF16 on lookup")
+    return encoded, scale.to(torch.float8_e8m0fnu).contiguous()
 
 
 def _raw_quantization_target(target):
@@ -41,13 +73,15 @@ class DeepSeekV41WeightSource(DeepSeekV4WeightSource):
             if not (preserve_engram and _is_engram_table(name))
         )
 
-    def engram_storage(self):
-        """Describe preserved tables from shard metadata, without loading rows."""
+    def engram_storage(self, *, table_dtype="source"):
+        """Validate source metadata and describe the table export format."""
         storage = None
         for name in self._logical_to_raw:
             if not name.endswith(".engram.embed.weight"):
                 continue
             weight = self.metadata(name)
+            if len(weight.shape) != 2 or min(weight.shape) <= 0:
+                raise ValueError(f"Invalid Engram table shape: {name}")
             scale_name = f"{name.removesuffix('.weight')}.scale"
             if weight.dtype in {torch.float8_e4m3fn, torch.uint8}:
                 scale = self.metadata(scale_name)
@@ -57,12 +91,7 @@ class DeepSeekV41WeightSource(DeepSeekV4WeightSource):
                     or scale.shape != (weight.shape[0], weight.shape[1] // 32)
                 ):
                     raise ValueError(f"Invalid FP8 Engram row scales: {scale_name}")
-                current = {
-                    "weight_dtype": "fp8_e4m3",
-                    "scale_dtype": "ue8m0",
-                    "group_size": 32,
-                    "axis": "row",
-                }
+                current = dict(_ENGRAM_FP8_STORAGE)
             else:
                 dtype = {
                     torch.bfloat16: "bf16",
@@ -74,6 +103,12 @@ class DeepSeekV41WeightSource(DeepSeekV4WeightSource):
                 if scale_name in self._logical_to_raw:
                     raise ValueError("Unquantized Engram weights must not have scales")
                 current = {"weight_dtype": dtype}
+            if table_dtype == "fp8":
+                if weight.shape[1] % 32:
+                    raise ValueError(
+                        "FP8 Engram tables require a width divisible by 32"
+                    )
+                current = dict(_ENGRAM_FP8_STORAGE)
             if storage is not None and storage != current:
                 raise ValueError(
                     "Preserved Engram tables must use the same storage format"
@@ -83,13 +118,26 @@ class DeepSeekV41WeightSource(DeepSeekV4WeightSource):
 
 
 class DeepSeekV41WeightMaterializer(DeepSeekV4WeightMaterializer):
+    """Keep tables externally backed and export runtime-compatible FP8 rows.
+
+    Calibration reads the original table. Only checkpoint export converts dense
+    rows; existing FP8 weights/scales are copied byte-for-byte. ``source`` is an
+    opt-out for consumers that support dense tables, not the XSGL INT8 runtime.
+    """
+
     def __init__(
         self,
         *,
         save_raw_checkpoint_format=True,
         preserve_engram=True,
         source_has_mtp=None,
+        engram_table_dtype="fp8",
+        engram_chunk_rows=65536,
     ):
+        if engram_table_dtype not in {"fp8", "source"}:
+            raise ValueError("engram_table_dtype must be 'fp8' or 'source'")
+        if engram_chunk_rows <= 0:
+            raise ValueError("engram_chunk_rows must be positive")
         super().__init__(
             fp8_block_size=(32, 32),
             fp4_block_size=32,
@@ -97,13 +145,19 @@ class DeepSeekV41WeightMaterializer(DeepSeekV4WeightMaterializer):
             source_has_mtp=source_has_mtp,
         )
         self.preserve_engram = preserve_engram
+        self.engram_table_dtype = engram_table_dtype
+        self.engram_chunk_rows = engram_chunk_rows
         self._source_quantization_config = {}
         self._engram_storage = None
 
     def configuration(self):
         result = dict(super().configuration())
         result.update(
-            key_layout="deepseek-v41-raw", preserve_engram=self.preserve_engram
+            key_layout="deepseek-v41-raw",
+            preserve_engram=self.preserve_engram,
+            engram_table_dtype=self.engram_table_dtype,
+            engram_encoding="row32-e4m3-ue8m0-v1",
+            engram_chunk_rows=self.engram_chunk_rows,
         )
         return result
 
@@ -115,7 +169,12 @@ class DeepSeekV41WeightMaterializer(DeepSeekV4WeightMaterializer):
         source = DeepSeekV41WeightSource(
             checkpoint, preserve_engram=self.preserve_engram
         )
-        self._engram_storage = source.engram_storage() if self.preserve_engram else None
+        # Validate before calibration starts, not after a full-model run.
+        self._engram_storage = (
+            source.engram_storage(table_dtype=self.engram_table_dtype)
+            if self.preserve_engram
+            else None
+        )
         return source
 
     @staticmethod
@@ -189,11 +248,114 @@ class DeepSeekV41WeightMaterializer(DeepSeekV4WeightMaterializer):
                 groups.setdefault(source, {})[name] = output_name
         result = {}
         for number, (source, names) in enumerate(sorted(groups.items())):
+            copied = {}
+            for table_number, (name, output_name) in enumerate(sorted(names.items())):
+                if self.engram_table_dtype == "fp8" and name.endswith(".weight"):
+                    with safe_open(source, framework="pt", device="cpu") as shard:
+                        dtype = shard.get_slice(name).get_dtype()
+                    if dtype in {"BF16", "F16", "F32"}:
+                        filename = (
+                            f"model-engram-fp8-{number:05d}-"
+                            f"{table_number:03d}.safetensors"
+                        )
+                        scale_name = f"{output_name.removesuffix('.weight')}.scale"
+                        self._encode_engram_table(
+                            source,
+                            name,
+                            Path(output_dir) / filename,
+                            output_name,
+                            scale_name,
+                        )
+                        result.update({output_name: filename, scale_name: filename})
+                        continue
+                copied[name] = output_name
+            if not copied:
+                continue
             filename = f"model-preserved-engram-{number:05d}.safetensors"
             destination = Path(output_dir) / filename
-            self._copy_tensor_payloads(source, destination, names)
-            result.update({name: filename for name in names.values()})
+            self._copy_tensor_payloads(source, destination, copied)
+            result.update({name: filename for name in copied.values()})
         return result
+
+    def _encode_engram_table(self, source, name, destination, weight_name, scale_name):
+        """Stream a huge table to one atomic safetensors file, using bounded RAM.
+
+        safetensors supplies bounded input slices. Its save_file API requires
+        complete output tensors, so emit the two payloads by offset instead of
+        allocating the full FP8 table and scale (over 100 GB per real layer).
+        """
+        with safe_open(source, framework="pt", device="cpu") as shard:
+            rows, width = shard.get_slice(name).get_shape()
+        if width % 32:
+            raise ValueError("FP8 Engram tables require a width divisible by 32")
+        weight_bytes = rows * width
+        scale_bytes = rows * (width // 32)
+        header = {
+            weight_name: {
+                "dtype": "F8_E4M3",
+                "shape": [rows, width],
+                "data_offsets": [0, weight_bytes],
+            },
+            scale_name: {
+                "dtype": "F8_E8M0",
+                "shape": [rows, width // 32],
+                "data_offsets": [weight_bytes, weight_bytes + scale_bytes],
+            },
+        }
+        payload = json.dumps(header, separators=(",", ":")).encode()
+        payload += b" " * (-len(payload) % 8)
+        data_start = 8 + len(payload)
+        if destination.exists():
+            with destination.open("rb") as existing:
+                length = struct.unpack("<Q", existing.read(8))[0]
+                actual = json.loads(existing.read(length))
+            if actual != header or destination.stat().st_size != (
+                8 + length + weight_bytes + scale_bytes
+            ):
+                raise ValueError(f"Encoded Engram shard disagrees: {destination}")
+            return
+        temporary = destination.with_suffix(".pending")
+        streaming_logger.info(
+            f"engram | encode FP8 row32 | tensor={name} | rows={rows}"
+        )
+        try:
+            with temporary.open("wb") as output:
+                output.write(struct.pack("<Q", len(payload)))
+                output.write(payload)
+                for start in range(0, rows, self.engram_chunk_rows):
+                    end = min(rows, start + self.engram_chunk_rows)
+                    # Clone a bounded slice, then close the entire file mapping.
+                    # Keeping one mmap for the whole scan can accumulate resident
+                    # source pages up to the size of the hundreds-of-GB table.
+                    with safe_open(source, framework="pt", device="cpu") as shard:
+                        chunk = shard.get_slice(name)[start:end].clone()
+                    weight, scale = _encode_engram_rows(chunk)
+                    del chunk
+                    output.seek(data_start + start * width)
+                    output.write(memoryview(weight.view(torch.uint8).numpy()))
+                    output.seek(data_start + weight_bytes + start * (width // 32))
+                    output.write(memoryview(scale.view(torch.uint8).numpy()))
+                    del weight, scale
+                    if start // self.engram_chunk_rows % 64 == 0 or end == rows:
+                        streaming_logger.info(
+                            f"engram | encode FP8 row32 | tensor={name} | "
+                            f"rows={end}/{rows}"
+                        )
+                output.flush()
+                os.fsync(output.fileno())
+            with safe_open(temporary, framework="pt", device="cpu") as encoded:
+                if set(encoded.keys()) != set(header):
+                    raise ValueError("Encoded Engram tensor names disagree")
+                for key, spec in header.items():
+                    item = encoded.get_slice(key)
+                    if (
+                        item.get_shape() != spec["shape"]
+                        or item.get_dtype() != spec["dtype"]
+                    ):
+                        raise ValueError(f"Invalid encoded Engram header: {key}")
+            os.replace(temporary, destination)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     @staticmethod
     def _copy_tensor_payloads(source, destination, names):
