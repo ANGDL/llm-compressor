@@ -144,8 +144,7 @@ def test_streaming_w8a8_targets_exclude_kda_but_keep_dsa_and_mlp():
     main = next(
         node
         for node in tree.body
-        if isinstance(node, ast.FunctionDef)
-        and node.name == "main"
+        if isinstance(node, ast.FunctionDef) and node.name == "main"
     )
     targets = next(
         ast.literal_eval(node.value)
@@ -272,8 +271,12 @@ def test_w8a8_targets_group_repeated_suffixes_compactly():
 
     target = namespace["build_glm5_next_w8a8_targets"](model, [])[0]
     assert len(target) < 300
-    assert match_name("model.language_model.layers.0.mlp.shared_experts.up_proj", target)
-    assert match_name("language_model.model.layers.11.mlp.shared_experts.up_proj", target)
+    assert match_name(
+        "model.language_model.layers.0.mlp.shared_experts.up_proj", target
+    )
+    assert match_name(
+        "language_model.model.layers.11.mlp.shared_experts.up_proj", target
+    )
 
 
 @pytest.mark.unit
@@ -302,7 +305,5 @@ def test_ignore_inference_skips_packed_auxiliary_tensors():
     assert "model.language_model.layers.0.mlp.gate_proj" not in ignores
     assert "model.language_model.layers.3.mlp.experts.0.gate_proj" not in ignores
     assert not [
-        name
-        for name in ignores
-        if ".mlp.experts." in name or ".mlp.gate_proj" in name
+        name for name in ignores if ".mlp.experts." in name or ".mlp.gate_proj" in name
     ], ignores

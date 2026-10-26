@@ -33,6 +33,7 @@ for _safetensors_name, _torch_name in (
     if hasattr(torch, _torch_name):
         _SAFETENSORS_DTYPES[_safetensors_name] = getattr(torch, _torch_name)
 
+
 @dataclass(frozen=True)
 class TensorMetadata:
     """Header-only information about one checkpoint tensor."""
@@ -97,9 +98,7 @@ class WeightMap:
         return cls._from_shards(tensor_shards)
 
     @classmethod
-    def _from_shards(
-        cls, tensor_shards: dict[str | None, Path]
-    ) -> WeightMap:
+    def _from_shards(cls, tensor_shards: dict[str | None, Path]) -> WeightMap:
         declared = {name for name in tensor_shards if name is not None}
         tensors = {}
         for shard in sorted(set(tensor_shards.values())):

@@ -1,9 +1,7 @@
 import io
 from contextlib import redirect_stdout
-from unittest.mock import MagicMock, patch
 
 import pytest
-import torch
 from torch import nn
 
 from llmcompressor.utils.imatrix_fallback_stats import (
@@ -74,9 +72,7 @@ class TestWarningSink:
         _reset_class_state()
         ImatrixFallbackStats._current_module.set("model.layers.1")
         _imatrix_warning_sink(
-            _FakeMessage(
-                "imatrix_mse: all zeros. Falling back to uniform MSE."
-            )
+            _FakeMessage("imatrix_mse: all zeros. Falling back to uniform MSE.")
         )
         assert ImatrixFallbackStats._all_zero["model.layers.1"] == 1
         assert len(ImatrixFallbackStats._no_importance) == 0
@@ -204,7 +200,7 @@ class TestContextManager:
         _reset_class_state()
         buf = io.StringIO()
         with redirect_stdout(buf):
-            with ImatrixFallbackStats() as stats:
+            with ImatrixFallbackStats():
                 token = ImatrixFallbackStats._current_module.set("mod")
                 try:
                     _imatrix_warning_sink(
@@ -313,8 +309,9 @@ class TestIntegrationWithObserver:
 
     def test_no_importance_fallback_is_tracked(self):
         """Observer without gatherer falls back and the warning is counted."""
-        from llmcompressor.observers.imatrix import IMatrixMSEObserver
         from compressed_tensors.quantization import QuantizationArgs
+
+        from llmcompressor.observers.imatrix import IMatrixMSEObserver
 
         stats = ImatrixFallbackStats()
         stats.install_hooks()
@@ -341,8 +338,9 @@ class TestIntegrationWithObserver:
 
     def test_attach_without_module_name_uses_class_name(self):
         """When no module name is recorded, observer uses class name as fallback."""
-        from llmcompressor.observers.imatrix import IMatrixMSEObserver
         from compressed_tensors.quantization import QuantizationArgs
+
+        from llmcompressor.observers.imatrix import IMatrixMSEObserver
 
         stats = ImatrixFallbackStats()
         stats.install_hooks()
@@ -385,9 +383,7 @@ class TestIntegrationWithObserver:
         # Now for mod_b
         token_b = ImatrixFallbackStats._current_module.set("layer.b")
         _imatrix_warning_sink(
-            _FakeMessage(
-                "imatrix_mse: all zeros. Falling back to uniform MSE."
-            )
+            _FakeMessage("imatrix_mse: all zeros. Falling back to uniform MSE.")
         )
         ImatrixFallbackStats._current_module.reset(token_b)
 
@@ -414,8 +410,8 @@ class TestClassPatches:
         _reset_class_state()
 
     def test_patches_are_applied_once(self):
-        from llmcompressor.observers.imatrix import IMatrixMSEObserver
         from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
+        from llmcompressor.observers.imatrix import IMatrixMSEObserver
 
         # Store originals before first call
         original_gatherer_init = IMatrixGatherer.on_initialize

@@ -117,9 +117,7 @@ def test_committed_boundary_is_validated_and_reloaded(tmp_path):
         transaction.write_tensor(
             "weight", torch.ones(2), output_shard="model.safetensors"
         )
-        transaction.write_boundary(
-            0, {"hidden": torch.arange(3)}, boundary=1
-        )
+        transaction.write_boundary(0, {"hidden": torch.arange(3)}, boundary=1)
         transaction.commit()
 
     boundary, values = writer.committed_boundary("subgraph-00000")
@@ -152,9 +150,7 @@ def test_writer_preserves_bfloat16_storage(tmp_path):
     writer = StreamingCheckpointWriter(tmp_path, run_fingerprint="run-a")
     expected = torch.tensor([1.5, -2.25], dtype=torch.bfloat16)
     with writer.transaction("subgraph-00000") as transaction:
-        transaction.write_tensor(
-            "weight", expected, output_shard="model.safetensors"
-        )
+        transaction.write_tensor("weight", expected, output_shard="model.safetensors")
         transaction.commit()
 
     writer.assemble_shards()
@@ -172,18 +168,12 @@ def test_direct_writer_publishes_final_shard_without_tensor_payloads(tmp_path):
     )
 
     assert output == tmp_path / "model-subgraph-00000.safetensors"
-    assert torch.equal(
-        read_shard(output)["layers.0.weight"], torch.arange(4)
-    )
+    assert torch.equal(read_shard(output)["layers.0.weight"], torch.arange(4))
     assert not (tmp_path / "transactions").exists()
     assert not list(tmp_path.rglob("*.bin"))
-    assert writer.committed_metadata()[0]["tensor_names"] == [
-        "layers.0.weight"
-    ]
+    assert writer.committed_metadata()[0]["tensor_names"] == ["layers.0.weight"]
     with pytest.raises(ArtifactCompatibilityError, match="different run"):
-        DirectSafetensorsWriter(
-            tmp_path, run_fingerprint="run-b"
-        ).committed_metadata()
+        DirectSafetensorsWriter(tmp_path, run_fingerprint="run-b").committed_metadata()
 
 
 def test_async_direct_writer_returns_before_disk_write_finishes(tmp_path):
@@ -296,9 +286,7 @@ def test_async_writer_releases_snapshot_reservation_after_failure(tmp_path):
         "snapshot", writer.estimate_snapshot_bytes({"weight": source})
     )
 
-    writer.write_shard(
-        "subgraph-00000", {"weight": source}, reservation=reservation
-    )
+    writer.write_shard("subgraph-00000", {"weight": source}, reservation=reservation)
     with pytest.raises(RuntimeError, match="subgraph-00000"):
         writer.close()
 

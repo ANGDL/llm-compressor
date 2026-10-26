@@ -160,7 +160,6 @@ import torch.nn as nn
 from safetensors import safe_open
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-
 # ---------------------------------------------------------------------------
 # Checkpoint helpers
 # ---------------------------------------------------------------------------
@@ -198,7 +197,7 @@ def _strip_prefix(
     tensors: dict[str, torch.Tensor], prefix: str
 ) -> dict[str, torch.Tensor]:
     dot = prefix + "."
-    return {k[len(dot):]: v for k, v in tensors.items() if k.startswith(dot)}
+    return {k[len(dot) :]: v for k, v in tensors.items() if k.startswith(dot)}
 
 
 # ---------------------------------------------------------------------------
@@ -229,11 +228,11 @@ class MiMoV2FlashMTPLayer(nn.Module):
         # Reuse the exact same classes the main stack uses. We pull them off
         # the loaded model so we don't have to import the trust_remote_code
         # module by name.
-        norm_cls = model.model.norm.__class__                  # MiMoV2RMSNorm
-        attn_cls = model.model.layers[0].self_attn.__class__   # MiMoV2Attention
+        norm_cls = model.model.norm.__class__  # MiMoV2RMSNorm
+        attn_cls = model.model.layers[0].self_attn.__class__  # MiMoV2Attention
         # MiMoV2MLP – grab from any MiMoV2MLP instance. Layer 0 is the dense
         # MLP layer (moe_layer_freq[0] == 0); use it to get the class.
-        mlp_cls = model.model.layers[0].mlp.__class__          # MiMoV2MLP
+        mlp_cls = model.model.layers[0].mlp.__class__  # MiMoV2MLP
 
         # ---- MTP-specific ----
         self.enorm = norm_cls(H, eps=eps)
@@ -307,9 +306,9 @@ class MiMoV2FlashMTPLayer(nn.Module):
         h = self.input_layernorm(h)
         attn_out, _ = self.self_attn(
             hidden_states=h,
-            attention_mask=None,        # mask preparation is bypassed; OK for Hessians
+            attention_mask=None,  # mask preparation is bypassed; OK for Hessians
             position_ids=position_ids,
-            past_key_values=None,       # no KV cache during calibration
+            past_key_values=None,  # no KV cache during calibration
             use_cache=False,
             cache_position=cache_position,
             position_embeddings=position_embeddings,
@@ -374,7 +373,7 @@ def _count_mtp_layers(model_path: str) -> int:
             with safe_open(path, framework="pt") as f:
                 for key in f.keys():
                     if key.startswith("model.mtp.layers."):
-                        idx_str = key[len("model.mtp.layers."):].split(".", 1)[0]
+                        idx_str = key[len("model.mtp.layers.") :].split(".", 1)[0]
                         if idx_str.isdigit():
                             candidates.add(int(idx_str))
         return len(candidates)
@@ -384,7 +383,7 @@ def _count_mtp_layers(model_path: str) -> int:
     indices: set[int] = set()
     for k in weight_map:
         if k.startswith("model.mtp.layers."):
-            idx_str = k[len("model.mtp.layers."):].split(".", 1)[0]
+            idx_str = k[len("model.mtp.layers.") :].split(".", 1)[0]
             if idx_str.isdigit():
                 indices.add(int(idx_str))
     return len(indices)
@@ -445,9 +444,7 @@ def attach_mtp_layer(model, model_path: str) -> None:
         )
         raw = _load_mtp_tensors(model_path, mtp_prefix)
         raw = _strip_prefix(raw, mtp_prefix)
-        print(
-            f"[attach_mtp_layer] Found {len(raw)} MTP tensors for block {offset}."
-        )
+        print(f"[attach_mtp_layer] Found {len(raw)} MTP tensors for block {offset}.")
 
         mtp_layers.append(
             MiMoV2FlashMTPLayer(
@@ -526,14 +523,12 @@ def attach_mtp_layer(model, model_path: str) -> None:
         # (we do NOT call lm_head again — that would double-count the head).
         if position_ids is None:
             seq_len = hidden_states.shape[1]
-            position_ids = torch.arange(
-                seq_len, device=hidden_states.device
-            ).unsqueeze(0)
+            position_ids = torch.arange(seq_len, device=hidden_states.device).unsqueeze(
+                0
+            )
 
         # MTP attention is SWA, so use the SWA rotary embeddings.
-        mtp_position_embeddings = self.model.swa_rotary_emb(
-            hidden_states, position_ids
-        )
+        mtp_position_embeddings = self.model.swa_rotary_emb(hidden_states, position_ids)
 
         prev_hidden = hidden_states
         for mtp_block in self.model.mtp.layers:
@@ -558,7 +553,5 @@ def attach_mtp_layer(model, model_path: str) -> None:
 
     print(
         "[attach_mtp_layer] Done. MTP sub-modules: "
-        + ", ".join(
-            name for name, _ in model.model.mtp.named_modules() if name
-        )
+        + ", ".join(name for name, _ in model.model.mtp.named_modules() if name)
     )

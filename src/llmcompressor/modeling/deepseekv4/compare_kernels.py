@@ -11,6 +11,7 @@
 
 import os
 import sys
+
 import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -22,11 +23,11 @@ REFERENCE_KERNEL_PATH = os.environ.get(
 os.environ["DEEPSEEK_V4_KERNEL_BACKEND"] = "reference"
 os.environ["DEEPSEEK_V4_REFERENCE_KERNEL_PATH"] = REFERENCE_KERNEL_PATH
 
-from llmcompressor.modeling.deepseekv4.kernels import (
-    sparse_attention,
+from llmcompressor.modeling.deepseekv4.kernels import (  # noqa: E402, I001
+    _load_reference_kernel_module,
     hc_split,
     reset_kernel_backend_cache,
-    _load_reference_kernel_module,
+    sparse_attention,
 )
 
 
@@ -79,7 +80,9 @@ topk = 16
 q = torch.randn(bsz, seqlen, n_heads, head_dim, device=device, dtype=torch.bfloat16)
 kv = torch.randn(bsz, n_kv, head_dim, device=device, dtype=torch.bfloat16)
 attn_sink = torch.randn(n_heads, device=device, dtype=torch.float32)
-topk_idxs = torch.randint(0, n_kv, (bsz, seqlen, topk), device=device, dtype=torch.int32)
+topk_idxs = torch.randint(
+    0, n_kv, (bsz, seqlen, topk), device=device, dtype=torch.int32
+)
 topk_idxs[:, :, -2:] = -1  # 最后 2 个位置无效
 softmax_scale = (1.0 / head_dim) ** 0.5
 

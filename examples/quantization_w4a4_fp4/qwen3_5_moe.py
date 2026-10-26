@@ -1,10 +1,14 @@
-from transformers import AutoProcessor, Qwen3_5MoeForConditionalGeneration
+import torch
 from datasets import load_dataset
+from transformers import AutoProcessor, Qwen3_5MoeForConditionalGeneration
+
 from llmcompressor import oneshot
 from llmcompressor.modifiers.quantization import QuantizationModifier
-import torch
 
-MODEL_ID = "/raid/engine/dsikka/models--Qwen--Qwen3.5-397B-A17B/snapshots/7cad2bae11cb49ca79f7d6a0954de2e2756f4e27"
+MODEL_ID = (
+    "/raid/engine/dsikka/models--Qwen--Qwen3.5-397B-A17B/"
+    "snapshots/7cad2bae11cb49ca79f7d6a0954de2e2756f4e27"
+)
 
 # Load model.
 model = Qwen3_5MoeForConditionalGeneration.from_pretrained(MODEL_ID, dtype="auto")
@@ -71,15 +75,16 @@ def data_collator(batch):
     }
 
 
-
 # Apply quantization.
-oneshot(model=model, 
-    recipe=recipe, 
+oneshot(
+    model=model,
+    recipe=recipe,
     dataset=ds,
     data_collator=data_collator,
     max_seq_length=MAX_SEQUENCE_LENGTH,
     num_calibration_samples=NUM_CALIBRATION_SAMPLES,
-    moe_calibrate_all_experts=True)
+    moe_calibrate_all_experts=True,
+)
 
 # Save to disk in compressed-tensors format.
 SAVE_DIR = "/raid/engine/dsikka/" + "Qwen3.5-397B-A17B" + "-NVFP4"

@@ -1,5 +1,6 @@
 """
-End-to-end MTP (Multi-Token Prediction) layer support for GLM-5 (GlmMoeDsa) quantization.
+End-to-end MTP (Multi-Token Prediction) layer support for GLM-5
+(GlmMoeDsa) quantization.
 
 GLM-5 has 78 main decoder layers (0–77) plus one MTP layer at index 78
 (``model.layers.78.*`` in the checkpoint).  The HuggingFace transformers
@@ -49,17 +50,16 @@ from typing import Optional
 import torch
 import torch.nn as nn
 from safetensors import safe_open
-
+from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import (
     GlmMoeDsaDecoderLayer,
     GlmMoeDsaRMSNorm,
 )
-from transformers.modeling_outputs import CausalLMOutputWithPast
-
 
 # ---------------------------------------------------------------------------
 # Checkpoint helpers
 # ---------------------------------------------------------------------------
+
 
 def _load_mtp_tensors(model_path: str, mtp_prefix: str) -> dict[str, torch.Tensor]:
     """Return every tensor whose name starts with ``<mtp_prefix>.`` ."""
@@ -93,7 +93,7 @@ def _strip_prefix(
     tensors: dict[str, torch.Tensor], prefix: str
 ) -> dict[str, torch.Tensor]:
     dot = prefix + "."
-    return {k[len(dot):]: v for k, v in tensors.items() if k.startswith(dot)}
+    return {k[len(dot) :]: v for k, v in tensors.items() if k.startswith(dot)}
 
 
 # ---------------------------------------------------------------------------
@@ -170,6 +170,7 @@ def _fuse_moe_expert_weights(
 # MTP layer module
 # ---------------------------------------------------------------------------
 
+
 class GlmMoeDsaMTPLayer(nn.Module):
     """
     One MTP (Multi-Token Prediction) layer for GLM-5.
@@ -203,26 +204,26 @@ class GlmMoeDsaMTPLayer(nn.Module):
         # like mlp_layer_types[mtp_layer_idx] and indexer_types[mtp_layer_idx].
         # The main-model config only has entries for layers 0..num_hidden_layers-1,
         # so we extend them (on a shallow copy) before constructing the decoder.
-        needs_extend = (
-            len(config.mlp_layer_types) <= mtp_layer_idx
-            or (
-                hasattr(config, "indexer_types")
-                and len(config.indexer_types) <= mtp_layer_idx
-            )
+        needs_extend = len(config.mlp_layer_types) <= mtp_layer_idx or (
+            hasattr(config, "indexer_types")
+            and len(config.indexer_types) <= mtp_layer_idx
         )
         if needs_extend:
             extended = copy.copy(config)
             if len(config.mlp_layer_types) <= mtp_layer_idx:
-                extended.mlp_layer_types = (
-                    list(config.mlp_layer_types)
-                    + ["sparse"] * (mtp_layer_idx - len(config.mlp_layer_types) + 1)
+                extended.mlp_layer_types = list(config.mlp_layer_types) + ["sparse"] * (
+                    mtp_layer_idx - len(config.mlp_layer_types) + 1
                 )
-            if hasattr(config, "indexer_types") and len(config.indexer_types) <= mtp_layer_idx:
+            if (
+                hasattr(config, "indexer_types")
+                and len(config.indexer_types) <= mtp_layer_idx
+            ):
                 # GLM-5.2 introduced cross-layer top-k sharing where some layers run a
                 # `"full"` indexer and others are `"shared"` (reuse the previous full
                 # layer's top-k). The MTP layer's indexer mode is NOT inferable from the
                 # last main layer:
-                #   - GLM-5.1: indexer_types absent in config → defaults to all `"full"`,
+                #   - GLM-5.1: indexer_types absent in config → defaults to
+                #     all `"full"`,
                 #     and MTP layer also has its own indexer.
                 #   - GLM-5.2: indexer_types has `"shared"` entries, and the last main
                 #     layer (77) happens to be `"shared"`. But the MTP layer (78) ships
@@ -234,9 +235,8 @@ class GlmMoeDsaMTPLayer(nn.Module):
                     name.startswith("self_attn.indexer.") for name in raw_tensors
                 )
                 fill = "full" if mtp_has_indexer else "shared"
-                extended.indexer_types = (
-                    list(config.indexer_types)
-                    + [fill] * (mtp_layer_idx - len(config.indexer_types) + 1)
+                extended.indexer_types = list(config.indexer_types) + [fill] * (
+                    mtp_layer_idx - len(config.indexer_types) + 1
                 )
         else:
             extended = config
@@ -342,6 +342,7 @@ class GlmMoeDsaMTPLayer(nn.Module):
 # Public API
 # ---------------------------------------------------------------------------
 
+
 def attach_mtp_layer(model, model_path: str) -> None:
     """
     Load the MTP layer (``model.layers.{num_hidden_layers}.*``) from *model_path*
@@ -364,7 +365,7 @@ def attach_mtp_layer(model, model_path: str) -> None:
         Directory containing the original (BF16) safetensors shards.
     """
     config = model.config
-    mtp_layer_idx = config.num_hidden_layers   # layer 78 for GLM-5
+    mtp_layer_idx = config.num_hidden_layers  # layer 78 for GLM-5
 
     try:
         ref_param = next(iter(model.parameters()))
@@ -548,10 +549,10 @@ def attach_mtp_layer(model, model_path: str) -> None:
         remapped = {}
         for k, v in sd.items():
             if k.startswith("mtp."):
-                rel = k[len("mtp."):]                          # strip "mtp."
+                rel = k[len("mtp.") :]  # strip "mtp."
                 rel = rel.replace("shared_head_norm.", "shared_head.norm.")
                 if rel.startswith("decoder."):
-                    rel = rel[len("decoder."):]                # strip "decoder."
+                    rel = rel[len("decoder.") :]  # strip "decoder."
                 remapped[ckpt_prefix + rel] = v
             else:
                 remapped[k] = v

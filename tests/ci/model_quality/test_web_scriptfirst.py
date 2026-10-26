@@ -7,8 +7,8 @@ import pytest
 import yaml
 
 from ci.model_quality.web import (
-    ControlPlane,
     DEFAULT_UPLOAD_REMOTE_PREFIX,
+    ControlPlane,
     DryRunExecutor,
     LaunchPolicy,
     PlanRegistry,
@@ -459,9 +459,7 @@ def test_launch_without_inference_skips_runtime_smoke(web_env) -> None:
     )
     # Missing inference is only a warning, so the launch is not blocked.
     assert not [
-        risk
-        for risk in preview["review"]["risks"]
-        if risk["severity"] == "error"
+        risk for risk in preview["review"]["risks"] if risk["severity"] == "error"
     ]
     run = control.start_run({"plan_hash": preview["plan_hash"]}, STARTER)
     # No inference/runtime-smoke job is scheduled ...

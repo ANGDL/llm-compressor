@@ -1,16 +1,8 @@
 import base64
-from io import BytesIO
 import os
+from io import BytesIO
 
 import torch
-from datasets import load_dataset
-from transformers import AutoProcessor, Qwen3_5MoeForConditionalGeneration
-from qwen_vl_utils import process_vision_info
-
-from llmcompressor import oneshot
-from llmcompressor.modifiers.quantization import GPTQModifier 
-from llmcompressor.utils import dispatch_for_generation
-
 from compressed_tensors.quantization import QuantizationScheme
 from compressed_tensors.quantization.quant_args import (
     QuantizationArgs,
@@ -18,12 +10,18 @@ from compressed_tensors.quantization.quant_args import (
     QuantizationType,
 )
 from compressed_tensors.utils import save_mtp_tensors_to_checkpoint
+from datasets import load_dataset
+from qwen_vl_utils import process_vision_info
+from transformers import AutoProcessor, Qwen3_5MoeForConditionalGeneration
 
-
+from llmcompressor import oneshot
+from llmcompressor.modifiers.quantization import GPTQModifier
 
 # Load model.
 model_id = "/ssd4/models/Qwen3.5-397B-A17B"
-model = Qwen3_5MoeForConditionalGeneration.from_pretrained(model_id, device_map=None, dtype="auto",local_files_only=True)
+model = Qwen3_5MoeForConditionalGeneration.from_pretrained(
+    model_id, device_map=None, dtype="auto", local_files_only=True
+)
 processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
 
 
@@ -59,13 +57,8 @@ def preprocess_and_tokenize(example):
         },
         {
             "role": "assistant",
-            "content": [
-                {
-                "text": f"{example['caption'][0]}",
-                "type": "text"
-                }
-            ],
-        }
+            "content": [{"text": f"{example['caption'][0]}", "type": "text"}],
+        },
     ]
     text = processor.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
@@ -98,6 +91,7 @@ def data_collator(batch):
         for key, value in batch[0].items()
     }
 
+
 # ---- Quantization config: W4A8 (int4 weights, int8 activations) ----
 # Weights: 4-bit, channelwise, symmetric, static
 weights_args = QuantizationArgs(
@@ -129,7 +123,7 @@ scheme = QuantizationScheme(
 recipe = [
     GPTQModifier(
         targets="Linear",
-        config_groups={"group_0": scheme}, 
+        config_groups={"group_0": scheme},
         ignore=[
             "re:.*lm_head",
             "re:visual.*",

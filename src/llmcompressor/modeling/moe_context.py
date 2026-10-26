@@ -110,9 +110,7 @@ def moe_calibration_context(
             requires_all_experts = bool(
                 getattr(module, "requires_all_experts_for_calibration", False)
             )
-            modules_to_replace.append(
-                (name, class_name, requires_all_experts)
-            )
+            modules_to_replace.append((name, class_name, requires_all_experts))
 
     # Step 2: Replace modules with progress bar
     if modules_to_replace:
@@ -130,9 +128,7 @@ def moe_calibration_context(
                 class_name,
                 original=module,
                 config=model.config,
-                calibrate_all_experts=(
-                    calibrate_all_experts or requires_all_experts
-                ),
+                calibrate_all_experts=(calibrate_all_experts or requires_all_experts),
             )
             # Apply the same offloading settings as the original module
             _apply_offloading_to_replacement(module, replacement)

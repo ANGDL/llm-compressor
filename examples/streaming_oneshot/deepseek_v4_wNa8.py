@@ -38,11 +38,11 @@ from compressed_tensors.quantization.quant_args import (
     QuantizationStrategy,
     QuantizationType,
 )
+from datasets import Dataset, concatenate_datasets, load_dataset
 from transformers import AutoTokenizer
 
 # Importing the native package registers DeepSeek-V4 with Transformers.
 import llmcompressor.modeling.deepseekv4  # noqa: F401
-from datasets import Dataset, concatenate_datasets, load_dataset
 from llmcompressor.modeling.deepseekv4.config import ModelConfig
 from llmcompressor.modeling.deepseekv4.model import DeepseekV4NativeForCausalLM
 from llmcompressor.modifiers.quantization import QuantizationModifier
@@ -86,9 +86,7 @@ def _encode_example(example: dict[str, Any]) -> dict[str, Any]:
             encode_messages,
         )
 
-        return {
-            "text": encode_messages(example["messages"], thinking_mode="thinking")
-        }
+        return {"text": encode_messages(example["messages"], thinking_mode="thinking")}
     if "text" in example:
         return {"text": example["text"]}
     if "input_ids" in example:
@@ -100,9 +98,7 @@ def _encode_example(example: dict[str, Any]) -> dict[str, Any]:
 
 def _load_source(source_id: str, split: str, samples: int) -> Dataset:
     if _is_local_json(source_id):
-        return load_dataset(
-            "json", data_files=source_id, split=f"train[:{samples}]"
-        )
+        return load_dataset("json", data_files=source_id, split=f"train[:{samples}]")
     return load_dataset(source_id, split=f"{split}[:{samples}]")
 
 
@@ -129,17 +125,14 @@ def load_calibration_dataset(
     schemas = [tuple(part.column_names) for part in parts]
     if any(schema != schemas[0] for schema in schemas[1:]):
         raise ValueError(
-            "All calibration sources must produce the same columns; "
-            f"got {schemas}"
+            "All calibration sources must produce the same columns; " f"got {schemas}"
         )
     return concatenate_datasets(parts)
 
 
 def _disable_absent_mtp(config: ModelConfig, tensor_names: set[str]) -> bool:
     """Make an MTP-free fine-tuned checkpoint match the native model graph."""
-    has_mtp = any(
-        name.startswith(("mtp.", "model.mtp.")) for name in tensor_names
-    )
+    has_mtp = any(name.startswith(("mtp.", "model.mtp.")) for name in tensor_names)
     if has_mtp:
         return False
     config.num_nextn_predict_layers = 0
@@ -237,9 +230,7 @@ def _schemes(
         if quantize_wo_a:
             other_targets.append(_WO_A_PATTERN)
         other_targets.append(
-            r"re:.*mtp\.0\.main_proj$"
-            if dspark
-            else r"re:.*mtp\.\d+\.(e_proj|h_proj)$"
+            r"re:.*mtp\.0\.main_proj$" if dspark else r"re:.*mtp\.\d+\.(e_proj|h_proj)$"
         )
         other.targets = other_targets
         return {"experts_w4a8": experts, "other_w8a8": other}, ignores

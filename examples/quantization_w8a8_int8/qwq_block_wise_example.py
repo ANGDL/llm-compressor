@@ -1,5 +1,5 @@
 import os
-import torch
+
 from compressed_tensors.quantization import QuantizationScheme
 from compressed_tensors.quantization.quant_args import (
     QuantizationArgs,
@@ -9,7 +9,6 @@ from compressed_tensors.quantization.quant_args import (
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from llmcompressor import oneshot
-from llmcompressor.modeling.gpt_oss import convert_model_for_quantization_gptoss
 from llmcompressor.modifiers.quantization import QuantizationModifier
 
 

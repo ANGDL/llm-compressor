@@ -122,9 +122,7 @@ def _qk_gemm_fp32(q: torch.Tensor, kv: torch.Tensor) -> torch.Tensor:
     if q.is_cuda and q.dtype == torch.bfloat16 and kv.dtype == torch.bfloat16:
         left = q.reshape(batch * sequence, heads, head_dim)
         right = kv.transpose(-1, -2).reshape(batch * sequence, head_dim, keys)
-        return _bmm_fp32(left, right).reshape(
-            batch, sequence, heads, keys
-        )
+        return _bmm_fp32(left, right).reshape(batch, sequence, heads, keys)
     return torch.einsum(
         "bshd,bskd->bshk",
         q.float(),
@@ -143,9 +141,7 @@ def _value_gemm_fp32(weights: torch.Tensor, values: torch.Tensor) -> torch.Tenso
     ):
         left = weights.reshape(batch * sequence, heads, keys)
         right = values.reshape(batch * sequence, keys, head_dim)
-        return _bmm_fp32(left, right).reshape(
-            batch, sequence, heads, head_dim
-        )
+        return _bmm_fp32(left, right).reshape(batch, sequence, heads, head_dim)
     return torch.einsum(
         "bshk,bskd->bshd",
         weights.float(),

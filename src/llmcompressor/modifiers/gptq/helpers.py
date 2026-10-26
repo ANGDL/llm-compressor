@@ -2,7 +2,6 @@ import math
 import os
 
 import torch
-from llmcompressor._torch_accelerator_compat import accelerator_is_available
 import transformers
 from compressed_tensors.quantization import (
     ActivationOrdering,
@@ -16,6 +15,8 @@ from compressed_tensors.utils import (
     getattr_chain,
     update_offload_parameter,
 )
+
+from llmcompressor._torch_accelerator_compat import accelerator_is_available
 
 GPTQ_PRECISION = torch.float32
 MIN_BATCHED_CHOLESKY_SIZE = 16
@@ -50,7 +51,9 @@ def make_empty_gptq_statistics(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Create the Hessian and sample counter used by streaming collection."""
     resolved_device = device if device is not None else module.weight.device
-    resolved_count_device = count_device if count_device is not None else resolved_device
+    resolved_count_device = (
+        count_device if count_device is not None else resolved_device
+    )
     return (
         make_empty_hessian(module, device=torch.device(resolved_device)),
         torch.zeros((), dtype=torch.int64, device=resolved_count_device),

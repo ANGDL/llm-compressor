@@ -130,9 +130,7 @@ def build_quantization_config(
             grouped[signature][1].append(module_name)
         config = QuantizationConfig(
             config_groups={
-                f"group_{index}": scheme.model_copy(
-                    update={"targets": targets}
-                )
+                f"group_{index}": scheme.model_copy(update={"targets": targets})
                 for index, (scheme, targets) in enumerate(grouped.values())
             }
         )

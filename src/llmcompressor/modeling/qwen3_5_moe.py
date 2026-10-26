@@ -1,9 +1,9 @@
 import torch
+import torch.nn.functional as F
+from loguru import logger
 
 from llmcompressor.modeling.moe_context import MoECalibrationModule
 from llmcompressor.utils.dev import skip_weights_initialize
-import torch.nn.functional as F
-from loguru import logger
 
 try:
     from transformers import Qwen3_5MoeConfig, Qwen3_5MoeTextConfig
@@ -15,9 +15,11 @@ except ImportError:
         "Transformers does not have Qwen3_5MoeSparseMoeBlock. "
         "CalibrationQwen3_5MoeSparseMoeBlock will not be registered."
     )
+
     class CalibrationQwen3_5MoeSparseMoeBlock:
         pass
 else:
+
     @MoECalibrationModule.register("Qwen3_5MoeSparseMoeBlock")
     class CalibrationQwen3_5MoeSparseMoeBlock(MoECalibrationModule):
         """
@@ -41,11 +43,13 @@ else:
             self.shared_expert = original.shared_expert
             self.shared_expert_gate = original.shared_expert_gate
             self.gate = original.gate
-            self.experts = SequentialQwen3VLMoeTextExperts(text_config, original.experts)
+            self.experts = SequentialQwen3VLMoeTextExperts(
+                text_config, original.experts
+            )
             self.calibrate_all_experts = calibrate_all_experts
             del original.experts
             original.experts = None
-        
+
         def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
             batch_size, sequence_length, hidden_dim = hidden_states.shape
             hidden_states_reshaped = hidden_states.view(-1, hidden_dim)
@@ -54,9 +58,9 @@ else:
             _, routing_weights, selected_experts = self.gate(hidden_states_reshaped)
 
             # expert mask: (num_experts, top_k, num_tokens)
-            expert_mask = F.one_hot(selected_experts, num_classes=self.num_experts).permute(
-                2, 1, 0
-            )
+            expert_mask = F.one_hot(
+                selected_experts, num_classes=self.num_experts
+            ).permute(2, 1, 0)
 
             final_hidden_states = torch.zeros(
                 (batch_size * sequence_length, hidden_dim),
@@ -101,10 +105,10 @@ else:
 
 class SequentialQwen3VLMoeTextExperts(torch.nn.ModuleList):
     def __init__(self, config, original):
+        from compressed_tensors.offload import disable_onloading
         from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
             Qwen3_5MoeMLP,
         )
-        from compressed_tensors.offload import disable_onloading
 
         self.num_experts = original.gate_up_proj.shape[0]
         with skip_weights_initialize():
