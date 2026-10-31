@@ -912,6 +912,19 @@ def test_raw_quantization_selectors_resolve_same_modules_as_native_recipe(
     )
 
 
+@pytest.mark.parametrize("mode", ["wna8", "w8a8", "w4a8"])
+def test_wo_a_quantization_defaults_on_and_can_be_disabled(mode):
+    groups, ignored = EXAMPLE._schemes(mode)
+    targets = [target for group in groups.values() for target in group.targets]
+    assert EXAMPLE._WO_A_PATTERN in targets
+    assert EXAMPLE._WO_A_PATTERN not in ignored
+
+    groups, ignored = EXAMPLE._schemes(mode, quantize_wo_a=False)
+    targets = [target for group in groups.values() for target in group.targets]
+    assert EXAMPLE._WO_A_PATTERN not in targets
+    assert EXAMPLE._WO_A_PATTERN in ignored
+
+
 def test_vision_branch_and_image_routing_bias():
     config = tiny_config(vision=True, dspark=False)
     model = DeepseekV41NativeForCausalLM(config)
