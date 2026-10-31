@@ -17,6 +17,9 @@ tables are exported in bounded chunks as FP8 E4M3 + UE8M0 row32 scales for
 runtime compatibility; q_weight/k_weight keep their original floating precision.
 Pass ``--quantize-engram-wkv`` to quantize Engram projections to W8A8
 with FP32 weight scales in every quantization mode.
+Attention ``wo_a`` projections are quantized with the other attention
+projections by default.
+Pass ``--no-quantize-wo-a`` to keep them in execution precision instead.
 Pass ``--use-float32-scale-dtype`` to use FP32 weight scales for all PTQ groups.
 Output tensor names and quantization selectors use the original checkpoint
 namespace unless ``--no-save-raw-checkpoint-format`` is set.
@@ -50,8 +53,12 @@ from llmcompressor.modifiers.quantization import QuantizationModifier
 from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
 from llmcompressor.streaming import DeepSeekV41WeightMaterializer, streaming_oneshot
 
+_WO_A_PATTERN = r"re:.*\.attn\.wo_a$"
 
-def _schemes(mode, *, quantize_engram_wkv=False, scale_dtype=None):
+
+def _schemes(
+    mode, *, quantize_wo_a=True, quantize_engram_wkv=False, scale_dtype=None
+):
     routed = r"re:model\.(layers|mtp)\.\d+\.ffn\.experts\.\d+\.(w1|w2|w3)$"
     other = [
         r"re:model\.(layers|mtp)\.\d+\.attn\.(wq_a|wq_b|wkv|wo_b)$",
@@ -59,6 +66,8 @@ def _schemes(mode, *, quantize_engram_wkv=False, scale_dtype=None):
         r"re:model\.(layers|mtp)\.\d+\.ffn\.shared_experts\.(w1|w2|w3)$",
         r"re:model\.mtp\.0\.main_proj$",
     ]
+    if quantize_wo_a:
+        other.append(_WO_A_PATTERN)
 
     def scheme(bits, targets, *, scale_dtype=None):
         return QuantizationScheme(
@@ -107,11 +116,12 @@ def _schemes(mode, *, quantize_engram_wkv=False, scale_dtype=None):
             else r"re:.*\.engram(\..*)?$"
         ),
         r"re:.*\.ffn\.gate$",
-        r"re:.*\.attn\.wo_a$",
         r"re:.*\.attn\.compressor\.(wkv|wgate)$",
         r"re:.*\.attn\.indexer\.(wk|weights_proj)$",
         r"re:.*\.(markov_head|confidence_head)(\..*)?$",
     ]
+    if not quantize_wo_a:
+        ignores.append(_WO_A_PATTERN)
     return groups, ignores
 
 
@@ -677,6 +687,15 @@ def main():
         help="Quantize Engram wkv to W8A8 with FP32 weight scales in every mode.",
     )
     parser.add_argument(
+        "--quantize-wo-a",
+        "--quantize_wo_a",
+        dest="quantize_wo_a",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Quantize attn.wo_a with the other attention projections "
+        "(default: enabled).",
+    )
+    parser.add_argument(
         "--use-float32-scale-dtype",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -741,6 +760,7 @@ def main():
     text.max_batch_size = args.batch_size
     groups, ignores = _schemes(
         args.quant_mode,
+        quantize_wo_a=args.quantize_wo_a,
         quantize_engram_wkv=args.quantize_engram_wkv,
         scale_dtype=torch.float32 if args.use_float32_scale_dtype else None,
     )

@@ -51,6 +51,10 @@ INT8 权重、动态 token INT8 激活及 FP32 per-channel weight scale，
 两种设置均保留 FP8 `engram.embed` 及其 UE8M0 scale，不量化
 Engram 的 `q_weight`、`k_weight`。
 
+`wo_a` 默认随其他 attention 投影进入对应的量化组；可用
+`--no-quantize-wo-a` 显式关闭。关闭后 `wo_a` 保留执行精度，
+不再产生 INT8 weight 和 weight scale。
+
 与 V4 示例一致，`--use-float32-scale-dtype` 将所有 PTQ 量化组的 weight
 scale 指定为 FP32，适用于三种主量化模式。该选项默认关闭，也可用
 `--no-use-float32-scale-dtype` 显式关闭；关闭时普通量化组沿用默认 scale
@@ -62,7 +66,7 @@ scale，与参考权重格式保持一致。该参数只控制 PTQ weight scale�
 再次量化；不能将二者的存储字节或数值格式互换。
 
 Vision/aligner、router、norm/mHC、compressor、indexer 控制投影、
-grouped `wo_a`、embedding/head、Markov/confidence 头不做额外 PTQ。
+embedding/head、Markov/confidence 头不做额外 PTQ。
 普通源 FP8/FP4 权重由 materializer 解码为执行精度；这些未选模块不保证维持
 原始存储 dtype。只有 Engram 巨表及其行级 scale 逐字节保留，读取时先按行 gather
 再转浮点。若源分片只含待保留表，会优先创建硬链接；否则使用有界缓冲复制。
