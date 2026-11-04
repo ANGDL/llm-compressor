@@ -22,6 +22,7 @@ from llmcompressor.modifiers.gptq.helpers import (
     make_empty_hessian,
     make_empty_gptq_statistics,
 )
+from llmcompressor.utils.hardware_ops import optional_hardware_backend
 from llmcompressor.utils.triton_backend import is_triton_disabled
 
 __all__ = [
@@ -178,6 +179,7 @@ def quantize_weight(*args, **kwargs):
     return _quantize_weight_batched(*args, **kwargs)
 
 
+@optional_hardware_backend("gptq_block_update", contract_version=1)
 @ImplBackend.entrypoint("gptq_block_update")
 def gptq_block_update(
     W1: torch.Tensor,
