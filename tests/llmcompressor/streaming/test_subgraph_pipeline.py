@@ -15,10 +15,6 @@ from transformers import AutoModelForCausalLM, Qwen3Config, Qwen3ForCausalLM
 
 from llmcompressor import oneshot
 from llmcompressor.modifiers.gptq import GPTQModifier
-from llmcompressor.modifiers.pruning import (
-    SparseGPTModifier,
-    WandaPruningModifier,
-)
 from llmcompressor.modifiers.quantization import QuantizationModifier
 from llmcompressor.modifiers.transform import AWQModifier, SmoothQuantModifier
 from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
@@ -1094,34 +1090,4 @@ def test_streaming_awq_matches_sequential_oneshot(tmp_path):
             ignore=["lm_head"],
         ),
         fingerprint="7",
-    )
-
-
-def test_streaming_sparsegpt_composes_with_quantization(tmp_path):
-    _assert_streaming_matches_oneshot(
-        tmp_path,
-        transform=lambda: SparseGPTModifier(
-            sparsity=0.5,
-            targets=["Linear"],
-            ignore=["re:.*lm_head"],
-        ),
-        quantizer=lambda: QuantizationModifier(
-            scheme="W8A8", ignore=["lm_head"]
-        ),
-        fingerprint="4",
-    )
-
-
-def test_streaming_wanda_composes_with_quantization(tmp_path):
-    _assert_streaming_matches_oneshot(
-        tmp_path,
-        transform=lambda: WandaPruningModifier(
-            sparsity=0.5,
-            targets=["Linear"],
-            ignore=["re:.*lm_head"],
-        ),
-        quantizer=lambda: QuantizationModifier(
-            scheme="W8A8", ignore=["lm_head"]
-        ),
-        fingerprint="5",
     )

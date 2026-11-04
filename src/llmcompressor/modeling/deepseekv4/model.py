@@ -719,8 +719,13 @@ class Transformer(nn.Module):
         self.lm_head = ParallelHead(args.vocab_size, args.dim, args.norm_eps, args.hc_eps)
         self.mtp = nn.ModuleList([MTPBlock(args.n_layers + layer_id, args) for layer_id in range(args.n_mtp_layers)])
         for mtp_block in self.mtp:
-            mtp_block.embed = self.embed
-            mtp_block.lm_head = self.lm_head
+            with torch.device("meta"):
+                mtp_block.embed = Embedding(args.vocab_size, args.dim)
+                mtp_block.lm_head = ParallelHead(
+                    args.vocab_size, args.dim, args.norm_eps, args.hc_eps
+                )
+            mtp_block.embed.weight = self.embed.weight
+            mtp_block.lm_head.weight = self.lm_head.weight
         self._dynamic_tied_weights_keys = {}
         for layer_id in range(args.n_mtp_layers):
             self._dynamic_tied_weights_keys[f"mtp.{layer_id}.embed.weight"] = "embed.weight"

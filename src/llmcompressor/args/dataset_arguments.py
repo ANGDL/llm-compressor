@@ -103,6 +103,15 @@ class CustomDatasetArguments(DVCDatasetArguments):
                 stacklevel=3,
             )
 
+        self.validate()
+
+    def validate(self):
+        """
+        Raise a ValueError if any argument has an invalid value. Subclasses extend this
+        rather than `__post_init__`, so that the deprecation warning above keeps
+        pointing at the caller
+        """
+
 
 @dataclass
 class DatasetArguments(CustomDatasetArguments):
@@ -261,11 +270,24 @@ class DatasetArguments(CustomDatasetArguments):
             "than one gpu. Default is cpu."
         },
     )
-    sequential_targets_per_subgraph: int = field(
+    sequential_targets_per_subgraph: int | str = field(
         default=1,
         metadata={
             "help": "Number of sequential targets to include per subgraph. "
-            "Higher values use more VRAM but are faster to calibrate. Default is 1."
+            "Higher values use more VRAM but are faster to calibrate. Use 'auto' to "
+            "group as many consecutive targets as fit within "
+            "`gpu_memory_utilization`. Default is 1."
+        },
+    )
+    gpu_memory_utilization: float = field(
+        default=0.9,
+        metadata={
+            "help": "Only used when sequential_targets_per_subgraph='auto'. Fraction "
+            "of the GPU's total memory that sequential calibration may use. Memory "
+            "already in use, by other processes or by modules kept onloaded for the "
+            "whole calibration, counts against it. Lower it if calibration runs out "
+            "of memory, which leaves more headroom for what the memory estimate "
+            "misses. Default is 0.9."
         },
     )
     quantization_aware_calibration: bool = field(
@@ -282,6 +304,15 @@ class DatasetArguments(CustomDatasetArguments):
             "layer outputs as the inputs to the next sequential layer. If False, use "
             "unquantized layer outputs as the inputs to the next sequential layer. "
             "Default is True"
+        },
+    )
+    log_sequential_error: bool = field(
+        default=False,
+        metadata={
+            "help": "Only relevant for the sequential pipeline. If True, compute and "
+            "log the SQNR between each subgraph's pre-compression and "
+            "post-compression outputs, independent of propagate_error. "
+            "Default is False."
         },
     )
     use_loss_mask: bool = field(
@@ -301,14 +332,47 @@ class DatasetArguments(CustomDatasetArguments):
             "multiprocessing."
         },
     )
-    sequential_prefetch: bool = field(
+    stage_weights_in_pinned_memory: bool = field(
         default=False,
         metadata={
-            "help": "When using the sequential pipeline, prefetch the next batch in a "
-            "background thread to overlap onload with forward. Default False; set True "
-            "for faster calibration when GPU memory allows (two batches on device)."
+            "help": "When using the sequential pipeline, stage offloaded module "
+            "tensors in pinned CPU memory before onloading them to the execution "
+            "device. Only moves weights. Default False."
         },
     )
+    layerwise_decompression: bool = field(
+        default=False,
+        metadata={
+            "help": "When True, each layer is decompressed before calibrating in "
+            "the sequential pipeline. Use when loading a pre-compressed model "
+            "that needs recalibration. Default False."
+        },
+    )
+    layerwise_compression: bool = field(
+        default=False,
+        metadata={
+            "help": "When True, each layer is compressed after propagation in the "
+            "sequential pipeline. Reduces peak memory by keeping only the "
+            "active layer decompressed. Default False."
+        },
+    )
+
+    def validate(self):
+        super().validate()
+
+        targets_per_subgraph = self.sequential_targets_per_subgraph
+        if targets_per_subgraph != "auto" and (
+            not isinstance(targets_per_subgraph, int) or targets_per_subgraph < 1
+        ):
+            raise ValueError(
+                "sequential_targets_per_subgraph must be a positive integer or "
+                f'"auto", got {targets_per_subgraph!r}'
+            )
+        if not 0 < self.gpu_memory_utilization <= 1:
+            raise ValueError(
+                "gpu_memory_utilization must be greater than 0 and at most 1, got "
+                f"{self.gpu_memory_utilization}"
+            )
 
     def is_dataset_provided(self) -> bool:
         return self.dataset is not None or self.dataset_path is not None

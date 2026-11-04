@@ -4,6 +4,9 @@ import torch
 from compressed_tensors.quantization import QuantizationArgs, QuantizationStrategy
 from compressed_tensors.quantization.lifecycle import fake_quantize
 from compressed_tensors.quantization.utils import calculate_qparams
+from compressed_tensors.quantization.utils.mxfp_utils import (
+    should_generate_mx_scales,
+)
 from compressed_tensors.utils import patch_attr
 from loguru import logger
 from torch import distributed as dist
@@ -11,6 +14,11 @@ from torch.utils.hooks import RemovableHandle
 
 from llmcompressor.modifiers.utils.hooks import HooksMixin
 from llmcompressor.observers.base import MinMaxTuple, Observer
+from llmcompressor.observers.grid_search import (
+    _default_triton_error_buffer,
+    _grid_search_observer,
+    _resolve_grid_type,
+)
 from llmcompressor.observers.helpers import flatten_for_calibration
 
 __all__ = [
@@ -56,7 +64,8 @@ def accumulate_imatrix_statistics(
 @Observer.register("imatrix_mse")
 class IMatrixMSEObserver(Observer):
     """
-    MSE observer weighted by per-input-channel importance (E[x²]).
+    Search candidate min/max ranges using per-input-channel activation
+    importance (E[x²]) to weight QDQ error.
 
     Supports CHANNEL, GROUP, and TENSOR_GROUP for weight-only Linear modules.
     Falls back to uniform MSE when importance data is unavailable.
@@ -64,6 +73,40 @@ class IMatrixMSEObserver(Observer):
     Importance is accumulated on the observer as raw ``_imatrix_sum`` /
     ``_imatrix_count`` and synced across DDP ranks via ``_act_sync_dict``
     before observation.
+
+    The base objective is ``importance * abs(QDQ(w) - w) ** norm``, summed over
+    each quantization group. If ``magnitude_normalization`` is enabled, it also
+    multiplies each element by ``sqrt(w**2 + group_absmax**2)``. Importance is
+    accumulated from observer inputs as E[x²].
+
+    Observer kwargs are read from ``QuantizationArgs.observer_kwargs``:
+        maxshrink (float): Maximum fraction of range to shrink. Defaults to
+            ``0.95``.
+        patience (int): Number of consecutive candidates outside the current
+            best-score tolerance before early stopping. Triton uses
+            ``triton_error_buffer`` for this tolerance; eager search counts
+            strict non-improvements. ``0`` runs the full search. Defaults to
+            ``5``.
+        grid (float): Linear grid resolution or exponential candidate budget.
+            Defaults to ``20``.
+        norm (float): Power applied to absolute QDQ error before importance
+            weighting. Defaults to ``3.0``.
+        expand (float): Multiplier applied to observed min/max before the
+            shrink search; must be at least ``1``. Defaults to ``1.0``.
+        strict (bool): Raise an error if importance is unavailable or has an
+            unsupported shape. If false, warn and fall back to uniform MSE.
+            Defaults to ``False``.
+        grid_type (str or None): ``"linear"`` or ``"exponential"``. ``None``
+            selects exponential spacing when MX scales are generated (E8M0),
+            and linear spacing otherwise. Exponential candidates are powers
+            of two starting at 1. Defaults to ``None``.
+        magnitude_normalization (bool): Multiply each error by
+            ``sqrt(w**2 + group_absmax**2)``. Defaults to ``False``.
+        triton_error_buffer (float): Relative tolerance used by the Triton
+            implementation for per-group patience; it affects early stopping,
+            not the error score. Defaults to ``1.0`` for 4-bit floating point
+            quantization and ``0.30`` otherwise. The eager implementation does
+            not use this option.
     """
 
     _act_sync_dict = {
@@ -83,6 +126,11 @@ class IMatrixMSEObserver(Observer):
         self.strict = kw.get("strict", False)
         self.expand = kw.get("expand", 1.0)
         self.chunk_size = kw.get("chunk_size", 0)
+        self.magnitude_normalization = kw.get("magnitude_normalization", False)
+        self.grid_type = _resolve_grid_type(kw.get("grid_type"), self.args)
+        self.triton_error_buffer = kw.get(
+            "triton_error_buffer", _default_triton_error_buffer(self.args)
+        )
 
         self._imatrix_sum: torch.Tensor | None = None
         self._imatrix_count: torch.Tensor = torch.tensor(0, dtype=torch.int64)
@@ -96,6 +144,11 @@ class IMatrixMSEObserver(Observer):
             raise ValueError(f"chunk_size must be >= 0, got {self.chunk_size}")
         if not (0 <= self.maxshrink <= 1):
             raise ValueError(f"maxshrink must be in [0, 1], got {self.maxshrink}")
+        if not isinstance(self.magnitude_normalization, bool):
+            raise ValueError(
+                "magnitude_normalization must be a bool, got "
+                f"{self.magnitude_normalization!r}"
+            )
         if (
             not isinstance(self.norm, (int, float))
             or not math.isfinite(self.norm)
@@ -169,16 +222,20 @@ class IMatrixMSEObserver(Observer):
 
     def update_statistics_from_observed(self, observed: torch.Tensor) -> None:
         importance_weights = self._prepare_importance(observed)
-        self.min_vals, self.max_vals = _grid_search(
+        self.min_vals, self.max_vals = _grid_search_observer(
             observed,
             self.args,
             self.maxshrink,
             self.patience,
             self.grid,
             self.norm,
+            self.triton_error_buffer,
             expand=self.expand,
             importance_weights=importance_weights,
             chunk_size=self.chunk_size,
+            use_imatrix_error=True,
+            magnitude_normalization=self.magnitude_normalization,
+            grid_type=self.grid_type,
         )
 
     # ------------------------------------------------------------------
@@ -424,7 +481,9 @@ def _compute_err(
     effective_chunk_size: int,
 ) -> torch.Tensor:
     if effective_chunk_size <= 0 or scales.numel() <= effective_chunk_size:
-        q = fake_quantize(observed, scales.unsqueeze(-1), zps.unsqueeze(-1), args).float()
+        q = fake_quantize(
+            observed, scales.unsqueeze(-1), zps.unsqueeze(-1), args
+        ).float()
         q.sub_(observed_f).abs_().pow_(norm)
         if importance_weights is not None:
             q.mul_(importance_weights)
@@ -476,8 +535,12 @@ class NVFP4ExpandedIMatrixObserver(IMatrixMSEObserver):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         kw = self.args.observer_kwargs
-        self.expand = kw.get("expand", 1.8)
-        self.maxshrink = kw.get("maxshrink", 1 - 0.8 / 1.8)
+        if should_generate_mx_scales(self.args):
+            self.expand = kw.get("expand", 1.0)
+            self.maxshrink = kw.get("maxshrink", 1.0 - 1.0 / 64.0)
+        else:
+            self.expand = kw.get("expand", 1.8)
+            self.maxshrink = kw.get("maxshrink", 1 - 0.8 / 1.8)
         self.grid = kw.get("grid", 200)
         self.norm = kw.get("norm", 2.4)
         self.patience = kw.get("patience", 1000)

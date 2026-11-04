@@ -1571,6 +1571,21 @@ class HFTracer(Tracer):
                     # Without this, torch.jit.script fails because the inputs type is Optional[torch.Tensor].
                     # It cannot infer on the attributes and methods the input should have, and fails.
                     node.type = torch.Tensor
+                # It is a concrete arg so it is not used and should be removed.
+                else:
+                    to_visit = [node]
+                    to_delete = collections.OrderedDict()
+                    while to_visit:
+                        n = to_visit.pop(0)
+                        if n in to_delete:
+                            to_delete.move_to_end(n)
+                        to_delete[n] = None
+                        to_visit += list(n.users.keys())
+                    # don't prune if the node actually flows to the output
+                    if any(n.op == "output" for n in to_delete):
+                        continue
+                    for user in reversed(to_delete.keys()):
+                        self.graph.erase_node(user)
 
             # TODO: solves GraphModule creation.
             # Without this, return type annotation "Tuple" is causing code execution failure.

@@ -726,8 +726,8 @@ must not retain `pipeline_devices` as a placeholder for expert parallelism.
 ## Modifier lifecycle
 
 Streaming PTQ reuses normal Modifier hooks and `sequential_epoch_end`; it does
-not maintain separate implementations of iMatrix, RTN, GPTQ, SmoothQuant, AWQ,
-SparseGPT, or Wanda.
+not maintain separate implementations of iMatrix, RTN, GPTQ, SmoothQuant, or AWQ.
+Legacy SparseGPT and Wanda pruning were removed with the upstream sparsity APIs.
 
 A modifier is compatible only if every module it reads or changes is present in
 the current working set. Cross-target mappings require an explicit working-set

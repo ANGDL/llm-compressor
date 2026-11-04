@@ -73,7 +73,6 @@ model_free_ptq(
     scheme="FP8_BLOCK",
     ignore=["lm_head"],
     device=["cuda:0", "cuda:1", "cuda:2", "cuda:3"],
-    max_workers=4,
 )
 ```
 
@@ -92,7 +91,7 @@ When `device=None`, all visible CUDA devices are selected automatically.
 
 After all files are processed, the safetensors index and model config are updated with the quantization metadata.
 
-Multiple files can be processed in parallel using the `max_workers` argument.
+Multiple files are processed in parallel. By default (`max_workers="auto"`), the number of workers is chosen from the number of safetensors files, the estimated memory of each job, the free memory of each device, and the available CPUs. Pass an integer to set it explicitly, for example when host memory is tight, since `"auto"` does not account for host memory.
 
 ## Arguments
 
@@ -103,7 +102,7 @@ Multiple files can be processed in parallel using the `max_workers` argument.
 | `scheme` | `QuantizationScheme \| str \| None` | `None` | One quantization scheme to apply. Mutually exclusive with `config` |
 | `config` | `QuantizationConfig \| None` | `None` | One or more data-free config groups, optionally including `kv_cache_scheme`; mutually exclusive with `scheme` |
 | `ignore` | `Iterable[str]` | `()` | Module names or regex patterns to skip. Modules ending in `"norm"` are always ignored automatically |
-| `max_workers` | `int` | `1` | Upper bound on concurrent worker threads for processing safetensors shards. Effective concurrency may be lower when GPU memory is tight |
+| `max_workers` | `int \| "auto"` | `"auto"` | Upper bound on concurrent worker threads for processing safetensors shards. `"auto"` chooses it from the number of shards, their estimated memory, free device memory, and available CPUs. Effective concurrency may be lower when GPU memory is tight |
 | `device` | `str \| torch.device \| list[str \| torch.device] \| None` | `None` | Device or devices to use. A list enables multi-GPU shard scheduling; `None` automatically selects all visible CUDA devices, or CPU when no accelerator is available |
 | `converter` | `Converter \| None` | `None` | Optional `compressed-tensors` converter to apply before quantization, e.g. to convert modelopt-format checkpoints to compressed-tensors format |
 | `strict_symmetric` | `bool` | `False` | Use the strict symmetric integer weight range `[-127, 127]` instead of the default `[-128, 127]` |
@@ -152,7 +151,6 @@ model_free_ptq(
         "re:.*q_a_proj$",
         "model.embed_tokens",
     ],
-    max_workers=15,
     device="cuda:0",
 )
 ```
@@ -184,7 +182,6 @@ model_free_ptq(
         "re:.*q_a_proj$",
         "model.embed_tokens",
     ],
-    max_workers=15,
     device="cuda:0",
 )
 ```
@@ -210,9 +207,10 @@ ignore=[
 | Scheme | Description |
 |--------|-------------|
 | `FP8_DYNAMIC` | FP8 weights with dynamic per-token activation quantization |
-| `FP8_BLOCK` | FP8 weights with block-wise scaling (Blackwell-optimized) |
+| `FP8_BLOCK` | FP8 weights with 128x128 block scales and dynamic per-group FP8 activations |
 | `NVFP4A16` | NVFP4 weight-only quantization with FP8 group scales and a global scale |
 | `MXFP4/MXFP8` | MXFP4 or MXFP8 quantization with MX-format microscales |
+| `MXFP4xFP8` | MXFP4 weights with dynamic FP8 activations; commonly paired with FP8 weights on dense layers of MoE models |
 
 Note: Many of these schemes, such as NVFP4 and MXFP4 may potentially lead to improved recovery when applied with a calibration algorithm that requires data, such as GPTQ. Consider comparing performance using oneshot.
 For the full list of supported schemes and formats, see [Compression Schemes](../compression_schemes.md).

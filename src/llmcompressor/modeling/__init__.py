@@ -22,3 +22,4 @@ from .step3p5 import CalibrationStep3p5MoEMLP  # noqa: F401
 
 from .fuse import *
 from .moe.conversion_mappings import patch_moe_mappings  # noqa: F401
+from .moe.linearize import repack_moe  # noqa: F401
