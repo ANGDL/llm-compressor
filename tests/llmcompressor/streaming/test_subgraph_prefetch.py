@@ -24,9 +24,7 @@ def test_prefetch_materializes_without_installing_shared_model(tmp_path, monkeyp
     reference = SessionModel()
     checkpoint = checkpoint_for(reference, tmp_path)
     model = build_meta_model(SessionModel)
-    session = SubgraphWeightSession(
-        model, SafetensorsWeightSource(checkpoint)
-    )
+    session = SubgraphWeightSession(model, SafetensorsWeightSource(checkpoint))
     plan = session.plan(subgraph_for("layers.0"))
     original_prepare = session.prepare
     started = threading.Event()

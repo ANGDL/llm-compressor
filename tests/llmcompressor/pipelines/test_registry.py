@@ -3,8 +3,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from llmcompressor.modifiers.autosmooth import AutoSmoothModifier
 from llmcompressor.modifiers.autoround import AutoRoundModifier
+from llmcompressor.modifiers.autosmooth import AutoSmoothModifier
 from llmcompressor.modifiers.pruning import SparseGPTModifier, WandaPruningModifier
 from llmcompressor.modifiers.quantization import GPTQModifier, QuantizationModifier
 from llmcompressor.modifiers.transform import (

@@ -45,8 +45,7 @@ def _transformers_kda_gate(raw_g, A_log, dt_bias, lower_bound=None):
 def test_kimi_k3_vision_config_preserves_attention_implementation():
     assert KimiK3VisionConfig()._attn_implementation == "flash_attention_2"
     assert (
-        KimiK3VisionConfig(_attn_implementation="eager")._attn_implementation
-        == "eager"
+        KimiK3VisionConfig(_attn_implementation="eager")._attn_implementation == "eager"
     )
     assert MoonViT3dPretrainedModel._supports_sdpa is False
 
@@ -57,9 +56,7 @@ def test_kimi_k3_fla_reference_adapter_preserves_fused_contract():
     def chunk_kda(**kwargs):
         captured.update(kwargs)
         q = kwargs["q"]
-        state = q.new_zeros(
-            q.shape[0], q.shape[2], q.shape[3], 5
-        )
+        state = q.new_zeros(q.shape[0], q.shape[2], q.shape[3], 5)
         return q, state
 
     def recurrent_kda(**kwargs):
@@ -113,9 +110,7 @@ def test_kimi_k3_fla_reference_adapter_preserves_fused_contract():
         torch.float32,
     )
     torch.testing.assert_close(captured["beta"], beta)
-    torch.testing.assert_close(
-        captured["g"], g + 2
-    )
+    torch.testing.assert_close(captured["g"], g + 2)
     torch.testing.assert_close(
         captured["q"].square().sum(dim=-1),
         torch.ones_like(captured["q"][..., 0]),
@@ -325,9 +320,7 @@ def test_kimi_k3_fla_reference_adapter_matches_packed_native():
         outputs.append(output)
         states.append(state)
 
-    torch.testing.assert_close(
-        actual, torch.cat(outputs, dim=1), atol=2e-5, rtol=2e-5
-    )
+    torch.testing.assert_close(actual, torch.cat(outputs, dim=1), atol=2e-5, rtol=2e-5)
     torch.testing.assert_close(
         actual_state.transpose(-1, -2),
         torch.cat(states, dim=0),

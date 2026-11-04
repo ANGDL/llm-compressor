@@ -33,13 +33,12 @@ from datasets import Dataset, load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from llmcompressor import oneshot
+from llmcompressor.logger import LoggerConfig, configure_logger
 from llmcompressor.modifiers.autosmooth import AutoSmoothModifier
 from llmcompressor.modifiers.gptq import GPTQModifier
 from llmcompressor.modifiers.quantization import QuantizationModifier
 from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
 from llmcompressor.utils import ImatrixFallbackStats
-
-from llmcompressor.logger import LoggerConfig, configure_logger
 
 configure_logger(LoggerConfig(console_log_level="DEBUG"))
 

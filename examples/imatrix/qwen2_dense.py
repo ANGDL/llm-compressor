@@ -1,14 +1,13 @@
+import os
+
 from compressed_tensors.offload import dispatch_model
 from compressed_tensors.quantization import preset_name_to_scheme
+from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from llmcompressor import oneshot
 from llmcompressor.modifiers.quantization import QuantizationModifier
 from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
-from datasets import load_dataset
-
-import os
-
 
 # Select model and load it.
 model_id = "/ssd3/models/Qwen2.5-72B-Instruct"
@@ -29,6 +28,7 @@ DATASET_SPLIT = "train_sft"
 ds = load_dataset(DATASET_ID, split=f"{DATASET_SPLIT}[:{NUM_CALIBRATION_SAMPLES}]")
 ds = ds.shuffle(seed=42)
 
+
 def preprocess(example):
     return {
         "text": tokenizer.apply_chat_template(
@@ -37,7 +37,9 @@ def preprocess(example):
         )
     }
 
+
 ds = ds.map(preprocess)
+
 
 # Tokenize inputs.
 def tokenize(sample):

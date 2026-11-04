@@ -17,7 +17,7 @@ __all__ = [
 
 class _AcceleratorCompat:
     def _current_backend(self) -> str:
-        if hasattr(torch, "cuda") and torch.cuda.is_available():
+        if hasattr(torch, "cuda") and torch.accelerator.is_available():
             return "cuda"
         if hasattr(torch, "xpu") and torch.xpu.is_available():
             return "xpu"
@@ -46,7 +46,7 @@ class _AcceleratorCompat:
     def current_device_index(self) -> int:
         backend = self._current_backend()
         if backend == "cuda":
-            return torch.cuda.current_device()
+            return torch.accelerator.current_device_index()
         if backend == "xpu":
             return torch.xpu.current_device()
         return 0
@@ -54,7 +54,7 @@ class _AcceleratorCompat:
     def device_count(self) -> int:
         backend = self._current_backend()
         if backend == "cuda":
-            return torch.cuda.device_count()
+            return torch.accelerator.device_count()
         if backend == "xpu":
             return torch.xpu.device_count()
         if backend == "mps":
@@ -65,7 +65,7 @@ class _AcceleratorCompat:
         backend = self._current_backend()
         index = self._device_index(device)
         if backend == "cuda":
-            torch.cuda.reset_peak_memory_stats(index)
+            torch.accelerator.reset_peak_memory_stats(index)
         elif backend == "xpu" and hasattr(torch.xpu, "reset_peak_memory_stats"):
             torch.xpu.reset_peak_memory_stats(index)
 
@@ -73,7 +73,7 @@ class _AcceleratorCompat:
         backend = self._current_backend()
         index = self._device_index(device)
         if backend == "cuda":
-            return torch.cuda.max_memory_allocated(index)
+            return torch.accelerator.max_memory_allocated(index)
         if backend == "xpu" and hasattr(torch.xpu, "max_memory_allocated"):
             return torch.xpu.max_memory_allocated(index)
         if backend == "mps" and hasattr(torch.mps, "current_allocated_memory"):
@@ -84,7 +84,7 @@ class _AcceleratorCompat:
         backend = self._current_backend()
         index = self._device_index(device)
         if backend == "cuda":
-            return torch.cuda.mem_get_info(index)
+            return torch.get_device_module().mem_get_info(index)
         if backend == "xpu" and hasattr(torch.xpu, "mem_get_info"):
             return torch.xpu.mem_get_info(index)
         if backend == "mps":

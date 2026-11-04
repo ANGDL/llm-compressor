@@ -31,7 +31,6 @@ import torch.nn as nn
 from safetensors import safe_open
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-
 # ---------------------------------------------------------------------------
 # Checkpoint helpers
 # ---------------------------------------------------------------------------
@@ -69,7 +68,7 @@ def _strip_prefix(
     tensors: dict[str, torch.Tensor], prefix: str
 ) -> dict[str, torch.Tensor]:
     dot = prefix + "."
-    return {k[len(dot):]: v for k, v in tensors.items() if k.startswith(dot)}
+    return {k[len(dot) :]: v for k, v in tensors.items() if k.startswith(dot)}
 
 
 # ---------------------------------------------------------------------------
@@ -132,10 +131,14 @@ class Step3p5MTPLayer(nn.Module):
         for name, tensor in raw.items():
             t = tensor.to(dtype=dtype, device=device)
             if name.startswith("transformer.shared_head.norm."):
-                own_sd[name.replace("transformer.shared_head.norm.", "shared_head_norm.")] = t
+                own_sd[
+                    name.replace("transformer.shared_head.norm.", "shared_head_norm.")
+                ] = t
             elif name.startswith("transformer.shared_head.output."):
                 own_sd[
-                    name.replace("transformer.shared_head.output.", "shared_head_output.")
+                    name.replace(
+                        "transformer.shared_head.output.", "shared_head_output."
+                    )
                 ] = t
             elif name.startswith(("enorm.", "hnorm.", "eh_proj.")):
                 own_sd[name] = t
@@ -221,7 +224,10 @@ def attach_mtp_layer(model, model_path: str) -> None:
         print(f"[attach_mtp_layer] Loading Step3.5 MTP weights from '{mtp_prefix}' ...")
         raw = _load_mtp_tensors(model_path, mtp_prefix)
         raw = _strip_prefix(raw, mtp_prefix)
-        print(f"[attach_mtp_layer] Found {len(raw)} MTP tensors for layer {mtp_layer_idx}.")
+        print(
+            f"[attach_mtp_layer] Found {len(raw)} MTP tensors for layer "
+            f"{mtp_layer_idx}."
+        )
         mtp_layers.append(
             Step3p5MTPLayer(
                 model=model,
@@ -311,13 +317,15 @@ def attach_mtp_layer(model, model_path: str) -> None:
             layer_idx = mtp_start_idx + layer_offset
             rel = ".".join(parts[2:])
             if rel.startswith("shared_head_norm."):
-                rel = rel.replace("shared_head_norm.", "transformer.shared_head.norm.", 1)
+                rel = rel.replace(
+                    "shared_head_norm.", "transformer.shared_head.norm.", 1
+                )
             elif rel.startswith("shared_head_output."):
                 rel = rel.replace(
                     "shared_head_output.", "transformer.shared_head.output.", 1
                 )
             elif rel.startswith("decoder."):
-                rel = rel[len("decoder."):]
+                rel = rel[len("decoder.") :]
             remapped[f"model.layers.{layer_idx}.{rel}"] = v
         return remapped
 

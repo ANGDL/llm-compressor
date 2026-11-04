@@ -6,10 +6,7 @@ from pathlib import Path
 from llmcompressor.modeling.deepseekv4.config import ModelConfig
 
 MODULE_PATH = (
-    Path(__file__).parents[2]
-    / "examples"
-    / "streaming_oneshot"
-    / "deepseek_v4_wNa8.py"
+    Path(__file__).parents[2] / "examples" / "streaming_oneshot" / "deepseek_v4_wNa8.py"
 )
 MODULE_SPEC = importlib.util.spec_from_file_location("deepseek_v4_wna8", MODULE_PATH)
 assert MODULE_SPEC is not None and MODULE_SPEC.loader is not None
@@ -17,9 +14,7 @@ MODULE = importlib.util.module_from_spec(MODULE_SPEC)
 MODULE_SPEC.loader.exec_module(MODULE)
 
 
-def test_native_config_load_normalizes_raw_model_type_without_warning(
-    tmp_path, caplog
-):
+def test_native_config_load_normalizes_raw_model_type_without_warning(tmp_path, caplog):
     (tmp_path / "config.json").write_text(
         json.dumps(
             {

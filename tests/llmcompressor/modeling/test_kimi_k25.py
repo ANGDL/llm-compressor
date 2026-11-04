@@ -8,10 +8,10 @@ from transformers.utils import import_utils
 
 from llmcompressor.modeling.kimi_k25 import (
     CalibrationKimiK25DeepseekV3MoE,
+    _normalize_checkpoint_tied_weight_keys,
     _patch_checkpoint_tie_weights,
     _patch_flash_attn_varlen_func,
     _patch_transformers_v5_for_checkpoint_code,
-    _normalize_checkpoint_tied_weight_keys,
     load_kimi_k25_model,
 )
 from llmcompressor.modeling.moe.linearize import get_non_linearized_moes

@@ -1,6 +1,7 @@
 import argparse
 import os
 
+from datasets import concatenate_datasets, load_dataset
 from torch.utils.data import DataLoader
 from transformers import (
     AutoProcessor,
@@ -9,7 +10,6 @@ from transformers import (
     default_data_collator,
 )
 
-from datasets import concatenate_datasets, load_dataset
 from llmcompressor.modifiers.quantization import QuantizationModifier
 from llmcompressor.streaming import streaming_oneshot
 from llmcompressor.utils import ImatrixFallbackStats

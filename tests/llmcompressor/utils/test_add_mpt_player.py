@@ -65,7 +65,10 @@ def test_add_mpt_player_updates_index_and_logs_progress(tmp_path, capsys):
 
     quant_tensor = torch.randn((2, 2), dtype=torch.float32)
     quant_file = "model.safetensors"
-    save_file({"model.layers.0.mlp.down_proj.weight": quant_tensor}, str(quant_dir / quant_file))
+    save_file(
+        {"model.layers.0.mlp.down_proj.weight": quant_tensor},
+        str(quant_dir / quant_file),
+    )
 
     quant_total_size = _tensor_size_in_bytes(quant_tensor)
     quant_index = {
@@ -91,7 +94,10 @@ def test_add_mpt_player_updates_index_and_logs_progress(tmp_path, capsys):
     assert updated_map["model.layers.3.self_attn.k_proj.weight"] == "mtp.safetensors"
 
     expected_added_size = _tensor_size_in_bytes(t_q) + _tensor_size_in_bytes(t_k)
-    assert updated_index["metadata"]["total_size"] == quant_total_size + expected_added_size
+    assert (
+        updated_index["metadata"]["total_size"]
+        == quant_total_size + expected_added_size
+    )
     assert (quant_dir / "model.safetensors.index.json.bak").exists()
 
     with safe_open(str(quant_dir / "mtp.safetensors"), framework="pt") as f:
@@ -111,7 +117,9 @@ def test_add_mpt_player_raises_when_no_matching_tensor(tmp_path):
 
     bf16_file = "model-00001-of-00001.safetensors"
     tensor = torch.ones((2, 2), dtype=torch.float32)
-    save_file({"model.layers.1.self_attn.q_proj.weight": tensor}, str(bf16_dir / bf16_file))
+    save_file(
+        {"model.layers.1.self_attn.q_proj.weight": tensor}, str(bf16_dir / bf16_file)
+    )
 
     with open(bf16_dir / "model.safetensors.index.json", "w") as f:
         json.dump(
@@ -123,7 +131,9 @@ def test_add_mpt_player_raises_when_no_matching_tensor(tmp_path):
         )
 
     quant_file = "model.safetensors"
-    save_file({"model.layers.0.mlp.down_proj.weight": tensor}, str(quant_dir / quant_file))
+    save_file(
+        {"model.layers.0.mlp.down_proj.weight": tensor}, str(quant_dir / quant_file)
+    )
     with open(quant_dir / "model.safetensors.index.json", "w") as f:
         json.dump(
             {
@@ -173,7 +183,10 @@ def test_add_mpt_player_supports_layer_name_matching(tmp_path, capsys):
 
     quant_tensor = torch.randn((2, 2), dtype=torch.float32)
     quant_file = "model.safetensors"
-    save_file({"model.layers.0.mlp.down_proj.weight": quant_tensor}, str(quant_dir / quant_file))
+    save_file(
+        {"model.layers.0.mlp.down_proj.weight": quant_tensor},
+        str(quant_dir / quant_file),
+    )
 
     with open(quant_dir / "model.safetensors.index.json", "w") as f:
         json.dump(

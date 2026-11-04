@@ -43,9 +43,7 @@ def _directory_bytes(path: Path) -> int:
 def _resource_summary(device: torch.device, path: Path) -> str:
     rss_kib = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     gpu_peak = (
-        torch.cuda.max_memory_allocated(device)
-        if device.type == "cuda"
-        else 0
+        torch.accelerator.max_memory_allocated(device) if device.type == "cuda" else 0
     )
     return (
         f"rss_peak_mib={rss_kib / 1024:.1f}, "
@@ -101,7 +99,7 @@ def _streaming_oneshot_from_boundaries(
         return output
 
     if device.type == "cuda":
-        torch.cuda.reset_peak_memory_stats(device)
+        torch.accelerator.reset_peak_memory_stats(device)
     started = time.monotonic()
     logger.info(f"streaming collect: starting {len(targets)} sequential targets")
     collect_calibration_statistics(

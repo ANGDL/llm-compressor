@@ -10,10 +10,10 @@ from transformers.utils.quantization_config import CompressedTensorsConfig
 from llmcompressor import oneshot
 from llmcompressor.args import DatasetArguments
 from llmcompressor.pytorch.utils import tensors_to_device
-from llmcompressor.transformers.data import TextGenerationDataset
 from llmcompressor.transformers.compression.compressed_tensors_utils import (
     _register_quantization_qparams_as_buffers,
 )
+from llmcompressor.transformers.data import TextGenerationDataset
 from tests.testing_utils import parse_params, requires_gpu
 
 CONFIGS_DIRECTORY = "tests/llmcompressor/transformers/compression/configs"

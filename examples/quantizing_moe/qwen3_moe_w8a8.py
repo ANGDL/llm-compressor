@@ -3,7 +3,6 @@ import os
 import shutil
 from pathlib import Path
 
-import torch
 from datasets import Dataset, load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -11,7 +10,6 @@ from llmcompressor import oneshot
 from llmcompressor.modifiers.autosmooth import AutoSmoothModifier
 from llmcompressor.modifiers.awq import AWQMapping
 from llmcompressor.modifiers.quantization import GPTQModifier
-
 
 MODEL_ARTIFACT_FILES = {
     "config.json",
@@ -34,9 +32,7 @@ def copy_original_non_model_files(source_dir, save_dir):
 
 
 parser = argparse.ArgumentParser()
-parser.add_argument(
-    "--model-id", default="/ssd4/models/Qwen3-235B-A22B-Instruct-2507"
-)
+parser.add_argument("--model-id", default="/ssd4/models/Qwen3-235B-A22B-Instruct-2507")
 parser.add_argument("--output-dir")
 parser.add_argument("--dataset-id", default="HuggingFaceH4/ultrachat_200k")
 parser.add_argument("--dataset-split", default="train_sft")
@@ -67,7 +63,13 @@ if dataset_path.is_dir():
     elif parquet_files:
         dataset = load_dataset(
             "parquet",
-            data_files={args.dataset_split: [str(path) for path in parquet_files if args.dataset_split in path.name]},
+            data_files={
+                args.dataset_split: [
+                    str(path)
+                    for path in parquet_files
+                    if args.dataset_split in path.name
+                ]
+            },
             split=args.dataset_split,
         )
     else:
@@ -84,11 +86,7 @@ dataset = dataset.shuffle(seed=42)
 
 
 def preprocess(example):
-    return {
-        "text": tokenizer.apply_chat_template(
-            example["messages"], tokenize=False
-        )
-    }
+    return {"text": tokenizer.apply_chat_template(example["messages"], tokenize=False)}
 
 
 dataset = dataset.map(preprocess)

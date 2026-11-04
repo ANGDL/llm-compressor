@@ -11,9 +11,7 @@ import pytest
 
 @pytest.mark.integration
 def test_incremental_peak_stays_below_source_checkpoint(tmp_path):
-    checkpoint_value = os.environ.get(
-        "LLMCOMPRESSOR_STREAMING_RESOURCE_CHECKPOINT"
-    )
+    checkpoint_value = os.environ.get("LLMCOMPRESSOR_STREAMING_RESOURCE_CHECKPOINT")
     if not checkpoint_value:
         pytest.skip(
             "set LLMCOMPRESSOR_STREAMING_RESOURCE_CHECKPOINT to a local "
@@ -40,6 +38,5 @@ def test_incremental_peak_stays_below_source_checkpoint(tmp_path):
 
     assert Path(measurements["output"], "FINALIZED").is_file()
     assert (
-        measurements["incremental_peak_bytes"]
-        < measurements["checkpoint_bytes"]
+        measurements["incremental_peak_bytes"] < measurements["checkpoint_bytes"]
     ), measurements

@@ -30,18 +30,13 @@ from llmcompressor.streaming.pipeline import _write_remaining_direct_shards
 
 
 def test_streaming_dtype_policy_preserves_control_state_by_default():
-    policy = StreamingDTypePolicy.for_quantized_modules(
-        torch.bfloat16, ("layer.proj",)
-    )
+    policy = StreamingDTypePolicy.for_quantized_modules(torch.bfloat16, ("layer.proj",))
 
     assert policy.resolve("layer.proj.weight", torch.float32) == torch.bfloat16
     assert policy.resolve("layer.proj.bias", torch.float32) == torch.bfloat16
     assert policy.resolve("layer.attn_sink", torch.float32) == torch.float32
     assert policy.resolve("layer.norm.weight", torch.bfloat16) == torch.bfloat16
-    assert (
-        policy.resolve("layer.experts.weight", torch.int8)
-        == torch.bfloat16
-    )
+    assert policy.resolve("layer.experts.weight", torch.int8) == torch.bfloat16
 
 
 def test_streaming_dtype_policy_allows_model_adapter_override():
@@ -51,16 +46,11 @@ def test_streaming_dtype_policy_allows_model_adapter_override():
         overrides=((r".*\.attention_sink_bias", torch.float32),),
     )
 
-    assert (
-        policy.resolve("layer.attention_sink_bias", torch.bfloat16)
-        == torch.float32
-    )
+    assert policy.resolve("layer.attention_sink_bias", torch.bfloat16) == torch.float32
 
 
 class ScaledIntMaterializer(WeightMaterializer):
-    def dependencies(
-        self, tensor_name: str, metadata: TensorMetadata
-    ) -> list[str]:
+    def dependencies(self, tensor_name: str, metadata: TensorMetadata) -> list[str]:
         return [tensor_name.replace(".weight", ".scale")]
 
     def materialize_cpu(
@@ -291,9 +281,7 @@ def test_default_materializer_rejects_integer_source(sharded_checkpoint):
         (torch.ones(2, 3, dtype=torch.float16), "returned dtype"),
     ],
 )
-def test_rejects_invalid_materializer_output(
-    sharded_checkpoint, result, message
-):
+def test_rejects_invalid_materializer_output(sharded_checkpoint, result, message):
     source = SafetensorsWeightSource(sharded_checkpoint)
 
     with pytest.raises((TypeError, ValueError), match=message):
@@ -307,9 +295,7 @@ def test_rejects_invalid_materializer_output(
 
 def test_materializer_manifest_identity_is_stable_and_dtype_sensitive():
     materializer = CastWeightMaterializer()
-    policy = StreamingDTypePolicy.for_quantized_modules(
-        torch.bfloat16, ("layer.proj",)
-    )
+    policy = StreamingDTypePolicy.for_quantized_modules(torch.bfloat16, ("layer.proj",))
 
     first = materializer.manifest_info(target_dtype=torch.bfloat16)
     second = materializer.manifest_info(target_dtype=torch.bfloat16)
@@ -370,25 +356,32 @@ def test_deepseek_v4_materializer_decodes_ue8m0_endpoints():
 def test_deepseek_v4_materializer_raw_output_names_match_sglang_contract(
     mtp_index,
 ):
-    materializer = DeepSeekV4WeightMaterializer(
-        save_raw_checkpoint_format=True
-    )
+    materializer = DeepSeekV4WeightMaterializer(save_raw_checkpoint_format=True)
 
-    assert materializer.output_tensor_name(
-        f"model.mtp.{mtp_index}.ffn.experts.7.w1.weight"
-    ) == f"mtp.{mtp_index}.ffn.experts.7.w1.weight"
-    assert materializer.output_tensor_name(
-        f"model.mtp.{mtp_index}.ffn.shared_experts.w2.weight_scale"
-    ) == f"mtp.{mtp_index}.ffn.shared_experts.w2.scale"
-    assert materializer.output_tensor_name(
-        f"model.mtp.{mtp_index}.lm_head.weight"
-    ) == f"mtp.{mtp_index}.head.weight"
-    assert materializer.output_module_name(
-        f"model.mtp.{mtp_index}.ffn.experts.7.w1"
-    ) == f"mtp.{mtp_index}.ffn.experts.7.w1"
-    assert materializer.output_weight_scale_name(
-        f"mtp.{mtp_index}.ffn.experts.7.w1"
-    ) == f"mtp.{mtp_index}.ffn.experts.7.w1.scale"
+    assert (
+        materializer.output_tensor_name(
+            f"model.mtp.{mtp_index}.ffn.experts.7.w1.weight"
+        )
+        == f"mtp.{mtp_index}.ffn.experts.7.w1.weight"
+    )
+    assert (
+        materializer.output_tensor_name(
+            f"model.mtp.{mtp_index}.ffn.shared_experts.w2.weight_scale"
+        )
+        == f"mtp.{mtp_index}.ffn.shared_experts.w2.scale"
+    )
+    assert (
+        materializer.output_tensor_name(f"model.mtp.{mtp_index}.lm_head.weight")
+        == f"mtp.{mtp_index}.head.weight"
+    )
+    assert (
+        materializer.output_module_name(f"model.mtp.{mtp_index}.ffn.experts.7.w1")
+        == f"mtp.{mtp_index}.ffn.experts.7.w1"
+    )
+    assert (
+        materializer.output_weight_scale_name(f"mtp.{mtp_index}.ffn.experts.7.w1")
+        == f"mtp.{mtp_index}.ffn.experts.7.w1.scale"
+    )
 
 
 @pytest.mark.parametrize("save_raw_checkpoint_format", [False, True])
@@ -616,9 +609,7 @@ def test_transformers_materializer_restores_checkpoint_names_on_output(tmp_path)
             self.layer.ffn_hc.scale = torch.nn.Parameter(torch.empty(3))
             self.layer.self_attn = torch.nn.Module()
             self.layer.self_attn.forget_gate = torch.nn.Module()
-            self.layer.self_attn.forget_gate.A_log = torch.nn.Parameter(
-                torch.empty(2)
-            )
+            self.layer.self_attn.forget_gate.A_log = torch.nn.Parameter(torch.empty(2))
             self.layer.self_attn.forget_gate.dt_bias = torch.nn.Parameter(
                 torch.empty(2)
             )
@@ -649,12 +640,8 @@ def test_transformers_materializer_restores_checkpoint_names_on_output(tmp_path)
     conversions = [
         WeightRenaming("hc_attn_fn", "attn_hc.fn"),
         WeightRenaming("hc_ffn_scale", "ffn_hc.scale"),
-        WeightRenaming(
-            r"self_attn\.A_log", "self_attn.forget_gate.A_log"
-        ),
-        WeightRenaming(
-            r"self_attn\.dt_bias", "self_attn.forget_gate.dt_bias"
-        ),
+        WeightRenaming(r"self_attn\.A_log", "self_attn.forget_gate.A_log"),
+        WeightRenaming(r"self_attn\.dt_bias", "self_attn.forget_gate.dt_bias"),
         WeightConverter(
             source_patterns=[
                 "self_attn.q_conv1d.weight",
@@ -678,9 +665,7 @@ def test_transformers_materializer_restores_checkpoint_names_on_output(tmp_path)
         target_dtype=torch.float32,
     )
 
-    assert materializer.output_tensor_names("layer.attn_hc.fn") == (
-        "layer.hc_attn_fn",
-    )
+    assert materializer.output_tensor_names("layer.attn_hc.fn") == ("layer.hc_attn_fn",)
     hc_outputs = materializer.prepare_output_tensors(
         "layer.attn_hc.fn", values["layer.attn_hc.fn"]
     )
@@ -689,18 +674,18 @@ def test_transformers_materializer_restores_checkpoint_names_on_output(tmp_path)
     assert materializer.output_tensor_names("layer.ffn_hc.scale") == (
         "layer.hc_ffn_scale",
     )
-    assert materializer.output_tensor_names(
-        "layer.self_attn.forget_gate.A_log"
-    ) == ("layer.self_attn.A_log",)
+    assert materializer.output_tensor_names("layer.self_attn.forget_gate.A_log") == (
+        "layer.self_attn.A_log",
+    )
     a_log_outputs = materializer.prepare_output_tensors(
         "layer.self_attn.forget_gate.A_log",
         values["layer.self_attn.forget_gate.A_log"],
     )
     assert tuple(a_log_outputs) == ("layer.self_attn.A_log",)
     assert torch.equal(a_log_outputs["layer.self_attn.A_log"], a_log)
-    assert materializer.output_tensor_names(
-        "layer.self_attn.forget_gate.dt_bias"
-    ) == ("layer.self_attn.dt_bias",)
+    assert materializer.output_tensor_names("layer.self_attn.forget_gate.dt_bias") == (
+        "layer.self_attn.dt_bias",
+    )
     conv_outputs = materializer.prepare_output_tensors(
         "layer.self_attn.conv1d.weight",
         values["layer.self_attn.conv1d.weight"],
@@ -792,9 +777,7 @@ def test_kimi_k3_source_normalizes_native_e8m0_scale_to_bytes(tmp_path):
         "language_model.model.layers.1.block_sparse_moe.experts.0.w1.weight_packed"
     )
     scale_name = raw_name.removesuffix("_packed") + "_scale"
-    scale = torch.tensor([127, 128], dtype=torch.uint8).view(
-        torch.float8_e8m0fnu
-    )
+    scale = torch.tensor([127, 128], dtype=torch.uint8).view(torch.float8_e8m0fnu)
     save_file(
         {
             raw_name: torch.tensor([[0x01, 0x29]], dtype=torch.uint8),

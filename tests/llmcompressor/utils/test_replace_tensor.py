@@ -119,7 +119,8 @@ def test_replace_tensors_generates_suffixed_outputs_for_full_precision_source(tm
         == "matched_tensors.bf16copy.safetensors"
     )
     assert (
-        updated_index["weight_map"]["model.layers.0.mlp.down_proj.weight"] == target_file
+        updated_index["weight_map"]["model.layers.0.mlp.down_proj.weight"]
+        == target_file
     )
     expected_total_size = (
         _tensor_size_in_bytes(target_original)
@@ -131,17 +132,24 @@ def test_replace_tensors_generates_suffixed_outputs_for_full_precision_source(tm
 
     with (target_dir / "config.json.bf16copy").open("r") as file:
         updated_config = json.load(file)
-    assert "model.layers.3.self_attn.q_proj" in updated_config["quantization_config"]["ignore"]
-    assert updated_config["quantization_config"]["config_groups"] == original_target_config[
-        "quantization_config"
-    ]["config_groups"]
+    assert (
+        "model.layers.3.self_attn.q_proj"
+        in updated_config["quantization_config"]["ignore"]
+    )
+    assert (
+        updated_config["quantization_config"]["config_groups"]
+        == original_target_config["quantization_config"]["config_groups"]
+    )
 
     with (target_dir / "model.safetensors.index.json").open("r") as file:
         original_index = json.load(file)
     with (target_dir / "config.json").open("r") as file:
         original_config = json.load(file)
 
-    assert original_index["weight_map"]["model.layers.3.self_attn.q_proj.weight"] == target_file
+    assert (
+        original_index["weight_map"]["model.layers.3.self_attn.q_proj.weight"]
+        == target_file
+    )
     assert original_config == original_target_config
 
 
@@ -166,7 +174,8 @@ def test_replace_tensors_copies_quantized_groups_for_quantized_source(tmp_path):
         source_dir / "model.safetensors.index.json",
         {
             "metadata": {
-                "total_size": _tensor_size_in_bytes(qweight) + _tensor_size_in_bytes(qscale)
+                "total_size": _tensor_size_in_bytes(qweight)
+                + _tensor_size_in_bytes(qscale)
             },
             "weight_map": {
                 "model.layers.2.self_attn.q_proj.weight": source_file,
@@ -239,10 +248,10 @@ def test_replace_tensors_copies_quantized_groups_for_quantized_source(tmp_path):
     config_groups = updated_config["quantization_config"]["config_groups"]
     assert "target_group" in config_groups
     assert "source_group" in config_groups
-    assert config_groups["source_group"]["targets"] == ["model.layers.2.self_attn.q_proj"]
-    assert (
-        config_groups["source_group"]["weights"]["num_bits"] == 4
-    )
+    assert config_groups["source_group"]["targets"] == [
+        "model.layers.2.self_attn.q_proj"
+    ]
+    assert config_groups["source_group"]["weights"]["num_bits"] == 4
     assert updated_config["quantization_config"]["ignore"] == ["lm_head"]
 
     with (target_dir / "model.safetensors.index.json.quantcopy").open("r") as file:
@@ -267,7 +276,10 @@ def test_replace_tensors_raises_when_no_tensor_matches(tmp_path):
 
     tensor = torch.ones((2, 2), dtype=torch.float32)
     source_file = "model.safetensors"
-    save_file({"model.layers.0.self_attn.q_proj.weight": tensor}, str(source_dir / source_file))
+    save_file(
+        {"model.layers.0.self_attn.q_proj.weight": tensor},
+        str(source_dir / source_file),
+    )
     _write_json(
         source_dir / "model.safetensors.index.json",
         {
@@ -276,7 +288,9 @@ def test_replace_tensors_raises_when_no_tensor_matches(tmp_path):
         },
     )
 
-    save_file({"model.layers.1.mlp.down_proj.weight": tensor}, str(target_dir / source_file))
+    save_file(
+        {"model.layers.1.mlp.down_proj.weight": tensor}, str(target_dir / source_file)
+    )
     _write_json(
         target_dir / "model.safetensors.index.json",
         {

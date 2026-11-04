@@ -54,9 +54,7 @@ def build_meta_model(
         # Model-derived buffers such as rotary frequencies are not checkpoint
         # weights, but traced prefix execution needs their real values.
         configs = [
-            value
-            for value in (*args, *kwargs.values())
-            if hasattr(value, "to_dict")
+            value for value in (*args, *kwargs.values()) if hasattr(value, "to_dict")
         ]
         previous = [
             (config, getattr(config, "_streaming_meta_init", None))
@@ -164,10 +162,7 @@ class TargetWeightLoader:
             else getattr(model, "_tied_weights_keys", None)
         )
         self._tied_weight_sources = (
-            {
-                str(alias): str(canonical)
-                for alias, canonical in declared_ties.items()
-            }
+            {str(alias): str(canonical) for alias, canonical in declared_ties.items()}
             if isinstance(declared_ties, dict)
             else {}
         )
@@ -198,18 +193,12 @@ class TargetWeightLoader:
                 "with PreparedSubgraphWeights.move_to()"
             )
 
-        plan = self.plan(
-            target_name, allow_missing_state=allow_missing_state
-        )
-        prepared_bytes, workspace_bytes = self.estimate_preparation(
-            plan, dtype=dtype
-        )
+        plan = self.plan(target_name, allow_missing_state=allow_missing_state)
+        prepared_bytes, workspace_bytes = self.estimate_preparation(plan, dtype=dtype)
         with HostMemoryBudget().reserve(
             f"target {target_name!r}", prepared_bytes + workspace_bytes
         ) as reservation:
-            prepared = self.materialize_cpu(
-                plan, dtype=dtype, reservation=reservation
-            )
+            prepared = self.materialize_cpu(plan, dtype=dtype, reservation=reservation)
             reservation.release_reserved(reservation.reserved_bytes)
             with self.installed(prepared) as target:
                 yield target
@@ -223,9 +212,7 @@ class TargetWeightLoader:
         """Resolve model aliases and source names without loading tensors."""
 
         if target_name in self._active_targets:
-            raise RuntimeError(
-                f"Target {target_name!r} is already materialized"
-            )
+            raise RuntimeError(f"Target {target_name!r} is already materialized")
         try:
             target = self.model.get_submodule(target_name)
         except AttributeError as error:
@@ -251,9 +238,7 @@ class TargetWeightLoader:
             allow_missing=allow_missing_state,
         )
         parameter_groups = [
-            group
-            for group in parameter_groups
-            if id(group[0]) in parameter_sources
+            group for group in parameter_groups if id(group[0]) in parameter_sources
         ]
         buffer_groups = [
             group for group in buffer_groups if id(group[0]) in buffer_sources
@@ -320,9 +305,7 @@ class TargetWeightLoader:
                 allow_missing=allow_missing_state,
             )
             parameter_groups = [
-                group
-                for group in parameter_groups
-                if id(group[0]) in parameter_sources
+                group for group in parameter_groups if id(group[0]) in parameter_sources
             ]
             self._validate_shapes(parameter_sources, parameter_groups)
             plans.append(
@@ -357,9 +340,7 @@ class TargetWeightLoader:
                     sources[id(tensor)], metadata, dtype, tensor.dtype
                 )
                 output_elements = 1
-                for dimension in self.materializer.logical_shape(
-                    source_name, metadata
-                ):
+                for dimension in self.materializer.logical_shape(source_name, metadata):
                     output_elements *= dimension
                 prepared_bytes += output_elements * output_dtype.itemsize
                 if tensor.dtype.is_floating_point:
@@ -475,9 +456,7 @@ class TargetWeightLoader:
                     "count={} | names={}",
                     lambda: plan.name or "<root>",
                     lambda: len(auxiliary_parameters),
-                    lambda: [
-                        name for name, _ in auxiliary_parameters[:8]
-                    ]
+                    lambda: [name for name, _ in auxiliary_parameters[:8]]
                     + (
                         [f"... {len(auxiliary_parameters) - 8} more"]
                         if len(auxiliary_parameters) > 8
@@ -637,9 +616,7 @@ class TargetWeightLoader:
             for alias in aliases:
                 owner, name = _owner_and_name(target, alias)
                 owner._buffers[name] = (
-                    torch.zeros(
-                        original.shape, dtype=original.dtype, device=device
-                    )
+                    torch.zeros(original.shape, dtype=original.dtype, device=device)
                     if original.is_meta
                     else original.to(device=device)
                 )
@@ -657,14 +634,9 @@ class TargetWeightLoader:
                 owner._buffers[name] = original
 
     @staticmethod
-    def _validate_meta(
-        groups: list[tuple[torch.Tensor, list[str]]], kind: str
-    ) -> None:
+    def _validate_meta(groups: list[tuple[torch.Tensor, list[str]]], kind: str) -> None:
         non_meta = [
-            name
-            for tensor, names in groups
-            if not tensor.is_meta
-            for name in names
+            name for tensor, names in groups if not tensor.is_meta for name in names
         ]
         if non_meta:
             raise RuntimeError(
@@ -690,19 +662,13 @@ class TargetWeightLoader:
                 if name in self._tied_weight_sources
             )
             candidates = list(dict.fromkeys(candidates))
-            matches = [
-                name for name in candidates if name in self._source_names
-            ]
+            matches = [name for name in candidates if name in self._source_names]
             if not matches:
                 if global_aliases is None:
-                    global_aliases = self._global_tensor_aliases(
-                        parameters=parameters
-                    )
+                    global_aliases = self._global_tensor_aliases(parameters=parameters)
                 candidates.extend(global_aliases.get(id(tensor), ()))
                 candidates = list(dict.fromkeys(candidates))
-                matches = [
-                    name for name in candidates if name in self._source_names
-                ]
+                matches = [name for name in candidates if name in self._source_names]
             if not matches:
                 missing_checkpoint_state = [
                     name for name in candidates if name in self._initial_state_names
@@ -723,13 +689,9 @@ class TargetWeightLoader:
                     f"{candidates}. Fused or renamed checkpoint tensors require a "
                     "custom mapping and are not supported by TargetWeightLoader."
                 )
-            if (
-                candidates[0] not in self._source_names
-                and matches[0] != candidates[0]
-            ):
+            if candidates[0] not in self._source_names and matches[0] != candidates[0]:
                 streaming_logger.debug(
-                    "weights | alias resolved | target={} | aliases={} | "
-                    "source={}",
+                    "weights | alias resolved | target={} | aliases={} | " "source={}",
                     target_name or "<root>",
                     aliases,
                     matches[0],
@@ -737,9 +699,7 @@ class TargetWeightLoader:
             resolved[id(tensor)] = matches[0]
         return resolved
 
-    def _global_tensor_aliases(
-        self, *, parameters: bool
-    ) -> dict[int, list[str]]:
+    def _global_tensor_aliases(self, *, parameters: bool) -> dict[int, list[str]]:
         named = (
             self.model.named_parameters(recurse=True, remove_duplicate=False)
             if parameters
@@ -758,9 +718,7 @@ class TargetWeightLoader:
         for tensor, _ in groups:
             source_name = sources[id(tensor)]
             metadata = self.source.metadata(source_name)
-            source_shape = self.materializer.logical_shape(
-                source_name, metadata
-            )
+            source_shape = self.materializer.logical_shape(source_name, metadata)
             if source_shape != tuple(tensor.shape):
                 raise ValueError(
                     f"Checkpoint tensor {source_name!r} has shape {source_shape}; "
@@ -919,9 +877,7 @@ class TargetWeightLoader:
     @staticmethod
     def _restore_meta_parameters(
         target: nn.Module,
-        installed: list[
-            tuple[list[str], bool, torch.dtype, tuple[int, ...]]
-        ],
+        installed: list[tuple[list[str], bool, torch.dtype, tuple[int, ...]]],
     ) -> None:
         for aliases, requires_grad, dtype, shape in installed:
             meta = nn.Parameter(

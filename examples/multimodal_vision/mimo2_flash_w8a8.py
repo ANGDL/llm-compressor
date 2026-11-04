@@ -1,27 +1,25 @@
 import argparse
 import os
-from typing import Any, cast
 from contextlib import contextmanager
+from typing import Any, cast
 
 import torch
+from compressed_tensors.entrypoints.convert import (
+    FP8BlockDequantizer,
+    convert_checkpoint,
+)
+from compressed_tensors.offload.dispatch import dispatch_model as _dispatch_model
+from compressed_tensors.quantization import preset_name_to_scheme
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from llmcompressor import oneshot
 from llmcompressor.modeling.mimo_v2_flash_mtp import attach_mtp_layer
+from llmcompressor.modifiers.gptq import GPTQModifier
+from llmcompressor.modifiers.quantization import QuantizationModifier
+from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
 from llmcompressor.pipelines.basic import pipeline as basic_pipeline
 from llmcompressor.pipelines.data_free import pipeline as data_free_pipeline
-from llmcompressor.modifiers.quantization import QuantizationModifier
-from llmcompressor.modifiers.gptq import GPTQModifier
-from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
-from compressed_tensors.quantization import preset_name_to_scheme
-from compressed_tensors.offload.dispatch import dispatch_model as _dispatch_model
-
-from compressed_tensors.entrypoints.convert import (
-    FP8BlockDequantizer,
-    convert_checkpoint,
-)
-
 
 """
 MiMo-V2-Flash quantization script.
@@ -120,8 +118,7 @@ class MiMoV2FlashFP8BlockDequantizer(FP8BlockDequantizer):
         weight_blocks = padded.reshape(Sb, bh, Cb, bw).transpose(1, 2)
         scale_inv_expanded = weight_scale_inv.unsqueeze(-1).unsqueeze(-1)
         dequantized_blocks = (
-            weight_blocks.to(torch.float32)
-            * scale_inv_expanded.to(torch.float32)
+            weight_blocks.to(torch.float32) * scale_inv_expanded.to(torch.float32)
         ).to(self.dtype)
         dequantized = dequantized_blocks.transpose(1, 2).reshape(padded_R, padded_C)
         return dequantized[:R, :C]
@@ -156,17 +153,23 @@ def patch_pipeline_dispatch(extra_memory_gb: float):
 patch_pipeline_dispatch(5)
 
 MODEL_ID = "/path/to/models/MiMo-V2-Flash"
-BFLOAT16_SAVE_DIR = os.path.join("/ssd3/models", MODEL_ID.rstrip("/").split("/")[-1] + "-bf16")
+BFLOAT16_SAVE_DIR = os.path.join(
+    "/ssd3/models", MODEL_ID.rstrip("/").split("/")[-1] + "-bf16"
+)
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Convert MiMo-V2-Flash from FP8 blocks to BF16 and/or quantize it to W8A8"
+        description=(
+            "Convert MiMo-V2-Flash from FP8 blocks to BF16 and/or quantize it to W8A8"
+        )
     )
     parser.add_argument("--model_id", type=str, default=MODEL_ID)
     parser.add_argument("--bf16_dir", type=str, default=BFLOAT16_SAVE_DIR)
     parser.add_argument("--save_dir", type=str, default="/ssd3/models")
-    parser.add_argument("--observer", type=str, default=None, choices=[None, "imatrix_mse"])
+    parser.add_argument(
+        "--observer", type=str, default=None, choices=[None, "imatrix_mse"]
+    )
     parser.add_argument("--modifier", type=str, default="GPTQ", choices=["GPTQ", "RTN"])
     parser.add_argument(
         "--convert-bf16",
@@ -179,7 +182,9 @@ def parse_args():
         action="store_true",
         help="Run W8A8 quantization from the BF16 model directory.",
     )
-    parser.add_argument("--dataset_id", type=str, default="HuggingFaceH4/ultrachat_200k")
+    parser.add_argument(
+        "--dataset_id", type=str, default="HuggingFaceH4/ultrachat_200k"
+    )
     parser.add_argument("--dataset_split", type=str, default="train_sft")
     parser.add_argument("--num_calibration_samples", type=int, default=32)
     parser.add_argument("--max_sequence_length", type=int, default=8192)
@@ -269,7 +274,9 @@ def quantize_model(args):
     ds = ds.map(lambda example: preprocess(example, tokenizer))
     column_names = ds.column_names
     if not isinstance(column_names, list):
-        raise TypeError(f"Expected dataset column_names to be a list, got {type(column_names)!r}")
+        raise TypeError(
+            f"Expected dataset column_names to be a list, got {type(column_names)!r}"
+        )
     ds = ds.map(
         lambda sample: tokenize(sample, tokenizer, args.max_sequence_length),
         remove_columns=column_names,
@@ -335,8 +342,8 @@ def quantize_model(args):
         max_seq_length=args.max_sequence_length,
         num_calibration_samples=args.num_calibration_samples,
         batch_size=1,
-        sequential_targets=['MiMoV2Attention', 'MiMoV2MLP'],
-        trust_remote_code_model=True
+        sequential_targets=["MiMoV2Attention", "MiMoV2MLP"],
+        trust_remote_code_model=True,
     )
 
     save_name = args.bf16_dir.rstrip("/").split("/")[-1] + tail_name

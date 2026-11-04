@@ -1,7 +1,7 @@
 import json
-import torch
 from typing import Iterable
 
+import torch
 from compressed_tensors.quantization import (
     QuantizationConfig,
     QuantizationScheme,
@@ -13,6 +13,7 @@ from compressed_tensors.utils.safetensors_load import (
     find_safetensors_index_file,
 )
 from loguru import logger
+
 from llmcompressor.modifiers.quantization.scale_dtype import validate_scale_dtype
 
 from .microscale import get_fused_names, has_microscale_scheme

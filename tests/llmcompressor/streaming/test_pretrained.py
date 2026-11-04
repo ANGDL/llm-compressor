@@ -97,9 +97,7 @@ def _write_raw_deepseek_v4_checkpoint(checkpoint, *, omit_names=()):
             continue
         dtype_name = dtype_names[tensor.dtype]
         storage = (
-            tensor.view(torch.uint16)
-            if tensor.dtype == torch.bfloat16
-            else tensor
+            tensor.view(torch.uint16) if tensor.dtype == torch.bfloat16 else tensor
         )
         entries.append(
             (raw_name, dtype_name, tuple(tensor.shape), storage.numpy().tobytes())
@@ -319,9 +317,9 @@ def test_qwen3_pretrained_mode_hides_boundary_construction(tmp_path, monkeypatch
     )
     assert not (tmp_path / "work").exists()
     int4_packer.assert_not_called()
-    assert '"lm_head.weight"' not in (
-        output / "model.safetensors.index.json"
-    ).read_text()
+    assert (
+        '"lm_head.weight"' not in (output / "model.safetensors.index.json").read_text()
+    )
 
 
 @pytest.mark.parametrize(
@@ -395,9 +393,7 @@ def test_deepseek_v4_preserves_input_ids_and_collects_all_experts(
     config = _tiny_deepseek_v4_config()
     checkpoint = tmp_path / "checkpoint"
     source_model = DeepseekV4NativeForCausalLM(config)
-    source_model.save_pretrained(
-        checkpoint, safe_serialization=True
-    )
+    source_model.save_pretrained(checkpoint, safe_serialization=True)
     _write_raw_deepseek_v4_checkpoint(checkpoint)
     dataset = DataLoader(
         [
@@ -444,27 +440,21 @@ def test_deepseek_v4_preserves_input_ids_and_collects_all_experts(
     }
 
     assert (output / "FINALIZED").is_file()
-    assert not list(
-        (tmp_path / "work" / "artifacts" / "statistics").glob(
-            "target-*"
-        )
-    )
+    assert not list((tmp_path / "work" / "artifacts" / "statistics").glob("target-*"))
     if checkpoint_progress:
         assert (tmp_path / "work" / "staging").is_dir()
         assert list(output.glob("*.safetensors"))
     else:
         assert not (tmp_path / "work" / "staging").exists()
         for index in range(2):
-            assert (
-                output / f"model-subgraph-{index:05d}.safetensors"
-            ).is_file()
+            assert (output / f"model-subgraph-{index:05d}.safetensors").is_file()
     output_config = json.loads((output / "config.json").read_text())
     assert output_config["architectures"] == ["DeepseekV4ForCausalLM"]
     assert output_config["model_type"] == "deepseek_v4"
     if save_raw_checkpoint_format:
-        weight_map = json.loads(
-            (output / "model.safetensors.index.json").read_text()
-        )["weight_map"]
+        weight_map = json.loads((output / "model.safetensors.index.json").read_text())[
+            "weight_map"
+        ]
         assert "mtp.0.ffn.experts.0.w1.weight" in weight_map
         assert "mtp.0.ffn.experts.0.w1.scale" in weight_map
         assert "mtp.0.ffn.shared_experts.w1.weight" in weight_map
@@ -507,9 +497,7 @@ def test_deepseek_v4_missing_mtp_norms_fail_before_calibration(tmp_path):
             "model.mtp.0.hnorm.weight",
         },
     )
-    dataset = DataLoader(
-        [{"input_ids": torch.tensor([1, 2, 3, 4])}], batch_size=1
-    )
+    dataset = DataLoader([{"input_ids": torch.tensor([1, 2, 3, 4])}], batch_size=1)
 
     with pytest.raises(KeyError, match="model.mtp.0.(enorm|hnorm).weight"):
         streaming_oneshot(
@@ -556,9 +544,7 @@ def test_deepseek_v4_dspark_forward_teacher_forces_valid_seed_and_context():
 
     for layer_id in config.dspark_target_layer_ids:
         handles.append(
-            model.model.layers[layer_id].register_forward_hook(
-                capture_target(layer_id)
-            )
+            model.model.layers[layer_id].register_forward_hook(capture_target(layer_id))
         )
     handles.append(
         model.model.mtp[0].main_proj.register_forward_pre_hook(
@@ -599,9 +585,7 @@ def test_deepseek_v4_dspark_forward_teacher_forces_valid_seed_and_context():
     )
     assert torch.equal(draft_ids[0], torch.tensor([[4, 31, 31]]))
     assert torch.equal(draft_ids[1], draft_ids[0])
-    assert torch.equal(
-        context_masks[0], torch.tensor([[False, True, True, True]])
-    )
+    assert torch.equal(context_masks[0], torch.tensor([[False, True, True, True]]))
     assert torch.equal(context_masks[1], context_masks[0])
     assert torch.allclose(projected_contexts[0], expected_context)
     assert torch.allclose(projected_contexts[1], projected_contexts[0])
@@ -665,18 +649,14 @@ def test_deepseek_v4_0731_dspark_streaming_checkpoint_contract(tmp_path):
 
     assert config.n_mtp_layers == 3
     assert not {
-        name
-        for name in stats.all_zero_counter
-        if name.startswith("model.mtp.")
+        name for name in stats.all_zero_counter if name.startswith("model.mtp.")
     }
     assert not {
-        name
-        for name in stats.no_importance_counter
-        if name.startswith("model.mtp.")
+        name for name in stats.no_importance_counter if name.startswith("model.mtp.")
     }
-    weight_map = json.loads(
-        (output / "model.safetensors.index.json").read_text()
-    )["weight_map"]
+    weight_map = json.loads((output / "model.safetensors.index.json").read_text())[
+        "weight_map"
+    ]
     assert "mtp.0.main_proj.weight" in weight_map
     assert "mtp.1.attn.wq_a.weight" in weight_map
     assert "mtp.2.markov_head.markov_w1.weight" in weight_map

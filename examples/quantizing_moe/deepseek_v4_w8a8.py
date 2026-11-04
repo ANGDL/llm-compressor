@@ -7,12 +7,21 @@ from glob import glob
 
 import numpy as np
 import torch
+from compressed_tensors.offload import get_device_map
+from compressed_tensors.offload.dispatch import dispatch_model as _dispatch_model
+from compressed_tensors.quantization import QuantizationScheme, preset_name_to_scheme
+from compressed_tensors.quantization.quant_args import (
+    QuantizationArgs,
+    QuantizationStrategy,
+    QuantizationType,
+)
 from datasets import concatenate_datasets, load_dataset
 from loguru import logger
 from safetensors.torch import save_file
 from transformers import AutoTokenizer
 
 from llmcompressor import oneshot
+from llmcompressor.logger import LoggerConfig, configure_logger
 from llmcompressor.modeling.deepseek_v4 import CalibrationDeepseekV4MoE  # noqa: F401
 from llmcompressor.modeling.deepseekv4.model import DeepseekV4NativeForCausalLM
 from llmcompressor.modifiers.gptq import GPTQModifier
@@ -24,15 +33,6 @@ from llmcompressor.streaming.materialization.deepseek_v4 import (
     DeepSeekV4WeightMaterializer,
 )
 from llmcompressor.utils import ImatrixFallbackStats
-from compressed_tensors.offload import get_device_map
-from compressed_tensors.offload.dispatch import dispatch_model as _dispatch_model
-from compressed_tensors.quantization import preset_name_to_scheme, QuantizationScheme
-from compressed_tensors.quantization.quant_args import (
-    QuantizationArgs,
-    QuantizationStrategy,
-    QuantizationType,
-)
-from llmcompressor.logger import LoggerConfig, configure_logger
 
 configure_logger(LoggerConfig(console_log_level="DEBUG"))
 
@@ -42,7 +42,8 @@ Note:
     为了获得良好的量化体验，请保证你的内存+交换内存>=3T
     为了保证精度，请设置环境变量：
         export DEEPSEEK_V4_KERNEL_BACKEND=reference
-        export DEEPSEEK_V4_REFERENCE_KERNEL_PATH=/ssd4/models/DeepSeek-V4-Pro/inference/kernel.py
+        export \
+            DEEPSEEK_V4_REFERENCE_KERNEL_PATH=/ssd4/models/DeepSeek-V4-Pro/inference/kernel.py
 
 Usage:
 1. Convert to BF16 (optional, can skip if already have a BF16 checkpoint):
@@ -54,7 +55,8 @@ Usage:
         --model_id /ssd4/models/DeepSeek-V4-Pro/ --bf16_save_dir /ssd2/models/ \
         --step int8 --observer "imatrix_mse" --modifier RTN --quant_mode wNa8 \
         --dataset_id ./ultrachat_200k ./calibration_data_dsv4_pro.jsonl \
-        --num_calibration_samples 512 --max_sequence_length 8192 --pipeline sequential  \
+        --num_calibration_samples 512 --max_sequence_length 8192 \
+        --pipeline sequential \
         --save_dir /ssd3/models
 3. Packed
     python -m llmcompressor.utils.pack_int4_to_int8 \
@@ -86,7 +88,10 @@ parser.add_argument(
     type=str,
     default="all",
     choices=["all", "bf16", "int8"],
-    help="Which step to run: 'bf16' (FP8/FP4→BF16 only), 'int8' (BF16→INT8 only), 'all' (both).",
+    help=(
+        "Which step to run: 'bf16' (FP8/FP4→BF16 only), "
+        "'int8' (BF16→INT8 only), 'all' (both)."
+    ),
 )
 parser.add_argument(
     "--observer",
@@ -151,7 +156,8 @@ parser.add_argument(
     choices=["w8a8", "wNa8", "w4a8"],
     help=(
         "Quantization mode: 'w8a8' (uniform INT8 for all linear layers), "
-        "'wNa8' (mixed precision: routed experts INT4, attention/shared_experts/MTP INT8), "
+        "'wNa8' (mixed precision: routed experts INT4, "
+        "attention/shared_experts/MTP INT8), "
         "'w4a8' (uniform INT4 weights + INT8 activations). "
         "The wNa8 mode follows the original checkpoint precision: FP4→INT4, FP8→INT8."
     ),
@@ -164,10 +170,14 @@ parser.add_argument(
     default=False,
     help="Quantize attn.wo_a; wNa8 always uses the INT8 scheme for it.",
 )
-parser.add_argument("--dataset_id", type=str, nargs="+",
-                    default=["HuggingFaceH4/ultrachat_200k"],
-                    help="HuggingFace dataset ID(s) or path(s) to local JSON/JSONL files. "
-                         "Multiple sources can be specified and will be concatenated.")
+parser.add_argument(
+    "--dataset_id",
+    type=str,
+    nargs="+",
+    default=["HuggingFaceH4/ultrachat_200k"],
+    help="HuggingFace dataset ID(s) or path(s) to local JSON/JSONL files. "
+    "Multiple sources can be specified and will be concatenated.",
+)
 parser.add_argument("--dataset_split", type=str, default="train_sft")
 parser.add_argument(
     "--num_calibration_samples",
@@ -219,7 +229,10 @@ parser.add_argument(
     "--max-memory-cpu-gb",
     type=float,
     default=1500.0,
-    help="Max CPU memory in GB for model loading (passed as max_memory={'cpu': <value>e9}).",
+    help=(
+        "Max CPU memory in GB for model loading "
+        "(passed as max_memory={'cpu': <value>e9})."
+    ),
 )
 parser.add_argument(
     "--bf16_convert_workers",
@@ -284,7 +297,6 @@ def maybe_skip_from_accelerate(skip_restore: bool):
         ct_utils.from_accelerate = original_from_accelerate
 
 
-
 # ===========================================================================
 # Module 1: FP8/FP4 → BF16 Conversion
 # ===========================================================================
@@ -295,6 +307,7 @@ def maybe_skip_from_accelerate(skip_restore: bool):
 # The reader below preserves raw dtypes and delegates dequantization to
 # `DeepSeekV4WeightMaterializer`, which is also used by streaming PTQ.
 # ===========================================================================
+
 
 class SafetensorsReader:
     """Low-level reader for safetensors files that handles F8_E8M0/F8_E4M3/I8 dtypes."""
@@ -463,7 +476,7 @@ def _raw_key_to_hf_key(key: str) -> str:
     if key.startswith("model."):
         return key
     if key.startswith("head."):
-        return "model.lm_head." + key[len("head."):]
+        return "model.lm_head." + key[len("head.") :]
     if key.startswith("lm_head."):
         return "model." + key
     return "model." + key
@@ -509,9 +522,7 @@ def _convert_shard(
             info = reader.get_tensor_info(key)
             dtype_str = info["dtype"]
             scale_key = (
-                key.rsplit(".", 1)[0] + ".scale"
-                if key.endswith(".weight")
-                else None
+                key.rsplit(".", 1)[0] + ".scale" if key.endswith(".weight") else None
             )
 
             if scale_key and scale_key in scale_keys:
@@ -523,12 +534,12 @@ def _convert_shard(
                     logical_key: reader.get_tensor(key),
                     logical_scale_key: reader.get_tensor(scale_key),
                 }
-                output_tensors[
-                    _bf16_output_key(key, save_raw_checkpoint_format)
-                ] = materializer.materialize_cpu(
-                    logical_key,
-                    tensors,
-                    target_dtype=torch.bfloat16,
+                output_tensors[_bf16_output_key(key, save_raw_checkpoint_format)] = (
+                    materializer.materialize_cpu(
+                        logical_key,
+                        tensors,
+                        target_dtype=torch.bfloat16,
+                    )
                 )
             elif key.endswith(".scale"):
                 # Skip standalone scale keys (already handled above)
@@ -539,9 +550,9 @@ def _convert_shard(
                 )
             else:
                 # Non-quantized tensor: read as-is
-                output_tensors[
-                    _bf16_output_key(key, save_raw_checkpoint_format)
-                ] = reader.get_tensor(key)
+                output_tensors[_bf16_output_key(key, save_raw_checkpoint_format)] = (
+                    reader.get_tensor(key)
+                )
 
     save_file(output_tensors, out_path)
     logger.info(f"Saved: {shard_name} ({len(output_tensors)} tensors)")
@@ -648,7 +659,9 @@ def preprocess(example):
 
 # Preprocess each source to unified {"text": ...} schema before concatenation,
 # since different sources may have different column schemas.
-all_datasets = [part.map(preprocess, remove_columns=part.column_names) for part in all_datasets]
+all_datasets = [
+    part.map(preprocess, remove_columns=part.column_names) for part in all_datasets
+]
 
 if len(all_datasets) == 1:
     ds = all_datasets[0]
@@ -663,7 +676,8 @@ bf16_model_id = BFLOAT16_SAVE_DIR
 # Override cache-related config to avoid allocating hundreds of GB of KV cache
 # buffers that are not needed for quantization. The model registers large
 # persistent=False buffers sized by max_batch_size × max_seq_len per layer.
-from llmcompressor.modeling.deepseekv4.config import ModelConfig
+from llmcompressor.modeling.deepseekv4.config import ModelConfig  # noqa: E402
+
 config = ModelConfig.from_pretrained(bf16_model_id)
 config.max_batch_size = 1
 is_dspark = config.is_dspark
@@ -792,9 +806,7 @@ elif args.quant_mode == "wNa8":
         r"re:.*ffn\.shared_experts\.(w1|w2|w3)$",
     ]
     other_targets.append(
-        r"re:.*mtp\.0\.main_proj$"
-        if is_dspark
-        else r"re:.*mtp\.\d+\.(e_proj|h_proj)$"
+        r"re:.*mtp\.0\.main_proj$" if is_dspark else r"re:.*mtp\.\d+\.(e_proj|h_proj)$"
     )
     if args.quantize_wo_a:
         other_targets.append(_WO_A_PATTERN)
@@ -929,7 +941,7 @@ else:
 # wNa8 mode uses per-expert quantization targets; mark as unpacked in the
 # output directory name so downstream tooling can distinguish formats.
 if args.quant_mode == "wNa8" or args.quant_mode == "w4a8":
-    tail_name += '-unpacked' 
+    tail_name += "-unpacked"
 
 SAVE_NAME = args.model_id.rstrip("/").split("/")[-1] + tail_name
 SAVE_DIR = os.path.join(args.save_dir, SAVE_NAME)
@@ -938,5 +950,5 @@ if args.save_raw_checkpoint_format:
     model.save_raw_format = True
 
 with maybe_skip_from_accelerate(args.skip_restore_from_accelerate):
-    model.save_pretrained(SAVE_DIR, save_compressed=True, max_shard_size='50GB')
+    model.save_pretrained(SAVE_DIR, save_compressed=True, max_shard_size="50GB")
 tokenizer.save_pretrained(SAVE_DIR)

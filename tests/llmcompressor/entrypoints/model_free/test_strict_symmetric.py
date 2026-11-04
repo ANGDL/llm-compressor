@@ -64,10 +64,14 @@ def test_model_free_strict_symmetric_scale_is_float32():
     )
 
     compress_module(module)
-    expected = torch.round(
-        torch.tensor([[1.0, -0.5], [0.25, -0.75]], dtype=torch.float32)
-        / module.weight_scale.detach()
-    ).clamp(-128, 127).to(torch.int8)
+    expected = (
+        torch.round(
+            torch.tensor([[1.0, -0.5], [0.25, -0.75]], dtype=torch.float32)
+            / module.weight_scale.detach()
+        )
+        .clamp(-128, 127)
+        .to(torch.int8)
+    )
     assert torch.equal(module.weight.detach(), expected)
 
 

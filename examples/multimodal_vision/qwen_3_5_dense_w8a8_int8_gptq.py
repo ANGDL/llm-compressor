@@ -1,26 +1,18 @@
-import base64
 import argparse
-from io import BytesIO
+import base64
 import os
-from pathlib import Path
 import shutil
+from io import BytesIO
+from pathlib import Path
 
 import torch
+from compressed_tensors.utils import save_mtp_tensors_to_checkpoint
 from datasets import Dataset, load_dataset
-from transformers import AutoProcessor, Qwen3_5ForConditionalGeneration
 from qwen_vl_utils import process_vision_info
+from transformers import AutoProcessor, Qwen3_5ForConditionalGeneration
 
 from llmcompressor import oneshot
 from llmcompressor.modifiers.quantization import GPTQModifier
-from llmcompressor.modifiers.quantization import QuantizationModifier
-from llmcompressor.utils import dispatch_for_generation
-from compressed_tensors.utils import save_mtp_tensors_to_checkpoint
-from compressed_tensors.quantization.quant_args import (
-  QuantizationArgs,
-  QuantizationStrategy,
-  QuantizationType,
-)
-
 
 MODEL_ARTIFACT_FILES = {
     "config.json",
@@ -40,6 +32,7 @@ def copy_original_non_model_files(source_dir, save_dir):
         ):
             continue
         shutil.copy2(source_path, os.path.join(save_dir, filename))
+
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--model-id", default="/data/models/Qwen3.5-27B")
@@ -69,7 +62,9 @@ if dataset_path.is_dir():
         parser.error(f"no Flickr30k test Arrow shards in {DATASET_ID}")
     ds = Dataset.from_file(str(shards[0]))
     if len(ds) < NUM_CALIBRATION_SAMPLES:
-        parser.error(f"first Arrow shard has fewer than {NUM_CALIBRATION_SAMPLES} samples")
+        parser.error(
+            f"first Arrow shard has fewer than {NUM_CALIBRATION_SAMPLES} samples"
+        )
     ds = ds.select(range(NUM_CALIBRATION_SAMPLES))
 else:
     ds = load_dataset(DATASET_ID, split=f"test[:{NUM_CALIBRATION_SAMPLES}]")
@@ -94,13 +89,8 @@ def preprocess_and_tokenize(example):
         },
         {
             "role": "assistant",
-            "content": [
-                {
-                "text": f"{example['caption'][0]}",
-                "type": "text"
-                }
-            ],
-        }
+            "content": [{"text": f"{example['caption'][0]}", "type": "text"}],
+        },
     ]
     text = processor.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
@@ -119,7 +109,9 @@ def preprocess_and_tokenize(example):
 
 
 ds = ds.map(preprocess_and_tokenize, remove_columns=ds.column_names)
-model = Qwen3_5ForConditionalGeneration.from_pretrained(model_id, device_map=None, dtype="auto")
+model = Qwen3_5ForConditionalGeneration.from_pretrained(
+    model_id, device_map=None, dtype="auto"
+)
 
 
 # Define a oneshot data collator for multimodal inputs.

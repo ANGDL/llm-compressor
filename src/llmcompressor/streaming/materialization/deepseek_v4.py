@@ -45,9 +45,7 @@ class DeepSeekV4WeightSource(CheckpointWeightSource):
         if len(self._logical_to_raw) != len(self._source.tensor_names()):
             raise ValueError("DeepSeek-V4 key normalization produced duplicates")
         self._primary_names = tuple(
-            name
-            for name in self._logical_to_raw
-            if not name.endswith(".scale")
+            name for name in self._logical_to_raw if not name.endswith(".scale")
         )
 
     def tensor_names(self):
@@ -70,9 +68,7 @@ class DeepSeekV4WeightSource(CheckpointWeightSource):
             except KeyError as error:
                 raise KeyError(f"Unknown DeepSeek-V4 tensor {name!r}") from error
         raw_values = self._source.load_tensors_cpu(raw_names)
-        return {
-            name: raw_values[self._logical_to_raw[name]] for name in requested
-        }
+        return {name: raw_values[self._logical_to_raw[name]] for name in requested}
 
     def iter_tensor_groups_cpu(self, groups) -> Iterator[dict[str, torch.Tensor]]:
         logical_groups = [tuple(dict.fromkeys(group)) for group in groups]
@@ -171,9 +167,7 @@ class DeepSeekV4WeightMaterializer(WeightMaterializer):
             return f"{output_module_name}.scale"
         return super().output_weight_scale_name(output_module_name)
 
-    def dependencies(
-        self, tensor_name: str, metadata: TensorMetadata
-    ) -> list[str]:
+    def dependencies(self, tensor_name: str, metadata: TensorMetadata) -> list[str]:
         if tensor_name.endswith(".weight") and metadata.dtype in {
             torch.float8_e4m3fn,
             torch.int8,
@@ -185,10 +179,10 @@ class DeepSeekV4WeightMaterializer(WeightMaterializer):
     def logical_shape(
         self, tensor_name: str, metadata: TensorMetadata
     ) -> tuple[int, ...]:
-        if (
-            tensor_name.endswith(".weight")
-            and metadata.dtype in {torch.int8, torch.uint8}
-        ):
+        if tensor_name.endswith(".weight") and metadata.dtype in {
+            torch.int8,
+            torch.uint8,
+        }:
             return (*metadata.shape[:-1], metadata.shape[-1] * 2)
         return metadata.shape
 
@@ -234,9 +228,7 @@ class DeepSeekV4WeightMaterializer(WeightMaterializer):
         out_dim, packed_in_dim = weight.shape
         in_dim = packed_in_dim * 2
         packed = weight.to(torch.uint8)
-        table = torch.tensor(
-            self._FP4_TABLE, dtype=torch.float32, device=weight.device
-        )
+        table = torch.tensor(self._FP4_TABLE, dtype=torch.float32, device=weight.device)
         low = table[(packed & 0x0F).long()]
         high = table[((packed >> 4) & 0x0F).long()]
         unpacked = torch.stack((low, high), dim=-1).flatten(1)
@@ -247,9 +239,9 @@ class DeepSeekV4WeightMaterializer(WeightMaterializer):
                 "DeepSeek-V4 FP4 scale shape does not match weight blocks: "
                 f"weight={tuple(weight.shape)}, scale={tuple(scale.shape)}"
             )
-        expanded_scale = decoded_scale.repeat_interleave(
-            self.fp4_block_size, dim=-1
-        )[:, :in_dim]
+        expanded_scale = decoded_scale.repeat_interleave(self.fp4_block_size, dim=-1)[
+            :, :in_dim
+        ]
         return unpacked * expanded_scale
 
     def materialize_cpu(
@@ -281,9 +273,7 @@ class DeepSeekV4WeightMaterializer(WeightMaterializer):
             )
         return result.to(dtype=target_dtype)
 
-    def estimate_workspace_bytes(
-        self, tensor_name, metadata, target_dtype
-    ) -> int:
+    def estimate_workspace_bytes(self, tensor_name, metadata, target_dtype) -> int:
         if self.dependencies(tensor_name, metadata):
             elements = 1
             for dimension in self.logical_shape(tensor_name, metadata):

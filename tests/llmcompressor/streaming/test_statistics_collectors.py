@@ -100,9 +100,7 @@ def test_streaming_gptq_matches_shared_oneshot_primitives():
 
 def test_imatrix_matches_direct_sum_and_count():
     module = nn.Linear(4, 3)
-    inputs = torch.tensor(
-        [[[1.0, 2.0, 3.0, 4.0], [2.0, 3.0, 4.0, 5.0]]]
-    )
+    inputs = torch.tensor([[[1.0, 2.0, 3.0, 4.0], [2.0, 3.0, 4.0, 5.0]]])
     collector = IMatrixStatisticsCollector({"proj": module})
 
     with collector:
@@ -194,9 +192,7 @@ def test_detach_stops_collection_and_export_is_an_isolated_snapshot():
     after = collector.export()
     before["proj.imatrix_sum"].add_(100)
 
-    assert torch.equal(
-        after["proj.imatrix_sum"], torch.full((4,), 2.0)
-    )
+    assert torch.equal(after["proj.imatrix_sum"], torch.full((4,), 2.0))
     assert after["proj.imatrix_count"].item() == 2
 
 
@@ -213,9 +209,7 @@ def test_context_exception_removes_hooks():
     before = collector.export()
     module(torch.full((1, 2, 4), 1000.0))
     after = collector.export()
-    assert torch.equal(
-        before["proj.gptq_hessian"], after["proj.gptq_hessian"]
-    )
+    assert torch.equal(before["proj.gptq_hessian"], after["proj.gptq_hessian"])
 
 
 def test_collector_allocates_statistics_only_on_first_forward():
@@ -258,9 +252,7 @@ def make_store(tmp_path, tensor_names):
         software=SoftwareInfo.from_versions({"torch": torch.__version__}),
     )
     store = ArtifactStore(tmp_path / "artifacts")
-    store.initialize(
-        manifest, normalized_recipe={"GPTQModifier": {}}, targets=["proj"]
-    )
+    store.initialize(manifest, normalized_recipe={"GPTQModifier": {}}, targets=["proj"])
     metadata = TargetStatisticsMetadata(
         target_name="proj",
         target_index=0,

@@ -342,8 +342,7 @@ class IntermediatesCache:
                     value.is_pinned()
                     and device is not None
                     and accelerator_is_available()
-                    and torch.device(device).type
-                    == current_accelerator_type()
+                    and torch.device(device).type == current_accelerator_type()
                 )
                 return value.to(device=device, non_blocking=non_blocking)
             case list():

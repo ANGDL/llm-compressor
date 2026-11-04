@@ -284,9 +284,7 @@ class KimiK3WeightMaterializer(WeightMaterializer):
             )
         return result.to(dtype=target_dtype)
 
-    def estimate_workspace_bytes(
-        self, tensor_name, metadata, target_dtype
-    ) -> int:
+    def estimate_workspace_bytes(self, tensor_name, metadata, target_dtype) -> int:
         if self._is_packed_expert(tensor_name, metadata):
             elements = 1
             for dimension in self.logical_shape(tensor_name, metadata):

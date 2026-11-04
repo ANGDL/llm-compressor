@@ -113,13 +113,9 @@ def _dense_dspark_attention(
     exp_scores = torch.exp(scores - scores_max)
     exp_scores = exp_scores.masked_fill(mask, 0.0)
     exp_scores_bf16 = exp_scores.bfloat16()
-    output = torch.einsum(
-        "bsht,btd->bshd", exp_scores_bf16.float(), kv.float()
-    )
+    output = torch.einsum("bsht,btd->bshd", exp_scores_bf16.float(), kv.float())
     sink = attn_sink.view(1, 1, -1, 1)
-    denominator = exp_scores.sum(dim=-1, keepdim=True) + torch.exp(
-        sink - scores_max
-    )
+    denominator = exp_scores.sum(dim=-1, keepdim=True) + torch.exp(sink - scores_max)
     return (output / denominator).to(kv.dtype)
 
 
@@ -131,12 +127,10 @@ class TraceFriendlyAttention(Attention):
         freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
         kv_cache = self.kv_cache
         qr = self.q_norm(self.wq_a(x))
-        q = self.wq_b(qr).view(
-            bsz, seqlen, self.n_local_heads, self.head_dim
+        q = self.wq_b(qr).view(bsz, seqlen, self.n_local_heads, self.head_dim)
+        q = q * torch.rsqrt(q.float().square().mean(-1, keepdim=True) + self.eps).to(
+            q.dtype
         )
-        q = q * torch.rsqrt(
-            q.float().square().mean(-1, keepdim=True) + self.eps
-        ).to(q.dtype)
         _apply_rotary_4d(q[..., -self.rope_head_dim :], freqs_cis)
         kv = self.kv_norm(self.wkv(x))
         _apply_rotary_3d(kv[..., -self.rope_head_dim :], freqs_cis)
@@ -145,9 +139,11 @@ class TraceFriendlyAttention(Attention):
             self.compressor.freqs_cis = self.freqs_cis
             if self.indexer is not None:
                 self.indexer.freqs_cis = self.freqs_cis
-        topk_idxs = _window_topk_idxs(
-            self.window_size, bsz, seqlen, start_pos
-        ).to(x.device).int()
+        topk_idxs = (
+            _window_topk_idxs(self.window_size, bsz, seqlen, start_pos)
+            .to(x.device)
+            .int()
+        )
         if self.compress_ratio:
             offset = kv.size(1) if start_pos == 0 else self.window_size
             if self.indexer is not None:
@@ -162,8 +158,10 @@ class TraceFriendlyAttention(Attention):
                 kv_cache[:bsz, :seqlen] = kv.float()
             else:
                 cutoff = seqlen % self.window_size
-                left, right = kv[:, -self.window_size :].float().split(
-                    [self.window_size - cutoff, cutoff], dim=1
+                left, right = (
+                    kv[:, -self.window_size :]
+                    .float()
+                    .split([self.window_size - cutoff, cutoff], dim=1)
                 )
                 kv_cache[:bsz, cutoff : self.window_size] = left
                 kv_cache[:bsz, :cutoff] = right
@@ -180,14 +178,10 @@ class TraceFriendlyAttention(Attention):
         output = sparse_attention(
             q, attn_kv, self.attn_sink, topk_idxs, self.softmax_scale
         ).to(x.dtype)
-        _apply_rotary_4d(
-            output[..., -self.rope_head_dim :], freqs_cis, inverse=True
-        )
+        _apply_rotary_4d(output[..., -self.rope_head_dim :], freqs_cis, inverse=True)
         output = output.view(bsz, seqlen, self.n_local_groups, -1)
         all_inputs = output.reshape(-1, output.size(-1))
-        all_outputs = self.wo_a(all_inputs).view(
-            bsz * seqlen, self.n_local_groups, -1
-        )
+        all_outputs = self.wo_a(all_inputs).view(bsz * seqlen, self.n_local_groups, -1)
         output = torch.stack(
             [
                 all_outputs[
@@ -207,8 +201,7 @@ class TraceFriendlyBlock(Block):
         super().__init__(layer_id, args)
         self.attn = TraceFriendlyAttention(layer_id, args)
         self._target_flags = tuple(
-            float(layer_id == target_id)
-            for target_id in args.dspark_target_layer_ids
+            float(layer_id == target_id) for target_id in args.dspark_target_layer_ids
         )
 
     def forward(
@@ -257,9 +250,9 @@ class DSparkAttention(TraceFriendlyAttention):
         q = self.wq_b(qr).view(
             x.shape[0], block_size, self.n_local_heads, self.head_dim
         )
-        q = q * torch.rsqrt(
-            q.float().square().mean(-1, keepdim=True) + self.eps
-        ).to(q.dtype)
+        q = q * torch.rsqrt(q.float().square().mean(-1, keepdim=True) + self.eps).to(
+            q.dtype
+        )
         _apply_rotary_4d(q[..., -self.rope_head_dim :], draft_freqs)
 
         kv = self.kv_norm(self.wkv(x))
@@ -279,9 +272,7 @@ class DSparkAttention(TraceFriendlyAttention):
             self.attn_sink,
             self.softmax_scale,
         )
-        _apply_rotary_4d(
-            output[..., -self.rope_head_dim :], draft_freqs, inverse=True
-        )
+        _apply_rotary_4d(output[..., -self.rope_head_dim :], draft_freqs, inverse=True)
         output = output.view(x.shape[0], block_size, self.n_local_groups, -1)
         all_inputs = output.reshape(-1, output.size(-1))
         all_outputs = self.wo_a(all_inputs).view(
@@ -354,15 +345,9 @@ class DSparkBlock(Block):
         embedding_weight: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         seed_positions: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor | tuple[
-        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
-    ]:
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if self.stage_id == 0:
-            if (
-                input_ids is None
-                or embedding_weight is None
-                or seed_positions is None
-            ):
+            if input_ids is None or embedding_weight is None or seed_positions is None:
                 raise ValueError(
                     "The first DSpark block requires input ids, seed positions, "
                     "and embedding"
@@ -372,9 +357,10 @@ class DSparkBlock(Block):
             if attention_mask is None:
                 attention_mask = torch.ones_like(input_ids)
             context_positions = seed_positions[:, None] - self.attn.window_size
-            context_positions = context_positions + torch.arange(
-                self.attn.window_size, device=input_ids.device
-            )[None, :]
+            context_positions = (
+                context_positions
+                + torch.arange(self.attn.window_size, device=input_ids.device)[None, :]
+            )
             context_indices = context_positions.clamp(min=0)
             main_mask = attention_mask.gather(1, context_indices).bool()
             main_mask = main_mask & (context_positions >= 0)
@@ -387,19 +373,13 @@ class DSparkBlock(Block):
             # for the sampled main-model output used by reference inference.
             draft_seed_ids = input_ids.gather(1, seed_positions[:, None])
             noise = draft_seed_ids.expand(-1, self.block_size - 1) * 0
-            draft_ids = torch.cat(
-                (draft_seed_ids, noise + self.noise_token_id), dim=1
-            )
+            draft_ids = torch.cat((draft_seed_ids, noise + self.noise_token_id), dim=1)
             input_embeds = F.embedding(draft_ids, embedding_weight)
             x, main_x, main_mask = self.forward_embed(
                 torch.cat(context_hiddens, dim=-1), input_embeds, main_mask
             )
             input_ids = draft_ids
-        elif (
-            main_x is None
-            or main_mask is None
-            or not isinstance(x, torch.Tensor)
-        ):
+        elif main_x is None or main_mask is None or not isinstance(x, torch.Tensor):
             raise ValueError("DSpark decoder blocks require hidden and context states")
 
         residual = x
@@ -446,9 +426,7 @@ class DSparkInputAdapter(nn.Module):
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids)
         positions = torch.arange(input_ids.shape[1], device=input_ids.device)
-        valid_positions = torch.where(
-            attention_mask.bool(), positions[None, :], -1
-        )
+        valid_positions = torch.where(attention_mask.bool(), positions[None, :], -1)
         return attention_mask, valid_positions.amax(dim=1).clamp(min=0)
 
 
@@ -461,9 +439,7 @@ class DSparkTransformer(nn.Module):
         self.hc_mult = args.hc_mult
         self.input_adapter = DSparkInputAdapter()
         self._config_target_layer_ids = tuple(args.dspark_target_layer_ids)
-        invalid_targets = set(self._config_target_layer_ids) - set(
-            range(args.n_layers)
-        )
+        invalid_targets = set(self._config_target_layer_ids) - set(range(args.n_layers))
         if invalid_targets:
             raise ValueError(
                 f"DSpark target layer ids are out of range: {sorted(invalid_targets)}"
@@ -494,17 +470,11 @@ class DSparkTransformer(nn.Module):
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        attention_mask, seed_positions = self.input_adapter(
-            input_ids, attention_mask
-        )
+        attention_mask, seed_positions = self.input_adapter(input_ids, attention_mask)
         hidden_states = self.embed(input_ids)
-        hidden_states = hidden_states.unsqueeze(2).repeat(
-            1, 1, self.hc_mult, 1
-        )
+        hidden_states = hidden_states.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
         current_hidden = hidden_states.mean(dim=2)
-        main_hiddens = tuple(
-            current_hidden * 0 for _ in self.config_target_layer_ids
-        )
+        main_hiddens = tuple(current_hidden * 0 for _ in self.config_target_layer_ids)
         for layer in self.layers:
             hidden_states, main_hiddens = layer(
                 hidden_states, 0, input_ids, main_hiddens
@@ -536,9 +506,7 @@ class DSparkTransformer(nn.Module):
         return self._config_target_layer_ids
 
 
-class DeepseekV4DSparkForCausalLM(
-    DeepseekV4NativePreTrainedModel, GenerationMixin
-):
+class DeepseekV4DSparkForCausalLM(DeepseekV4NativePreTrainedModel, GenerationMixin):
     """Transformers wrapper for the 0731 DeepSeek-V4 DSpark checkpoint."""
 
     config: ModelConfig
@@ -555,14 +523,10 @@ class DeepseekV4DSparkForCausalLM(
             )
         super().__init__(config)
         self.model = DSparkTransformer(config)
-        self.model._config_target_layer_ids = tuple(
-            config.dspark_target_layer_ids
-        )
+        self.model._config_target_layer_ids = tuple(config.dspark_target_layer_ids)
         self.vocab_size = config.vocab_size
         self.save_raw_format = False
-        self.register_load_state_dict_pre_hook(
-            self._remap_checkpoint_keys_for_loading
-        )
+        self.register_load_state_dict_pre_hook(self._remap_checkpoint_keys_for_loading)
         self._register_state_dict_hook(self._remap_state_dict_for_saving)
         self.post_init()
 

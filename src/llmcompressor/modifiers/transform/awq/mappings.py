@@ -31,7 +31,8 @@ class AWQMapping:
         is placed on ``balance_layers[0]``.
     :param norm_bias: optional bias term to add to the norm of the activation
         layer during smoothing.
-        if use it, please set DISABLE_OFFSET_NORM_CALIBRATION=1 in env to disable the offset-norm calibration.
+        if use it, please set DISABLE_OFFSET_NORM_CALIBRATION=1 in env to
+        disable the offset-norm calibration.
     """
 
     smooth_layer: str

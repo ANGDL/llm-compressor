@@ -126,9 +126,7 @@ def test_commit_propagated_batch_consumes_only_matching_input(store):
     store.put(0, 0, {"hidden_states": torch.tensor([0])})
     store.put(0, 1, {"hidden_states": torch.tensor([1])})
 
-    store.commit_propagated_batch(
-        0, 1, 0, {"hidden_states": torch.tensor([10])}
-    )
+    store.commit_propagated_batch(0, 1, 0, {"hidden_states": torch.tensor([10])})
 
     assert not store.contains(0, 0)
     assert store.contains(0, 1)
@@ -143,9 +141,7 @@ def test_failed_propagated_snapshot_retains_input_batch(store, monkeypatch):
 
     monkeypatch.setattr(store, "put", fail_put)
     with pytest.raises(RuntimeError, match="snapshot failed"):
-        store.commit_propagated_batch(
-            0, 1, 0, {"hidden_states": torch.tensor([10])}
-        )
+        store.commit_propagated_batch(0, 1, 0, {"hidden_states": torch.tensor([10])})
 
     assert store.contains(0, 0)
 
@@ -155,7 +151,7 @@ def test_memory_store_rejects_complete_non_cpu_boundaries():
         InMemoryBoundaryActivationStore("meta")
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+@pytest.mark.skipif(not torch.accelerator.is_available(), reason="CUDA is unavailable")
 def test_cross_device_boundary_read_does_not_clone_after_copy(monkeypatch):
     store = InMemoryBoundaryActivationStore()
     store.put(0, 0, {"hidden_states": torch.ones(4)})

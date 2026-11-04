@@ -34,6 +34,7 @@ from compressed_tensors.quantization.quant_args import (
     QuantizationStrategy,
     QuantizationType,
 )
+from datasets import load_dataset
 from torch.utils.data import DataLoader
 from transformers import (
     AutoConfig,
@@ -41,7 +42,6 @@ from transformers import (
     AutoProcessor,
 )
 
-from datasets import load_dataset
 from llmcompressor.modeling.glm5_next import attach_mtp_layer
 from llmcompressor.modifiers.quantization import QuantizationModifier
 from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
@@ -66,9 +66,7 @@ def _load_dataset(source: str, split: str, samples: int):
     return load_dataset(source, split=f"{split}[:{samples}]")
 
 
-def load_calibration_dataset(
-    sources: list[str], split: str, samples: int, seed: int
-):
+def load_calibration_dataset(sources: list[str], split: str, samples: int, seed: int):
     if samples < len(sources):
         raise ValueError(
             "num-calibration-samples must be at least the number of dataset sources"
@@ -281,9 +279,7 @@ def main() -> None:
     parser.add_argument("--model-id", type=Path, required=True)
     parser.add_argument("--dataset-id", nargs="+", default=["lmms-lab/flickr30k"])
     parser.add_argument("--dataset-split", default="test")
-    parser.add_argument(
-        "--text-dataset-id", default="HuggingFaceH4/ultrachat_200k"
-    )
+    parser.add_argument("--text-dataset-id", default="HuggingFaceH4/ultrachat_200k")
     parser.add_argument("--text-dataset-split", default="train_sft")
     parser.add_argument("--text-calibration-samples", type=int, default=0)
     parser.add_argument("--num-calibration-samples", type=positive_int, default=32)

@@ -6,7 +6,6 @@ from collections.abc import Callable
 from pathlib import Path
 from threading import RLock
 
-
 _GIB = 1024**3
 
 

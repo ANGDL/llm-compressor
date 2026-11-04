@@ -65,13 +65,14 @@ def test_pack_int4_to_int8_matches_oneshot_int32_packing(columns):
     # INT8 checkpoint contract uses two's-complement nibbles, which differ by
     # the sign bit in each nibble.
     packed_int32 = pack_to_int32(values, num_bits=4)
-    expected = torch.stack(
-        [
-            (packed_int32 >> shift) & 0xFF
-            for shift in (0, 8, 16, 24)
-        ],
-        dim=-1,
-    ).reshape(2, -1).to(torch.uint8)
+    expected = (
+        torch.stack(
+            [(packed_int32 >> shift) & 0xFF for shift in (0, 8, 16, 24)],
+            dim=-1,
+        )
+        .reshape(2, -1)
+        .to(torch.uint8)
+    )
     expected = (expected ^ 0x88)[:, : columns // 2].contiguous().view(torch.int8)
     assert torch.equal(packed, expected)
 
@@ -103,9 +104,7 @@ def test_cpu_snapshot_packs_in_bounded_blocks(
         block_shapes.append(tuple(tensor.shape))
         return pack_block(tensor)
 
-    monkeypatch.setattr(
-        int4_packing, "_pack_int4_block", recording_pack_block
-    )
+    monkeypatch.setattr(int4_packing, "_pack_int4_block", recording_pack_block)
     actual = pack_int4_to_int8_cpu_snapshot(
         values,
         max_workspace_bytes=max_workspace_bytes,
@@ -115,8 +114,7 @@ def test_cpu_snapshot_packs_in_bounded_blocks(
     assert torch.equal(actual, expected)
     assert len(block_shapes) == expected_blocks
     assert all(
-        (rows * columns) <= max_workspace_bytes
-        for rows, columns in block_shapes
+        (rows * columns) <= max_workspace_bytes for rows, columns in block_shapes
     )
 
 

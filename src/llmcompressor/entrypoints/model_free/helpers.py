@@ -1,9 +1,10 @@
 import torch
+from loguru import logger
+
 from llmcompressor._torch_accelerator_compat import (
     accelerator_is_available,
     current_accelerator_type,
 )
-from loguru import logger
 
 __all__ = ["gpu_if_available"]
 

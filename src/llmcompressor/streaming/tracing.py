@@ -142,8 +142,8 @@ class TracedBoundaryAdapter:
                 sample_batch = next(batch_iterator)
             except StopIteration as error:
                 raise ValueError("Streaming calibration batches are empty") from error
-            self._prefix_runtime_parameters = (
-                self._declared_runtime_parameters("prefix")
+            self._prefix_runtime_parameters = self._declared_runtime_parameters(
+                "prefix"
             )
             self._prefix_runtime_modules = self._discover_prefix_runtime_modules(
                 prefix, sample_batch
@@ -387,9 +387,7 @@ def trace_streaming_boundaries(
     target_subgraphs.reverse()
     trace_consumed_names(target_subgraphs)
 
-    loader = TargetWeightLoader(
-        model, source, materializer, dtype_policy=dtype_policy
-    )
+    loader = TargetWeightLoader(model, source, materializer, dtype_policy=dtype_policy)
     weight_session = SubgraphWeightSession(
         model, source, materializer, dtype_policy=dtype_policy
     )

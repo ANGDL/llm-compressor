@@ -21,13 +21,13 @@ from compressed_tensors.quantization import (
 from compressed_tensors.utils import align_module_device, match_named_modules
 from loguru import logger
 from pydantic import PrivateAttr
+from torch.utils._pytree import tree_map
+
 from llmcompressor._torch_accelerator_compat import (
     accelerator_is_available,
     current_accelerator_type,
     current_device_index,
 )
-from torch.utils._pytree import tree_map
-
 from llmcompressor.core import Event, State
 from llmcompressor.modifiers import Modifier
 from llmcompressor.modifiers.autoround.utils import (

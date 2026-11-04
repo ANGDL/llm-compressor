@@ -1,31 +1,23 @@
-import base64
 import argparse
+import base64
+import os
+import shutil
 from collections import Counter
 from contextvars import ContextVar
 from io import BytesIO
-import os
-import shutil
 
 import torch
+from compressed_tensors.quantization import preset_name_to_scheme
+from compressed_tensors.utils import match_named_modules, save_mtp_tensors_to_checkpoint
 from datasets import load_dataset
 from loguru import logger
-from transformers import AutoProcessor, Qwen3_5MoeForConditionalGeneration
 from qwen_vl_utils import process_vision_info
+from transformers import AutoProcessor, Qwen3_5MoeForConditionalGeneration
 
 from llmcompressor import oneshot
-from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
 from llmcompressor.modifiers.quantization import QuantizationModifier
-
-
-from compressed_tensors.quantization import QuantizationScheme, preset_name_to_scheme
-from compressed_tensors.quantization.quant_args import (
-    QuantizationArgs,
-    QuantizationStrategy,
-    QuantizationType,
-)
-from compressed_tensors.utils import match_named_modules, save_mtp_tensors_to_checkpoint
+from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
 from llmcompressor.observers.imatrix import IMatrixMSEObserver
-
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--model_id", type=str, default="/data/models/Qwen3.5-122B-A10B")
@@ -80,7 +72,9 @@ def _install_imatrix_all_zero_stats_hooks():
     original_gatherer_init = IMatrixGatherer.on_initialize
 
     def _gatherer_init_with_module_names(self, state, **kwargs):
-        resolved_targets = self.targets if isinstance(self.targets, list) else [self.targets]
+        resolved_targets = (
+            self.targets if isinstance(self.targets, list) else [self.targets]
+        )
         for module_name, module in match_named_modules(
             state.model,
             resolved_targets,
@@ -136,7 +130,6 @@ def _print_imatrix_all_zero_summary():
 _install_imatrix_all_zero_stats_hooks()
 
 
-
 MODEL_ARTIFACT_FILES = {
     "config.json",
     "model.safetensors.index.json",
@@ -156,9 +149,12 @@ def copy_original_non_model_files(source_dir, save_dir):
             continue
         shutil.copy2(source_path, os.path.join(save_dir, filename))
 
+
 # Load model.
 model_id = args.model_id
-model = Qwen3_5MoeForConditionalGeneration.from_pretrained(model_id, device_map=None, dtype="auto",local_files_only=True)
+model = Qwen3_5MoeForConditionalGeneration.from_pretrained(
+    model_id, device_map=None, dtype="auto", local_files_only=True
+)
 processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
 
 
@@ -170,6 +166,7 @@ DATASET_ID = args.dataset_id
 DATASET_SPLIT = f"test[:{NUM_CALIBRATION_SAMPLES}]"
 TEXT_DATASET_ID = args.text_dataset_id
 TEXT_DATASET_SPLIT = args.text_dataset_split
+
 
 def _load_text_dataset(dataset_id, dataset_split):
     return load_dataset(
@@ -333,11 +330,12 @@ def data_collator(batch):
         for key, value in batch[0].items()
     }
 
+
 # Apply to all Linear layers, excluding lm_head
 scheme = preset_name_to_scheme("W8A8", ["Linear"])
 scheme.weights.observer = "imatrix_mse"
 
-ignore=[
+ignore = [
     "re:.*lm_head",
     "re:visual.*",
     "re:model.visual.*",

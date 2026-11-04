@@ -26,17 +26,31 @@ def test_case_1():
     marker = "<｜Assistant｜><think>"
     first_start = prompt.find(marker) + len(marker)
     first_end = prompt.find("<｜User｜>", first_start)
-    parsed_tc = parse_message_from_completion_text(prompt[first_start:first_end], thinking_mode="thinking")
-    assert parsed_tc["reasoning_content"] == "The user wants to know the weather in Beijing. I should use the get_weather tool."
+    parsed_tc = parse_message_from_completion_text(
+        prompt[first_start:first_end], thinking_mode="thinking"
+    )
+    assert (
+        parsed_tc["reasoning_content"]
+        == "The user wants to know the weather in Beijing. I should use the "
+        "get_weather tool."
+    )
     assert parsed_tc["content"] == ""
     assert len(parsed_tc["tool_calls"]) == 1
     assert parsed_tc["tool_calls"][0]["function"]["name"] == "get_weather"
-    assert json.loads(parsed_tc["tool_calls"][0]["function"]["arguments"]) == {"location": "Beijing", "unit": "celsius"}
+    assert json.loads(parsed_tc["tool_calls"][0]["function"]["arguments"]) == {
+        "location": "Beijing",
+        "unit": "celsius",
+    }
 
     # Parse: final assistant turn with content
     last_start = prompt.rfind(marker) + len(marker)
-    parsed_final = parse_message_from_completion_text(prompt[last_start:], thinking_mode="thinking")
-    assert parsed_final["reasoning_content"] == "Got the weather data. Let me format a nice response."
+    parsed_final = parse_message_from_completion_text(
+        prompt[last_start:], thinking_mode="thinking"
+    )
+    assert (
+        parsed_final["reasoning_content"]
+        == "Got the weather data. Let me format a nice response."
+    )
     assert "22°C" in parsed_final["content"]
     assert parsed_final["tool_calls"] == []
 
@@ -53,8 +67,13 @@ def test_case_2():
     # Parse: last assistant turn
     marker = "<｜Assistant｜><think>"
     last_start = prompt.rfind(marker) + len(marker)
-    parsed = parse_message_from_completion_text(prompt[last_start:], thinking_mode="thinking")
-    assert parsed["reasoning_content"] == "The user asks about the capital of France. It is Paris."
+    parsed = parse_message_from_completion_text(
+        prompt[last_start:], thinking_mode="thinking"
+    )
+    assert (
+        parsed["reasoning_content"]
+        == "The user asks about the capital of France. It is Paris."
+    )
     assert parsed["content"] == "The capital of France is Paris."
     assert parsed["tool_calls"] == []
 

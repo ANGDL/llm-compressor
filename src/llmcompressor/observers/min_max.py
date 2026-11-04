@@ -44,9 +44,7 @@ class StrictSymmetricMinMaxObserver(MemorylessMinMaxObserver):
         scales = torch.clamp(max_val_pos / qmax, min=1e-8)
 
         if self.args.scale_dtype is not None:
-            scales = round_to_quantized_type_dtype(
-                scales, dtype=self.args.scale_dtype
-            )
+            scales = round_to_quantized_type_dtype(scales, dtype=self.args.scale_dtype)
 
         return {
             "scale": scales,
