@@ -201,7 +201,7 @@ def _int_scheme(
             num_bits=8,
             type=QuantizationType.INT,
             strategy=QuantizationStrategy.TOKEN,
-            symmetric=False,
+            symmetric=True,
             dynamic=True,
             observer=None,
         ),

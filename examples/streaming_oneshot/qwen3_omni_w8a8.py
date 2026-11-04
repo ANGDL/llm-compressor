@@ -218,6 +218,7 @@ ignores = [
     r"re:.*visual.*",
     r"re:.*code2wav.*",
     r"re:.*audio_tower.*",
+    r"re:.*mlp.gate$",
 ]
 
 # Recipe
