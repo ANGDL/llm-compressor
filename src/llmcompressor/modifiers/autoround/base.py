@@ -28,7 +28,7 @@ from llmcompressor._torch_accelerator_compat import (
 )
 from torch.utils._pytree import tree_map
 
-from llmcompressor.core import Event, State
+from llmcompressor.core import Event, State, active_session
 from llmcompressor.modifiers import Modifier
 from llmcompressor.modifiers.autoround.utils import (
     fix_attention_mask,
@@ -160,8 +160,9 @@ class AutoRoundModifier(Modifier, QuantizationMixin):
     :param iters: number of tuning iterations per block (decoding layer). Higher values
         typically improve accuracy at the cost of longer tuning time. Defaults to 200.
     :param enable_torch_compile: whether to enable `torch.compile` to accelerate the
-        tuning loop. Disable if your environment or model encounters compilation issues.
-        Defaults to True.
+        tuning loop. Defaults to True. **Disable for multi-GPU DDP with large models**:
+        per-rank compilation time can vary by 10+ minutes on 100B+ models, causing other
+        ranks to time out on NCCL collectives while waiting for the slow rank.
     :param batch_size: calibration/tuning batch size used by AutoRound when optimizing
         rounding/clipping parameters. Larger values can improve stability but require
         more memory. Defaults to 8.
@@ -213,6 +214,12 @@ class AutoRoundModifier(Modifier, QuantizationMixin):
 
         self._sequential_targets = infer_sequential_targets(
             state.model, sequential_targets=kwargs.get("sequential_targets")
+        )
+
+        logger.info(
+            "AutoRound: set propagate_error=False in dataset_args to reuse "
+            "SequentialPipeline cached activations as FP16 reference output, "
+            "skipping collect_reference and its CPU RAM allocation."
         )
         return True
 
@@ -388,12 +395,45 @@ class AutoRoundModifier(Modifier, QuantizationMixin):
             # per-batch CPU->GPU transfer automatically.
             ar_inputs = [((args, kwargs),) for args, kwargs in cur_inputs]
 
+            # Read FP16 reference outputs from IntermediatesCache if the sequential
+            # pipeline exposed them via state and propagate_error=False. When
+            # propagate_error=True the cache holds the current subgraph's *inputs*
+            # (not outputs) at this point, so we must skip and let AutoRound run
+            # collect_reference itself.
+            _state = active_session().state
+            _seq_activations = getattr(_state, "sequential_activations", None)
+            _propagate_error = getattr(_state, "sequential_propagate_error", True)
+            _fp_ref = None
+            if _seq_activations is not None and not _propagate_error:
+                _HIDDEN_STATE_KEYS = {"hidden_states", "inputs_embeds"}
+                _refs = []
+                _num_batches = min(
+                    len(cur_inputs), len(_seq_activations.batch_intermediates)
+                )
+                for _b in range(_num_batches):
+                    _batch = _seq_activations.batch_intermediates[_b]
+                    # Name match: prefer standard hidden_states / inputs_embeds keys.
+                    _found = next(
+                        (
+                            _batch[n].value
+                            for n in _batch
+                            if n in _HIDDEN_STATE_KEYS
+                            and isinstance(_batch[n].value, torch.Tensor)
+                        ),
+                        None,
+                    )
+                    if _found is not None:
+                        _refs.append(_found)
+                if len(_refs) == len(cur_inputs):
+                    _fp_ref = _refs
+
             q_input, _ = ar.quantize_block(
                 block=decoding_layer,
                 inputs=ar_inputs,
                 q_input=self._q_input,
                 device=str(device),
                 auto_offload=auto_offload,
+                reference_output=_fp_ref,
             )
             self._q_input = q_input
 
@@ -633,10 +673,12 @@ class AutoRoundModifier(Modifier, QuantizationMixin):
                 group_size = -1
             elif weight_args.strategy == QuantizationStrategy.TENSOR:
                 group_size = 0
+            elif weight_args.strategy == QuantizationStrategy.BLOCK:
+                group_size = tuple(weight_args.block_structure)
             else:
                 raise ValueError(
-                    "AutoRoundModifier only supports channel-wise and tensor-wise "
-                    "weight quantization"
+                    "AutoRoundModifier only supports channel-wise, tensor-wise, "
+                    "and block-wise weight quantization"
                 )
 
         if data_type == "float":
@@ -726,7 +768,15 @@ class AutoRoundModifier(Modifier, QuantizationMixin):
                 continue
 
             quant_scheme = getattr(module, "quantization_scheme", None)
+            # KV-cache-only schemes quantize module outputs and intentionally have
+            # no weight arguments. They are handled by QuantizationModifier, not
+            # AutoRound's weight-quantization layer configuration.
             if quant_scheme is None:
+                continue
+            if (
+                isinstance(quant_scheme, QuantizationScheme)
+                and quant_scheme.weights is None
+            ):
                 continue
 
             if not isinstance(quant_scheme, QuantizationScheme):

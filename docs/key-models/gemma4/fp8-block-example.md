@@ -2,7 +2,7 @@
 
 This example quantizes the `google/gemma-4-31B-it` model to FP8 block format using the `model_free_ptq` entrypoint. Because FP8 block quantization does not require a calibration dataset, no calibration data is needed.
 
-The full example script can be found [here](../../../examples/model_free_ptq/gemma4_fp8_block.py).
+The full example script can be found [here](https://github.com/vllm-project/llm-compressor/blob/main/examples/model_free_ptq/gemma4_fp8_block.py).
 
 ### Code Walkthrough
 
@@ -19,7 +19,6 @@ model_free_ptq(
     save_directory=SAVE_DIR,
     scheme="FP8_BLOCK",
     ignore=["re:.*vision.*", "lm_head", "re:.*embed_tokens.*"],
-    max_workers=8,
     device="cuda:0",
 )
 ```

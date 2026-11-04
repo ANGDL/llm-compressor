@@ -3,9 +3,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from llmcompressor.modifiers.autosmooth import AutoSmoothModifier
 from llmcompressor.modifiers.autoround import AutoRoundModifier
-from llmcompressor.modifiers.pruning import SparseGPTModifier, WandaPruningModifier
+from llmcompressor.modifiers.autosmooth import AutoSmoothModifier
+from llmcompressor.modifiers.pruning import REAPPruningModifier
 from llmcompressor.modifiers.quantization import GPTQModifier, QuantizationModifier
 from llmcompressor.modifiers.transform import (
     AWQModifier,
@@ -39,9 +39,11 @@ from llmcompressor.pipelines import (
         ([SmoothQuantModifier(), GPTQModifier(scheme="W4A16")], SequentialPipeline),
         ([AWQModifier(), QuantizationModifier(scheme="W4A16")], SequentialPipeline),
         ([AWQModifier(), QuantizationModifier(scheme="FP8")], SequentialPipeline),
-        ([SparseGPTModifier(sparsity=1.0)], SequentialPipeline),
         ([IMatrixGatherer()], SequentialPipeline),
-        ([WandaPruningModifier(sparsity=1.0)], SequentialPipeline),
+        (
+            [REAPPruningModifier(sparsity=0.5, report_path="reap.json")],
+            SequentialPipeline,
+        ),
         ([QuIPModifier()], DataFreePipeline),
         ([SpinQuantModifier()], DataFreePipeline),
         ([QuIPModifier(), QuantizationModifier(scheme="FP8")], SequentialPipeline),

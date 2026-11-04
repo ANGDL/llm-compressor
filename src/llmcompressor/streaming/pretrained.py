@@ -78,9 +78,7 @@ def _recipe_quantizer(recipe: Recipe):
     supported_transforms = {
         "AWQModifier",
         "IMatrixGatherer",
-        "SparseGPTModifier",
         "SmoothQuantModifier",
-        "WandaPruningModifier",
     }
     unsupported = [
         type(modifier).__name__
@@ -90,8 +88,8 @@ def _recipe_quantizer(recipe: Recipe):
     ]
     if unsupported:
         raise ValueError(
-            "Pretrained streaming mode supports AWQ, SmoothQuant, iMatrix, "
-            "SparseGPT, or Wanda plus one quantizer; "
+            "Pretrained streaming mode supports AWQ, SmoothQuant, or iMatrix "
+            "plus one quantizer; "
             f"got unsupported modifiers {unsupported}"
         )
     return quantizers[0]
@@ -353,8 +351,6 @@ def streaming_oneshot_from_pretrained(
         in {
             "AWQModifier",
             "SmoothQuantModifier",
-            "SparseGPTModifier",
-            "WandaPruningModifier",
         }
         for modifier in parsed_recipe.modifiers
     )
