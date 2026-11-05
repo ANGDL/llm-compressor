@@ -447,6 +447,14 @@ class StreamingCheckpointWriter:
         self.states_dir = self.root / "state"
         self.coordinator = coordinator
         self.compactor = BoundaryCompactor(self.root)
+        self._scan_stats = {
+            "transaction_count": 0,
+            "metadata_bytes": 0,
+            "payload_count": 0,
+            "payload_bytes": 0,
+            "boundary_count": 0,
+            "boundary_bytes": 0,
+        }
         self.transactions_dir.mkdir(parents=True, exist_ok=True)
         manifest = self.root / "writer.json"
         if manifest.exists():
@@ -479,6 +487,8 @@ class StreamingCheckpointWriter:
                     f"Transaction {transaction_id!r} belongs to a different run"
                 )
             for record in self._records(metadata, path.parent):
+                self._scan_stats["payload_count"] += 1
+                self._scan_stats["payload_bytes"] += record.size
                 if not self._validate_payload(record):
                     return False
             boundary = metadata.get("boundary")
@@ -497,6 +507,8 @@ class StreamingCheckpointWriter:
                 if boundary.get("sha256") != fingerprint_json(batch_records):
                     return False
                 for record in batch_records:
+                    self._scan_stats["boundary_count"] += 1
+                    self._scan_stats["boundary_bytes"] += int(record["size"])
                     boundary_path = path.parent / record["path"]
                     if not boundary_path.is_file():
                         return False
@@ -535,17 +547,33 @@ class StreamingCheckpointWriter:
         return (self.transactions_dir / transaction_id).is_dir()
 
     def committed_metadata(self) -> list[dict[str, Any]]:
+        self._scan_stats = {
+            "transaction_count": 0,
+            "metadata_bytes": 0,
+            "payload_count": 0,
+            "payload_bytes": 0,
+            "boundary_count": 0,
+            "boundary_bytes": 0,
+        }
         result = []
         for directory in sorted(self.transactions_dir.iterdir()):
             if not directory.is_dir() or directory.name.endswith(".pending"):
                 continue
             path = directory / "metadata.json"
+            self._scan_stats["transaction_count"] += 1
+            self._scan_stats["metadata_bytes"] += path.stat().st_size
             if not self.is_transaction_complete(directory.name):
                 raise RuntimeError(
                     f"Committed transaction {directory.name!r} is corrupt"
                 )
             result.append(json.loads(path.read_text(encoding="utf-8")))
         return result
+
+    @property
+    def scan_stats(self):
+        from ..recovery import ResumeScanStats
+
+        return ResumeScanStats(**self._scan_stats)
 
     def load_transaction_metadata(self, transaction_id: str) -> dict[str, Any]:
         """Load one committed transaction after validating its objects."""

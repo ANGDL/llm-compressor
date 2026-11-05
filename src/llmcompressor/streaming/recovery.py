@@ -15,6 +15,7 @@ if TYPE_CHECKING:
 __all__ = [
     "RecoveryErrorKind",
     "ResumePlan",
+    "ResumeScanStats",
     "build_resume_plan",
     "classify_recovery_error",
 ]
@@ -28,6 +29,18 @@ class RecoveryErrorKind(str, Enum):
 
 
 @dataclass(frozen=True)
+class ResumeScanStats:
+    """Bytes and objects inspected while constructing one resume plan."""
+
+    transaction_count: int = 0
+    metadata_bytes: int = 0
+    payload_count: int = 0
+    payload_bytes: int = 0
+    boundary_count: int = 0
+    boundary_bytes: int = 0
+
+
+@dataclass(frozen=True)
 class ResumePlan:
     """The validated contiguous prefix of committed subgraph transactions."""
 
@@ -35,6 +48,7 @@ class ResumePlan:
     next_transaction_id: str
     boundary_index: int | None
     metadata: tuple[dict[str, Any], ...] = ()
+    scan_stats: ResumeScanStats = ResumeScanStats()
 
     @property
     def metadata_by_id(self) -> dict[str, dict[str, Any]]:
@@ -73,6 +87,7 @@ def build_resume_plan(writer: StreamingCheckpointWriter) -> ResumePlan:
         next_transaction_id=f"subgraph-{next_index:05d}",
         boundary_index=boundary_index,
         metadata=tuple(ordered),
+        scan_stats=writer.scan_stats,
     )
 
 

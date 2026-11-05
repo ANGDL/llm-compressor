@@ -71,6 +71,7 @@ from .quantize import quantize_streaming
 from .recovery import (
     RecoveryErrorKind,
     ResumePlan,
+    ResumeScanStats,
     build_resume_plan,
     classify_recovery_error,
 )
@@ -146,6 +147,7 @@ __all__ = [
     "RecoveryErrorKind",
     "RetiredBoundaryError",
     "ResumePlan",
+    "ResumeScanStats",
     "build_resume_plan",
     "classify_recovery_error",
     "fault_point",
