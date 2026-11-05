@@ -822,6 +822,18 @@ M2 当前进度（2026-11-05）：
 - [x] 已覆盖历史 boundary 合法回收、损坏 boundary、强杀恢复和 subgraph 回归。
 - [ ] 继续补充 8/32/128 子图扫描计数、读字节量和资源曲线报告。
 
+M3 当前进度（2026-11-05）：
+
+- [x] 发布阶段持久化 `ready`、`backed_up`、`installed`、`cleaned` 状态。
+- [x] finalize 重试可处理输出已备份、输出已安装和旧 backup 残留窗口。
+- [x] 覆盖重复 finalize、direct-writer publish-in-place 和配置/索引校验回归。
+
+M4 当前进度（2026-11-05）：
+
+- [x] 增加显式 `ModifierContract`，表达工作集估算、统计生命周期、传播、恢复和输出所有权。
+- [x] calibration output 复用通过 contract 判断，空 recipe 保持不复用。
+- [ ] 将 modifier contract 纳入 manifest 指纹和资源 admission，补充各算法专项上界。
+
 核心完成后的下一优先级是 D/E：恢复和 GC 的收益覆盖全部 PTQ 算法。
 E1 的 GPTQ 优化和 E3 的 MoE 专家执行作为两个独立延伸验证，
 依据峰值、重算和质量数据决定后续投入。

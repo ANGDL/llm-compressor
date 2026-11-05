@@ -54,6 +54,7 @@ from .materialization import (
     WeightMaterializer,
     materialize_weights,
 )
+from .modifier_contract import calibration_outputs_reusable
 from .output import (
     prepare_quantized_tensor_for_save,
     quantized_module_formats,
@@ -517,11 +518,8 @@ def _modifier_update(
 
 
 def _can_reuse_calibration_outputs(recipe: Recipe) -> bool:
-    """Require an explicit promise from every concrete modifier class."""
-    return bool(recipe.modifiers) and all(
-        type(modifier).__dict__.get("calibration_outputs_reusable", False)
-        for modifier in recipe.modifiers
-    )
+    """Require an explicit promise from every modifier contract."""
+    return calibration_outputs_reusable(recipe.modifiers)
 
 
 def _compress_modules(modules: Sequence[torch.nn.Module]) -> None:
