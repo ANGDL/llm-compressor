@@ -268,3 +268,55 @@ def test_layerwise_quantization_scopes_apply_config_to_passed_modules():
     )
     assert model[0].quantization_status == QuantizationStatus.CALIBRATION
     assert not hasattr(model[1], "quantization_scheme")
+
+
+def test_layerwise_quantization_preserves_explicit_scale_dtype():
+    model = nn.Sequential(nn.Linear(4, 2, bias=False, dtype=torch.bfloat16))
+    modifier = QuantizationModifier(
+        config_groups={
+            "group_0": QuantizationScheme(
+                targets=["Linear"],
+                weights=QuantizationArgs(
+                    num_bits=8,
+                    type="int",
+                    strategy="channel",
+                    symmetric=True,
+                    scale_dtype=torch.float32,
+                ),
+            )
+        }
+    )
+    modifier.start_layerwise_calibration(model, [model[0]])
+
+    assert model[0].weight_scale.dtype == torch.float32
+    modifier.end_layerwise_calibration([model[0]])
+    assert model[0].weight_scale.dtype == torch.float32
+
+
+def test_layerwise_quantization_fuses_only_current_group_and_releases_hooks():
+    model = nn.Sequential(_FakeDecoderLayer(), _FakeDecoderLayer())
+    modifier = QuantizationModifier(targets="Linear", scheme="NVFP4")
+    for current_index in range(len(model)):
+        modules = list(model[current_index].modules())
+        modifier.start_layerwise_calibration(model, modules)
+        projections = [
+            model[current_index].q_proj,
+            model[current_index].k_proj,
+            model[current_index].v_proj,
+        ]
+        for projection in projections:
+            assert projection.weight_observer.fusion_handler.is_fused
+        for other_index, layer in enumerate(model):
+            if other_index != current_index:
+                assert not hasattr(layer.q_proj, "weight_observer")
+        handles = set(modifier._calibration_hooks)
+        assert handles
+
+        modifier.end_layerwise_calibration(modules)
+
+        assert not modifier._calibration_hooks
+        assert not modifier._hooks
+        for projection in projections:
+            assert not hasattr(projection, "weight_observer")
+            assert not projection._forward_hooks
+            assert not projection._forward_pre_hooks

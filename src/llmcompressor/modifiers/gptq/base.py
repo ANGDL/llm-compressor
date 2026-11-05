@@ -209,7 +209,8 @@ class GPTQModifier(Modifier, QuantizationMixin):
     def on_calibration_start(self, state: State, event: Event, **kwargs):
         # register quantization calibration hooks
         # assume quantization has been initialized by this modifier or one before it
-        QuantizationMixin.start_calibration(self, state.model)
+        if not state.layerwise_calibration:
+            QuantizationMixin.start_calibration(self, state.model)
 
         # register gptq hooks
         added_hook = False
@@ -239,7 +240,8 @@ class GPTQModifier(Modifier, QuantizationMixin):
         """
         Finish calibrating by removing observers and calibration hooks
         """
-        QuantizationMixin.end_calibration(self, state.model)
+        if not state.layerwise_calibration:
+            QuantizationMixin.end_calibration(self, state.model)
         self.remove_hooks()  # remove gptq hooks
 
     def estimate_sequential_memory(

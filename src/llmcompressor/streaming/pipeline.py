@@ -14,9 +14,9 @@ from compressed_tensors.quantization.utils import is_module_quantized
 
 from llmcompressor.core import LifecycleCallbacks, create_session
 from llmcompressor.modifiers.quantization.calibration import (
-    freeze_module_quantization,
     set_quantization_scale_dtype,
 )
+from llmcompressor.modifiers.quantization.quantization.mixin import QuantizationMixin
 from llmcompressor.modifiers.utils.hooks import HooksMixin
 from llmcompressor.recipe import Recipe
 from llmcompressor.utils.helpers import DisableQuantization
@@ -485,11 +485,12 @@ def _write_loaded_target_direct(
         tensors.clear()
 
 
-def _modifier_update(modules: Sequence[torch.nn.Module]) -> None:
+def _modifier_update(
+    modules: Sequence[torch.nn.Module], quantizers: Sequence[QuantizationMixin]
+) -> None:
     LifecycleCallbacks.sequential_epoch_end(list(modules))
-    for module in modules:
-        if is_module_quantized(module):
-            freeze_module_quantization(module)
+    for quantizer in quantizers:
+        quantizer.end_layerwise_calibration(list(modules))
 
 
 def _can_reuse_calibration_outputs(recipe: Recipe) -> bool:
@@ -824,6 +825,7 @@ def run_subgraph_streaming_pipeline(
 
     streaming_logger.info("setup | initializing modifier session")
     with create_session() as session:
+        session.state.layerwise_calibration = True
         with _stage_logger(
             adapter.model, "[setup] initialize modifiers", device
         ):
@@ -837,6 +839,11 @@ def run_subgraph_streaming_pipeline(
             )
             LifecycleCallbacks.calibration_start()
         streaming_logger.info("setup | modifier session ready")
+        quantizers = [
+            modifier
+            for modifier in session.lifecycle.recipe.modifiers
+            if isinstance(modifier, QuantizationMixin)
+        ]
         reuse_calibration_outputs = _can_reuse_calibration_outputs(recipe)
         streaming_logger.info(
             "setup | activation propagation | "
@@ -990,6 +997,19 @@ def run_subgraph_streaming_pipeline(
                     resident_modules = tuple(
                         subgraph.submodules(adapter.model)
                     )
+                    with _stage_logger(
+                        adapter.model,
+                        f"{target_label} | initialize quantization",
+                        device,
+                    ):
+                        for quantizer in quantizers:
+                            weight_stack.callback(
+                                quantizer.end_layerwise_calibration,
+                                list(resident_modules),
+                            )
+                            quantizer.start_layerwise_calibration(
+                                adapter.model, list(resident_modules)
+                            )
                     # Match the ordinary sequential calibration pipeline: model
                     # execution is inference-only. Besides avoiding autograd
                     # storage, this is required by models such as DeepSeek-V4
@@ -1049,7 +1069,7 @@ def run_subgraph_streaming_pipeline(
                         f"{target_label} | modifier update",
                         device,
                     ):
-                        _modifier_update(resident_modules)
+                        _modifier_update(resident_modules, quantizers)
                     # Algorithms that update weights need a fresh forward for
                     # the next target. Statistics-only recipes have already
                     # committed that boundary during calibration. The final
