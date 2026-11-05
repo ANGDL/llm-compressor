@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import torch
 import yaml
 
@@ -75,9 +76,7 @@ def test_explicit_indexed_device_is_preserved(monkeypatch):
     def fail_if_called():
         raise AssertionError("indexed devices must not query current accelerator")
 
-    monkeypatch.setattr(
-        "llmcompressor.utils.dev.accelerator_device", fail_if_called
-    )
+    monkeypatch.setattr("llmcompressor.utils.dev.accelerator_device", fail_if_called)
 
     assert resolve_execution_device("cuda:3") == torch.device("cuda:3")
     assert resolve_execution_device("cpu") == torch.device("cpu")
@@ -109,10 +108,9 @@ def test_streaming_oneshot_runs_three_stages_and_resumes(tmp_path):
     )
     assert result == output
     assert (output / "FINALIZED").is_file()
-    assert yaml.safe_load((output / "recipe.yaml").read_text()) == {
-        "GPTQModifier": {}
-    }
+    assert yaml.safe_load((output / "recipe.yaml").read_text()) == {"GPTQModifier": {}}
     assert calls == ["dataset"]
+    assert not work.exists()
 
     resumed = streaming_oneshot(
         model_factory=TwoLayer,
@@ -130,3 +128,85 @@ def test_streaming_oneshot_runs_three_stages_and_resumes(tmp_path):
     )
     assert resumed == output
     assert calls == ["dataset"]
+    assert not work.exists()
+
+
+@pytest.mark.parametrize(
+    "failed_stage",
+    [
+        "collect_calibration_statistics",
+        "quantize_streaming",
+        "finalize_streaming_checkpoint",
+    ],
+)
+def test_boundary_mode_retains_work_after_failure(tmp_path, monkeypatch, failed_stage):
+    work = tmp_path / "output.work"
+    artifact = work / "artifacts" / "progress"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_text("recover")
+
+    def fail(**_kwargs):
+        raise RuntimeError("injected stage failure")
+
+    for stage in (
+        "collect_calibration_statistics",
+        "quantize_streaming",
+        "finalize_streaming_checkpoint",
+    ):
+        monkeypatch.setattr(
+            f"llmcompressor.streaming.oneshot.{stage}",
+            fail if stage == failed_stage else lambda **_kwargs: None,
+        )
+
+    with pytest.raises(RuntimeError, match="injected stage failure"):
+        streaming_oneshot(
+            model_factory=TwoLayer,
+            checkpoint=tmp_path / "checkpoint",
+            output_dir=tmp_path / "output",
+            work_dir=work,
+            calibration_batches=[],
+            targets=("layers.0", "layers.1"),
+            recipe={"GPTQModifier": {}},
+            dataset_fingerprint="c" * 64,
+            schemes={"layers.0": scheme(), "layers.1": scheme()},
+            device="cpu",
+        )
+
+    assert artifact.read_text() == "recover"
+
+
+@pytest.mark.parametrize("pretrained_mode", [False, True])
+@pytest.mark.parametrize(
+    ("checkpoint", "output", "work"),
+    [
+        ("checkpoint", "output", "output"),
+        ("checkpoint", "output", "output/work"),
+        ("checkpoint", "work/output", "work"),
+        ("checkpoint", "output", "checkpoint"),
+        ("checkpoint", "output", "checkpoint/work"),
+        ("work/checkpoint", "output", "work"),
+    ],
+)
+def test_streaming_rejects_overlapping_work_paths(
+    tmp_path, checkpoint, output, work, pretrained_mode
+):
+    arguments = {
+        "output_dir": tmp_path / output,
+        "work_dir": tmp_path / work,
+        "recipe": {"GPTQModifier": {}},
+        "dataset_fingerprint": "c" * 64,
+        "device": "cpu",
+    }
+    if pretrained_mode:
+        arguments.update(model=tmp_path / checkpoint, dataset=[])
+    else:
+        arguments.update(
+            model_factory=TwoLayer,
+            checkpoint=tmp_path / checkpoint,
+            calibration_batches=[],
+            targets=("layers.0", "layers.1"),
+            schemes={"layers.0": scheme(), "layers.1": scheme()},
+        )
+
+    with pytest.raises(ValueError, match="work_dir|output_dir"):
+        streaming_oneshot(**arguments)

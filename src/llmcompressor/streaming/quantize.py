@@ -34,6 +34,7 @@ from .artifacts import (
 )
 from .checkpoint import (
     SafetensorsWeightSource,  # noqa: F401
+    SingleParticipantCoordinator,
     StreamingCheckpointWriter,
 )
 from .materialization import (
@@ -271,7 +272,12 @@ def quantize_streaming(
 
     staging = Path(staging_dir)
     writer = StreamingCheckpointWriter(
-        staging, run_fingerprint=run_fingerprint
+        staging,
+        run_fingerprint=run_fingerprint,
+        coordinator=SingleParticipantCoordinator(
+            staging,
+            run_fingerprint=run_fingerprint,
+        ),
     )
     device = torch.device(device)
     source_names = set(source.tensor_names())

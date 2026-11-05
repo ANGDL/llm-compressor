@@ -765,6 +765,8 @@ def test_finalize_only_publishes_completed_direct_writer_shards(
 
 
 def test_checkpoint_progress_persists_boundaries_and_prefetches(tmp_path, monkeypatch):
+    from llmcompressor.streaming.finalize import finalize_streaming_checkpoint
+
     config = Qwen3Config(
         vocab_size=32,
         hidden_size=8,
@@ -789,24 +791,45 @@ def test_checkpoint_progress_persists_boundaries_and_prefetches(tmp_path, monkey
 
     monkeypatch.setattr(SubgraphPrefetcher, "submit", record_submit)
 
-    streaming_oneshot(
-        model=checkpoint,
-        dataset=_calibration_data(),
-        dataset_fingerprint="9" * 64,
-        recipe=_imatrix_recipe(),
-        output_dir=tmp_path / "output",
-        work_dir=tmp_path / "work",
-        num_calibration_samples=2,
-        max_seq_length=4,
-        target_dtype=torch.float32,
-        checkpoint_progress=True,
+    work = tmp_path / "output.work"
+    arguments = {
+        "model": checkpoint,
+        "dataset_fingerprint": "9" * 64,
+        "output_dir": tmp_path / "output",
+        "work_dir": work,
+        "num_calibration_samples": 2,
+        "max_seq_length": 4,
+        "target_dtype": torch.float32,
+        "checkpoint_progress": True,
+        "device": "cpu",
+    }
+
+    def fail_finalize(**_kwargs):
+        raise RuntimeError("injected finalization failure")
+
+    monkeypatch.setattr(
+        "llmcompressor.streaming.pretrained.finalize_streaming_checkpoint",
+        fail_finalize,
     )
+    with pytest.raises(RuntimeError, match="injected finalization failure"):
+        streaming_oneshot(
+            dataset=_calibration_data(), recipe=_imatrix_recipe(), **arguments
+        )
 
     assert submitted
-    transaction = (
-        tmp_path / "work/staging/transactions/subgraph-00000/metadata.json"
-    )
+    transaction = work / "staging/transactions/subgraph-00000/metadata.json"
     assert '"boundary": {' in transaction.read_text()
+
+    monkeypatch.setattr(
+        "llmcompressor.streaming.pretrained.finalize_streaming_checkpoint",
+        finalize_streaming_checkpoint,
+    )
+    result = streaming_oneshot(
+        dataset=_calibration_data(), recipe=_imatrix_recipe(), **arguments
+    )
+
+    assert (result / "FINALIZED").is_file()
+    assert not work.exists()
 
 
 def test_streaming_gptq_matches_sequential_oneshot(tmp_path, monkeypatch):

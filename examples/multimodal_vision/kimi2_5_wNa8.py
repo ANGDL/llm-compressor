@@ -1,34 +1,41 @@
 import argparse
-import base64
-from io import BytesIO
 import os
 from contextlib import contextmanager
 
-from datasets import load_dataset
 import torch
-from transformers import AutoProcessor
-
-from llmcompressor import oneshot
-from llmcompressor.modeling import load_kimi_k25_model
-from llmcompressor.pipelines.basic import pipeline as basic_pipeline
-from llmcompressor.pipelines.data_free import pipeline as data_free_pipeline
-from llmcompressor.modifiers.quantization import QuantizationModifier
-from llmcompressor.modifiers.gptq import GPTQModifier
-from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
 from compressed_tensors.offload import get_device_map
 from compressed_tensors.offload.dispatch import dispatch_model as _dispatch_model
+from compressed_tensors.quantization import QuantizationScheme
 from compressed_tensors.quantization.quant_args import (
     QuantizationArgs,
     QuantizationStrategy,
     QuantizationType,
 )
-from compressed_tensors.quantization import QuantizationScheme
+from transformers import AutoProcessor
 
+from llmcompressor import oneshot
+from llmcompressor.datasets import (
+    build_calibration_messages,
+    load_calibration_datasets,
+)
+from llmcompressor.modeling import load_kimi_k25_model
+from llmcompressor.modifiers.gptq import GPTQModifier
+from llmcompressor.modifiers.quantization import QuantizationModifier
+from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
+from llmcompressor.pipelines.basic import pipeline as basic_pipeline
+from llmcompressor.pipelines.data_free import pipeline as data_free_pipeline
 
 """
 Usage:
-    python kimi2_5_wNa8.py --model_id /ssd3/models/Kimi-K2.6-bf16/ --dataset_id /data/quant/lmms-lab___flickr30k --text_dataset_id /data/quant/ultrachat_200k --text_calibration_samples 256 --modifier=RTN --observer imatrix_mse > k26.log 2>&1 &
-    python -m llmcompressor.utils.pack_int4_to_int8 -i /ssd2/models/Kimi-K2.6-bf16-W4A8Experts-W8A8Other-IMatrix-RTN-unpacked/ -o /ssd3/models/Kimi-K2.6-w4a8-v2
+    python kimi2_5_wNa8.py \
+        --model_id /ssd3/models/Kimi-K2.6-bf16/ \
+        --dataset_id /data/quant/lmms-lab___flickr30k \
+        --text_dataset_id /data/quant/ultrachat_200k \
+        --text_calibration_samples 256 --modifier=RTN \
+        --observer imatrix_mse > k26.log 2>&1 &
+    python -m llmcompressor.utils.pack_int4_to_int8 \
+        -i /ssd2/models/Kimi-K2.6-bf16-W4A8Experts-W8A8Other-IMatrix-RTN-unpacked/ \
+        -o /ssd3/models/Kimi-K2.6-w4a8-v2
 """
 
 
@@ -129,21 +136,14 @@ NUM_TEXT_CALIBRATION_SAMPLES = args.text_calibration_samples
 MULTIMODAL_MAX_SEQUENCE_LENGTH = args.multimodal_max_sequence_length
 
 # Load dataset and preprocess.
-multimodal_ds = load_dataset(
+multimodal_ds, text_examples = load_calibration_datasets(
     DATASET_ID,
-    split=f"{DATASET_SPLIT}[:{NUM_CALIBRATION_SAMPLES}]",
-)
-multimodal_ds = multimodal_ds.shuffle(seed=42)
-
-text_ds = load_dataset(
+    DATASET_SPLIT,
     TEXT_DATASET_ID,
-    split=f"{TEXT_DATASET_SPLIT}[:{NUM_TEXT_CALIBRATION_SAMPLES}]",
-) if NUM_TEXT_CALIBRATION_SAMPLES > 0 else None
-if text_ds is not None:
-    text_ds = text_ds.shuffle(seed=42)
-    text_examples = list(text_ds)
-else:
-    text_examples = []
+    TEXT_DATASET_SPLIT,
+    NUM_CALIBRATION_SAMPLES,
+    NUM_TEXT_CALIBRATION_SAMPLES,
+)
 
 
 def tokenize_messages(messages, max_sequence_length):
@@ -155,72 +155,15 @@ def tokenize_messages(messages, max_sequence_length):
     )
 
 
-def _normalize_text_content(content):
-    if isinstance(content, str):
-        return [{"type": "text", "text": content}]
-
-    normalized = []
-    for item in content:
-        if isinstance(item, str):
-            normalized.append({"type": "text", "text": item})
-        elif isinstance(item, dict):
-            if item.get("type") == "text":
-                normalized.append({"type": "text", "text": item.get("text", "")})
-            elif "text" in item:
-                normalized.append({"type": "text", "text": item["text"]})
-    return normalized
-
-
-def format_text_example(example):
-    return [
-        {
-            "role": message["role"],
-            "content": _normalize_text_content(message["content"]),
-        }
-        for message in example["messages"]
-    ]
-
-
-def build_multimodal_messages(example):
-    buffered = BytesIO()
-    example["image"].save(buffered, format="PNG")
-    encoded_image = base64.b64encode(buffered.getvalue())
-    encoded_image_text = encoded_image.decode("utf-8")
-    base64_img = f"data:image;base64,{encoded_image_text}"
-    return [
-        {
-            "role": "user",
-            "content": [
-                {"type": "image", "image_url": base64_img},
-                {"type": "text", "text": "What does the image show?"},
-            ],
-        },
-        {
-            "role": "assistant",
-            "content": [
-                {
-                "text": f"{example['caption'][0]}",
-                "type": "text"
-                }
-            ],
-        }
-    ]
-
-
-def build_calibration_messages(multimodal_example, text_example=None):
-    messages = build_multimodal_messages(multimodal_example)
-    if text_example is not None:
-        messages.extend(format_text_example(text_example))
-    return messages
-
-
 def preprocess_and_tokenize(multimodal_example, idx):
     text_example = None
     if text_examples:
         text_example = text_examples[idx % len(text_examples)]
 
     return tokenize_messages(
-        build_calibration_messages(multimodal_example, text_example),
+        build_calibration_messages(
+            multimodal_example, text_example, image_format="image_url_flat"
+        ),
         MULTIMODAL_MAX_SEQUENCE_LENGTH,
     )
 

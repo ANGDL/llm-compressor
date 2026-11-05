@@ -21,9 +21,14 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
-from llmcompressor.streaming.artifacts import ArtifactCompatibilityError
+from llmcompressor.streaming.activations.metadata import boundary_summary
+from llmcompressor.streaming.artifacts import (
+    ArtifactCompatibilityError,
+    fingerprint_json,
+)
 
 from .._logging import streaming_logger
+from .coordinator import SingleParticipantCoordinator, fault_point
 
 if TYPE_CHECKING:
     from llmcompressor.streaming.loading.host_memory import HostMemoryReservation
@@ -179,6 +184,45 @@ class TensorRecord:
         )
 
 
+def _atomic_torch_save(path: Path, value: Any) -> None:
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("wb") as file:
+            torch.save(value, file)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temporary, path)
+        _sync_directory(path.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _boundary_records(boundary: Mapping[str, Any]) -> list[dict[str, Any]]:
+    batches = boundary.get("batches", [])
+    if not isinstance(batches, list):
+        raise ValueError("Boundary batches must be a list")
+    records = []
+    for value in batches:
+        if not isinstance(value, Mapping):
+            raise ValueError("Boundary batch records must be mappings")
+        required = {"index", "path", "size", "sha256", "summary"}
+        if set(value) != required:
+            raise ValueError(
+                "Boundary batch record fields must be "
+                f"{sorted(required)}"
+            )
+        records.append(dict(value))
+    return records
+
+
 class _Transaction(AbstractContextManager["_Transaction"]):
     def __init__(
         self,
@@ -193,6 +237,9 @@ class _Transaction(AbstractContextManager["_Transaction"]):
         self.quantized_modules: dict[str, str] = {}
         self.omitted_tied_weights: dict[str, str] = {}
         self.config_updates: dict[str, Any] = {}
+        self.boundary_records: dict[int, dict[str, Any]] = {}
+        self.boundary_index: int | None = None
+        self.expected_boundary_batches: int | None = None
         self._did_commit = False
 
     def __enter__(self) -> _Transaction:
@@ -262,7 +309,12 @@ class _Transaction(AbstractContextManager["_Transaction"]):
         self.config_updates.update(updates)
 
     def write_boundary(
-        self, batch_index: int, value: Any, *, boundary: int
+        self,
+        batch_index: int,
+        value: Any,
+        *,
+        boundary: int,
+        expected_batch_count: int | None = None,
     ) -> None:
         """Stage one next-boundary batch inside this transaction."""
 
@@ -274,17 +326,58 @@ class _Transaction(AbstractContextManager["_Transaction"]):
             raise ValueError(f"Duplicate boundary batch {batch_index}")
         path = self.pending / "boundaries" / f"batch-{batch_index:05d}.pt"
         path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(value, path)
+        _atomic_torch_save(path, value)
         self.boundaries[batch_index] = path
         self.boundary_index = boundary
+        summary = boundary_summary(value)
+        self.boundary_records[batch_index] = {
+            "index": batch_index,
+            "path": path.relative_to(self.pending).as_posix(),
+            "size": path.stat().st_size,
+            "sha256": _sha256_file(path),
+            "summary": summary,
+        }
+        if expected_batch_count is not None:
+            if expected_batch_count < 0:
+                raise ValueError("expected_batch_count must be non-negative")
+            if (
+                self.expected_boundary_batches is not None
+                and self.expected_boundary_batches != expected_batch_count
+            ):
+                raise ValueError("Conflicting expected boundary batch counts")
+            self.expected_boundary_batches = expected_batch_count
 
     def commit(self) -> None:
         if self._did_commit:
             raise RuntimeError("Transaction has already been committed")
         if not self.records and not self.config_updates:
             raise ValueError("Transaction has no output delta")
+        if hasattr(self, "boundaries"):
+            batch_indices = sorted(self.boundaries)
+            expected_count = (
+                self.expected_boundary_batches
+                if self.expected_boundary_batches is not None
+                else len(batch_indices)
+            )
+            if expected_count != len(batch_indices):
+                raise ValueError(
+                    f"Boundary {self.boundary_index} has {len(batch_indices)} "
+                    f"batches, expected {expected_count}"
+                )
+            if batch_indices != list(range(expected_count)):
+                raise ValueError(
+                    f"Boundary batch indices must be contiguous from zero: "
+                    f"{batch_indices}"
+                )
+            boundary_batches = [
+                self.boundary_records[index] for index in batch_indices
+            ]
+            boundary_digest = fingerprint_json(boundary_batches)
+        else:
+            boundary_batches = []
+            boundary_digest = None
         metadata = {
-            "schema_version": 1,
+            "schema_version": 2,
             "transaction_id": self.transaction_id,
             "run_fingerprint": self.writer.run_fingerprint,
             "records": [
@@ -297,20 +390,30 @@ class _Transaction(AbstractContextManager["_Transaction"]):
             "boundary": (
                 {
                     "index": self.boundary_index,
-                    "batches": [
-                        path.relative_to(self.pending).as_posix()
-                        for _, path in sorted(self.boundaries.items())
-                    ],
+                    "expected_batch_count": len(boundary_batches),
+                    "batches": boundary_batches,
+                    "sha256": boundary_digest,
                 }
                 if hasattr(self, "boundaries")
                 else None
             ),
         }
+        fault_point("transaction.before_metadata")
         _atomic_json(self.pending / "metadata.json", metadata)
+        fault_point("transaction.after_metadata")
         _sync_directory(self.pending / "tensors")
+        if hasattr(self, "boundaries"):
+            _sync_directory(self.pending / "boundaries")
         _sync_directory(self.pending)
+        fault_point("transaction.before_rename")
         os.replace(self.pending, self.committed)
         _sync_directory(self.writer.transactions_dir)
+        fault_point("transaction.after_rename")
+        if self.writer.coordinator is not None:
+            self.writer.coordinator.ensure_committed(
+                self.transaction_id,
+                metadata,
+            )
         self._did_commit = True
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:
@@ -327,7 +430,13 @@ class StreamingCheckpointWriter:
     unit (a subgraph) independent from the checkpoint file layout.
     """
 
-    def __init__(self, root: str | Path, *, run_fingerprint: str):
+    def __init__(
+        self,
+        root: str | Path,
+        *,
+        run_fingerprint: str,
+        coordinator: SingleParticipantCoordinator | None = None,
+    ):
         if not run_fingerprint:
             raise ValueError("run_fingerprint cannot be empty")
         self.root = Path(root)
@@ -335,6 +444,7 @@ class StreamingCheckpointWriter:
         self.transactions_dir = self.root / "transactions"
         self.shards_dir = self.root / "shards"
         self.states_dir = self.root / "state"
+        self.coordinator = coordinator
         self.transactions_dir.mkdir(parents=True, exist_ok=True)
         manifest = self.root / "writer.json"
         if manifest.exists():
@@ -371,13 +481,32 @@ class StreamingCheckpointWriter:
                     return False
             boundary = metadata.get("boundary")
             if boundary is not None:
-                for relative_path in boundary.get("batches", []):
-                    boundary_path = path.parent / relative_path
+                batch_records = _boundary_records(boundary)
+                if int(boundary.get("expected_batch_count", len(batch_records))) != len(
+                    batch_records
+                ):
+                    return False
+                if [record["index"] for record in batch_records] != list(
+                    range(len(batch_records))
+                ):
+                    return False
+                if boundary.get("sha256") != fingerprint_json(batch_records):
+                    return False
+                for record in batch_records:
+                    boundary_path = path.parent / record["path"]
                     if not boundary_path.is_file():
                         return False
-                    torch.load(
+                    if boundary_path.stat().st_size != int(record["size"]):
+                        return False
+                    if _sha256_file(boundary_path) != record["sha256"]:
+                        return False
+                    value = torch.load(
                         boundary_path, map_location="cpu", weights_only=False
                     )
+                    if boundary_summary(value) != record["summary"]:
+                        return False
+            if self.coordinator is not None:
+                self.coordinator.ensure_committed(transaction_id, metadata)
             return True
         except (
             OSError,
@@ -427,8 +556,12 @@ class StreamingCheckpointWriter:
         if boundary is None:
             return None
         values = [
-            torch.load(root / path, map_location="cpu", weights_only=False)
-            for path in boundary["batches"]
+            torch.load(
+                root / record["path"],
+                map_location="cpu",
+                weights_only=False,
+            )
+            for record in _boundary_records(boundary)
         ]
         return int(boundary["index"]), values
 

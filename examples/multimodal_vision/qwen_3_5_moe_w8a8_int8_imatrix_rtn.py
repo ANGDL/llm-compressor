@@ -1,31 +1,25 @@
-import base64
 import argparse
-from collections import Counter
-from contextvars import ContextVar
-from io import BytesIO
 import os
 import shutil
+from collections import Counter
+from contextvars import ContextVar
 
 import torch
-from datasets import load_dataset
+from compressed_tensors.quantization import preset_name_to_scheme
+from compressed_tensors.utils import match_named_modules, save_mtp_tensors_to_checkpoint
 from loguru import logger
-from transformers import AutoProcessor, Qwen3_5MoeForConditionalGeneration
 from qwen_vl_utils import process_vision_info
+from transformers import AutoProcessor, Qwen3_5MoeForConditionalGeneration
 
 from llmcompressor import oneshot
-from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
-from llmcompressor.modifiers.quantization import QuantizationModifier
-
-
-from compressed_tensors.quantization import QuantizationScheme, preset_name_to_scheme
-from compressed_tensors.quantization.quant_args import (
-    QuantizationArgs,
-    QuantizationStrategy,
-    QuantizationType,
+from llmcompressor.datasets import (
+    build_calibration_messages,
+    format_calibration_text,
+    load_calibration_datasets,
 )
-from compressed_tensors.utils import match_named_modules, save_mtp_tensors_to_checkpoint
+from llmcompressor.modifiers.quantization import QuantizationModifier
+from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
 from llmcompressor.observers.imatrix import IMatrixMSEObserver
-
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--model_id", type=str, default="/data/models/Qwen3.5-122B-A10B")
@@ -80,7 +74,9 @@ def _install_imatrix_all_zero_stats_hooks():
     original_gatherer_init = IMatrixGatherer.on_initialize
 
     def _gatherer_init_with_module_names(self, state, **kwargs):
-        resolved_targets = self.targets if isinstance(self.targets, list) else [self.targets]
+        resolved_targets = (
+            self.targets if isinstance(self.targets, list) else [self.targets]
+        )
         for module_name, module in match_named_modules(
             state.model,
             resolved_targets,
@@ -158,7 +154,9 @@ def copy_original_non_model_files(source_dir, save_dir):
 
 # Load model.
 model_id = args.model_id
-model = Qwen3_5MoeForConditionalGeneration.from_pretrained(model_id, device_map=None, dtype="auto",local_files_only=True)
+model = Qwen3_5MoeForConditionalGeneration.from_pretrained(
+    model_id, device_map=None, dtype="auto", local_files_only=True
+)
 processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
 
 
@@ -167,120 +165,44 @@ NUM_CALIBRATION_SAMPLES = 256
 MAX_SEQUENCE_LENGTH = 8192
 
 DATASET_ID = args.dataset_id
-DATASET_SPLIT = f"test[:{NUM_CALIBRATION_SAMPLES}]"
+DATASET_SPLIT = "test"
 TEXT_DATASET_ID = args.text_dataset_id
 TEXT_DATASET_SPLIT = args.text_dataset_split
 
-def _load_text_dataset(dataset_id, dataset_split):
-    return load_dataset(
-        dataset_id,
-        split=f"{dataset_split}[:{NUM_CALIBRATION_SAMPLES}]",
-    )
-
-
-# Load dataset and preprocess.
-multimodal_ds = load_dataset(DATASET_ID, split=DATASET_SPLIT)
-multimodal_ds = multimodal_ds.shuffle(seed=42)
-
-text_examples = []
-if args.enable_non_multimodal_calibration:
-    text_ds = _load_text_dataset(TEXT_DATASET_ID, TEXT_DATASET_SPLIT)
-    text_ds = text_ds.shuffle(seed=42)
-    text_examples = list(text_ds)
-
-
-def _normalize_text_content(content):
-    if isinstance(content, str):
-        stripped = content.strip()
-        return [{"type": "text", "text": stripped}] if stripped else []
-
-    if isinstance(content, dict):
-        content = [content]
-
-    normalized = []
-    for item in content if isinstance(content, list) else []:
-        if isinstance(item, str):
-            stripped = item.strip()
-            if stripped:
-                normalized.append({"type": "text", "text": stripped})
-        elif isinstance(item, dict):
-            text_value = None
-            if item.get("type") == "text":
-                text_value = item.get("text")
-            elif item.get("type") == "reasoning":
-                text_value = item.get("reasoning")
-            else:
-                text_value = item.get("text") or item.get("reasoning")
-
-            if isinstance(text_value, str):
-                stripped = text_value.strip()
-                if stripped:
-                    normalized.append({"type": "text", "text": stripped})
-    return normalized
-
-
-def _format_messages(messages):
+def _prepare_text_example(example):
     formatted = []
-    for message in messages:
+    for message in example.get("messages", []):
         if not isinstance(message, dict):
             continue
-
         role = message.get("role", "user")
         if role not in {"user", "assistant", "system"}:
             role = "user"
-
-        normalized_content = _normalize_text_content(message.get("content", ""))
-        if normalized_content:
-            formatted.append({"role": role, "content": normalized_content})
-
-    return formatted
-
-
-def format_text_example(example):
-    messages = _format_messages(example.get("messages", []))
-    if not messages:
-        raise ValueError("Could not extract text messages from calibration sample")
-
-    return messages
-
-
-def build_multimodal_messages(example):
-    buffered = BytesIO()
-    example["image"].save(buffered, format="PNG")
-    encoded_image = base64.b64encode(buffered.getvalue())
-    encoded_image_text = encoded_image.decode("utf-8")
-    base64_qwen = f"data:image;base64,{encoded_image_text}"
-
-    return [
-        {
-            "role": "user",
-            "content": [
-                {"type": "image", "image": base64_qwen},
-                {"type": "text", "text": "What does the image show?"},
-            ],
-        },
-        {
-            "role": "assistant",
-            "content": [
-                {
-                    "text": f"{example['caption'][0]}",
-                    "type": "text",
-                }
-            ],
-        },
-    ]
+        formatted.append({"role": role, "content": message.get("content", "")})
+    messages = format_calibration_text(
+        {"messages": formatted} if "messages" in example else example
+    )
+    for message in messages:
+        message["content"] = [
+            {"type": "text", "text": block["text"].strip()}
+            for block in message["content"]
+            if block["text"].strip()
+        ]
+    return {
+        "messages": format_calibration_text(
+            {"messages": [message for message in messages if message["content"]]}
+        )
+    }
 
 
-def build_calibration_messages(
-    multimodal_example,
-    text_example=None,
-):
-    messages = build_multimodal_messages(multimodal_example)
-
-    if text_example is not None:
-        messages.extend(format_text_example(text_example))
-
-    return messages
+multimodal_ds, text_examples = load_calibration_datasets(
+    DATASET_ID,
+    DATASET_SPLIT,
+    TEXT_DATASET_ID,
+    TEXT_DATASET_SPLIT,
+    NUM_CALIBRATION_SAMPLES,
+    NUM_CALIBRATION_SAMPLES if args.enable_non_multimodal_calibration else 0,
+    text_preprocess=_prepare_text_example,
+)
 
 
 def _select_calibration_example(examples, idx):
@@ -296,6 +218,7 @@ def preprocess_and_tokenize(multimodal_example, idx):
     messages = build_calibration_messages(
         multimodal_example,
         text_example=text_example,
+        image_format="image",
     )
 
     text = processor.apply_chat_template(

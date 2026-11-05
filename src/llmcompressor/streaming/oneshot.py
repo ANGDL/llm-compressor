@@ -17,6 +17,8 @@ from torch import nn
 from llmcompressor.recipe import Recipe
 from llmcompressor.utils.dev import resolve_execution_device
 
+from ._cleanup import cleanup_successful_work_dir
+from .checkpoint import with_work_directory_lock
 from .collect import collect_calibration_statistics
 from .finalize import finalize_streaming_checkpoint
 from .materialization import StreamingDTypePolicy, WeightMaterializer
@@ -54,6 +56,7 @@ def _resource_summary(device: torch.device, path: Path) -> str:
     )
 
 
+@with_work_directory_lock
 def _streaming_oneshot_from_boundaries(
     *,
     model_factory: Callable[..., nn.Module],
@@ -86,10 +89,23 @@ def _streaming_oneshot_from_boundaries(
     pack_to_int8: bool = True,
 ) -> Path:
     """Run collect, quantize, and finalize with resumable intermediates."""
-    work = Path(work_dir)
+    work = Path(work_dir).expanduser()
+    output = Path(output_dir).expanduser()
+    resolved_work = work.resolve()
+    resolved_output = output.resolve()
+    resolved_checkpoint = Path(checkpoint).expanduser().resolve()
+    if (
+        resolved_work.is_relative_to(resolved_output)
+        or resolved_output.is_relative_to(resolved_work)
+    ):
+        raise ValueError("work_dir and output_dir must use separate directories")
+    if (
+        resolved_work.is_relative_to(resolved_checkpoint)
+        or resolved_checkpoint.is_relative_to(resolved_work)
+    ):
+        raise ValueError("work_dir and checkpoint must use separate directories")
     artifact_dir = work / "artifacts"
     staging_dir = work / "staging"
-    output = Path(output_dir)
     device = torch.device(device)
     dtype_policy = dtype_policy or StreamingDTypePolicy.for_quantized_modules(
         target_dtype, schemes
@@ -169,6 +185,7 @@ def _streaming_oneshot_from_boundaries(
         f"streaming finalize: completed in {time.monotonic() - started:.2f}s; "
         f"{_resource_summary(device, result)}"
     )
+    cleanup_successful_work_dir(work)
     return result
 
 
@@ -230,6 +247,10 @@ def streaming_oneshot(
 
     Set ``finalize_only=True`` to validate and publish completed direct-writer
     shards after a previous normal-mode run failed during finalization.
+
+    After successful publication, temporary artifacts are removed in every mode,
+    including checkpoint-progress mode. Failed runs retain their work directory
+    for recovery. Unrelated files in an explicit work directory are preserved.
     """
     device = resolve_execution_device(device)
     if work_dir is None:
