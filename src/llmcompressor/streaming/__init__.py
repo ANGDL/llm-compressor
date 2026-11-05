@@ -65,6 +65,7 @@ from .materialization import (
     WeightMaterializer,
     materialize_weights,
 )
+from .moe import ExpertGroup, ExpertGroupExecutor, ExpertGroupPlan, execute_expert_group
 from .modifier_contract import (
     ModifierContract,
     ModifierContractError,
@@ -106,6 +107,9 @@ __all__ = [
     "KimiK3WeightMaterializer",
     "KimiK3WeightSource",
     "ExecutionInfo",
+    "ExpertGroup",
+    "ExpertGroupExecutor",
+    "ExpertGroupPlan",
     "GPTQStatisticsCollector",
     "HostMemoryBudget",
     "HostMemoryError",
@@ -143,6 +147,7 @@ __all__ = [
     "WeightMaterializer",
     "fingerprint_checkpoint",
     "fingerprint_json",
+    "execute_expert_group",
     "build_meta_model",
     "build_modifier_contracts",
     "calibration_outputs_reusable",
