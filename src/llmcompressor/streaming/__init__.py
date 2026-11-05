@@ -65,15 +65,27 @@ from .materialization import (
     WeightMaterializer,
     materialize_weights,
 )
-from .moe import ExpertGroup, ExpertGroupExecutor, ExpertGroupPlan, execute_expert_group
 from .modifier_contract import (
     ModifierContract,
     ModifierContractError,
     build_modifier_contracts,
     calibration_outputs_reusable,
 )
+from .moe import (
+    ExpertGroup,
+    ExpertGroupExecutor,
+    ExpertGroupModifierAdapter,
+    ExpertGroupPlan,
+    RoutedExpertBatch,
+    execute_expert_group,
+)
 from .oneshot import streaming_oneshot
-from .parallel import ParallelContext, PlacementEntry, PlacementPlan, StatisticsScope
+from .parallel import (
+    ParallelContext,
+    PlacementEntry,
+    PlacementPlan,
+    StatisticsScope,
+)
 from .quantize import quantize_streaming
 from .recovery import (
     RecoveryErrorKind,
@@ -110,6 +122,7 @@ __all__ = [
     "ExpertGroup",
     "ExpertGroupExecutor",
     "ExpertGroupPlan",
+    "ExpertGroupModifierAdapter",
     "GPTQStatisticsCollector",
     "HostMemoryBudget",
     "HostMemoryError",
@@ -125,6 +138,7 @@ __all__ = [
     "PlacementPlan",
     "LoadedSubgraph",
     "RecipeInfo",
+    "RoutedExpertBatch",
     "SequentialInfo",
     "SoftwareInfo",
     "SourceCheckpointInfo",

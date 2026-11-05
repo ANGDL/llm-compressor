@@ -1,13 +1,22 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+
 import pytest
 import torch
 from safetensors.torch import save_file
 from torch import nn
 
+from llmcompressor.core import active_session
+from llmcompressor.modifiers.gptq import GPTQModifier
+from llmcompressor.modifiers.quantization import QuantizationModifier
 from llmcompressor.streaming import (
+    DiskBoundaryActivationStore,
     ExpertGroupExecutor,
+    ExpertGroupModifierAdapter,
     ExpertGroupPlan,
+    InMemoryBoundaryActivationStore,
+    RoutedExpertBatch,
     SafetensorsWeightSource,
     SubgraphWeightSession,
     build_meta_model,
@@ -159,6 +168,74 @@ def test_group_executor_loads_only_one_group_and_restores_meta(tmp_path):
     assert all(parameter.is_meta for parameter in model.parameters())
 
 
+def test_group_executor_callback_runs_while_group_is_resident(tmp_path):
+    reference = ExpertsModel()
+    checkpoint = tmp_path / "model.safetensors"
+    save_file(reference.state_dict(), checkpoint)
+    model = build_meta_model(ExpertsModel)
+    session = SubgraphWeightSession(model, SafetensorsWeightSource(checkpoint))
+    plan = ExpertGroupPlan.from_num_experts("experts", 4, 2)
+    executor = ExpertGroupExecutor(model, session, plan)
+    seen = []
+    completed = []
+
+    def callback(group, loaded, experts, hidden_states, top_k_index, top_k_weights):
+        seen.append(
+            (
+                group.indices,
+                loaded.module_names,
+                tuple(
+                    not experts[index].proj.weight.is_meta
+                    for index in group.indices
+                ),
+                hidden_states.shape,
+                top_k_index.shape,
+                top_k_weights.shape,
+            )
+        )
+
+    def after_group(
+        group,
+        loaded,
+        experts,
+        hidden_states,
+        top_k_index,
+        top_k_weights,
+        group_output,
+    ):
+        completed.append(
+            (
+                group.indices,
+                loaded.module_names,
+                group_output.shape,
+                all(
+                    not experts[index].proj.weight.is_meta
+                    for index in group.indices
+                ),
+            )
+        )
+
+    executor.execute(
+        torch.randn(4, 3),
+        torch.tensor([[0], [1], [2], [3]]),
+        torch.ones(4, 1),
+        device="cpu",
+        dtype=torch.float32,
+        on_group=callback,
+        after_group=after_group,
+    )
+
+    assert seen == [
+        ((0, 1), ("experts.0", "experts.1"), (True, True), (4, 3), (4, 1), (4, 1)),
+        ((2, 3), ("experts.2", "experts.3"), (True, True), (4, 3), (4, 1), (4, 1)),
+    ]
+    assert completed == [
+        ((0, 1), ("experts.0", "experts.1"), (4, 3), True),
+        ((2, 3), ("experts.2", "experts.3"), (4, 3), True),
+    ]
+    assert all(parameter.is_meta for parameter in model.parameters())
+
+
 def test_routing_rejects_unowned_expert_indices():
     model = ExpertsModel(num_experts=2)
     group = ExpertGroupPlan.from_num_experts("experts", 2, 1).groups[0]
@@ -171,3 +248,158 @@ def test_routing_rejects_unowned_expert_indices():
             torch.ones(1, 1),
             group,
         )
+
+
+class GatedExpert(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.gate_proj = nn.Linear(8, 8, bias=False)
+        self.up_proj = nn.Linear(8, 8, bias=False)
+        self.down_proj = nn.Linear(8, 8, bias=False)
+
+    def forward(self, hidden_states):
+        return self.down_proj(
+            torch.nn.functional.silu(self.gate_proj(hidden_states))
+            * self.up_proj(hidden_states)
+        )
+
+
+class GatedExpertsModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.experts = nn.ModuleList([GatedExpert() for _ in range(5)])
+
+
+def _routed_inputs(store):
+    for batch_index, num_tokens in enumerate((7, 3)):
+        store.put(
+            0,
+            batch_index,
+            RoutedExpertBatch(
+                batch_index,
+                torch.randn(num_tokens, 8),
+                torch.tensor([[0, 1], [2, 0], [3, 1], [1, 2], [0, 3], [1, 0], [2, 1]])[
+                    :num_tokens
+                ],
+                torch.softmax(torch.randn(num_tokens, 2), dim=-1),
+            ),
+        )
+
+
+def _calibrate_groups(tmp_path, group_size, inputs, outputs, modifier, save_group):
+    model = build_meta_model(GatedExpertsModel)
+    session = SubgraphWeightSession(
+        model, SafetensorsWeightSource(tmp_path / "experts.safetensors")
+    )
+    executor = ExpertGroupExecutor(
+        model, session, ExpertGroupPlan.from_num_experts("experts", 5, group_size)
+    )
+    executor.calibrate(
+        inputs=inputs,
+        outputs=outputs,
+        input_boundary=0,
+        output_boundary=1,
+        modifier=modifier,
+        save_group=save_group,
+        device="cpu",
+        dtype=torch.float32,
+        calibrate_all_experts=False,
+    )
+    return model
+
+
+def _expert_modifier(modifier_type):
+    return modifier_type(
+        config_groups={
+            "experts": {
+                "targets": [r"re:experts\.\d+\.(gate|up|down)_proj$"],
+                "weights": {
+                    "num_bits": 4,
+                    "type": "int",
+                    "strategy": "group",
+                    "group_size": 4,
+                    "symmetric": True,
+                },
+            }
+        },
+        **({"batched_quantization": None} if modifier_type is GPTQModifier else {}),
+    )
+
+
+@pytest.mark.parametrize("modifier_type", [GPTQModifier, QuantizationModifier])
+@pytest.mark.parametrize("group_size", [1, 2])
+def test_group_calibration_matches_all_resident_gated_experts(
+    tmp_path, modifier_type, group_size
+):
+    torch.manual_seed(31)
+    save_file(GatedExpertsModel().state_dict(), tmp_path / "experts.safetensors")
+    inputs = DiskBoundaryActivationStore(tmp_path / "routed-inputs")
+    _routed_inputs(inputs)
+    modifier = ExpertGroupModifierAdapter(_expert_modifier(modifier_type))
+    original_session = active_session()
+    snapshots = []
+    propagated = []
+    for size in (5, group_size):
+        saved = {}
+        outputs = DiskBoundaryActivationStore(tmp_path / f"outputs-{size}")
+
+        def save_group(group, loaded):
+            assert sum(
+                not next(expert.parameters()).is_meta
+                for expert in loaded.model.experts
+            ) == len(group.indices)
+            saved.update(
+                (name, tensor.detach().cpu().clone())
+                for name, tensor in loaded.state_tensors()
+            )
+
+        model = _calibrate_groups(
+            tmp_path, size, inputs, outputs, modifier, save_group
+        )
+        assert all(parameter.is_meta for parameter in model.parameters())
+        assert not any(
+            hasattr(module, "weight_observer") for module in model.modules()
+        )
+        assert active_session() is original_session
+        snapshots.append(saved)
+        propagated.append([outputs.get(1, index) for index in (0, 1)])
+
+    assert snapshots[0].keys() == snapshots[1].keys()
+    for name, reference in snapshots[0].items():
+        torch.testing.assert_close(
+            snapshots[1][name], reference, rtol=0, atol=0, msg=name
+        )
+    for reference, grouped in zip(propagated[0], propagated[1]):
+        torch.testing.assert_close(grouped, reference, rtol=0, atol=0)
+
+
+def test_group_failure_cleans_hooks_meta_and_partial_output(tmp_path):
+    save_file(GatedExpertsModel().state_dict(), tmp_path / "experts.safetensors")
+    inputs = InMemoryBoundaryActivationStore()
+    outputs = InMemoryBoundaryActivationStore()
+    _routed_inputs(inputs)
+    adapter = ExpertGroupModifierAdapter(_expert_modifier(GPTQModifier))
+    captured = []
+
+    class FailingAdapter:
+        @contextmanager
+        def calibration(self, model):
+            captured.append(model)
+            with adapter.calibration(model):
+                yield
+                raise RuntimeError("injected calibration failure")
+
+    with pytest.raises(RuntimeError, match="injected calibration failure"):
+        _calibrate_groups(
+            tmp_path, 2, inputs, outputs, FailingAdapter(), lambda *_: None
+        )
+
+    assert outputs.batch_indices(1) == ()
+    assert all(parameter.is_meta for parameter in captured[0].parameters())
+    assert not any(
+        module._forward_hooks or module._forward_pre_hooks
+        for module in captured[0].modules()
+    )
+    assert not any(
+        hasattr(module, "weight_observer") for module in captured[0].modules()
+    )
