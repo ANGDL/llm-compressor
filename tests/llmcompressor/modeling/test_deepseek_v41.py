@@ -53,6 +53,34 @@ EXAMPLE = importlib.util.module_from_spec(EXAMPLE_SPEC)
 EXAMPLE_SPEC.loader.exec_module(EXAMPLE)
 
 
+def test_calibration_mixes_text_sources_with_different_metadata(tmp_path, monkeypatch):
+    monkeypatch.setattr("datasets.config.HF_DATASETS_CACHE", tmp_path / "cache")
+    sources = []
+    metadata_rows = ({"meta": {"language": "zh"}}, {"prompt_id": "a"})
+    for index, metadata in enumerate(metadata_rows):
+        source = tmp_path / f"source-{index}.jsonl"
+        rows = [
+            {
+                "messages": [{"role": "user", "content": f"source {index} row {row}"}],
+                **metadata,
+            }
+            for row in range(4)
+        ]
+        source.write_text("\n".join(json.dumps(row) for row in rows))
+        sources.append(str(source))
+
+    dataset, text = EXAMPLE.load_calibration_datasets(
+        sources, "train_sft", [], "train_sft", 5, 0, 42
+    )
+
+    assert len(dataset) == 5
+    assert dataset.column_names == ["messages"]
+    assert text == []
+    contents = [row["messages"][0]["content"][0]["text"] for row in dataset]
+    assert sum(content.startswith("source 0") for content in contents) == 3
+    assert sum(content.startswith("source 1") for content in contents) == 2
+
+
 def tiny_config(*, engram=False, vision=False, dspark=True):
     stages = 3 if dspark else 0
     return ModelConfig(
