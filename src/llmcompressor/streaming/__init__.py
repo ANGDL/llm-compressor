@@ -37,6 +37,7 @@ from .checkpoint import (
     with_work_directory_lock,
 )
 from .collect import collect_calibration_statistics
+from .compaction import BoundaryCompactor, RetiredBoundaryError
 from .finalize import finalize_streaming_checkpoint
 from .inference import (
     StreamingInference,
@@ -85,6 +86,7 @@ __all__ = [
     "ArtifactCompatibilityError",
     "ArtifactStore",
     "BoundaryActivationStore",
+    "BoundaryCompactor",
     "CalibrationInfo",
     "CastWeightMaterializer",
     "CheckpointWeightSource",
@@ -142,6 +144,7 @@ __all__ = [
     "trace_streaming_boundaries",
     "streaming_oneshot",
     "RecoveryErrorKind",
+    "RetiredBoundaryError",
     "ResumePlan",
     "build_resume_plan",
     "classify_recovery_error",

@@ -28,6 +28,7 @@ from llmcompressor.streaming.artifacts import (
 )
 
 from .._logging import streaming_logger
+from ..compaction import BoundaryCompactor, RetiredBoundaryError
 from .coordinator import SingleParticipantCoordinator, fault_point
 
 if TYPE_CHECKING:
@@ -445,6 +446,7 @@ class StreamingCheckpointWriter:
         self.shards_dir = self.root / "shards"
         self.states_dir = self.root / "state"
         self.coordinator = coordinator
+        self.compactor = BoundaryCompactor(self.root)
         self.transactions_dir.mkdir(parents=True, exist_ok=True)
         manifest = self.root / "writer.json"
         if manifest.exists():
@@ -481,6 +483,8 @@ class StreamingCheckpointWriter:
                     return False
             boundary = metadata.get("boundary")
             if boundary is not None:
+                if self.compactor.is_retired(transaction_id):
+                    return True
                 batch_records = _boundary_records(boundary)
                 if int(boundary.get("expected_batch_count", len(batch_records))) != len(
                     batch_records
@@ -569,6 +573,10 @@ class StreamingCheckpointWriter:
         boundary = metadata.get("boundary")
         if boundary is None:
             return
+        if self.compactor.is_retired(transaction_id):
+            raise RetiredBoundaryError(
+                f"Boundary for transaction {transaction_id!r} was compacted"
+            )
         root = self.transactions_dir / transaction_id
         for record in _boundary_records(boundary):
             try:

@@ -814,6 +814,14 @@ EP 延伸遵守 §3.7：全局发布完成后统一授权清理，不能由各 r
 - [x] 以 tiny dense 执行事务强杀/恢复验证；RTN+iMatrix 和 GPTQ 的完整矩阵继续扩展。
 - [ ] 记录真实执行结果，再更新 guide 支持范围。
 
+M2 当前进度（2026-11-05）：
+
+- [x] 已实现一次 committed subgraph 扫描和连续链校验。
+- [x] 已实现逐 batch frontier reader，恢复不再装入历史 boundary 列表。
+- [x] 已实现保留最近两个 boundary 的 retirement 记录和幂等删除。
+- [x] 已覆盖历史 boundary 合法回收、损坏 boundary、强杀恢复和 subgraph 回归。
+- [ ] 继续补充 8/32/128 子图扫描计数、读字节量和资源曲线报告。
+
 核心完成后的下一优先级是 D/E：恢复和 GC 的收益覆盖全部 PTQ 算法。
 E1 的 GPTQ 优化和 E3 的 MoE 专家执行作为两个独立延伸验证，
 依据峰值、重算和质量数据决定后续投入。
