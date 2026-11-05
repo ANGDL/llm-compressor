@@ -832,7 +832,8 @@ M4 当前进度（2026-11-05）：
 
 - [x] 增加显式 `ModifierContract`，表达工作集估算、统计生命周期、传播、恢复和输出所有权。
 - [x] calibration output 复用通过 contract 判断，空 recipe 保持不复用。
-- [ ] 将 modifier contract 纳入 manifest 指纹和资源 admission，补充各算法专项上界。
+- [x] modifier contract 指纹纳入 manifest 和 run fingerprint。
+- [ ] 将 modifier contract 纳入资源 admission，补充各算法专项上界。
 
 核心完成后的下一优先级是 D/E：恢复和 GC 的收益覆盖全部 PTQ 算法。
 E1 的 GPTQ 优化和 E3 的 MoE 专家执行作为两个独立延伸验证，
