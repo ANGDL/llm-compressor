@@ -23,9 +23,11 @@ __all__ = ["finalize_streaming_checkpoint"]
 
 _INDEX_NAME = "model.safetensors.index.json"
 _FINALIZED = "FINALIZED"
+_PUBLISH_STATE_SUFFIX = ".publish-state.json"
 
 
 def _atomic_json(path: Path, value: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     try:
         with temporary.open("w", encoding="utf-8") as file:
@@ -36,6 +38,73 @@ def _atomic_json(path: Path, value: Any) -> None:
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _publish_state_path(staging: Path) -> Path:
+    return staging.parent / f".{staging.name}{_PUBLISH_STATE_SUFFIX}"
+
+
+def _write_publish_state(path: Path, *, phase: str, **values: Any) -> None:
+    _atomic_json(
+        path,
+        {
+            "schema_version": 1,
+            "phase": phase,
+            **values,
+        },
+    )
+
+
+def _read_publish_state(path: Path) -> dict[str, Any] | None:
+    if not path.is_file():
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"Cannot read publish state {path}") from error
+    if value.get("schema_version") != 1 or not value.get("phase"):
+        raise RuntimeError(f"Invalid publish state {path}")
+    return value
+
+
+def _recover_published_output(
+    *,
+    state_path: Path,
+    output: Path,
+    backup: Path,
+) -> bool:
+    state = _read_publish_state(state_path)
+    if state is None:
+        return False
+    phase = state["phase"]
+    if phase == "installed" or phase == "cleaned":
+        if output.is_dir() and (output / _FINALIZED).is_file():
+            shutil.rmtree(output / ".streaming-state", ignore_errors=True)
+            if backup.exists():
+                shutil.rmtree(backup)
+            state_path.unlink(missing_ok=True)
+            return True
+        raise RuntimeError(
+            f"Publish state {state_path} says output is installed but output "
+            "is incomplete"
+        )
+    if phase == "backed_up" and backup.exists() and not output.exists():
+        os.replace(backup, output)
+        _sync_directory(output.parent)
+        state_path.unlink(missing_ok=True)
+        return False
+    return False
+
+
+def _sync_directory(path: Path) -> None:
+    try:
+        descriptor = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _dtype_size(dtype_name: str) -> int:
@@ -163,10 +232,18 @@ def finalize_streaming_checkpoint(
     source_dir = Path(checkpoint).expanduser().resolve()
     staging = Path(staging_dir).expanduser().resolve()
     output = Path(output_dir).expanduser().resolve()
+    publish_state = _publish_state_path(staging)
+    backup = staging.parent / "replaced-output"
     if not source_dir.is_dir():
         raise ValueError(f"checkpoint must be a directory: {source_dir}")
     if output == source_dir:
         raise ValueError("output_dir must differ from the source checkpoint")
+    if publish_in_place and _recover_published_output(
+        state_path=publish_state,
+        output=output,
+        backup=backup,
+    ):
+        return output
     if output.exists() and any(output.iterdir()) and not overwrite_output:
         raise FileExistsError(f"Refusing to overwrite existing output: {output}")
     if publish_in_place and staging.stat().st_dev != output.parent.stat().st_dev:
@@ -374,8 +451,13 @@ def finalize_streaming_checkpoint(
             _validate_transformers_config(temporary)
         (temporary / _FINALIZED).write_bytes(b"")
         if publish_in_place:
-            shutil.rmtree(states_dir)
-            backup = temporary.parent / "replaced-output"
+            _write_publish_state(
+                publish_state,
+                phase="ready",
+                staging=str(temporary),
+                output=str(output),
+                backup=str(backup),
+            )
             if backup.exists():
                 raise FileExistsError(
                     f"Cannot safely replace output while backup exists: {backup}"
@@ -387,14 +469,38 @@ def finalize_streaming_checkpoint(
                     replaced = True
                 else:
                     output.rmdir()
+            _write_publish_state(
+                publish_state,
+                phase="backed_up",
+                staging=str(temporary),
+                output=str(output),
+                backup=str(backup),
+            )
             try:
                 os.replace(temporary, output)
+                _sync_directory(output.parent)
+                _write_publish_state(
+                    publish_state,
+                    phase="installed",
+                    staging=str(temporary),
+                    output=str(output),
+                    backup=str(backup),
+                )
+                shutil.rmtree(output / ".streaming-state", ignore_errors=True)
+                _write_publish_state(
+                    publish_state,
+                    phase="cleaned",
+                    staging=str(temporary),
+                    output=str(output),
+                    backup=str(backup),
+                )
             except Exception:
                 if replaced and not output.exists():
                     os.replace(backup, output)
                 raise
             if replaced:
                 shutil.rmtree(backup)
+            publish_state.unlink(missing_ok=True)
         else:
             if overwrite_output and output.exists():
                 if any(output.iterdir()):
