@@ -729,6 +729,19 @@ Streaming PTQ reuses normal Modifier hooks and `sequential_epoch_end`; it does
 not maintain separate implementations of iMatrix, RTN, GPTQ, SmoothQuant, or AWQ.
 Legacy SparseGPT and Wanda pruning were removed with the upstream sparsity APIs.
 
+The session resolves quantization schemes once on the meta model so transforms
+can inspect them. Weight and activation observers and quantization calibration
+hooks are deferred until the current working set is installed. Streaming calls
+the shared `QuantizationMixin.start_layerwise_calibration()` used by upstream
+layerwise decompression, including scoped fused observers and scale dtype setup.
+GPTQ keeps its own Hessian hooks and update implementation.
+
+After all modifiers finish `sequential_epoch_end`, the shared
+`end_layerwise_calibration()` releases the current group's calibration hooks and
+observers. Failure cleanup runs before restoring the working set to meta.
+Compression continues through compressed-tensors' `compress_module()` with the
+streaming scale dtype preparation and checkpoint writer.
+
 A modifier is compatible only if every module it reads or changes is present in
 the current working set. Cross-target mappings require an explicit working-set
 declaration. GPTQ must retain its Hessian and perform error propagation while the

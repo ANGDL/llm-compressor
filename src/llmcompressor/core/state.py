@@ -92,6 +92,8 @@ class State:
     :type data: Data
     :param hardware: Hardware instance holding info about the target hardware being used
     :type hardware: Hardware
+    :param layerwise_calibration: Defer quantization observers and calibration hooks
+        until the pipeline installs each working set
     """
 
     model: Any = None
@@ -106,6 +108,7 @@ class State:
     current_batch_idx: int = -1
     sequential_activations: Any = None
     sequential_propagate_error: bool = True
+    layerwise_calibration: bool = False
 
     @property
     def compression_ready(self) -> bool:

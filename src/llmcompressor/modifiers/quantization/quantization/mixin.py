@@ -452,7 +452,7 @@ class QuantizationMixin(HooksMixin):
         self, model: torch.nn.Module, modules: list[torch.nn.Module]
     ):
         """
-        Set up quantization for a subset of modules after layerwise
+        Set up quantization for a subset of resident modules after loading or
         decompression. Applies quantization config scoped to the given
         modules, then initializes observers, calibration hooks, and fuses
         weight observers.
@@ -463,10 +463,18 @@ class QuantizationMixin(HooksMixin):
         apply_quantization_config(model, self.resolved_config, allowed_modules=modules)
         for module in modules:
             if is_module_quantized(module):
+                set_quantization_scale_dtype(module)
                 self._initialize_observers(module)
                 self._calibration_hooks |= self._initialize_hooks(module)
                 apply_calibration_status(module)
         fuse_weight_observers(model, modules)
+
+    def end_layerwise_calibration(self, modules: list[torch.nn.Module]) -> None:
+        """Release the active group's calibration hooks and freeze its observers."""
+        self.remove_hooks(self._calibration_hooks)
+        self._calibration_hooks.clear()
+        for module in modules:
+            freeze_module_quantization(module)
 
     def sync_obs_act_stats(self, modules: Iterator[torch.nn.Module]):
         """

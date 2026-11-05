@@ -12,7 +12,6 @@ from compressed_tensors.quantization.utils import is_module_quantized
 from llmcompressor.core import Event, State
 from llmcompressor.modifiers import Modifier
 from llmcompressor.modifiers.quantization.calibration import (
-    freeze_module_quantization,
     observe,
     update_qparams,
 )
@@ -90,10 +89,13 @@ class QuantizationModifier(Modifier, QuantizationMixin):
         """
         Begin calibrating activations.
 
-        Skipped when layerwise_decompression is enabled; per-layer calibration
-        setup is handled by start_layerwise_calibration in the pipeline.
+        With layerwise decompression or deferred calibration, the pipeline calls
+        start_layerwise_calibration after installing the current working set.
         """
-        if not getattr(state, "layerwise_decompression", False):
+        if not (
+            getattr(state, "layerwise_decompression", False)
+            or state.layerwise_calibration
+        ):
             QuantizationMixin.start_calibration(self, state.model)
 
     def on_sequential_epoch_end(
@@ -130,19 +132,21 @@ class QuantizationModifier(Modifier, QuantizationMixin):
             broadcast_qparams_and_cleanup(module_list, module_to_rank, _WEIGHT_Q_PARAMS)
 
         if getattr(state, "layerwise_decompression", False):
-            self.remove_hooks(self._calibration_hooks)
+            self.end_layerwise_calibration(modules)
             for module in modules:
-                freeze_module_quantization(module)
                 enable_quantization(module)
 
     def on_calibration_end(self, state: State, event: Event, **kwargs):
         """
         Finish calibrating by removing observers and calibration hooks.
 
-        Skipped when layerwise_decompression is enabled; per-layer cleanup
-        is handled in on_sequential_epoch_end.
+        Layerwise execution owns cleanup for each working set. Other pipelines
+        finish calibration across the model here.
         """
-        if not getattr(state, "layerwise_decompression", False):
+        if not (
+            getattr(state, "layerwise_decompression", False)
+            or state.layerwise_calibration
+        ):
             QuantizationMixin.end_calibration(self, state.model)
 
     def estimate_sequential_memory(

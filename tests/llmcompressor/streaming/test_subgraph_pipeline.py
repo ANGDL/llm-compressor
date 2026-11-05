@@ -16,6 +16,7 @@ from transformers import AutoModelForCausalLM, Qwen3Config, Qwen3ForCausalLM
 from llmcompressor import oneshot
 from llmcompressor.modifiers.gptq import GPTQModifier
 from llmcompressor.modifiers.quantization import QuantizationModifier
+from llmcompressor.modifiers.quantization.quantization.mixin import QuantizationMixin
 from llmcompressor.modifiers.transform import AWQModifier, SmoothQuantModifier
 from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
 from llmcompressor.pipelines.sequential.helpers import Subgraph
@@ -85,6 +86,80 @@ def _calibration_data():
         ],
         batch_size=1,
     )
+
+
+@pytest.mark.parametrize("quantizer_class", [QuantizationModifier, GPTQModifier])
+@pytest.mark.parametrize("fail_initialization", [False, True])
+def test_streaming_scopes_observers_to_resident_group_and_cleans_up(
+    tmp_path, monkeypatch, quantizer_class, fail_initialization
+):
+    config = Qwen3Config(
+        vocab_size=32,
+        hidden_size=8,
+        intermediate_size=16,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=4,
+        max_position_embeddings=32,
+        tie_word_embeddings=True,
+    )
+    checkpoint = tmp_path / "checkpoint"
+    Qwen3ForCausalLM(config).save_pretrained(checkpoint, safe_serialization=True)
+    groups = []
+    captured = {}
+    original_start = QuantizationMixin.start_layerwise_calibration
+
+    def check_residency(modifier, model, modules):
+        captured.update(model=model, modifier=modifier)
+        assert not modifier._calibration_hooks
+        assert not any(hasattr(module, "weight_observer") for module in model.modules())
+        current = set(modules)
+        for module in modules:
+            weight = getattr(module, "weight", None)
+            if weight is not None:
+                assert not weight.is_meta
+        original_start(modifier, model, modules)
+        observers = [
+            module for module in model.modules() if hasattr(module, "weight_observer")
+        ]
+        assert observers
+        assert set(observers).issubset(current)
+        groups.append(observers)
+        if fail_initialization:
+            raise RuntimeError("injected group initialization failure")
+
+    monkeypatch.setattr(
+        QuantizationMixin, "start_layerwise_calibration", check_residency
+    )
+    quantizer = quantizer_class(
+        scheme="W8A8", ignore=["lm_head"], weight_observer="imatrix_mse"
+    )
+    arguments = {
+        "model": checkpoint,
+        "dataset": _calibration_data(),
+        "dataset_fingerprint": "a" * 64,
+        "recipe": quantizer,
+        "output_dir": tmp_path / "output",
+        "work_dir": tmp_path / "work",
+        "num_calibration_samples": 2,
+        "max_seq_length": 4,
+        "target_dtype": torch.float32,
+    }
+    if fail_initialization:
+        with pytest.raises(RuntimeError, match="injected group initialization failure"):
+            streaming_oneshot(**arguments)
+        assert len(groups) == 1
+    else:
+        streaming_oneshot(**arguments)
+        assert len(groups) == 2
+
+    assert not captured["modifier"]._calibration_hooks
+    assert not captured["modifier"]._hooks
+    assert not any(
+        hasattr(module, "weight_observer") for module in captured["model"].modules()
+    )
+    assert all(parameter.is_meta for parameter in captured["model"].parameters())
 
 
 def _imatrix_recipe():
