@@ -537,6 +537,13 @@ Hessian（海森矩阵）是损失对参数的二阶导数矩阵。对 GPTQ 使�
 
 优先级：P1 可行性验证，完整实现晚于 M4。
 
+当前已增加独立的 `streaming.moe.ExpertGroupExecutor` 执行层骨架：
+它按有限专家组调用现有权重 session 加载和回收线性化专家，并提供
+组驻留前后 callback，使 GPTQ 等 modifier 可以在不修改
+`modifiers/gptq/*` 的前提下挂载自己的 collector/lifecycle。该骨架只证明
+专家分组、路由合并和设备驻留边界，不代表 pretrained streaming pipeline
+已经接入专家组模式，也不代表任何具体 MoE 模型已经获得完整支持。
+
 当前项目已经支持已适配 MoE 模型的校准、量化和 streaming 执行；
 这里增加的是更细的设备驻留粒度，不是首次接入 MoE 模型。
 目标是处理“单个 MoE decoder 的全部专家放不进设备”的情况。
