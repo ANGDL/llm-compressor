@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 import torch
@@ -14,8 +15,10 @@ from llmcompressor.streaming import (
     quantize_streaming,
 )
 from llmcompressor.streaming.finalize import (
+    _publish_state_path,
     _validate_quantized_module_weights,
     _validate_transformers_config,
+    _write_publish_state,
 )
 from tests.llmcompressor.streaming.test_quantize import prepare, scheme
 
@@ -309,6 +312,51 @@ def test_finalize_copy_auxiliary_directory_when_destination_already_exists(
         validate_config=False,
     )
     assert (output2 / "custom_module" / "custom.py").is_file()
+
+
+def test_publish_state_recovers_after_output_was_backed_up(tmp_path):
+    checkpoint, artifacts, _, _ = prepare(tmp_path)
+    staging = tmp_path / "staging"
+    quantize_streaming(
+        checkpoint=checkpoint,
+        artifact_dir=artifacts,
+        staging_dir=staging,
+        schemes={"layers.0": scheme()},
+        target_dtype=torch.float32,
+    )
+    for shard in (staging / "shards").glob("*.safetensors"):
+        os.replace(shard, staging / shard.name)
+    os.replace(staging / "state", staging / ".streaming-state")
+    (staging / "shards").rmdir()
+    output = tmp_path / "output"
+    output.mkdir()
+    (output / "old.txt").write_text("old", encoding="utf-8")
+    backup = tmp_path / "replaced-output"
+    os.replace(output, backup)
+    state_path = _publish_state_path(staging)
+    _write_publish_state(
+        state_path,
+        phase="backed_up",
+        staging=str(staging),
+        output=str(output),
+        backup=str(backup),
+    )
+
+    result = finalize_streaming_checkpoint(
+        checkpoint=checkpoint,
+        artifact_dir=artifacts,
+        staging_dir=staging,
+        output_dir=output,
+        publish_in_place=True,
+        overwrite_output=True,
+        validate_config=False,
+    )
+
+    assert result == output
+    assert (output / "FINALIZED").is_file()
+    assert not (output / "old.txt").exists()
+    assert not backup.exists()
+    assert not state_path.exists()
 
 
 
