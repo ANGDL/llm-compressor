@@ -54,7 +54,10 @@ from .materialization import (
     WeightMaterializer,
     materialize_weights,
 )
-from .modifier_contract import calibration_outputs_reusable
+from .modifier_contract import (
+    build_modifier_contracts,
+    calibration_outputs_reusable,
+)
 from .output import (
     prepare_quantized_tensor_for_save,
     quantized_module_formats,
@@ -237,6 +240,10 @@ def _initialize_run(
 ) -> str:
     normalized_recipe = _normalized_recipe_payload(recipe)
     source_info = fingerprint_checkpoint(checkpoint)
+    modifier_contracts = build_modifier_contracts(recipe.modifiers)
+    modifier_contract_sha256 = fingerprint_json(
+        [contract.to_dict() for contract in modifier_contracts]
+    )
     parallel_context = parallel_context or ParallelContext.single_device()
     placement = placement or PlacementPlan(ep_size=parallel_context.ep_size)
     run_fingerprint = fingerprint_json(
@@ -252,6 +259,7 @@ def _initialize_run(
             "execution": {
                 "propagation_mode": "sequential-compatible",
                 "boundary_schema": 1,
+                "modifier_contract_sha256": modifier_contract_sha256,
             },
             "parallel": {
                 "context": parallel_context.to_dict(),
@@ -273,7 +281,9 @@ def _initialize_run(
             target_dtype=target_dtype, dtype_policy=dtype_policy
         ),
         software=SoftwareInfo.from_versions({"torch": torch.__version__}),
-        execution=ExecutionInfo(),
+        execution=ExecutionInfo(
+            modifier_contract_sha256=modifier_contract_sha256
+        ),
         parallel=ParallelInfo.from_context(
             parallel_context.to_dict(),
             placement_fingerprint=placement.fingerprint,

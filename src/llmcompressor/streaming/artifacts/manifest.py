@@ -151,6 +151,7 @@ class ExecutionInfo:
     propagation_mode: str = "sequential-compatible"
     boundary_schema: int = 1
     implementation: str = "streaming-subgraph-v1"
+    modifier_contract_sha256: str = ""
 
     def __post_init__(self) -> None:
         if not self.propagation_mode:
@@ -159,6 +160,11 @@ class ExecutionInfo:
             raise ValueError("boundary_schema must be positive")
         if not self.implementation:
             raise ValueError("implementation cannot be empty")
+        if self.modifier_contract_sha256:
+            _require_sha256(
+                self.modifier_contract_sha256,
+                "modifier_contract_sha256",
+            )
 
 
 @dataclass(frozen=True)
