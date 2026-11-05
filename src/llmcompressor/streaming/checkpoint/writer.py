@@ -543,6 +543,52 @@ class StreamingCheckpointWriter:
             result.append(json.loads(path.read_text(encoding="utf-8")))
         return result
 
+    def load_transaction_metadata(self, transaction_id: str) -> dict[str, Any]:
+        """Load one committed transaction after validating its objects."""
+
+        if not self.is_transaction_complete(transaction_id):
+            raise RuntimeError(
+                f"Committed transaction {transaction_id!r} is corrupt"
+            )
+        path = self.transactions_dir / transaction_id / "metadata.json"
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def iter_committed_boundary(
+        self,
+        transaction_id: str,
+        *,
+        metadata: Mapping[str, Any] | None = None,
+    ):
+        """Yield committed boundary batches one at a time."""
+
+        metadata = (
+            metadata
+            if metadata is not None
+            else self.load_transaction_metadata(transaction_id)
+        )
+        boundary = metadata.get("boundary")
+        if boundary is None:
+            return
+        root = self.transactions_dir / transaction_id
+        for record in _boundary_records(boundary):
+            try:
+                value = torch.load(
+                    root / record["path"],
+                    map_location="cpu",
+                    weights_only=False,
+                )
+            except (
+                OSError,
+                RuntimeError,
+                EOFError,
+                pickle.UnpicklingError,
+            ) as error:
+                raise RuntimeError(
+                    f"Cannot read committed boundary batch "
+                    f"{root / record['path']}"
+                ) from error
+            yield int(record["index"]), value
+
     def committed_boundary(
         self, transaction_id: str
     ) -> tuple[int, list[Any]] | None:
@@ -550,18 +596,16 @@ class StreamingCheckpointWriter:
 
         if not self.is_transaction_complete(transaction_id):
             return None
-        root = self.transactions_dir / transaction_id
-        metadata = json.loads((root / "metadata.json").read_text())
+        metadata = self.load_transaction_metadata(transaction_id)
         boundary = metadata.get("boundary")
         if boundary is None:
             return None
         values = [
-            torch.load(
-                root / record["path"],
-                map_location="cpu",
-                weights_only=False,
+            value
+            for _, value in self.iter_committed_boundary(
+                transaction_id,
+                metadata=metadata,
             )
-            for record in _boundary_records(boundary)
         ]
         return int(boundary["index"]), values
 

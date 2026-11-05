@@ -59,6 +59,7 @@ from .output import (
     quantized_tensor_bytes_for_save,
 )
 from .parallel import ParallelContext, PlacementPlan
+from .recovery import build_resume_plan
 from .tied_weights import infer_transformers_tied_weights
 from .tracing import TracedBoundaryAdapter
 
@@ -814,17 +815,15 @@ def run_subgraph_streaming_pipeline(
         )
     source = adapter.weight_session.source
     written: set[str] = set()
-    first_transaction = "subgraph-00000"
-    if transaction_writer is None or not transaction_writer.is_transaction_complete(
-        first_transaction
-    ):
-        if transaction_writer is not None and transaction_writer.has_transaction(
-            first_transaction
-        ):
-            raise RuntimeError(
-                f"Committed transaction {first_transaction!r} is corrupt; "
-                "refusing to replace durable output"
-            )
+    resume_plan = (
+        build_resume_plan(transaction_writer)
+        if transaction_writer is not None
+        else None
+    )
+    resume_metadata = (
+        resume_plan.metadata_by_id if resume_plan is not None else {}
+    )
+    if transaction_writer is None or not resume_plan.transaction_ids:
         # Boundary zero is not covered by a preceding subgraph transaction.
         # Always recreate it when the first subgraph is incomplete so a crash
         # while snapshotting the dataloader cannot leave a partial input set.
@@ -902,28 +901,32 @@ def run_subgraph_streaming_pipeline(
                 transaction_id = f"subgraph-{target_index:05d}"
                 if (
                     transaction_writer is not None
-                    and transaction_writer.is_transaction_complete(transaction_id)
+                    and resume_plan is not None
+                    and transaction_id in resume_metadata
                 ):
                     label = _target_label(
                         target_index, len(adapter.targets), target_name
                     )
                     streaming_logger.info(f"{label} | restoring checkpoint")
-                    metadata = next(
-                        value
-                        for value in transaction_writer.committed_metadata()
-                        if value["transaction_id"] == transaction_id
-                    )
+                    metadata = resume_metadata[transaction_id]
                     written.update(
                         record["name"] for record in metadata["records"]
                     )
-                    committed_boundary = transaction_writer.committed_boundary(
-                        transaction_id
-                    )
-                    if committed_boundary is not None:
-                        boundary_index, values = committed_boundary
+                    boundary = metadata.get("boundary")
+                    if boundary is not None:
+                        boundary_index = int(boundary["index"])
                         boundaries.delete(boundary_index)
-                        for batch_index, value in enumerate(values):
-                            boundaries.put(boundary_index, batch_index, value)
+                        for batch_index, value in (
+                            transaction_writer.iter_committed_boundary(
+                                transaction_id,
+                                metadata=metadata,
+                            )
+                        ):
+                            boundaries.put(
+                                boundary_index,
+                                batch_index,
+                                value,
+                            )
                     boundaries.delete(target_index)
                     continue
                 if (

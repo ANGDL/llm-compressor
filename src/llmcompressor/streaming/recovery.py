@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from .artifacts import ArtifactCompatibilityError
 from .checkpoint.coordinator import CommittedTransactionCorruptionError
@@ -34,12 +34,21 @@ class ResumePlan:
     transaction_ids: tuple[str, ...]
     next_transaction_id: str
     boundary_index: int | None
+    metadata: tuple[dict[str, Any], ...] = ()
+
+    @property
+    def metadata_by_id(self) -> dict[str, dict[str, Any]]:
+        return {value["transaction_id"]: value for value in self.metadata}
 
 
 def build_resume_plan(writer: StreamingCheckpointWriter) -> ResumePlan:
     """Scan committed transaction metadata once and reject holes or corruption."""
 
-    metadata = writer.committed_metadata()
+    metadata = [
+        value
+        for value in writer.committed_metadata()
+        if value["transaction_id"].startswith("subgraph-")
+    ]
     ordered = sorted(
         metadata,
         key=lambda value: value["transaction_id"],
@@ -63,6 +72,7 @@ def build_resume_plan(writer: StreamingCheckpointWriter) -> ResumePlan:
         transaction_ids=tuple(expected),
         next_transaction_id=f"subgraph-{next_index:05d}",
         boundary_index=boundary_index,
+        metadata=tuple(ordered),
     )
 
 
