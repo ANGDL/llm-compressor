@@ -47,6 +47,7 @@ from .checkpoint import (
     SingleParticipantCoordinator,
     StreamingCheckpointWriter,
 )
+from .compaction import BoundaryCompactor
 from .loading import HostMemoryBudget, SubgraphPrefetcher
 from .materialization import (
     StreamingDTypePolicy,
@@ -823,6 +824,9 @@ def run_subgraph_streaming_pipeline(
     resume_metadata = (
         resume_plan.metadata_by_id if resume_plan is not None else {}
     )
+    committed_transaction_ids = list(
+        resume_plan.transaction_ids if resume_plan is not None else ()
+    )
     if transaction_writer is None or not resume_plan.transaction_ids:
         # Boundary zero is not covered by a preceding subgraph transaction.
         # Always recreate it when the first subgraph is incomplete so a crash
@@ -913,7 +917,11 @@ def run_subgraph_streaming_pipeline(
                         record["name"] for record in metadata["records"]
                     )
                     boundary = metadata.get("boundary")
-                    if boundary is not None:
+                    is_frontier = (
+                        transaction_id
+                        == resume_plan.transaction_ids[-1]
+                    )
+                    if boundary is not None and is_frontier:
                         boundary_index = int(boundary["index"])
                         boundaries.delete(boundary_index)
                         for batch_index, value in (
@@ -1195,6 +1203,10 @@ def run_subgraph_streaming_pipeline(
                                     )
                                 )
                                 transaction.commit()
+                            committed_transaction_ids.append(transaction_id)
+                            BoundaryCompactor(staging_dir).compact(
+                                tuple(committed_transaction_ids)
+                            )
                         else:
                             written.update(
                                 _write_loaded_target_direct(
