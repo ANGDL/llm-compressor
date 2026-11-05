@@ -231,3 +231,9 @@ def test_boundary_compaction_records_legal_retirement(tmp_path):
         "subgraph-00001",
         "subgraph-00002",
     )
+    stats = build_resume_plan(writer).scan_stats
+    assert stats.transaction_count == 3
+    assert stats.payload_count == 3
+    assert stats.boundary_count == 2
+    assert stats.payload_bytes > 0
+    assert stats.boundary_bytes > 0
