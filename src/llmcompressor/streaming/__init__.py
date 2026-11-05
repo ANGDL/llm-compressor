@@ -65,6 +65,12 @@ from .materialization import (
     WeightMaterializer,
     materialize_weights,
 )
+from .modifier_contract import (
+    ModifierContract,
+    ModifierContractError,
+    build_modifier_contracts,
+    calibration_outputs_reusable,
+)
 from .oneshot import streaming_oneshot
 from .parallel import ParallelContext, PlacementEntry, PlacementPlan, StatisticsScope
 from .quantize import quantize_streaming
@@ -107,6 +113,8 @@ __all__ = [
     "IMatrixStatisticsCollector",
     "InMemoryBoundaryActivationStore",
     "MaterializerInfo",
+    "ModifierContract",
+    "ModifierContractError",
     "ParallelContext",
     "ParallelInfo",
     "PlacementEntry",
@@ -136,6 +144,8 @@ __all__ = [
     "fingerprint_checkpoint",
     "fingerprint_json",
     "build_meta_model",
+    "build_modifier_contracts",
+    "calibration_outputs_reusable",
     "collect_calibration_statistics",
     "compare_cached_to_recompute",
     "finalize_streaming_checkpoint",
