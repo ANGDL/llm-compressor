@@ -10,7 +10,9 @@ from .artifacts import (
     ArtifactCompatibilityError,
     ArtifactStore,
     CalibrationInfo,
+    ExecutionInfo,
     MaterializerInfo,
+    ParallelInfo,
     RecipeInfo,
     SequentialInfo,
     SoftwareInfo,
@@ -22,11 +24,17 @@ from .artifacts import (
 )
 from .checkpoint import (
     CheckpointWeightSource,
+    CommittedTransactionCorruptionError,
     SafetensorsWeightSource,
+    SingleParticipantCoordinator,
     StreamingCheckpointWriter,
+    StreamingWorkDirectoryLock,
     TensorMetadata,
     TensorRecord,
+    TransactionCoordinationError,
     WeightMap,
+    fault_point,
+    with_work_directory_lock,
 )
 from .collect import collect_calibration_statistics
 from .finalize import finalize_streaming_checkpoint
@@ -57,7 +65,14 @@ from .materialization import (
     materialize_weights,
 )
 from .oneshot import streaming_oneshot
+from .parallel import ParallelContext, PlacementEntry, PlacementPlan, StatisticsScope
 from .quantize import quantize_streaming
+from .recovery import (
+    RecoveryErrorKind,
+    ResumePlan,
+    build_resume_plan,
+    classify_recovery_error,
+)
 from .statistics import (
     GPTQStatisticsCollector,
     IMatrixStatisticsCollector,
@@ -73,6 +88,7 @@ __all__ = [
     "CalibrationInfo",
     "CastWeightMaterializer",
     "CheckpointWeightSource",
+    "CommittedTransactionCorruptionError",
     "DiskBoundaryActivationStore",
     "DeepSeekV4WeightMaterializer",
     "DeepSeekV4WeightSource",
@@ -80,6 +96,7 @@ __all__ = [
     "DeepSeekV41WeightSource",
     "KimiK3WeightMaterializer",
     "KimiK3WeightSource",
+    "ExecutionInfo",
     "GPTQStatisticsCollector",
     "HostMemoryBudget",
     "HostMemoryError",
@@ -87,6 +104,10 @@ __all__ = [
     "IMatrixStatisticsCollector",
     "InMemoryBoundaryActivationStore",
     "MaterializerInfo",
+    "ParallelContext",
+    "ParallelInfo",
+    "PlacementEntry",
+    "PlacementPlan",
     "LoadedSubgraph",
     "RecipeInfo",
     "SequentialInfo",
@@ -97,13 +118,16 @@ __all__ = [
     "StreamingInference",
     "StreamingDTypePolicy",
     "StreamingCheckpointWriter",
+    "StreamingWorkDirectoryLock",
     "StatisticsCollectorGroup",
+    "StatisticsScope",
     "TargetStatisticsMetadata",
     "TargetWeightLoader",
     "SubgraphWeightSession",
     "TracedBoundaryAdapter",
     "TensorMetadata",
     "TensorRecord",
+    "TransactionCoordinationError",
     "WeightMap",
     "WeightMaterializer",
     "fingerprint_checkpoint",
@@ -117,4 +141,11 @@ __all__ = [
     "quantize_streaming",
     "trace_streaming_boundaries",
     "streaming_oneshot",
+    "RecoveryErrorKind",
+    "ResumePlan",
+    "build_resume_plan",
+    "classify_recovery_error",
+    "fault_point",
+    "SingleParticipantCoordinator",
+    "with_work_directory_lock",
 ]

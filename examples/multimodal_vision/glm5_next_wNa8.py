@@ -40,13 +40,11 @@ Example::
 """
 
 import argparse
-import base64
 import json
 import os
 import re
 from collections import defaultdict
 from contextlib import contextmanager
-from io import BytesIO
 
 import torch
 from compressed_tensors.offload import get_device_map
@@ -65,9 +63,13 @@ from transformers.models.glm5_next.modeling_glm5_next import (
 )
 
 # don't move this import to the top of the file
-from datasets import load_dataset
 from llmcompressor import oneshot
 from llmcompressor.core import active_session
+from llmcompressor.datasets import (
+    build_calibration_messages,
+    format_calibration_text,
+    load_calibration_datasets,
+)
 from llmcompressor.logger import LoggerConfig, configure_logger
 from llmcompressor.modeling.glm5_next import attach_mtp_layer
 from llmcompressor.modeling.moe.linearize import linearize_moe
@@ -623,19 +625,14 @@ def maybe_skip_from_accelerate(skip_restore: bool):
 
 patch_pipeline_dispatch(args.dispatch_extra_memory_gb)
 
-dataset = load_dataset(
+dataset, text_examples = load_calibration_datasets(
     args.dataset_id,
-    split=f"{args.dataset_split}[:{args.num_calibration_samples}]",
-).shuffle(seed=42)
-text_dataset = (
-    load_dataset(
-        args.text_dataset_id,
-        split=f"{args.text_dataset_split}[:{args.text_calibration_samples}]",
-    ).shuffle(seed=42)
-    if args.text_calibration_samples > 0
-    else None
+    args.dataset_split,
+    args.text_dataset_id,
+    args.text_dataset_split,
+    args.num_calibration_samples,
+    args.text_calibration_samples,
 )
-text_examples = list(text_dataset) if text_dataset is not None else []
 
 model = Glm5NextForConditionalGeneration.from_pretrained(
     args.model_id,
@@ -647,96 +644,17 @@ processor = AutoProcessor.from_pretrained(args.model_id)
 tokenizer = processor.tokenizer
 
 
-def _caption_text(example) -> str:
-    caption = example.get("caption", "")
-    if isinstance(caption, (list, tuple)):
-        caption = caption[0] if caption else ""
-    return str(caption)
-
-
-def _image_as_data_url(image) -> str:
-    buffered = BytesIO()
-    if hasattr(image, "convert"):
-        image = image.convert("RGB")
-    image.save(buffered, format="PNG")
-    encoded_image = base64.b64encode(buffered.getvalue()).decode("utf-8")
-    return f"data:image/png;base64,{encoded_image}"
-
-
-def _multimodal_messages(example):
-    image_url = _image_as_data_url(example["image"])
-    return [
-        {
-            "role": "user",
-            "content": [
-                {"type": "image", "url": image_url},
-                {"type": "text", "text": "What does the image show?"},
-            ],
-        },
-        {
-            "role": "assistant",
-            "content": [{"type": "text", "text": _caption_text(example)}],
-        },
-    ]
-
-
-def _normalize_text_content(content):
-    """Normalize common chat-dataset content formats for the GLM processor."""
-    if isinstance(content, str):
-        return [{"type": "text", "text": content}]
-    if isinstance(content, dict):
-        content = [content]
-
-    normalized = []
-    if not isinstance(content, (list, tuple)):
-        return normalized
-    for item in content:
-        if isinstance(item, str):
-            normalized.append({"type": "text", "text": item})
-        elif isinstance(item, dict):
-            if item.get("type") == "text":
-                normalized.append({"type": "text", "text": str(item.get("text", ""))})
-            elif "text" in item:
-                normalized.append({"type": "text", "text": str(item["text"])})
-    return normalized
-
-
-def _format_text_example(example):
-    messages = example.get("messages")
-    if messages is None:
-        text = example.get("text")
-        if text is None:
-            return []
-        return [{"role": "user", "content": [{"type": "text", "text": str(text)}]}]
-
-    formatted = []
-    for message in messages:
-        if not isinstance(message, dict) or "role" not in message:
-            continue
-        formatted.append(
-            {
-                "role": message["role"],
-                "content": _normalize_text_content(message.get("content", "")),
-            }
-        )
-    return formatted
-
-
-def _build_calibration_messages(multimodal_example, text_example=None):
-    messages = _multimodal_messages(multimodal_example)
-    if text_example is not None:
-        messages.extend(_format_text_example(text_example))
-    return messages
-
-
 def preprocess(example, idx):
+    if "input_ids" in example:
+        return example
     if "image" in example and example["image"] is not None:
         # tokenize=True is required here: GLM-5.3 expands <|image|> to the
         # processor-computed number of visual patch tokens.
         encoded = processor.apply_chat_template(
-            _build_calibration_messages(
+            build_calibration_messages(
                 example,
                 text_examples[idx % len(text_examples)] if text_examples else None,
+                image_format="url",
             ),
             tokenize=True,
             return_dict=True,
@@ -746,7 +664,9 @@ def preprocess(example, idx):
         )
         return dict(encoded)
     if "messages" in example:
-        text = tokenizer.apply_chat_template(example["messages"], tokenize=False)
+        text = tokenizer.apply_chat_template(
+            format_calibration_text(example), tokenize=False
+        )
         return dict(
             processor(
                 text=text,

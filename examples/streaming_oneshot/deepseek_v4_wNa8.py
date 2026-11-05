@@ -42,7 +42,7 @@ from transformers import AutoTokenizer
 
 # Importing the native package registers DeepSeek-V4 with Transformers.
 import llmcompressor.modeling.deepseekv4  # noqa: F401
-from datasets import Dataset, concatenate_datasets, load_dataset
+from llmcompressor.datasets import load_calibration_dataset
 from llmcompressor.modeling.deepseekv4.config import ModelConfig
 from llmcompressor.modeling.deepseekv4.model import DeepseekV4NativeForCausalLM
 from llmcompressor.modifiers.quantization import QuantizationModifier
@@ -74,13 +74,10 @@ def _configure_reference_kernel(path: Path | None) -> None:
     reset_kernel_backend_cache()
 
 
-def _is_local_json(path: str) -> bool:
-    candidate = Path(path).expanduser()
-    return candidate.is_file() or candidate.suffix.lower() in {".json", ".jsonl"}
-
-
 def _encode_example(example: dict[str, Any]) -> dict[str, Any]:
     """Normalize chat/text examples to the schema expected by the tokenizer."""
+    if "input_ids" in example:
+        return example
     if "messages" in example:
         from llmcompressor.modeling.deepseekv4.encoding.encoding_dsv4 import (
             encode_messages,
@@ -91,48 +88,9 @@ def _encode_example(example: dict[str, Any]) -> dict[str, Any]:
         }
     if "text" in example:
         return {"text": example["text"]}
-    if "input_ids" in example:
-        return example
     raise ValueError(
         "Calibration examples must contain 'messages', 'text', or 'input_ids'"
     )
-
-
-def _load_source(source_id: str, split: str, samples: int) -> Dataset:
-    if _is_local_json(source_id):
-        return load_dataset(
-            "json", data_files=source_id, split=f"train[:{samples}]"
-        )
-    return load_dataset(source_id, split=f"{split}[:{samples}]")
-
-
-def load_calibration_dataset(
-    source_ids: list[str], split: str, samples: int, seed: int = 42
-) -> Dataset:
-    """Load sources, allocate the requested total, and normalize their schemas."""
-    if samples < len(source_ids):
-        raise ValueError(
-            "num-calibration-samples must be at least the number of dataset "
-            f"sources ({samples} < {len(source_ids)})"
-        )
-    base, remainder = divmod(samples, len(source_ids))
-    parts = []
-    for index, source_id in enumerate(source_ids):
-        count = base + (index < remainder)
-        part = _load_source(source_id, split, count).shuffle(seed=seed)
-        columns = set(part.column_names)
-        if "input_ids" not in columns:
-            part = part.map(_encode_example, remove_columns=part.column_names)
-        parts.append(part)
-    if len(parts) == 1:
-        return parts[0]
-    schemas = [tuple(part.column_names) for part in parts]
-    if any(schema != schemas[0] for schema in schemas[1:]):
-        raise ValueError(
-            "All calibration sources must produce the same columns; "
-            f"got {schemas}"
-        )
-    return concatenate_datasets(parts)
 
 
 def _disable_absent_mtp(config: ModelConfig, tensor_names: set[str]) -> bool:
@@ -353,6 +311,7 @@ def main() -> None:
         args.dataset_id,
         args.dataset_split,
         args.num_calibration_samples,
+        preprocess=_encode_example,
     )
     config_groups, ignores = _schemes(
         args.quant_mode,

@@ -32,6 +32,8 @@ from .activations import (
 from .artifacts import (
     ArtifactStore,
     CalibrationInfo,
+    ExecutionInfo,
+    ParallelInfo,
     RecipeInfo,
     SequentialInfo,
     SoftwareInfo,
@@ -42,6 +44,7 @@ from .artifacts import (
 from .checkpoint import (
     AsyncDirectSafetensorsWriter,
     DirectSafetensorsWriter,
+    SingleParticipantCoordinator,
     StreamingCheckpointWriter,
 )
 from .loading import HostMemoryBudget, SubgraphPrefetcher
@@ -55,6 +58,7 @@ from .output import (
     quantized_module_formats,
     quantized_tensor_bytes_for_save,
 )
+from .parallel import ParallelContext, PlacementPlan
 from .tied_weights import infer_transformers_tied_weights
 from .tracing import TracedBoundaryAdapter
 
@@ -224,10 +228,14 @@ def _initialize_run(
     seed: int | None,
     pack_to_int8: bool,
     dtype_policy: StreamingDTypePolicy | None = None,
+    parallel_context: ParallelContext | None = None,
+    placement: PlacementPlan | None = None,
     replace_existing: bool = False,
 ) -> str:
     normalized_recipe = _normalized_recipe_payload(recipe)
     source_info = fingerprint_checkpoint(checkpoint)
+    parallel_context = parallel_context or ParallelContext.single_device()
+    placement = placement or PlacementPlan(ep_size=parallel_context.ep_size)
     run_fingerprint = fingerprint_json(
         {
             "source": source_info.content_fingerprint,
@@ -238,6 +246,14 @@ def _initialize_run(
                 target_dtype=target_dtype, dtype_policy=dtype_policy
             ).config_sha256,
             "output": {"pack_to_int8": pack_to_int8},
+            "execution": {
+                "propagation_mode": "sequential-compatible",
+                "boundary_schema": 1,
+            },
+            "parallel": {
+                "context": parallel_context.to_dict(),
+                "placement": placement.fingerprint,
+            },
         }
     )
     manifest = StreamingRunManifest(
@@ -254,6 +270,11 @@ def _initialize_run(
             target_dtype=target_dtype, dtype_policy=dtype_policy
         ),
         software=SoftwareInfo.from_versions({"torch": torch.__version__}),
+        execution=ExecutionInfo(),
+        parallel=ParallelInfo.from_context(
+            parallel_context.to_dict(),
+            placement_fingerprint=placement.fingerprint,
+        ),
     )
     ArtifactStore(artifact_dir).initialize(
         manifest,
@@ -759,7 +780,14 @@ def run_subgraph_streaming_pipeline(
         replace_existing=not checkpoint_progress,
     )
     transaction_writer = (
-        StreamingCheckpointWriter(staging_dir, run_fingerprint=run_fingerprint)
+        StreamingCheckpointWriter(
+            staging_dir,
+            run_fingerprint=run_fingerprint,
+            coordinator=SingleParticipantCoordinator(
+                staging_dir,
+                run_fingerprint=run_fingerprint,
+            ),
+        )
         if checkpoint_progress
         else None
     )
@@ -1151,6 +1179,7 @@ def run_subgraph_streaming_pipeline(
                                                 target_index + 1, batch_index
                                             ),
                                             boundary=target_index + 1,
+                                            expected_batch_count=len(batches),
                                         )
                                 written.update(
                                     _write_loaded_target(

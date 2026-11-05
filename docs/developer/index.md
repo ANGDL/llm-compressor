@@ -33,3 +33,16 @@ LLM Compressor is an open-source project that values community contributions. We
     [:octicons-arrow-right-24: Governance](governance.md)
 
 </div>
+
+## Streaming PTQ implementation
+
+- [Transactional Streaming PTQ implementation plan](transactional-streaming-ptq-plan.md):
+  recovery correctness, bounded activation retention, resource budgets, and
+  extensions for GPTQ, MoE expert parallelism (EP), multimodal models, and
+  modifier integration.
+
+## MoE AWQ accuracy
+
+- [MoE AWQ imbalance diagnosis and remediation plan](moe-awq-imbalance-plan.md):
+  transform equivalence, router compensation, expert calibration, bounded scales,
+  and independent quality evaluation.

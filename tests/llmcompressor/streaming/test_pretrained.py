@@ -444,16 +444,10 @@ def test_deepseek_v4_preserves_input_ids_and_collects_all_experts(
     }
 
     assert (output / "FINALIZED").is_file()
-    assert not list(
-        (tmp_path / "work" / "artifacts" / "statistics").glob(
-            "target-*"
-        )
-    )
+    assert not (tmp_path / "work").exists()
     if checkpoint_progress:
-        assert (tmp_path / "work" / "staging").is_dir()
         assert list(output.glob("*.safetensors"))
     else:
-        assert not (tmp_path / "work" / "staging").exists()
         for index in range(2):
             assert (
                 output / f"model-subgraph-{index:05d}.safetensors"

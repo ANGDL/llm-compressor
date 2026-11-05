@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any, Mapping, TypeVar
 
-CURRENT_SCHEMA_VERSION = 1
+CURRENT_SCHEMA_VERSION = 2
 
 _T = TypeVar("_T")
 
@@ -145,6 +145,55 @@ class SoftwareInfo:
 
 
 @dataclass(frozen=True)
+class ExecutionInfo:
+    """Execution semantics that affect propagation and recovery."""
+
+    propagation_mode: str = "sequential-compatible"
+    boundary_schema: int = 1
+    implementation: str = "streaming-subgraph-v1"
+
+    def __post_init__(self) -> None:
+        if not self.propagation_mode:
+            raise ValueError("propagation_mode cannot be empty")
+        if self.boundary_schema <= 0:
+            raise ValueError("boundary_schema must be positive")
+        if not self.implementation:
+            raise ValueError("implementation cannot be empty")
+
+
+@dataclass(frozen=True)
+class ParallelInfo:
+    """Serializable topology and placement identity."""
+
+    context: tuple[tuple[str, int], ...] = ()
+    placement_fingerprint: str = ""
+
+    @classmethod
+    def from_context(
+        cls,
+        context: Mapping[str, int],
+        *,
+        placement_fingerprint: str = "",
+    ) -> ParallelInfo:
+        return cls(
+            context=tuple(
+                sorted(
+                    (str(name), int(value)) for name, value in context.items()
+                )
+            ),
+            placement_fingerprint=placement_fingerprint,
+        )
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> ParallelInfo:
+        data = dict(value)
+        data["context"] = tuple(
+            (str(name), int(number)) for name, number in data.get("context", ())
+        )
+        return _from_mapping(cls, data)
+
+
+@dataclass(frozen=True)
 class StreamingRunManifest:
     source: SourceCheckpointInfo
     recipe: RecipeInfo
@@ -152,6 +201,8 @@ class StreamingRunManifest:
     sequential: SequentialInfo
     materializer: MaterializerInfo
     software: SoftwareInfo
+    execution: ExecutionInfo = field(default_factory=ExecutionInfo)
+    parallel: ParallelInfo = field(default_factory=ParallelInfo)
     schema_version: int = CURRENT_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
@@ -172,7 +223,16 @@ class StreamingRunManifest:
     def from_dict(cls, value: Mapping[str, Any]) -> StreamingRunManifest:
         expected_fields = {field.name for field in fields(cls)}
         unknown = set(value) - expected_fields
-        missing = expected_fields - set(value)
+        required_fields = {
+            "source",
+            "recipe",
+            "calibration",
+            "sequential",
+            "materializer",
+            "software",
+            "schema_version",
+        }
+        missing = required_fields - set(value)
         if unknown:
             raise ValueError(
                 f"Unexpected fields for StreamingRunManifest: {sorted(unknown)}"
@@ -195,6 +255,8 @@ class StreamingRunManifest:
             sequential=SequentialInfo.from_dict(value["sequential"]),
             materializer=_from_mapping(MaterializerInfo, value["materializer"]),
             software=SoftwareInfo.from_dict(value["software"]),
+            execution=_from_mapping(ExecutionInfo, value.get("execution", {})),
+            parallel=ParallelInfo.from_dict(value.get("parallel", {})),
             schema_version=schema_version,
         )
 

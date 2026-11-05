@@ -507,6 +507,76 @@ modifiers or execute any target. It validates every completed shard under
 `work_dir/publish` against that run identity, writes any still-missing static
 model tensors, and then publishes the checkpoint.
 
+### Shared calibration data helpers
+
+Streaming examples use the public helpers in `llmcompressor.datasets` to load
+calibration sources and build image/text conversations:
+
+```python
+from llmcompressor.datasets import (
+    build_calibration_messages,
+    load_calibration_datasets,
+)
+
+dataset, text_examples = load_calibration_datasets(
+    sources=["lmms-lab/flickr30k"],
+    split="test",
+    text_sources=["HuggingFaceH4/ultrachat_200k", "/data/custom.jsonl"],
+    text_split="train_sft",
+    samples=32,
+    text_samples=16,
+    seed=42,
+)
+
+messages = build_calibration_messages(
+    dataset[0],
+    text_examples[0] if text_examples else None,
+    image_format="image",
+)
+```
+
+`load_calibration_source(source, split, samples)` preserves the original source
+schema. Local JSON/JSONL files use the JSON builder's `train` split; Hub datasets
+and local dataset directories use the requested split.
+
+`load_calibration_dataset(sources, split, samples, seed=42)` divides the total
+sample budget across sources, assigning any remainder to the first sources.
+Each source is sliced before shuffling, matching the examples' existing sampling
+order. Text sources with `messages` or `text` are normalized to one chat schema,
+so differing metadata and JSON/Arrow message representations can be combined.
+Image and pretokenized sources keep their original features; concatenated sources
+must have compatible columns and feature types. A `preprocess=` callback can
+override normalization with a model-specific encoder, as DeepSeek V4 does.
+Pretokenized sources bypass this callback.
+
+`load_calibration_datasets(...)` applies this loader independently to primary
+and supplementary text sources, allowing different splits and sample budgets.
+Supplementary text is returned separately for cyclic pairing with image rows;
+it does not add primary calibration batches. Setting `text_samples=0` skips
+loading supplementary text.
+
+`build_calibration_messages(...)` handles image/caption and text-only records.
+The `image_format` argument selects the processor's expected content block:
+
+| Format | Image block | Example consumer |
+| --- | --- | --- |
+| `"image"` | `{"type": "image", "image": original_image}` | Kimi K3 |
+| `"url"` | `{"type": "image", "url": png_data_url}` | GLM-5.3 |
+| `"image_url"` | `{"type": "image_url", "image_url": {"url": png_data_url}}` | DeepSeek V4.1 |
+| `"image_url_flat"` | `{"type": "image", "image_url": png_data_url}` | Kimi K2.5/K2.6 |
+
+`format_calibration_text`, `normalize_text_content`, and `image_to_data_url`
+are also public for custom adapters. PNG conversion accepts PIL images and
+datasets image records containing bytes or paths. Model-specific tokenization,
+image resizing, patch extraction, sequence truncation, and collation remain in
+the respective processor or example.
+
+The GLM-5.3, Kimi K2.5/K2.6 WNa8, and Qwen3.5 MoE iMatrix RTN examples in
+`examples/multimodal_vision` use the same helpers for image/text calibration.
+`load_calibration_datasets(..., text_preprocess=...)` allows a model-specific
+policy for supplementary text. Qwen uses it to trim whitespace and map
+unsupported or missing chat roles to `user` before cyclic pairing.
+
 ## Tracing and boundaries
 
 The pretrained entry point builds a meta model and traces ordered sequential
@@ -762,8 +832,10 @@ The normal path uses `checkpoint_progress=False`:
 - finalization adds the index, config, recipe, and auxiliary files;
 - `work_dir/publish` is renamed to `output_dir` on the same filesystem;
 - after successful publication, framework-owned `artifacts`, `boundaries`,
-  `publish`, and `staging` entries are removed. The work root is removed only
-  when empty, so unrelated caller files are preserved.
+  `publish`, and `staging` entries are removed. The same successful-publication
+  cleanup applies to checkpoint-progress mode and the low-level boundary API.
+  The work root is removed only when empty, so unrelated caller files are
+  preserved.
 
 `checkpoint_progress=True` persists target transactions and boundary snapshots
 for crash recovery. It has higher disk and I/O cost and must remain opt-in. CPU
@@ -788,7 +860,8 @@ completed run.
 Any failure before or during publication retains the work directory for
 diagnosis and `finalize_only` recovery. A successful `finalize_only` retry uses
 the same cleanup rule as a successful normal run. Recovery mode with
-`checkpoint_progress=True` keeps its explicit durable progress state.
+`checkpoint_progress=True` retains durable progress until publication succeeds,
+then removes the temporary artifacts and the empty work directory.
 
 `pack_to_int8=True` packs W4A8 `int-quantized` weights before every writer path.
 No unpacked INT4 checkpoint may be written as an intermediate normal-run output.

@@ -46,7 +46,10 @@ from PIL import Image, ImageOps
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 
-from datasets import Dataset, concatenate_datasets, load_dataset
+from llmcompressor.datasets import (
+    build_calibration_messages,
+    load_calibration_datasets,
+)
 from llmcompressor.modeling.deepseekv41 import (
     DeepseekV41NativeForCausalLM,
     ModelConfig,
@@ -127,84 +130,6 @@ def _schemes(
     return groups, ignores
 
 
-def _is_local_json(value: str) -> bool:
-    path = Path(value).expanduser()
-    return path.is_file() or path.suffix.lower() in {".json", ".jsonl"}
-
-
-def _load_source(source: str, split: str, samples: int) -> Dataset:
-    if _is_local_json(source):
-        dataset = load_dataset("json", data_files=source, split=f"train[:{samples}]")
-    else:
-        dataset = load_dataset(source, split=f"{split}[:{samples}]")
-    if "image" not in dataset.column_names and "input_ids" not in dataset.column_names:
-        return Dataset.from_list(
-            [{"messages": _format_text_example(row)} for row in dataset]
-        )
-    return dataset
-
-
-def load_calibration_datasets(
-    sources: list[str],
-    split: str,
-    text_sources: list[str],
-    text_split: str,
-    samples: int,
-    text_samples: int,
-    seed: int,
-) -> tuple[Dataset, list[dict[str, Any]]]:
-    """Load multimodal and text calibration data from independent splits."""
-    if not sources:
-        raise ValueError("At least one multimodal calibration dataset is required")
-    if samples < len(sources):
-        raise ValueError(
-            "num-calibration-samples must be at least the number of multimodal "
-            f"dataset sources ({samples} < {len(sources)})"
-        )
-
-    base, remainder = divmod(samples, len(sources))
-    parts = []
-    for index, source in enumerate(sources):
-        count = base + (index < remainder)
-        parts.append(_load_source(source, split, count).shuffle(seed=seed))
-    if len(parts) == 1:
-        multimodal = parts[0]
-    else:
-        columns = [tuple(part.column_names) for part in parts]
-        if any(value != columns[0] for value in columns[1:]):
-            raise ValueError(
-                f"Multimodal calibration sources have different columns: {columns}"
-            )
-        multimodal = concatenate_datasets(parts)
-
-    if text_samples == 0:
-        return multimodal, []
-    if not text_sources:
-        raise ValueError(
-            "--text-calibration-samples is nonzero but --text-dataset-id is empty"
-        )
-    if text_samples < len(text_sources):
-        raise ValueError(
-            "text-calibration-samples must be at least the number of text "
-            f"dataset sources ({text_samples} < {len(text_sources)})"
-        )
-    base, remainder = divmod(text_samples, len(text_sources))
-    text_parts = []
-    for index, source in enumerate(text_sources):
-        count = base + (index < remainder)
-        text_parts.append(_load_source(source, text_split, count).shuffle(seed=seed))
-    if len(text_parts) == 1:
-        text_dataset = text_parts[0]
-    else:
-        columns = [tuple(part.column_names) for part in text_parts]
-        if any(value != columns[0] for value in columns[1:]):
-            raise ValueError(
-                f"Text calibration sources have different columns: {columns}"
-            )
-        text_dataset = concatenate_datasets(text_parts)
-    return multimodal, list(text_dataset)
-
-
 def _load_encoding(model_id: Path):
     encoding_path = model_id / "encoding" / "encoding.py"
     if not encoding_path.is_file():
@@ -229,106 +154,15 @@ def _load_image_processor(model_id: Path):
     return module
 
 
-def _caption_text(example: dict[str, Any]) -> str:
-    caption = example.get("caption", "")
-    if isinstance(caption, (list, tuple)):
-        caption = caption[0] if caption else ""
-    return str(caption)
-
-
-def _image_as_data_url(image: Any) -> str:
-    if isinstance(image, dict):
-        if image.get("bytes") is not None:
-            image = Image.open(io.BytesIO(image["bytes"]))
-        elif image.get("path"):
-            image = Image.open(image["path"])
-        else:
-            raise ValueError("Image records must contain bytes or path")
-    if not hasattr(image, "save"):
-        raise TypeError(f"Unsupported calibration image type: {type(image)!r}")
-    buffered = io.BytesIO()
-    image.convert("RGB").save(buffered, format="PNG")
-    encoded = base64.b64encode(buffered.getvalue()).decode("utf-8")
-    return f"data:image/png;base64,{encoded}"
-
-
-def _normalize_text_content(content: Any) -> list[dict[str, str]]:
-    if isinstance(content, str):
-        return [{"type": "text", "text": content}]
-    if isinstance(content, dict):
-        content = [content]
-    normalized = []
-    if not isinstance(content, (list, tuple)):
-        return normalized
-    for item in content:
-        if isinstance(item, str):
-            normalized.append({"type": "text", "text": item})
-        elif isinstance(item, dict):
-            if item.get("type") == "text":
-                normalized.append({"type": "text", "text": str(item.get("text", ""))})
-            elif "text" in item:
-                normalized.append({"type": "text", "text": str(item["text"])})
-    return normalized
-
-
-def _format_text_example(example: dict[str, Any]) -> list[dict[str, Any]]:
-    messages = example.get("messages")
-    if messages is None:
-        text = example.get("text")
-        if text is None:
-            raise ValueError("Text calibration records must contain messages or text")
-        return [{"role": "user", "content": [{"type": "text", "text": str(text)}]}]
-
-    formatted = []
-    for message in messages:
-        if not isinstance(message, dict) or "role" not in message:
-            continue
-        content = _normalize_text_content(message.get("content", ""))
-        if content:
-            formatted.append({"role": message["role"], "content": content})
-    if not formatted:
-        raise ValueError("Text calibration example contains no usable messages")
-    return formatted
-
-
-def _multimodal_messages(example: dict[str, Any]) -> list[dict[str, Any]]:
-    if "image" not in example or example["image"] is None:
-        raise ValueError("Multimodal calibration examples must contain an image")
-    return [
-        {
-            "role": "user",
-            "content": [
-                {
-                    "type": "image_url",
-                    "image_url": {"url": _image_as_data_url(example["image"])},
-                },
-                {"type": "text", "text": "What does the image show?"},
-            ],
-        },
-        {
-            "role": "assistant",
-            "content": [{"type": "text", "text": _caption_text(example)}],
-        },
-    ]
-
-
 def _build_calibration_messages(
     example: dict[str, Any],
     text_example: dict[str, Any] | None,
 ) -> tuple[list[dict[str, Any]], bool]:
-    if "image" in example and example["image"] is not None:
-        messages = _multimodal_messages(example)
-        if text_example is not None:
-            messages.extend(_format_text_example(text_example))
-        return messages, True
     if "input_ids" in example:
         return [example], False
-    if "messages" in example:
-        return _format_text_example(example), False
-    if "text" in example:
-        return _format_text_example(example), False
-    raise ValueError(
-        "Calibration examples must contain image, messages, text, or input_ids"
+    return (
+        build_calibration_messages(example, text_example, image_format="image_url"),
+        example.get("image") is not None,
     )
 
 

@@ -41,7 +41,10 @@ from transformers import (
     AutoProcessor,
 )
 
-from datasets import load_dataset
+from llmcompressor.datasets import (
+    build_calibration_messages,
+    load_calibration_datasets,
+)
 from llmcompressor.modeling.glm5_next import attach_mtp_layer
 from llmcompressor.modifiers.quantization import QuantizationModifier
 from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
@@ -55,136 +58,6 @@ def positive_int(value: str) -> int:
     return parsed
 
 
-def _is_local_json(value: str) -> bool:
-    path = Path(value).expanduser()
-    return path.is_file() or path.suffix.lower() in {".json", ".jsonl"}
-
-
-def _load_dataset(source: str, split: str, samples: int):
-    if _is_local_json(source):
-        return load_dataset("json", data_files=source, split=f"train[:{samples}]")
-    return load_dataset(source, split=f"{split}[:{samples}]")
-
-
-def load_calibration_dataset(
-    sources: list[str], split: str, samples: int, seed: int
-):
-    if samples < len(sources):
-        raise ValueError(
-            "num-calibration-samples must be at least the number of dataset sources"
-        )
-    base, remainder = divmod(samples, len(sources))
-    parts = []
-    for index, source in enumerate(sources):
-        count = base + (index < remainder)
-        part = _load_dataset(source, split, count).shuffle(seed=seed)
-        parts.append(part)
-    if len(parts) == 1:
-        return parts[0]
-    from datasets import concatenate_datasets
-
-    columns = [tuple(part.column_names) for part in parts]
-    if any(value != columns[0] for value in columns[1:]):
-        raise ValueError(f"Calibration sources have different columns: {columns}")
-    return concatenate_datasets(parts)
-
-
-def _caption_text(example: dict[str, Any]) -> str:
-    caption = example.get("caption", "")
-    if isinstance(caption, (list, tuple)):
-        caption = caption[0] if caption else ""
-    return str(caption)
-
-
-def _image_as_data_url(image: Any) -> str:
-    import base64
-    from io import BytesIO
-
-    buffered = BytesIO()
-    if hasattr(image, "convert"):
-        image = image.convert("RGB")
-    image.save(buffered, format="PNG")
-    encoded_image = base64.b64encode(buffered.getvalue()).decode("utf-8")
-    return f"data:image/png;base64,{encoded_image}"
-
-
-def _multimodal_messages(example: dict[str, Any]) -> list[dict[str, Any]]:
-    return [
-        {
-            "role": "user",
-            "content": [
-                {"type": "image", "url": _image_as_data_url(example["image"])},
-                {"type": "text", "text": "What does the image show?"},
-            ],
-        },
-        {
-            "role": "assistant",
-            "content": [{"type": "text", "text": _caption_text(example)}],
-        },
-    ]
-
-
-def _normalize_text_content(content: Any) -> list[dict[str, str]]:
-    if isinstance(content, str):
-        return [{"type": "text", "text": content}]
-    if isinstance(content, dict):
-        content = [content]
-
-    normalized = []
-    if not isinstance(content, (list, tuple)):
-        return normalized
-    for item in content:
-        if isinstance(item, str):
-            normalized.append({"type": "text", "text": item})
-        elif isinstance(item, dict):
-            if item.get("type") == "text":
-                normalized.append({"type": "text", "text": str(item.get("text", ""))})
-            elif "text" in item:
-                normalized.append({"type": "text", "text": str(item["text"])})
-    return normalized
-
-
-def _format_text_example(example: dict[str, Any]) -> list[dict[str, Any]]:
-    messages = example.get("messages")
-    if messages is None:
-        text = example.get("text")
-        if text is None:
-            raise ValueError("Text calibration records must contain messages or text")
-        return [{"role": "user", "content": [{"type": "text", "text": str(text)}]}]
-
-    formatted = []
-    for message in messages:
-        if not isinstance(message, dict) or "role" not in message:
-            continue
-        formatted.append(
-            {
-                "role": message["role"],
-                "content": _normalize_text_content(message.get("content", "")),
-            }
-        )
-    return formatted
-
-
-def _build_calibration_messages(
-    example: dict[str, Any], text_example: dict[str, Any] | None
-) -> list[dict[str, Any]]:
-    if "image" in example and example["image"] is not None:
-        messages = _multimodal_messages(example)
-    elif "messages" in example:
-        messages = _format_text_example(example)
-    elif "text" in example:
-        messages = _format_text_example(example)
-    elif "input_ids" in example:
-        return example
-    else:
-        raise ValueError(
-            "Calibration examples must contain image, messages, text, or input_ids"
-        )
-    if text_example is not None and "image" in example:
-        messages.extend(_format_text_example(text_example))
-    return messages
-
-
 def preprocess_calibration(
     example: dict[str, Any],
     index: int,
@@ -195,9 +68,10 @@ def preprocess_calibration(
 ) -> dict[str, Any]:
     if "input_ids" in example:
         return example
-    messages = _build_calibration_messages(
+    messages = build_calibration_messages(
         example,
         text_examples[index % len(text_examples)] if text_examples else None,
+        image_format="url",
     )
     if "image" in example and example["image"] is not None:
         return dict(
@@ -331,21 +205,15 @@ def main() -> None:
         local_files_only=True,
     )
     tokenizer = processor.tokenizer
-    dataset = load_calibration_dataset(
+    dataset, text_examples = load_calibration_datasets(
         args.dataset_id,
         args.dataset_split,
+        args.text_dataset_id,
+        args.text_dataset_split,
         args.num_calibration_samples,
+        args.text_calibration_samples if args.text_dataset_id else 0,
         args.seed,
     )
-    text_examples = []
-    if args.text_dataset_id and args.text_calibration_samples:
-        text_dataset = load_calibration_dataset(
-            [args.text_dataset_id],
-            args.text_dataset_split,
-            args.text_calibration_samples,
-            args.seed,
-        )
-        text_examples = list(text_dataset)
     dataset = dataset.map(
         preprocess_calibration,
         with_indices=True,

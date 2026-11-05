@@ -56,7 +56,10 @@ from compressed_tensors.quantization.quant_args import (
 from torch.utils.data import DataLoader
 from transformers import AutoProcessor
 
-from datasets import Dataset, load_dataset
+from llmcompressor.datasets import (
+    build_calibration_messages,
+    load_calibration_datasets,
+)
 from llmcompressor.modeling.kimi_k3 import (
     KimiK3Config,
     KimiK3ForConditionalGeneration,
@@ -115,115 +118,6 @@ def non_negative_int(value: str) -> int:
     return parsed
 
 
-def _is_local_json(path: str) -> bool:
-    candidate = Path(path).expanduser()
-    return candidate.is_file() or candidate.suffix.lower() in {".json", ".jsonl"}
-
-
-def _load_source(source_id: str, split: str, samples: int) -> Dataset:
-    if _is_local_json(source_id):
-        return load_dataset("json", data_files=source_id, split=f"train[:{samples}]")
-    return load_dataset(source_id, split=f"{split}[:{samples}]")
-
-
-def load_calibration_datasets(
-    dataset_id: str,
-    dataset_split: str,
-    text_dataset_id: str | None,
-    text_dataset_split: str,
-    num_calibration_samples: int,
-    text_calibration_samples: int,
-    seed: int = 42,
-) -> tuple[Dataset, list[dict[str, Any]]]:
-    """Load multimodal and text calibration data from independent splits."""
-    multimodal_dataset = _load_source(
-        dataset_id,
-        dataset_split,
-        num_calibration_samples,
-    ).shuffle(seed=seed)
-
-    if text_dataset_id is None or text_calibration_samples == 0:
-        return multimodal_dataset, []
-
-    text_dataset = _load_source(
-        text_dataset_id,
-        text_dataset_split,
-        text_calibration_samples,
-    ).shuffle(seed=seed)
-    return multimodal_dataset, list(text_dataset)
-
-
-def _normalize_text_content(content: Any) -> list[dict[str, str]]:
-    if isinstance(content, str):
-        return [{"type": "text", "text": content}]
-    if isinstance(content, dict):
-        content = [content]
-
-    normalized = []
-    for item in content if isinstance(content, list) else []:
-        if isinstance(item, str):
-            normalized.append({"type": "text", "text": item})
-        elif isinstance(item, dict):
-            text = item.get("text")
-            if text is None and item.get("type") == "reasoning":
-                text = item.get("reasoning")
-            if isinstance(text, str):
-                normalized.append({"type": "text", "text": text})
-    return normalized
-
-
-def _format_text_example(example: dict[str, Any]) -> list[dict[str, Any]]:
-    if "messages" not in example:
-        if isinstance(example.get("text"), str):
-            return [
-                {
-                    "role": "user",
-                    "content": [{"type": "text", "text": example["text"]}],
-                }
-            ]
-        raise ValueError("Text calibration examples must contain 'messages' or 'text'")
-
-    messages = []
-    for message in example["messages"]:
-        if not isinstance(message, dict) or "role" not in message:
-            raise ValueError("Text calibration messages must contain a role")
-        content = _normalize_text_content(message.get("content", ""))
-        if content:
-            messages.append({"role": message["role"], "content": content})
-    if not messages:
-        raise ValueError("Text calibration example contains no usable messages")
-    return messages
-
-
-def _build_multimodal_messages(example: dict[str, Any]) -> list[dict[str, Any]]:
-    if "image" not in example or "caption" not in example:
-        raise ValueError(
-            "Multimodal calibration examples must contain 'image' and 'caption'"
-        )
-    caption = example["caption"]
-    if isinstance(caption, (list, tuple)):
-        if not caption:
-            raise ValueError("Multimodal calibration example has an empty caption")
-        caption = caption[0]
-    if not isinstance(caption, str):
-        raise ValueError("Multimodal calibration caption must be a string")
-
-    return [
-        {
-            "role": "user",
-            "content": [
-                # K3 expects image data under the key matching the content type.
-                {"type": "image", "image": example["image"]},
-                {"type": "text", "text": "What does the image show?"},
-            ],
-        },
-        {
-            "role": "assistant",
-            "content": [{"type": "text", "text": caption}],
-        },
-    ]
-
-
 def _preprocess_multimodal_example(
     example: dict[str, Any],
     index: int,
@@ -232,9 +126,11 @@ def _preprocess_multimodal_example(
     text_examples: list[dict[str, Any]],
     max_sequence_length: int,
 ) -> dict[str, Any]:
-    messages = _build_multimodal_messages(example)
-    if text_examples:
-        messages.extend(_format_text_example(text_examples[index % len(text_examples)]))
+    messages = build_calibration_messages(
+        example,
+        text_examples[index % len(text_examples)] if text_examples else None,
+        image_format="image",
+    )
     return processor(
         messages=messages,
         padding=False,
@@ -502,7 +398,7 @@ def main() -> None:
         args.text_dataset_id,
         args.text_dataset_split,
         args.num_calibration_samples,
-        args.text_calibration_samples,
+        args.text_calibration_samples if args.text_dataset_id else 0,
     )
     dataset = multimodal_dataset.map(
         partial(

@@ -32,8 +32,9 @@ from llmcompressor.modifiers.quantization import QuantizationModifier
 from llmcompressor.recipe import Recipe
 from llmcompressor.utils.pytorch.module import infer_sequential_targets
 
-from ._logging import streaming_logger
+from ._cleanup import cleanup_successful_work_dir as _cleanup_successful_work_dir
 from .artifacts import fingerprint_json
+from .checkpoint import with_work_directory_lock
 from .finalize import finalize_streaming_checkpoint
 from .loading import build_meta_model
 from .materialization import (
@@ -51,9 +52,6 @@ from .pipeline import (
 from .tracing import trace_streaming_boundaries
 
 __all__ = ["streaming_oneshot_from_pretrained"]
-
-_OWNED_WORK_DIR_ENTRIES = ("artifacts", "boundaries", "publish", "staging")
-
 
 def _recipe_quantizer(recipe: Recipe):
     if any(
@@ -161,27 +159,6 @@ def _quantized_sequential_targets(
     return tuple(selected)
 
 
-def _cleanup_successful_work_dir(work: Path) -> None:
-    """Remove framework-owned recovery data after a successful publication."""
-    for name in _OWNED_WORK_DIR_ENTRIES:
-        path = work / name
-        try:
-            if path.is_symlink() or path.is_file():
-                path.unlink()
-            elif path.is_dir():
-                shutil.rmtree(path)
-        except OSError as error:
-            streaming_logger.warning(
-                "finalize | work cleanup incomplete | "
-                f"path={path} | error={error}"
-            )
-    try:
-        work.rmdir()
-    except OSError:
-        # Preserve the root when it contains files not owned by streaming PTQ.
-        pass
-
-
 def _dataset_fingerprint(
     dataset: Any,
     *,
@@ -229,6 +206,7 @@ def _prepare_messages_dataset(dataset: Any, tokenizer: Any) -> Any:
     )
 
 
+@with_work_directory_lock
 def streaming_oneshot_from_pretrained(
     *,
     model: str | Path,
@@ -276,6 +254,12 @@ def streaming_oneshot_from_pretrained(
         raise ValueError(
             "output_dir must not be inside work_dir; use sibling directories"
         )
+    resolved_checkpoint = checkpoint.resolve()
+    if (
+        resolved_work.is_relative_to(resolved_checkpoint)
+        or resolved_checkpoint.is_relative_to(resolved_work)
+    ):
+        raise ValueError("work_dir and checkpoint must use separate directories")
     output.parent.mkdir(parents=True, exist_ok=True)
     if (
         output.exists()
@@ -489,6 +473,5 @@ def streaming_oneshot_from_pretrained(
             recipe_yaml=parsed_recipe.yaml(),
             expected_run_fingerprint=run_fingerprint,
         )
-        if not checkpoint_progress:
-            _cleanup_successful_work_dir(work)
+        _cleanup_successful_work_dir(work)
         return result
