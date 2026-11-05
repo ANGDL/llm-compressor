@@ -237,3 +237,30 @@ def test_boundary_compaction_records_legal_retirement(tmp_path):
     assert stats.boundary_count == 2
     assert stats.payload_bytes > 0
     assert stats.boundary_bytes > 0
+
+
+@pytest.mark.parametrize("depth", [8, 32, 128])
+def test_resume_scan_stats_scale_linearly_with_subgraph_depth(tmp_path, depth):
+    root = tmp_path / f"depth-{depth}"
+    writer = StreamingCheckpointWriter(root, run_fingerprint="run-a")
+    for index in range(depth):
+        with writer.transaction(f"subgraph-{index:05d}") as transaction:
+            transaction.write_tensor(
+                f"weight-{index}",
+                torch.ones(2),
+                output_shard="model.safetensors",
+            )
+            transaction.write_boundary(
+                0,
+                {"hidden": torch.full((2,), index)},
+                boundary=index + 1,
+            )
+            transaction.commit()
+
+    plan = build_resume_plan(writer)
+
+    assert plan.scan_stats.transaction_count == depth
+    assert plan.scan_stats.payload_count == depth
+    assert plan.scan_stats.boundary_count == depth
+    assert plan.scan_stats.payload_bytes > depth
+    assert plan.scan_stats.boundary_bytes > depth
