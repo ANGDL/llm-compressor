@@ -8,7 +8,9 @@ Example:
         --text-calibration-samples 128 \
         --quant-mode wna8 --output-dir /path/to/DeepSeek-V4.1-Flash-WNa8
 
-The primary calibration dataset is multimodal. Each image row is converted
+The primary calibration dataset accepts image rows or text conversations.
+Text sources are normalized before mixing datasets with different metadata.
+Each image row is converted
 using the DeepSeek-V4.1 image preprocessing contract into ViT patches and
 image-span metadata. Optional text rows are appended to the same prompt so
 every calibration batch exercises the vision tower, aligner, text backbone and
@@ -132,8 +134,14 @@ def _is_local_json(value: str) -> bool:
 
 def _load_source(source: str, split: str, samples: int) -> Dataset:
     if _is_local_json(source):
-        return load_dataset("json", data_files=source, split=f"train[:{samples}]")
-    return load_dataset(source, split=f"{split}[:{samples}]")
+        dataset = load_dataset("json", data_files=source, split=f"train[:{samples}]")
+    else:
+        dataset = load_dataset(source, split=f"{split}[:{samples}]")
+    if "image" not in dataset.column_names and "input_ids" not in dataset.column_names:
+        return Dataset.from_list(
+            [{"messages": _format_text_example(row)} for row in dataset]
+        )
+    return dataset
 
 
 def load_calibration_datasets(
