@@ -152,6 +152,7 @@ class ExecutionInfo:
     boundary_schema: int = 1
     implementation: str = "streaming-subgraph-v1"
     modifier_contract_sha256: str = ""
+    execution_graph_sha256: str = ""
 
     def __post_init__(self) -> None:
         if not self.propagation_mode:
@@ -164,6 +165,11 @@ class ExecutionInfo:
             _require_sha256(
                 self.modifier_contract_sha256,
                 "modifier_contract_sha256",
+            )
+        if self.execution_graph_sha256:
+            _require_sha256(
+                self.execution_graph_sha256,
+                "execution_graph_sha256",
             )
 
 

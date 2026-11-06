@@ -7,7 +7,7 @@ from pathlib import Path
 
 from ._logging import streaming_logger
 
-_OWNED_WORK_DIR_ENTRIES = ("artifacts", "boundaries", "publish", "staging")
+_OWNED_WORK_DIR_ENTRIES = ("artifacts", "boundaries", "inputs", "publish", "staging")
 
 
 def cleanup_successful_work_dir(work: Path) -> None:

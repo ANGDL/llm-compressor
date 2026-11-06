@@ -413,13 +413,40 @@ class TransformersWeightMaterializer(WeightMaterializer):
         group = self._groups.get(tensor_name)
         if group is not None and group.transformed:
             return tuple(source.name for source in group.sources)
+        auxiliary = self._renamed_auxiliary_output_name(tensor_name)
+        if auxiliary is not None:
+            return (auxiliary,)
         return (self.materializer.output_tensor_name(tensor_name),)
+
+    def _renamed_auxiliary_output_name(self, tensor_name: str) -> str | None:
+        if tensor_name in self._groups:
+            return None
+        owner, separator, attribute = tensor_name.rpartition(".")
+        if not separator:
+            return None
+        weight = self._groups.get(f"{owner}.weight")
+        if weight is None or not weight.transformed:
+            return None
+        if weight.converter is not None or len(weight.sources) != 1:
+            raise NotImplementedError(
+                "Quantized auxiliary tensors require a pure checkpoint renaming: "
+                f"{tensor_name!r}"
+            )
+        source_name = weight.sources[0].name
+        if not source_name.endswith(".weight"):
+            raise ValueError(
+                f"Quantized source name must end in '.weight': {source_name!r}"
+            )
+        return f"{source_name.removesuffix('.weight')}.{attribute}"
 
     def prepare_output_tensors(
         self, tensor_name: str, tensor: torch.Tensor
     ) -> Mapping[str, torch.Tensor]:
         group = self._groups.get(tensor_name)
         if group is None or not group.transformed:
+            auxiliary = self._renamed_auxiliary_output_name(tensor_name)
+            if auxiliary is not None:
+                return {auxiliary: tensor}
             return self.materializer.prepare_output_tensors(tensor_name, tensor)
         if group.converter is None:
             if len(group.sources) != 1:

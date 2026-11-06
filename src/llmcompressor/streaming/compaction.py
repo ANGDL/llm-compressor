@@ -41,7 +41,10 @@ class BoundaryCompactor:
         subgraphs = [
             transaction_id
             for transaction_id in transaction_ids
-            if transaction_id.startswith("subgraph-")
+            if (
+                transaction_id.startswith("subgraph-")
+                or transaction_id == "prefix-00000"
+            )
         ]
         if len(subgraphs) <= self.keep_recent:
             return ()
@@ -132,6 +135,8 @@ class BoundaryCompactor:
 
 
 def _next_subgraph_id(transaction_id: str) -> str:
+    if transaction_id == "prefix-00000":
+        return "subgraph-00000"
     prefix, _, suffix = transaction_id.rpartition("-")
     if prefix != "subgraph" or not suffix.isdigit():
         raise ValueError(f"Invalid subgraph transaction id {transaction_id!r}")

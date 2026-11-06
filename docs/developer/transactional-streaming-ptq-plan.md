@@ -651,6 +651,12 @@ SpinQuant/QuIP 的下一阶段规划保留为独立变换适配器，不直接�
 - 变长图像 token、分辨率和输入组合纳入计划适用范围；
 - 动态分支超出已验证执行计划时拒绝，不宣称任意模型自动可追踪。
 
+2026-11-06 实施进度：已接入通用执行描述、完整校准输入/processor 摘要、
+独立 prefix 事务恢复及回收、显式外部工作集合并。新增标准 Transformers
+LLaVA decoder-only 导出/重载与通用 text/image/audio + MTP/跨层状态回归；
+没有新增模型特化。接口、验收矩阵与动态分支限制见
+[多分支执行与局部候选比较](streaming-execution-candidates.md)。
+
 ### E7：校准统计复用与候选分支
 
 优先级：P2，用于减少同一前缀下重复试验。
@@ -665,6 +671,14 @@ observer 搜索所需额外输入、全局 scale、路由信息仍需各自满�
 
 首个应用是在固定 boundary 的当前子图比较少量候选，不跨候选混用下游状态。
 候选评分与最终独立质量评测分离。
+
+2026-11-06 实施进度：新增 `CandidateStatisticsCache` 与
+`evaluate_streaming_candidates()`，在单个固定 target 比较最多八个 weight-only
+GPTQ 或 RTN/iMatrix 候选，逐候选重新加载原始权重，输出局部 MSE 报告。
+缓存包含输入/原始权重/计数/变换/dtype/实现身份，具备容量限制与原子提交；
+低层 reference collect 也可显式接入。没有在 pretrained 主循环中隐式保存
+全模型 H。使用方法与评分边界见
+[多分支执行与局部候选比较](streaming-execution-candidates.md)。
 
 ### E8：KV cache、结构剪枝和其他分布式扩展
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Generator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import chain
 from typing import Any, Iterator
 
@@ -24,6 +24,12 @@ from llmcompressor.utils.helpers import (
 )
 
 from .checkpoint import CheckpointWeightSource
+from .execution import (
+    StreamingExecutionDescriptor,
+    describe_streaming_execution,
+    fingerprint_execution_graph,
+    streaming_input_contract,
+)
 from .loading import SubgraphWeightSession, TargetWeightLoader
 from .materialization import StreamingDTypePolicy, WeightMaterializer
 
@@ -117,6 +123,8 @@ class TracedBoundaryAdapter:
     _target_subgraphs: tuple[Subgraph, ...]
     _prefix_runtime_modules: tuple[str, ...] | None = None
     _prefix_runtime_parameters: tuple[str, ...] | None = None
+    execution: StreamingExecutionDescriptor | None = None
+    input_contract: Any = None
 
     @property
     def targets(self) -> tuple[str, ...]:
@@ -156,16 +164,9 @@ class TracedBoundaryAdapter:
                     device=self.device,
                     dtype=self.dtype,
                     include_modules=self._prefix_runtime_modules,
+                    include_parameters=self._prefix_runtime_parameters or (),
                 )
             )
-            if self._prefix_runtime_parameters:
-                stack.enter_context(
-                    self.weight_session.loaded_parameters(
-                        self._prefix_runtime_parameters,
-                        device=self.device,
-                        dtype=self.dtype,
-                    )
-                )
             with (
                 torch.no_grad(),
                 disable_cache(self.model),
@@ -176,6 +177,13 @@ class TracedBoundaryAdapter:
                     if not isinstance(batch, Mapping):
                         raise TypeError(
                             "Traced streaming calibration batches must be mappings"
+                        )
+                    if (
+                        self.input_contract is not None
+                        and streaming_input_contract(batch) != self.input_contract
+                    ):
+                        raise ValueError(
+                            "Calibration inputs differ from the traced input contract"
                         )
                     values = _move_tensors(dict(batch), self.device)
                     inputs = {name: values[name] for name in prefix.input_names}
@@ -189,7 +197,7 @@ class TracedBoundaryAdapter:
         if not isinstance(sample_batch, Mapping):
             raise TypeError("Traced streaming calibration batches must be mappings")
         candidates = self._prefix_dependency_candidates()
-        discovered = []
+        discovered = list(self._execution_dependencies("prefix")[0])
         values = _move_tensors(dict(sample_batch), self.device)
         inputs = {name: values[name] for name in prefix.input_names}
 
@@ -208,16 +216,9 @@ class TracedBoundaryAdapter:
                             device=self.device,
                             dtype=self.dtype,
                             include_modules=discovered,
+                            include_parameters=self._prefix_runtime_parameters or (),
                         )
                     )
-                    if self._prefix_runtime_parameters:
-                        stack.enter_context(
-                            self.weight_session.loaded_parameters(
-                                self._prefix_runtime_parameters,
-                                device=self.device,
-                                dtype=self.dtype,
-                            )
-                        )
                     try:
                         with self._detect_prefix_dependency_calls(pending):
                             prefix.forward(self.model, **inputs)
@@ -237,14 +238,13 @@ class TracedBoundaryAdapter:
             "streaming_runtime_parameter_dependencies",
             None,
         )
-        if hook is None:
-            return ()
-        dependencies = hook(stage)
+        dependencies = hook(stage) if callable(hook) else ()
         if dependencies is None:
-            return ()
+            dependencies = ()
         if isinstance(dependencies, str):
             dependencies = (dependencies,)
-        result = tuple(dict.fromkeys(str(name) for name in dependencies))
+        declared = self._execution_dependencies(stage)[1]
+        result = tuple(dict.fromkeys((*map(str, dependencies), *declared)))
         for name in result:
             owner_name, separator, local_name = name.rpartition(".")
             if not separator:
@@ -256,6 +256,45 @@ class TracedBoundaryAdapter:
                     "does not name a direct parameter"
                 )
         return result
+
+    def _execution_dependencies(self, stage):
+        modules, parameters = [], []
+        if self.execution is not None:
+            for name, module_names, parameter_names in (
+                self.execution.runtime_dependencies
+            ):
+                if name == stage:
+                    modules.extend(module_names)
+                    parameters.extend(parameter_names)
+        return tuple(dict.fromkeys(modules)), tuple(dict.fromkeys(parameters))
+
+    def plan_target(self, index):
+        name = self.targets[index]
+        modules, _parameters = self._execution_dependencies(name)
+        parameters = self._declared_runtime_parameters(name)
+        for dependency in (*modules, *parameters):
+            if any(
+                target != name
+                and (dependency == target or dependency.startswith(target + "."))
+                for target in self.targets
+            ):
+                raise ValueError(
+                    "Runtime dependencies on another quantized target require "
+                    "an explicit propagated boundary"
+                )
+        for dependency in modules:
+            if any(
+                target != name and target.startswith(dependency + ".")
+                for target in self.targets
+            ):
+                raise ValueError(
+                    "Runtime dependency modules must not contain other targets"
+                )
+        return self.weight_session.plan(
+            self.target_subgraphs[index],
+            include_modules=modules,
+            include_parameters=parameters,
+        )
 
     def _prefix_dependency_candidates(self) -> tuple[str, ...]:
         target_ancestors = {""}
@@ -327,11 +366,21 @@ class TracedBoundaryAdapter:
         original = self.model.get_submodule(target_name)
         self.model.set_submodule(target_name, target)
         try:
-            with self.weight_session.loaded(
+            modules, _parameters = self._execution_dependencies(target_name)
+            parameters = tuple(
+                name for name in self._declared_runtime_parameters(target_name)
+                if not name.startswith(target_name + ".")
+            )
+            helper_plan = self.weight_session.plan(
                 subgraph,
+                include_modules=modules,
+                include_parameters=parameters,
+                exclude_modules=(target_name,),
+            )
+            with self.weight_session.loaded_plan(
+                helper_plan,
                 device=self.device,
                 dtype=self.dtype,
-                exclude_modules=(target_name,),
             ):
                 output = subgraph.forward(self.model, **inputs)
         finally:
@@ -369,6 +418,10 @@ def trace_streaming_boundaries(
             "Explicit target names differ from the shared sequential trace: "
             f"expected {plan.target_names}, got {tuple(target_names)}"
         )
+    execution = replace(
+        describe_streaming_execution(model, plan.target_names, sample_batch),
+        graph_fingerprint=fingerprint_execution_graph(plan.subgraphs),
+    )
 
     target_subgraphs = []
     required_names: set[str] = set()
@@ -402,4 +455,6 @@ def trace_streaming_boundaries(
         device=torch.device(device),
         dtype=dtype,
         _target_subgraphs=tuple(target_subgraphs),
+        execution=execution,
+        input_contract=streaming_input_contract(sample_batch),
     )

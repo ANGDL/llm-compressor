@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
 from contextlib import ExitStack, nullcontext
+from dataclasses import replace
 from math import prod
 from pathlib import Path
 from time import perf_counter
@@ -55,6 +56,12 @@ from .checkpoint import (
     StreamingCheckpointWriter,
 )
 from .compaction import BoundaryCompactor
+from .execution import (
+    FrozenCalibrationInputs,
+    StreamingExecutionDescriptor,
+    describe_streaming_execution,
+    freeze_calibration_inputs,
+)
 from .loading import HostMemoryBudget, HostMemoryError, SubgraphPrefetcher
 from .materialization import (
     StreamingDTypePolicy,
@@ -273,6 +280,7 @@ def _initialize_run(
     parallel_context: ParallelContext | None = None,
     placement: PlacementPlan | None = None,
     replace_existing: bool = False,
+    execution: StreamingExecutionDescriptor | None = None,
 ) -> str:
     normalized_recipe = _normalized_recipe_payload(recipe)
     source_info = fingerprint_checkpoint(checkpoint)
@@ -296,6 +304,9 @@ def _initialize_run(
                 "propagation_mode": "sequential-compatible",
                 "boundary_schema": 1,
                 "modifier_contract_sha256": modifier_contract_sha256,
+                "execution_graph_sha256": fingerprint_json(
+                    execution.to_dict() if execution is not None else {}
+                ),
             },
             "parallel": {
                 "context": parallel_context.to_dict(),
@@ -318,7 +329,10 @@ def _initialize_run(
         ),
         software=SoftwareInfo.from_versions({"torch": torch.__version__}),
         execution=ExecutionInfo(
-            modifier_contract_sha256=modifier_contract_sha256
+            modifier_contract_sha256=modifier_contract_sha256,
+            execution_graph_sha256=fingerprint_json(
+                execution.to_dict() if execution is not None else {}
+            ),
         ),
         parallel=ParallelInfo.from_context(
             parallel_context.to_dict(),
@@ -803,6 +817,7 @@ def run_subgraph_streaming_pipeline(
     async_save: bool = False,
     pack_to_int8: bool = True,
     dtype_policy: StreamingDTypePolicy | None = None,
+    execution: StreamingExecutionDescriptor | None = None,
 ) -> tuple[Path, Path, str]:
     """Calibrate, modify, propagate, and persist one subgraph at a time."""
 
@@ -825,6 +840,20 @@ def run_subgraph_streaming_pipeline(
     artifact_dir = work / "artifacts"
     staging_dir = work / "staging"
     publish_dir = work / "publish"
+    if not isinstance(calibration_batches, FrozenCalibrationInputs):
+        calibration_batches = freeze_calibration_inputs(
+            calibration_batches, work / "inputs"
+        )
+    execution = execution or adapter.execution or describe_streaming_execution(
+        adapter.model, adapter.targets
+    )
+    execution = replace(
+        execution, input_fingerprint=calibration_batches.fingerprint
+    )
+    adapter.execution = execution
+    execution.validate(adapter.model, adapter.targets)
+    for index in range(len(adapter.targets)):
+        adapter.plan_target(index)
     run_fingerprint = _initialize_run(
         checkpoint=checkpoint,
         artifact_dir=artifact_dir,
@@ -839,6 +868,7 @@ def run_subgraph_streaming_pipeline(
         seed=seed,
         pack_to_int8=pack_to_int8,
         replace_existing=not checkpoint_progress,
+        execution=execution or adapter.execution,
     )
     transaction_writer = (
         StreamingCheckpointWriter(
@@ -887,18 +917,23 @@ def run_subgraph_streaming_pipeline(
     committed_transaction_ids = list(
         resume_plan.transaction_ids if resume_plan is not None else ()
     )
+    if resume_plan is not None and resume_plan.prefix_metadata is not None:
+        committed_transaction_ids.insert(0, "prefix-00000")
     if transaction_writer is None or not resume_plan.transaction_ids:
-        # Boundary zero is not covered by a preceding subgraph transaction.
-        # Always recreate it when the first subgraph is incomplete so a crash
-        # while snapshotting the dataloader cannot leave a partial input set.
         streaming_logger.info("setup | collecting initial calibration boundary")
         with _stage_logger(
             adapter.model, "[setup] initial boundary", device
         ):
             boundaries.delete(0)
-            for batch_index, boundary in enumerate(
-                adapter.calibration_boundaries(calibration_batches)
-            ):
+            prefix_metadata = resume_plan.prefix_metadata if resume_plan else None
+            initial = (
+                transaction_writer.iter_committed_boundary(
+                    "prefix-00000", metadata=prefix_metadata
+                )
+                if prefix_metadata is not None
+                else enumerate(adapter.calibration_boundaries(calibration_batches))
+            )
+            for batch_index, boundary in initial:
                 boundaries.put(0, batch_index, boundary)
                 if batch_index == 0:
                     _debug_boundary(
@@ -909,10 +944,27 @@ def run_subgraph_streaming_pipeline(
                         consumer=adapter.targets[0],
                         value=boundary,
                     )
+                del boundary
         streaming_logger.info(
             "setup | initial boundary ready | "
             f"batches={len(boundaries.batch_indices(0))}"
         )
+        if transaction_writer is not None and prefix_metadata is None:
+            batches = boundaries.batch_indices(0)
+            with transaction_writer.transaction("prefix-00000") as transaction:
+                for batch_index in batches:
+                    value = boundaries.get(0, batch_index)
+                    disk_budget.check(
+                        "prefix boundary transaction",
+                        _boundary_nbytes(value) * 2 + 4096,
+                    )
+                    transaction.write_boundary(
+                        batch_index, value,
+                        boundary=0, expected_batch_count=len(batches),
+                    )
+                    del value
+                transaction.commit()
+            committed_transaction_ids.insert(0, "prefix-00000")
 
     streaming_logger.info("setup | initializing modifier session")
     with create_session() as session:
@@ -1097,7 +1149,7 @@ def run_subgraph_streaming_pipeline(
                     ):
                         plan = (
                             prefetched_plan if prefetch_pending
-                            else adapter.weight_session.plan(subgraph)
+                            else adapter.plan_target(target_index)
                         )
                         modifier_memory = estimate_modifier_memory(
                             modifiers, resident_modules, num_tokens=num_tokens,
@@ -1188,9 +1240,7 @@ def run_subgraph_streaming_pipeline(
                             f"{next_label} | plan weights",
                             device,
                         ):
-                            next_plan = adapter.weight_session.plan(
-                                adapter.target_subgraphs[next_index]
-                            )
+                            next_plan = adapter.plan_target(next_index)
                             next_required = (
                                 adapter.weight_session.estimate_preparation(
                                     next_plan, dtype=target_dtype

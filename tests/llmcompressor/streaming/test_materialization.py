@@ -603,6 +603,29 @@ def test_transformers_materializer_applies_registered_weight_conversions(
     )
 
 
+def test_transformers_renaming_includes_new_quantization_parameters(tmp_path):
+    with torch.device("meta"):
+        model = torch.nn.Module()
+        model.runtime = torch.nn.Linear(4, 4)
+    path = tmp_path / "model.safetensors"
+    save_file({"serialized.weight": torch.eye(4)}, path)
+    materializer = TransformersWeightMaterializer(
+        CastWeightMaterializer(),
+        model,
+        [WeightRenaming(r"serialized\.", "runtime.")],
+    )
+    materializer.create_source(str(path))
+    assert materializer.output_module_name("runtime") == "serialized"
+    for attribute in (
+        "weight_scale", "weight_zero_point", "weight_packed", "weight_shape"
+    ):
+        name = f"runtime.{attribute}"
+        expected = f"serialized.{attribute}"
+        tensor = torch.ones(4)
+        assert materializer.output_tensor_names(name) == (expected,)
+        assert materializer.prepare_output_tensors(name, tensor)[expected] is tensor
+
+
 def test_transformers_materializer_restores_checkpoint_names_on_output(tmp_path):
     class ConvertedModel(torch.nn.Module):
         base_model_prefix = ""

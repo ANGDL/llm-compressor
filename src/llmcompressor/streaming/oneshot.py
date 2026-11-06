@@ -24,6 +24,7 @@ from .finalize import finalize_streaming_checkpoint
 from .materialization import StreamingDTypePolicy, WeightMaterializer
 from .output import build_quantization_config
 from .quantize import quantize_streaming
+from .statistics import CandidateStatisticsCache
 
 __all__ = ["streaming_oneshot"]
 
@@ -87,6 +88,9 @@ def _streaming_oneshot_from_boundaries(
     seed: int | None = None,
     validate_config: bool = True,
     pack_to_int8: bool = True,
+    statistics_cache: CandidateStatisticsCache | None = None,
+    candidate_config: Any | None = None,
+    prefix_fingerprint: str = "",
 ) -> Path:
     """Run collect, quantize, and finalize with resumable intermediates."""
     work = Path(work_dir).expanduser()
@@ -104,6 +108,14 @@ def _streaming_oneshot_from_boundaries(
         or resolved_checkpoint.is_relative_to(resolved_work)
     ):
         raise ValueError("work_dir and checkpoint must use separate directories")
+    if statistics_cache is not None:
+        cache_root = statistics_cache.root.resolve()
+        if (
+            cache_root.is_relative_to(resolved_work)
+            or resolved_work.is_relative_to(cache_root)
+            or cache_root.is_relative_to(resolved_output)
+        ):
+            raise ValueError("Statistics cache must be separate from work/output")
     artifact_dir = work / "artifacts"
     staging_dir = work / "staging"
     device = torch.device(device)
@@ -141,6 +153,9 @@ def _streaming_oneshot_from_boundaries(
         num_samples=num_samples,
         max_seq_length=max_seq_length,
         seed=seed,
+        statistics_cache=statistics_cache,
+        candidate_config=candidate_config,
+        prefix_fingerprint=prefix_fingerprint,
     )
     logger.info(
         f"streaming collect: completed in {time.monotonic() - started:.2f}s; "
@@ -233,6 +248,10 @@ def streaming_oneshot(
     async_save: bool = False,
     pack_to_int8: bool = True,
     finalize_only: bool = False,
+    statistics_cache: CandidateStatisticsCache | None = None,
+    candidate_config: Any | None = None,
+    prefix_fingerprint: str = "",
+    processor_identity: Any = None,
 ) -> Path:
     """Run resumable streaming PTQ.
 
@@ -257,6 +276,15 @@ def streaming_oneshot(
         output = Path(output_dir).expanduser()
         work_dir = output.with_name(f"{output.name}.streaming-work")
     if model is not None:
+        if (
+            statistics_cache is not None
+            or candidate_config is not None
+            or prefix_fingerprint
+        ):
+            raise ValueError(
+                "Candidate statistics reuse requires explicit fixed boundaries; "
+                "use evaluate_streaming_candidates or boundary-mode streaming_oneshot"
+            )
         if checkpoint is not None or calibration_batches is not None:
             raise ValueError(
                 "Pass either model/dataset or checkpoint/calibration_batches, not both"
@@ -293,12 +321,18 @@ def streaming_oneshot(
             async_save=async_save,
             pack_to_int8=pack_to_int8,
             finalize_only=finalize_only,
+            processor_identity=processor_identity,
         )
 
     if async_save:
         raise ValueError("async_save currently requires pretrained mode")
     if finalize_only:
         raise ValueError("finalize_only currently requires pretrained mode")
+    if processor_identity is not None:
+        raise ValueError(
+            "Boundary mode records processor identity in candidate_config; "
+            "processor_identity requires pretrained mode"
+        )
 
     required = {
         "model_factory": model_factory,
@@ -340,4 +374,7 @@ def streaming_oneshot(
         seed=seed,
         validate_config=validate_config,
         pack_to_int8=pack_to_int8,
+        statistics_cache=statistics_cache,
+        candidate_config=candidate_config,
+        prefix_fingerprint=prefix_fingerprint,
     )
