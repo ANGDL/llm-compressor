@@ -171,6 +171,7 @@ class RoutedExpertBatch:
     hidden_states: torch.Tensor
     top_k_index: torch.Tensor
     top_k_weights: torch.Tensor
+    original_shape: tuple[int, ...] | None = None
 
 
 class ExpertGroupModifier(Protocol):
@@ -404,6 +405,62 @@ class ExpertGroupExecutor:
                         accumulated_output,
                     )
         return result
+
+    @contextmanager
+    def loaded_router(
+        self,
+        adapter,
+        *,
+        device: torch.device | str,
+        dtype: torch.dtype,
+    ) -> Generator[LoadedSubgraph, None, None]:
+        """Keep an adapter's router resident while expert groups are rotated."""
+        adapter.validate(self.model)
+        load_plan = self.weight_session.plan_modules(
+            adapter.router_module_names()
+        )
+        with self.weight_session.loaded_plan(
+            load_plan,
+            device=device,
+            dtype=dtype,
+        ) as loaded:
+            yield loaded
+
+    @torch.no_grad()
+    def execute_with_adapter(
+        self,
+        adapter,
+        hidden_states: torch.Tensor,
+        *,
+        device: torch.device | str,
+        dtype: torch.dtype,
+        batch_index: int = 0,
+        calibrate_all_experts: bool = False,
+    ) -> torch.Tensor:
+        """Route with a resident model adapter, then stream expert groups."""
+        resolved_device = torch.device(device)
+        if hidden_states.device != resolved_device:
+            raise ValueError(
+                "hidden_states must already be on the executor device; "
+                f"got {hidden_states.device}, expected {resolved_device}"
+            )
+        with self.loaded_router(
+            adapter, device=resolved_device, dtype=dtype
+        ):
+            routed = adapter.route(
+                self.model,
+                hidden_states,
+                batch_index=batch_index,
+            )
+            output = self.execute(
+                routed.hidden_states,
+                routed.top_k_index,
+                routed.top_k_weights,
+                device=resolved_device,
+                dtype=dtype,
+                calibrate_all_experts=calibrate_all_experts,
+            )
+        return adapter.restore_output(routed, output)
 
     @torch.no_grad()
     def calibrate(

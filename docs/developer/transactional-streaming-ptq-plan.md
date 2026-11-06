@@ -544,6 +544,12 @@ Hessian（海森矩阵）是损失对参数的二阶导数矩阵。对 GPTQ 使�
 专家分组、路由合并和设备驻留边界，不代表 pretrained streaming pipeline
 已经接入专家组模式，也不代表任何具体 MoE 模型已经获得完整支持。
 
+通用模型接口已经预留为 `MoEModelAdapter`。当前实现仅提供
+`StandardTransformersMoEAdapter`，约束为线性化后的 `experts` 集合和
+`gate`/`router` 返回 `(logits, top_k_weights, top_k_indices)` 的标准
+Transformers 形态。DSV4.1、Kimi、GPT-OSS 等具有特殊路由或融合权重布局的
+模型不进入本阶段；它们未来通过独立 adapter 注册，不修改通用 executor。
+
 当前项目已经支持已适配 MoE 模型的校准、量化和 streaming 执行；
 这里增加的是更细的设备驻留粒度，不是首次接入 MoE 模型。
 目标是处理“单个 MoE decoder 的全部专家放不进设备”的情况。

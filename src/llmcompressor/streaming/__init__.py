@@ -77,6 +77,8 @@ from .moe import (
     ExpertGroupModifierAdapter,
     ExpertGroupPlan,
     RoutedExpertBatch,
+    StandardTransformersMoEAdapter,
+    discover_standard_moe_adapters,
     execute_expert_group,
 )
 from .oneshot import streaming_oneshot
@@ -123,6 +125,8 @@ __all__ = [
     "ExpertGroupExecutor",
     "ExpertGroupPlan",
     "ExpertGroupModifierAdapter",
+    "StandardTransformersMoEAdapter",
+    "discover_standard_moe_adapters",
     "GPTQStatisticsCollector",
     "HostMemoryBudget",
     "HostMemoryError",
