@@ -43,6 +43,7 @@ from .materialization import (
     WeightMaterializer,
     apply_transformers_weight_conversions,
 )
+from .modifier_adapters import get_modifier_adapter, validate_streaming_modifiers
 from .output import build_quantization_config
 from .pipeline import (
     _complete_direct_writer_staging,
@@ -54,24 +55,22 @@ from .tracing import trace_streaming_boundaries
 __all__ = ["streaming_oneshot_from_pretrained"]
 
 def _recipe_quantizer(recipe: Recipe):
-    if any(
-        type(modifier).__name__ == "AutoRoundModifier"
-        for modifier in recipe.modifiers
-    ):
-        raise ValueError(
-            "Pretrained streaming mode does not yet support AutoRound: its "
-            "modifier owns quantization and checkpoint compression, which needs "
-            "a dedicated streaming output adapter"
-        )
     quantizers = [
         modifier
         for modifier in recipe.modifiers
         if isinstance(modifier, (QuantizationModifier, GPTQModifier))
+        or (
+            (adapter := get_modifier_adapter(modifier)) is not None
+            and adapter.owns_quantization
+        )
     ]
+    validate_streaming_modifiers(
+        recipe.modifiers, quantizers[0] if len(quantizers) == 1 else None
+    )
     if len(quantizers) != 1:
         raise ValueError(
             "Pretrained streaming mode requires exactly one "
-            "QuantizationModifier or GPTQModifier"
+            "QuantizationModifier, GPTQModifier, or adapted AutoRoundModifier"
         )
     supported_transforms = {
         "AWQModifier",
@@ -83,6 +82,7 @@ def _recipe_quantizer(recipe: Recipe):
         for modifier in recipe.modifiers
         if modifier is not quantizers[0]
         and type(modifier).__name__ not in supported_transforms
+        and get_modifier_adapter(modifier) is None
     ]
     if unsupported:
         raise ValueError(
@@ -285,6 +285,8 @@ def streaming_oneshot_from_pretrained(
         )
     if not checkpoint.is_dir():
         raise ValueError("Pretrained streaming mode requires a local model directory")
+    parsed_recipe = Recipe.create_instance(recipe)
+    quantizer = _recipe_quantizer(parsed_recipe)
     config = model_config or AutoConfig.from_pretrained(
         checkpoint, local_files_only=True
     )
@@ -306,11 +308,9 @@ def streaming_oneshot_from_pretrained(
     if dataloader is None:
         raise ValueError("Streaming PTQ requires calibration data")
 
-    parsed_recipe = Recipe.create_instance(recipe)
     for modifier in parsed_recipe.modifiers:
         if type(modifier).__name__ == "IMatrixGatherer":
             modifier.attach_by_initialize = False
-    quantizer = _recipe_quantizer(parsed_recipe)
     factory = model_factory or AutoModelForCausalLM.from_config
     meta_model = build_meta_model(
         factory,

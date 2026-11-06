@@ -13,6 +13,7 @@ from typing import Any, Callable
 import torch
 from compressed_tensors.quantization import QuantizationStrategy
 
+from .modifier_adapters import get_modifier_adapter
 from .modifier_contract import ModifierContractError, build_modifier_contracts
 
 __all__ = [
@@ -141,10 +142,17 @@ def estimate_modifier_memory(
     held = scratch = host = 0
     details = []
     for modifier, contract in zip(modifiers, contracts):
-        estimate_fn = getattr(modifier, "estimate_sequential_memory", None)
+        adapter = get_modifier_adapter(modifier)
+        estimate_fn = (
+            adapter.estimate_memory if adapter is not None
+            else getattr(modifier, "estimate_sequential_memory", None)
+        )
         modifier_held = modifier_scratch = 0
         modifier_host = 0
-        host_estimate_fn = getattr(modifier, "estimate_sequential_host_memory", None)
+        host_estimate_fn = (
+            adapter.estimate_host_memory if adapter is not None
+            else getattr(modifier, "estimate_sequential_host_memory", None)
+        )
         if callable(host_estimate_fn):
             for module in modules:
                 value = host_estimate_fn(module, num_tokens)

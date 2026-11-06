@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Iterable
 
 import torch
@@ -38,6 +38,7 @@ class ModifierContract:
     statistics_sync_scope: str = "single-participant"
     collective_owner: str = "modifier"
     communication_bytes: int = 0
+    streaming_adapter: str | None = None
 
     def __post_init__(self) -> None:
         if not self.modifier_type:
@@ -61,7 +62,7 @@ class ModifierContract:
             raise ValueError("communication_bytes must be non-negative")
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        values = {
             "modifier_type": self.modifier_type,
             "calibration_outputs_reusable": self.calibration_outputs_reusable,
             "requires_calibration_data": self.requires_calibration_data,
@@ -78,6 +79,9 @@ class ModifierContract:
             "collective_owner": self.collective_owner,
             "communication_bytes": self.communication_bytes,
         }
+        if self.streaming_adapter is not None:
+            values["streaming_adapter"] = self.streaming_adapter
+        return values
 
 
 def _declared(modifier: Any, name: str, default: Any) -> Any:
@@ -121,6 +125,8 @@ def build_modifier_contracts(
     modifiers: Iterable[Any],
 ) -> tuple[ModifierContract, ...]:
     """Build explicit contracts and reject invalid capability declarations."""
+
+    from .modifier_adapters import get_modifier_adapter
 
     contracts = []
     for modifier in modifiers:
@@ -173,6 +179,9 @@ def build_modifier_contracts(
                 communication_bytes=int(_declared(modifier, "communication_bytes", 0)),
             )
         )
+        adapter = get_modifier_adapter(modifier)
+        if adapter is not None:
+            contracts[-1] = replace(contracts[-1], **adapter.contract())
     if not contracts:
         raise ModifierContractError("Streaming requires at least one modifier")
     return tuple(contracts)

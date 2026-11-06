@@ -611,6 +611,34 @@ Transformers 形态。DSV4.1、Kimi、GPT-OSS 等具有特殊路由或融合权�
 新增 recipe 只有通过工作集、恢复和输出格式验收后才能进入支持矩阵。
 组合 modifier 要验证顺序和所有权，不以“各自支持”推导“任意组合支持”。
 
+2026-11-06 实施进度：首批接入独立 `streaming/modifier_adapters.py`，复用既有
+装载、`sequential_epoch_end`、压缩、事务提交和发布循环：
+
+- QAD：RTN weight-only + QAD，CPU teacher/input/最佳权重快照，至少两个 batch；
+  子图内训练失败整体重放，已提交子图恢复时登记完成，训练后量化输出向下游传播。
+- AutoSmooth：AutoSmooth + RTN weight-only，预检 mapping 的 smooth/balance/parent
+  均属于同一 target，拒绝跨 target 共享参数；搜索后重新计算下游 boundary。
+- AutoRound：单独 modifier，symmetric INT4/INT8 weight-only，Linear 两维均需
+  被 32 整除，关闭 compile 和外部 device_ids；明确采用 independent-block
+  语义，不恢复跨 block 的私有 q_input。设备/dtype/RNG 由适配层提供，算法输出
+  qparams，由 pipeline 压缩和保存，拒绝外部算法静默跳过目标层。
+- GPTQ modifier 未改动，E1 仍暂停。以上不表示 E5 全部完成；详见
+  [实现与验证记录](streaming-e5-validation.md)。
+
+SpinQuant/QuIP 的下一阶段规划保留为独立变换适配器，不直接调用它们当前在
+`calibration_start` 中遍历全模型的权重修改逻辑：
+
+1. 拆分 meta 阶段的变换规划与 resident target 的离线执行；声明每个变换读取、
+   修改的 tensor 集合、norm 依赖和 workspace，并纳入 admission。
+2. 首个候选为局部 R2；必须明确处理现有 SpinQuant 同时执行的 embedding
+   centering、untie 和 norm fusion，不能只运行 R2 后宣称与原 modifier 等价。
+3. 全局 R1 的 embedding/head/final norm 需要有独立事务所有者和 tied-weight
+   重写计划；不能依赖最后从 source 复制静态 tensor 来保存这些修改。
+4. R3/R4 和 QuIP 的在线变换需要持久化 CT transform config/权重、运行时 hook
+   重建及标准 reload 验证；transform ID、矩阵/随机源和实现版本进入 fingerprint。
+5. 加入未提交子图重放、已提交变换不重复融合、共享 tensor 一致性及完整模型
+   logits 验收后，才将对应 recipe 加入支持矩阵。此前在 preflight 明确拒绝。
+
 ### E6：多模态、MTP、跨层辅助分支
 
 优先级：P1 回归覆盖，P2 新能力。

@@ -818,8 +818,71 @@ declaration. GPTQ must retain its Hessian and perform error propagation while th
 weight is resident; it cannot be reduced to precomputed qparams plus generic
 RTN.
 
-AutoRound remains unsupported because it owns both quantization and checkpoint
-compression and therefore requires a dedicated streaming output adapter.
+The first E5 adapters reuse this lifecycle with explicitly limited recipes:
+
+| Adapter | Accepted recipe and scope | Boundary propagation |
+| --- | --- | --- |
+| QAD | `[QuantizationModifier, QADModifier]`, weight-only quantization, CPU teacher/input/snapshot cache, at least two calibration batches | Recompute using the trained, fake-quantized weights |
+| AutoSmooth | `[AutoSmoothModifier, QuantizationModifier]`, weight-only quantization, mappings whose smooth layer, balance layers and replay parent all belong to one target | Recompute after smoothing and weight calibration |
+| AutoRound | Standalone `AutoRoundModifier`, symmetric INT4/INT8 weight-only Linear layers with both dimensions divisible by 32; `device_ids=None`, `enable_torch_compile=False` | Reuse the full-precision calibration output |
+
+For example, an existing weight-only RTN recipe can add QAD:
+
+```python
+from llmcompressor.modifiers.qad import QADModifier
+from llmcompressor.modifiers.quantization import QuantizationModifier
+from llmcompressor.streaming import streaming_oneshot
+
+streaming_oneshot(
+    model="/path/to/local/checkpoint",
+    dataset=calibration_dataloader,
+    dataset_fingerprint="my-calibration-v1",
+    recipe=[
+        QuantizationModifier(
+            targets="Linear", scheme="W4A16", ignore=["lm_head"]
+        ),
+        QADModifier(num_epochs=1, offload_device="cpu"),
+    ],
+    output_dir="/path/to/output",
+    work_dir="/path/to/work",
+    device="cuda:0",
+    seed=42,
+    checkpoint_progress=True,
+)
+```
+
+QAD's `seed` controls its train/validation split and epoch shuffling. The
+streaming `seed` also controls target-local algorithm RNG. A failed, uncommitted
+target restarts from its original source weights; optimizer steps are not
+persisted. Committed targets restore their output and activation frontier and
+are marked complete without training again.
+
+AutoSmooth resolves mappings on the meta model and checks their mutation scope
+before loading target weights. Parameters shared outside that target are rejected
+by all three adapters. Search replays use unquantized parent forwards, followed by
+the ordinary RTN observer update. Arbitrary combinations with GPTQ, AWQ, or other
+adapters are not admitted by these initial recipe contracts.
+
+AutoRound runs independent block optimization: its private `q_input` is cleared
+at each target, including after recovery. This explicitly differs from its
+ordinary pipeline's cross-block `q_input` propagation. The adapter supplies the
+pipeline's device and dtype, disables implicit AMP, fingerprints the installed
+`auto-round` version, and requires each requested layer to return nonzero,
+finite weight scales. AutoRound supplies updated weights/qparams; compression,
+sharding, publication and recovery remain owned by the streaming pipeline.
+External layer skipping is rejected rather than silently publishing an
+unquantized result. Temporary parameter dtype/device changes and process-wide
+determinism settings made by AutoRound are restored before returning to the
+pipeline, including on failure.
+
+SpinQuant and QuIP still fail preflight with an explicit transform-adapter
+requirement. Their next stage needs per-target offline fusion, separate ownership
+of embeddings/head/norms and tied weights, reproducible transform identity, and
+online transform metadata that survives checkpoint reload. See the
+[E5 implementation and validation notes](../developer/streaming-e5-validation.md).
+The first adapters supply working-set estimates for admission; these are not
+strict bounds for arbitrary model activations, attention workspaces, extra
+forward kwargs, or external optimizer implementations.
 
 ## Output and recovery
 

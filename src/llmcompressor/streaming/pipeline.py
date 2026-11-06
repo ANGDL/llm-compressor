@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 from math import prod
 from pathlib import Path
 from time import perf_counter
@@ -13,7 +13,7 @@ import torch
 from compressed_tensors.compressors import compress_module
 from compressed_tensors.quantization.utils import is_module_quantized
 
-from llmcompressor.core import LifecycleCallbacks, create_session
+from llmcompressor.core import LifecycleCallbacks, active_session, create_session
 from llmcompressor.modifiers.quantization.calibration import (
     set_quantization_scale_dtype,
 )
@@ -60,6 +60,12 @@ from .materialization import (
     StreamingDTypePolicy,
     WeightMaterializer,
     materialize_weights,
+)
+from .modifier_adapters import (
+    StreamingModifierAdapter,
+    get_modifier_adapter,
+    modifier_adapters,
+    target_rng_scope,
 )
 from .modifier_contract import (
     ModifierContractError,
@@ -550,9 +556,15 @@ def _write_loaded_target_direct(
 
 
 def _modifier_update(
-    modules: Sequence[torch.nn.Module], quantizers: Sequence[QuantizationMixin]
+    modules: Sequence[torch.nn.Module], quantizers: Sequence[QuantizationMixin],
+    adapters: Sequence[StreamingModifierAdapter] = (),
 ) -> None:
-    LifecycleCallbacks.sequential_epoch_end(list(modules))
+    with ExitStack() as stack:
+        for adapter in adapters:
+            stack.enter_context(adapter.update_context(active_session().state.model))
+        LifecycleCallbacks.sequential_epoch_end(list(modules))
+    for adapter in adapters:
+        adapter.after_update(modules)
     for quantizer in quantizers:
         quantizer.end_layerwise_calibration(list(modules))
 
@@ -916,7 +928,21 @@ def run_subgraph_streaming_pipeline(
                 sequential_targets=adapter.targets,
                 copy_data=False,
             )
-            LifecycleCallbacks.calibration_start()
+            runtime_adapters = modifier_adapters(session.lifecycle.recipe.modifiers)
+            try:
+                for modifier_adapter in runtime_adapters:
+                    modifier_adapter.before_calibration(adapter.model, adapter.targets)
+                    configure = getattr(modifier_adapter, "configure_algorithm", None)
+                    if callable(configure):
+                        session.state.autoround_kwargs_adapter = configure
+                LifecycleCallbacks.calibration_start()
+                for modifier_adapter in runtime_adapters:
+                    modifier_adapter.validate_targets(adapter.model, adapter.targets)
+            except BaseException:
+                for modifier_adapter in runtime_adapters:
+                    modifier_adapter.abort()
+                session.finalize()
+                raise
         streaming_logger.info("setup | modifier session ready")
         quantizers = [
             modifier
@@ -967,6 +993,12 @@ def run_subgraph_streaming_pipeline(
                     written.update(
                         record["name"] for record in metadata["records"]
                     )
+                    written.update(
+                        f"{name}.weight"
+                        for name in subgraph.submodule_dict(adapter.model)
+                        if materializer.output_module_name(name)
+                        in metadata.get("quantized_modules", {})
+                    )
                     boundary = metadata.get("boundary")
                     is_frontier = (
                         transaction_id
@@ -987,6 +1019,10 @@ def run_subgraph_streaming_pipeline(
                                 value,
                             )
                     boundaries.delete(target_index)
+                    for modifier_adapter in runtime_adapters:
+                        modifier_adapter.restore_target(
+                            adapter.model.get_submodule(target_name)
+                        )
                     continue
                 if (
                     transaction_writer is not None
@@ -1000,6 +1036,13 @@ def run_subgraph_streaming_pipeline(
                 if not batches:
                     raise RuntimeError(
                         f"Missing boundary {target_index} for {target_name!r}"
+                    )
+                if any(
+                    len(batches) < modifier_adapter.minimum_batches
+                    for modifier_adapter in runtime_adapters
+                ):
+                    raise ModifierContractError(
+                        "Streaming QAD validation requires at least two batches"
                     )
                 target_count = len(adapter.targets)
                 target_label = _target_label(
@@ -1027,6 +1070,12 @@ def run_subgraph_streaming_pipeline(
                     resident_modules = tuple(
                         subgraph.submodules(adapter.model)
                     )
+                    if runtime_adapters:
+                        weight_stack.enter_context(
+                            target_rng_scope(seed, target_index, device)
+                        )
+                    for modifier_adapter in runtime_adapters:
+                        modifier_adapter.before_target(resident_modules)
                     num_tokens = 0
                     max_batch_tokens = 0
                     boundary_bytes = 0
@@ -1207,9 +1256,14 @@ def run_subgraph_streaming_pipeline(
                                 quantizer.end_layerwise_calibration,
                                 list(resident_modules),
                             )
-                            quantizer.start_layerwise_calibration(
-                                adapter.model, list(resident_modules)
-                            )
+                            quantizer_adapter = get_modifier_adapter(quantizer)
+                            start = getattr(quantizer_adapter, "start_quantizer", None)
+                            if callable(start):
+                                start(adapter.model, resident_modules)
+                            else:
+                                quantizer.start_layerwise_calibration(
+                                    adapter.model, list(resident_modules)
+                                )
                     # Match the ordinary sequential calibration pipeline: model
                     # execution is inference-only. Besides avoiding autograd
                     # storage, this is required by models such as DeepSeek-V4
@@ -1269,7 +1323,9 @@ def run_subgraph_streaming_pipeline(
                         f"{target_label} | modifier update",
                         device,
                     ):
-                        _modifier_update(resident_modules, quantizers)
+                        _modifier_update(
+                            resident_modules, quantizers, runtime_adapters
+                        )
                     # Algorithms that update weights need a fresh forward for
                     # the next target. Statistics-only recipes have already
                     # committed that boundary during calibration. The final
@@ -1290,7 +1346,15 @@ def run_subgraph_streaming_pipeline(
                             consumed_names = subgraph.consumed_names
                             with (
                                 HooksMixin.disable_hooks(),
-                                DisableQuantization(adapter.model),
+                                (
+                                    nullcontext()
+                                    if any(
+                                        modifier_adapter.propagation_mode
+                                        == "post-update-quantized"
+                                        for modifier_adapter in runtime_adapters
+                                    )
+                                    else DisableQuantization(adapter.model)
+                                ),
                                 torch.no_grad(),
                             ):
                                 for batch_index in batches:
@@ -1410,7 +1474,11 @@ def run_subgraph_streaming_pipeline(
                 with _stage_logger(
                     adapter.model, "[finalize] modifier session", device
                 ):
-                    LifecycleCallbacks.calibration_end()
+                    if pipeline_failed and runtime_adapters:
+                        for modifier_adapter in runtime_adapters:
+                            modifier_adapter.abort()
+                    else:
+                        LifecycleCallbacks.calibration_end()
                     session.finalize()
                 streaming_logger.info("finalize | modifier session complete")
             except BaseException:

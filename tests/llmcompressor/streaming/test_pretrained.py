@@ -191,11 +191,15 @@ def _tiny_deepseek_v4_dspark_config():
     )
 
 
-def test_pretrained_explains_autoround_output_adapter_requirement():
-    from llmcompressor.modifiers.autoround import AutoRoundModifier
-
-    recipe = Recipe.from_modifiers(AutoRoundModifier(scheme="W4A16"))
-    with pytest.raises(ValueError, match="dedicated streaming output adapter"):
+def test_pretrained_autoround_requires_explicit_pipeline_ownership():
+    autoround = pytest.importorskip("llmcompressor.modifiers.autoround")
+    modifier = autoround.AutoRoundModifier(
+        scheme="W4A16", enable_torch_compile=False
+    )
+    recipe = Recipe.from_modifiers(modifier)
+    assert _recipe_quantizer(recipe) is modifier
+    modifier.device_ids = "0,1"
+    with pytest.raises(ValueError, match="placement belongs to the pipeline"):
         _recipe_quantizer(recipe)
 
 

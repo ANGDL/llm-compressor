@@ -328,6 +328,9 @@ class AutoRoundModifier(Modifier, QuantizationMixin):
             # cache_device tensors don't accumulate on GPU between blocks.
             "low_gpu_mem_usage": True,
         }
+        kwargs_adapter = getattr(state, "autoround_kwargs_adapter", None)
+        if callable(kwargs_adapter):
+            kwargs = kwargs_adapter(self, decoding_layer, kwargs)
 
         llmc_registered_qparams = self._preprocess_qparams(decoding_layer)
         with (
