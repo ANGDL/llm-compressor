@@ -5,6 +5,12 @@ from .activations import (
     DiskBoundaryActivationStore,
     InMemoryBoundaryActivationStore,
 )
+from .admission import (
+    DeviceMemoryBudget,
+    DeviceMemoryError,
+    ModifierMemoryEstimate,
+    estimate_modifier_memory,
+)
 from .artifacts import (
     CURRENT_SCHEMA_VERSION,
     ArtifactCompatibilityError,
@@ -114,6 +120,8 @@ __all__ = [
     "CheckpointWeightSource",
     "CommittedTransactionCorruptionError",
     "DiskBoundaryActivationStore",
+    "DeviceMemoryBudget",
+    "DeviceMemoryError",
     "DeepSeekV4WeightMaterializer",
     "DeepSeekV4WeightSource",
     "DeepSeekV41WeightMaterializer",
@@ -134,6 +142,7 @@ __all__ = [
     "IMatrixStatisticsCollector",
     "InMemoryBoundaryActivationStore",
     "MaterializerInfo",
+    "ModifierMemoryEstimate",
     "ModifierContract",
     "ModifierContractError",
     "ParallelContext",
@@ -166,6 +175,7 @@ __all__ = [
     "fingerprint_checkpoint",
     "fingerprint_json",
     "execute_expert_group",
+    "estimate_modifier_memory",
     "build_meta_model",
     "build_modifier_contracts",
     "calibration_outputs_reusable",

@@ -21,6 +21,7 @@ class IMatrixGatherer(Modifier):
 
     requires_calibration_data: bool = True
     calibration_outputs_reusable: ClassVar[bool] = True
+    memory_estimate: ClassVar[tuple[int, int]] = (0, 0)
 
     targets: str | list[str] = Field(default_factory=lambda: ["Linear"])
     ignore: list[str] = Field(default_factory=lambda: ["lm_head"])
