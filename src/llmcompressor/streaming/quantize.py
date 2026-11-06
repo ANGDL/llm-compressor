@@ -148,6 +148,7 @@ def _quantize_module(
     use_gptq: bool,
     blocksize: int,
     dampening_frac: float,
+    compress: bool = True,
 ) -> torch.nn.Module:
     module = initialize_quantized_linear(weight, scheme, device)
     initialize_observer(module, "weight")
@@ -198,7 +199,8 @@ def _quantize_module(
         set_quantization_scale_dtype(module)
 
     freeze_module_quantization(module)
-    compress_module(module)
+    if compress:
+        compress_module(module)
     return module
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import shutil
 from collections.abc import Callable
 from contextlib import ExitStack
@@ -35,6 +36,7 @@ from llmcompressor.utils.pytorch.module import infer_sequential_targets
 from ._cleanup import cleanup_successful_work_dir as _cleanup_successful_work_dir
 from .artifacts import fingerprint_json
 from .checkpoint import with_work_directory_lock
+from .execution import freeze_calibration_inputs
 from .finalize import finalize_streaming_checkpoint
 from .loading import build_meta_model
 from .materialization import (
@@ -238,6 +240,7 @@ def streaming_oneshot_from_pretrained(
     pack_to_int8: bool,
     finalize_only: bool = False,
     dtype_policy: StreamingDTypePolicy | None = None,
+    processor_identity: Any = None,
 ) -> Path:
     """Run traced streaming PTQ with an oneshot-like model/dataset interface."""
     checkpoint = Path(model).expanduser()
@@ -337,6 +340,7 @@ def streaming_oneshot_from_pretrained(
         shuffle_calibration_samples=shuffle_calibration_samples,
     )
 
+    dataloader = freeze_calibration_inputs(dataloader, work / "inputs")
     try:
         sample_batch = next(iter(dataloader))
     except StopIteration as error:
@@ -369,6 +373,34 @@ def streaming_oneshot_from_pretrained(
             device=device,
             dtype=target_dtype,
             tracing_ignore=dataset_args.tracing_ignore,
+        )
+        adapter.execution = adapter.execution.with_inputs(
+            dataloader.fingerprint,
+            {
+                "declared": processor_identity,
+                "processor_files": {
+                    name: hashlib.sha256((checkpoint / name).read_bytes()).hexdigest()
+                    for name in (
+                        "preprocessor_config.json", "processor_config.json",
+                        "tokenizer_config.json", "special_tokens_map.json",
+                    )
+                    if (checkpoint / name).is_file()
+                },
+                "tokenizer": (
+                    {
+                        "class": (
+                            f"{type(tokenizer).__module__}."
+                            f"{type(tokenizer).__qualname__}"
+                        ),
+                        "vocab": tokenizer.get_vocab(),
+                        "special_tokens": tokenizer.special_tokens_map,
+                        "chat_template": getattr(tokenizer, "chat_template", None),
+                    }
+                    if tokenizer is not None
+                    and callable(getattr(tokenizer, "get_vocab", None))
+                    else None
+                ),
+            },
         )
         targets = adapter.targets
         covered = tuple(
@@ -407,6 +439,7 @@ def streaming_oneshot_from_pretrained(
                 seed=seed,
                 pack_to_int8=pack_to_int8,
                 replace_existing=True,
+                execution=adapter.execution,
             )
             _complete_direct_writer_staging(
                 adapter=adapter,
@@ -438,6 +471,7 @@ def streaming_oneshot_from_pretrained(
                     checkpoint_progress=checkpoint_progress,
                     async_save=async_save,
                     pack_to_int8=pack_to_int8,
+                    execution=adapter.execution,
                 )
             )
         qconfig = build_quantization_config(quantizer.resolved_config)

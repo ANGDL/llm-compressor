@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from contextlib import nullcontext
 from typing import Any
 
 import torch
@@ -13,6 +14,7 @@ from .activations import BoundaryActivationStore, DiskBoundaryActivationStore
 from .artifacts import (
     ArtifactStore,
     CalibrationInfo,
+    ExecutionInfo,
     RecipeInfo,
     SequentialInfo,
     SoftwareInfo,
@@ -21,6 +23,12 @@ from .artifacts import (
     fingerprint_checkpoint,
     fingerprint_json,
 )
+from .execution import (
+    fingerprint_streaming_value,
+    fingerprint_streaming_values,
+    freeze_calibration_inputs,
+    streaming_configuration,
+)
 from .loading import SubgraphWeightSession, build_meta_model
 from .materialization import (
     CastWeightMaterializer,
@@ -28,6 +36,8 @@ from .materialization import (
     WeightMaterializer,
 )
 from .statistics import (
+    CandidateStatisticsCache,
+    CandidateStatisticsKey,
     GPTQStatisticsCollector,
     IMatrixStatisticsCollector,
     StatisticsCollectorGroup,
@@ -134,6 +144,9 @@ def collect_calibration_statistics(
     num_samples: int | None = None,
     max_seq_length: int | None = None,
     seed: int | None = None,
+    statistics_cache: CandidateStatisticsCache | None = None,
+    candidate_config: Any | None = None,
+    prefix_fingerprint: str = "",
 ) -> ArtifactStore:
     """Collect GPTQ/iMatrix statistics one target at a time.
 
@@ -154,6 +167,15 @@ def collect_calibration_statistics(
     if unknown:
         raise ValueError(f"Unsupported streaming algorithms: {sorted(unknown)}")
     _validate_recipe(recipe, calibration_mode)
+    if (
+        statistics_cache is not None
+        and (forward_target is not None or target_module_selector is not None)
+        and candidate_config is None
+    ):
+        raise ValueError(
+            "Cached custom forwards/selectors require candidate_config "
+            "to identify their execution and transform semantics"
+        )
     try:
         dataset_fingerprint = str(dataset_fingerprint)
         if len(dataset_fingerprint) != 64 or any(
@@ -167,6 +189,24 @@ def collect_calibration_statistics(
     materializer = materializer or CastWeightMaterializer()
     source = materializer.create_source(checkpoint)
     source_info = fingerprint_checkpoint(checkpoint)
+    input_identity = {}
+    if (
+        statistics_cache is not None
+        or candidate_config is not None
+        or prefix_fingerprint
+    ):
+        frozen = freeze_calibration_inputs(
+            calibration_batches()
+            if callable(calibration_batches) else calibration_batches,
+            f"{artifact_dir}/cache-inputs",
+        )
+        calibration_batches = frozen
+        input_identity = {
+            "inputs": frozen.fingerprint,
+            "transform": fingerprint_streaming_value(candidate_config),
+            "prefix": prefix_fingerprint,
+            "algorithms": sorted(algorithms),
+        }
     manifest = StreamingRunManifest(
         source=source_info,
         recipe=RecipeInfo(fingerprint_json(recipe)),
@@ -181,6 +221,10 @@ def collect_calibration_statistics(
             target_dtype=target_dtype, dtype_policy=dtype_policy
         ),
         software=SoftwareInfo.from_versions({"torch": torch.__version__}),
+        execution=ExecutionInfo(
+            execution_graph_sha256=fingerprint_json(input_identity)
+            if input_identity else ""
+        ),
     )
     store = ArtifactStore(artifact_dir)
     store.initialize(manifest, normalized_recipe=recipe, targets=targets)
@@ -231,20 +275,86 @@ def collect_calibration_statistics(
                 raise ValueError(
                     f"No Linear modules found under target {target_name!r}"
                 )
-            collectors = []
-            if "gptq" in algorithms:
-                collectors.append(GPTQStatisticsCollector(modules))
-            if "imatrix" in algorithms:
-                collectors.append(IMatrixStatisticsCollector(modules))
-            collector_group = StatisticsCollectorGroup(collectors)
-            with collector_group:
+            key = None
+            if statistics_cache is not None:
+                key = CandidateStatisticsKey(
+                    source_fingerprint=fingerprint_streaming_values(
+                        (name, tensor) for name, tensor in target.state_dict().items()
+                    ),
+                    dataset_fingerprint=dataset_fingerprint,
+                    target_name=target_name,
+                    target_index=index,
+                    boundary_fingerprint=_boundary_fingerprint(
+                        boundaries, index, batches
+                    ),
+                    prefix_fingerprint=prefix_fingerprint,
+                    algorithms=tuple(sorted(algorithms)),
+                    observer_fingerprint=fingerprint_json({
+                        "algorithms": sorted(algorithms),
+                        "counting": "raw-unmasked-input-v1",
+                        "torch": torch.__version__,
+                        "modules": sorted(modules),
+                    }),
+                    transform_fingerprint=fingerprint_streaming_value(
+                        {
+                            "declared": candidate_config,
+                            "materializer": manifest.materializer.config_sha256,
+                            "materializer_type": manifest.materializer.identifier,
+                            "model_configuration": streaming_configuration(
+                                (model_args, model_kwargs)
+                            ),
+                            "classes": [
+                                (
+                                    name, type(module).__module__,
+                                    type(module).__qualname__,
+                                )
+                                for name, module in target.named_modules()
+                            ],
+                        }
+                    ),
+                    dtype=str(target_dtype),
+                )
+            expected_names = tuple(
+                f"{module_name}.{statistic}"
+                for module_name in modules
+                for statistic in (
+                    (
+                        ("gptq_hessian", "gptq_num_samples")
+                        if "gptq" in algorithms
+                        else ()
+                    )
+                    + (
+                        ("imatrix_sum", "imatrix_count")
+                        if "imatrix" in algorithms
+                        else ()
+                    )
+                )
+            )
+            statistics = (
+                statistics_cache.get(
+                    key, expected_names=tuple(sorted(expected_names))
+                )
+                if key is not None
+                else None
+            )
+            collector_group = None
+            if statistics is None:
+                collectors = []
+                if "gptq" in algorithms:
+                    collectors.append(GPTQStatisticsCollector(modules))
+                if "imatrix" in algorithms:
+                    collectors.append(IMatrixStatisticsCollector(modules))
+                collector_group = StatisticsCollectorGroup(collectors)
+            with torch.no_grad(), collector_group or nullcontext():
                 for batch_index in batches:
                     value = boundaries.get(index, batch_index, device=device)
                     output = run_forward(target, value)
                     if index + 1 < len(targets):
                         boundaries.put(index + 1, batch_index, output)
-        # The group is detached by the context but retains its CPU statistics.
-        statistics = collector_group.export()
+            if collector_group is not None:
+                statistics = collector_group.export()
+                if key is not None:
+                    statistics_cache.put(key, statistics)
         metadata = TargetStatisticsMetadata(
             target_name=target_name,
             target_index=index,
@@ -262,3 +372,14 @@ def collect_calibration_statistics(
             f"{index + 1}/{len(targets)} {target_name}"
         )
     return store
+
+
+def _boundary_fingerprint(
+    boundaries: BoundaryActivationStore,
+    boundary: int,
+    batches: Sequence[int],
+) -> str:
+    return fingerprint_streaming_values(
+        (batch, boundaries.get(boundary, batch))
+        for batch in batches
+    )

@@ -351,7 +351,7 @@ class _Transaction(AbstractContextManager["_Transaction"]):
     def commit(self) -> None:
         if self._did_commit:
             raise RuntimeError("Transaction has already been committed")
-        if not self.records and not self.config_updates:
+        if not self.records and not self.config_updates and not self.boundary_records:
             raise ValueError("Transaction has no output delta")
         if hasattr(self, "boundaries"):
             batch_indices = sorted(self.boundaries)

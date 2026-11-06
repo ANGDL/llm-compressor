@@ -30,6 +30,12 @@ from .artifacts import (
     fingerprint_checkpoint,
     fingerprint_json,
 )
+from .candidates import (
+    StreamingCandidate,
+    StreamingCandidateEvaluation,
+    StreamingCandidateResult,
+    evaluate_streaming_candidates,
+)
 from .checkpoint import (
     CheckpointWeightSource,
     CommittedTransactionCorruptionError,
@@ -46,6 +52,12 @@ from .checkpoint import (
 )
 from .collect import collect_calibration_statistics
 from .compaction import BoundaryCompactor, RetiredBoundaryError
+from .execution import (
+    StreamingExecutionDescriptor,
+    describe_streaming_execution,
+    fingerprint_streaming_value,
+    fingerprint_streaming_values,
+)
 from .finalize import finalize_streaming_checkpoint
 from .inference import (
     StreamingInference,
@@ -105,6 +117,8 @@ from .recovery import (
     classify_recovery_error,
 )
 from .statistics import (
+    CandidateStatisticsCache,
+    CandidateStatisticsKey,
     GPTQStatisticsCollector,
     IMatrixStatisticsCollector,
     StatisticsCollectorGroup,
@@ -166,6 +180,12 @@ __all__ = [
     "StreamingCheckpointWriter",
     "StreamingWorkDirectoryLock",
     "StatisticsCollectorGroup",
+    "CandidateStatisticsCache",
+    "CandidateStatisticsKey",
+    "StreamingCandidate",
+    "StreamingCandidateEvaluation",
+    "StreamingCandidateResult",
+    "evaluate_streaming_candidates",
     "StatisticsScope",
     "TargetStatisticsMetadata",
     "TargetWeightLoader",
@@ -187,6 +207,10 @@ __all__ = [
     "compare_cached_to_recompute",
     "finalize_streaming_checkpoint",
     "materialize_weights",
+    "StreamingExecutionDescriptor",
+    "describe_streaming_execution",
+    "fingerprint_streaming_value",
+    "fingerprint_streaming_values",
     "load_streaming_model",
     "quantize_streaming",
     "trace_streaming_boundaries",

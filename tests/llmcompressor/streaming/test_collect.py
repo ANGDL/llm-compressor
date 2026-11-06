@@ -110,7 +110,9 @@ def test_resume_skips_completed_target_and_uses_persisted_boundary(tmp_path):
     assert ArtifactStore(artifacts).is_target_complete(1)
 
 
-@pytest.mark.parametrize("modifier", ["AWQModifier", "SmoothQuantModifier", "AutoRoundModifier"])
+@pytest.mark.parametrize(
+    "modifier", ["AWQModifier", "SmoothQuantModifier", "AutoRoundModifier"]
+)
 def test_rejects_non_reference_recipe(modifier, tmp_path):
     checkpoint, _ = checkpoint_for(tmp_path)
     with pytest.raises(ValueError, match=modifier):
@@ -123,3 +125,66 @@ def test_rejects_non_reference_recipe(modifier, tmp_path):
             recipe={modifier: {}},
             dataset_fingerprint="b" * 64,
         )
+
+
+def test_collect_cache_skips_hooks_but_still_propagates_boundaries(
+    tmp_path, monkeypatch
+):
+    from llmcompressor.streaming import CandidateStatisticsCache
+    from llmcompressor.streaming.statistics import (
+        GPTQStatisticsCollector,
+        IMatrixStatisticsCollector,
+    )
+
+    checkpoint, _reference = checkpoint_for(tmp_path)
+    batches = [torch.randn(2, 3, 4)]
+    cache = CandidateStatisticsCache(tmp_path / "cache")
+
+    def run(name):
+        return collect_calibration_statistics(
+            model_factory=TwoLayer, checkpoint=str(checkpoint),
+            artifact_dir=str(tmp_path / name), calibration_batches=batches,
+            targets=("layers.0", "layers.1"), recipe={"GPTQModifier": {}},
+            dataset_fingerprint="a" * 64, target_dtype=torch.float32,
+            statistics_cache=cache,
+        )
+
+    first = run("first")
+    for collector in (GPTQStatisticsCollector, IMatrixStatisticsCollector):
+        monkeypatch.setattr(
+            collector, "attach",
+            lambda *_args: pytest.fail("cache hits must not attach collectors"),
+        )
+    second = run("second")
+    for index in (0, 1):
+        expected = first.load_target_statistics(index)
+        actual = second.load_target_statistics(index)
+        assert actual.keys() == expected.keys()
+        for name in actual:
+            torch.testing.assert_close(actual[name], expected[name], rtol=0, atol=0)
+
+
+def test_collect_cache_resume_binds_actual_inputs_and_transform(tmp_path):
+    from llmcompressor.streaming import (
+        ArtifactCompatibilityError,
+        CandidateStatisticsCache,
+    )
+
+    checkpoint, _reference = checkpoint_for(tmp_path)
+    batches = [torch.randn(2, 3, 4)]
+    arguments = {
+        "model_factory": TwoLayer, "checkpoint": str(checkpoint),
+        "artifact_dir": str(tmp_path / "artifacts"),
+        "calibration_batches": batches, "targets": ("layers.0",),
+        "recipe": {"GPTQModifier": {}}, "dataset_fingerprint": "a" * 64,
+        "target_dtype": torch.float32,
+        "statistics_cache": CandidateStatisticsCache(tmp_path / "cache"),
+    }
+    collect_calibration_statistics(**arguments)
+    with pytest.raises(ArtifactCompatibilityError):
+        collect_calibration_statistics(
+            **arguments, candidate_config={"rotation": "new"}
+        )
+    batches[0].add_(1)
+    with pytest.raises(ArtifactCompatibilityError):
+        collect_calibration_statistics(**arguments)

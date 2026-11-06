@@ -237,6 +237,8 @@ class SubgraphWeightSession:
                     name = attribute_name
                 elif isinstance(value, torch.Tensor) and value.is_meta:
                     if not separator:
+                        if attribute_name in self.model._parameters:
+                            continue
                         raise ValueError(
                             "A root-level checkpoint tensor cannot be loaded as a "
                             f"module working set: {attribute_name!r}"
@@ -269,11 +271,13 @@ class SubgraphWeightSession:
         dtype: torch.dtype = torch.bfloat16,
         include_modules: Sequence[str] = (),
         exclude_modules: Sequence[str] = (),
+        include_parameters: Sequence[str] = (),
     ) -> Generator[LoadedSubgraph, None, None]:
         plan = self.plan(
             subgraph,
             include_modules=include_modules,
             exclude_modules=exclude_modules,
+            include_parameters=include_parameters,
         )
         with self.loaded_plan(plan, device=device, dtype=dtype) as loaded:
             yield loaded
@@ -351,6 +355,7 @@ class SubgraphWeightSession:
         *,
         include_modules: Sequence[str] = (),
         exclude_modules: Sequence[str] = (),
+        include_parameters: Sequence[str] = (),
     ) -> SubgraphLoadPlan:
         """Resolve a subgraph working set without loading checkpoint tensors."""
 
@@ -359,9 +364,25 @@ class SubgraphWeightSession:
             include_modules=include_modules,
             exclude_modules=exclude_modules,
         )
-        return self.plan_modules(
+        base = self.plan_modules(
             module_names,
             allow_missing_state=True,
+        )
+        direct_parameters = tuple(
+            str(node.target)
+            for node in subgraph.graph.nodes
+            if node.op == "get_attr" and str(node.target) in self.model._parameters
+        )
+        uncovered = tuple(
+            name for name in dict.fromkeys((*include_parameters, *direct_parameters))
+            if not any(_contains(root, name) for root in module_names)
+        )
+        direct = self.plan_parameters(uncovered) if uncovered else None
+        return SubgraphLoadPlan(
+            module_names=_minimal_roots(
+                (*base.module_names, *(direct.module_names if direct else ()))
+            ),
+            targets=base.targets + (direct.targets if direct else ()),
         )
 
     def plan_parameters(

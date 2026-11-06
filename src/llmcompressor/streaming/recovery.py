@@ -49,6 +49,7 @@ class ResumePlan:
     boundary_index: int | None
     metadata: tuple[dict[str, Any], ...] = ()
     scan_stats: ResumeScanStats = ResumeScanStats()
+    prefix_metadata: dict[str, Any] | None = None
 
     @property
     def metadata_by_id(self) -> dict[str, dict[str, Any]]:
@@ -58,9 +59,11 @@ class ResumePlan:
 def build_resume_plan(writer: StreamingCheckpointWriter) -> ResumePlan:
     """Scan committed transaction metadata once and reject holes or corruption."""
 
+    committed = list(writer.committed_metadata())
+    prefix = [value for value in committed if value["transaction_id"] == "prefix-00000"]
     metadata = [
         value
-        for value in writer.committed_metadata()
+        for value in committed
         if value["transaction_id"].startswith("subgraph-")
     ]
     ordered = sorted(
@@ -88,6 +91,7 @@ def build_resume_plan(writer: StreamingCheckpointWriter) -> ResumePlan:
         boundary_index=boundary_index,
         metadata=tuple(ordered),
         scan_stats=writer.scan_stats,
+        prefix_metadata=prefix[0] if prefix else None,
     )
 
 
