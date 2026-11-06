@@ -1,6 +1,6 @@
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Literal
+from typing import ClassVar, Literal
 
 import torch
 import torch.distributed as dist
@@ -103,6 +103,7 @@ class SmoothQuantModifier(Modifier):
     """
 
     requires_calibration_data: bool = True
+    modifies_norms: ClassVar[bool] = True
 
     smoothing_strength: float = 0.5
     mappings: list[tuple | list] | None = None

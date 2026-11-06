@@ -1,6 +1,6 @@
 import inspect
 from collections.abc import Iterator
-from typing import Literal
+from typing import ClassVar, Literal
 
 import torch
 from compressed_tensors.distributed import wait_for_comms
@@ -142,6 +142,7 @@ class AWQModifier(Modifier):
     """
 
     requires_calibration_data: bool = True
+    modifies_norms: ClassVar[bool] = True
 
     # Allow arbitrary types because AWQMapping has fields of type torch.nn.Module
     model_config: ConfigDict = ConfigDict(arbitrary_types_allowed=True)
@@ -312,6 +313,20 @@ class AWQModifier(Modifier):
 
         return held, scratch
 
+    def estimate_sequential_host_memory(self, module: Module, num_tokens: int) -> int:
+        """Estimate CPU input-cache bytes independently of device scratch."""
+        if not (
+            isinstance(self.offload_device, (str, torch.device))
+            and torch.device(self.offload_device).type == "cpu"
+        ):
+            return 0
+        mappings = self._mappings_by_parent.get(module, [])
+        if not mappings:
+            return 0
+        with disable_onloading():
+            weight = mappings[0].balance_layers[0].weight
+            return num_tokens * weight.shape[-1] * weight.element_size()
+
     def on_finalize(self, state: State, **kwargs) -> bool:
         """
         Clean up by clearing the activations and mapping data
@@ -360,7 +375,7 @@ class AWQModifier(Modifier):
                     )
                 smooth_layer = smooth_layers[0]
                 smooth_name = module_to_name.get(smooth_layer)
-                
+
                 if 'norm' in smooth_name.lower():
                     setattr(smooth_layer, "norm_bias", mapping.norm_bias)
 
@@ -633,7 +648,9 @@ class AWQModifier(Modifier):
                             # because the desired smooth layer is v_proj
                             # https://github.com/casper-hansen/AutoAWQ/blob/main/awq/quantize/scale.py#L123
                             weight = module.weight
-                            weight[-scales.size(0) :].add_(norm_bias).div_(scales.view(-1, 1)).sub_(norm_bias)
+                            weight[-scales.size(0) :].add_(norm_bias).div_(
+                                scales.view(-1, 1)
+                            ).sub_(norm_bias)
                             update_offload_parameter(module, "weight", weight)
                         if hasattr(module, "bias") and module.bias is not None:
                             update_offload_parameter(

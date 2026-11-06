@@ -326,24 +326,6 @@ def streaming_oneshot_from_pretrained(
     dtype_policy = dtype_policy or StreamingDTypePolicy.for_quantized_modules(
         target_dtype, schemes
     )
-    uses_imatrix = any(
-        scheme.weights is not None and scheme.weights.observer == "imatrix_mse"
-        for scheme in schemes.values()
-    )
-    uses_calibration_transform = any(
-        type(modifier).__name__
-        in {
-            "AWQModifier",
-            "SmoothQuantModifier",
-        }
-        for modifier in parsed_recipe.modifiers
-    )
-    use_gptq = isinstance(quantizer, GPTQModifier)
-    if not use_gptq and not uses_imatrix and not uses_calibration_transform:
-        raise ValueError(
-            "RTN streaming PTQ requires a calibration modifier or "
-            "weights.observer='imatrix_mse'"
-        )
     device = torch.device(device)
     fingerprint = _dataset_fingerprint(
         dataset,

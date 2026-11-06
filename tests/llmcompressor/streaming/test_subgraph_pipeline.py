@@ -88,6 +88,102 @@ def _calibration_data():
     )
 
 
+@pytest.mark.parametrize("failure_kind", ["device", "disk", "modifier"])
+def test_admission_failure_does_not_prepare_target(
+    tmp_path, monkeypatch, failure_kind
+):
+    from llmcompressor.streaming.admission import (
+        DeviceMemoryBudget,
+        DeviceMemoryError,
+        DiskSpaceBudget,
+        DiskSpaceError,
+    )
+    from llmcompressor.streaming.modifier_contract import ModifierContractError
+
+    config = Qwen3Config(
+        vocab_size=32, hidden_size=8, intermediate_size=16,
+        num_hidden_layers=2, num_attention_heads=2, num_key_value_heads=1,
+        head_dim=4, max_position_embeddings=32, tie_word_embeddings=True,
+    )
+    checkpoint = tmp_path / "checkpoint"
+    Qwen3ForCausalLM(config).save_pretrained(checkpoint, safe_serialization=True)
+    prepared_roots = []
+    original_prepare = SubgraphWeightSession.prepare
+
+    def record_prepare(weight_session, plan, **kwargs):
+        prepared_roots.extend(plan.module_names)
+        return original_prepare(weight_session, plan, **kwargs)
+
+    monkeypatch.setattr(SubgraphWeightSession, "prepare", record_prepare)
+    recipe = _imatrix_recipe()
+    if failure_kind == "device":
+        monkeypatch.setattr(
+            "llmcompressor.streaming.pipeline.DeviceMemoryBudget",
+            lambda: DeviceMemoryBudget(available_bytes=0),
+        )
+        exception = DeviceMemoryError
+    elif failure_kind == "disk":
+        monkeypatch.setattr(
+            "llmcompressor.streaming.pipeline.DiskSpaceBudget",
+            lambda root: DiskSpaceBudget(root, available_bytes=lambda _root: 0),
+        )
+        exception = DiskSpaceError
+    else:
+        class UnknownMemoryQuantizer(QuantizationModifier):
+            def estimate_sequential_memory(self, _module, _num_tokens):
+                return None
+
+        recipe = [UnknownMemoryQuantizer(scheme="W8A8", ignore=["lm_head"])]
+        exception = ModifierContractError
+    with pytest.raises(exception):
+        streaming_oneshot(
+            model=checkpoint, dataset=_calibration_data(),
+            dataset_fingerprint="admission-failure", recipe=recipe,
+            output_dir=tmp_path / "output", work_dir=tmp_path / "work",
+            num_calibration_samples=2, max_seq_length=4,
+            target_dtype=torch.float32, device="cpu",
+        )
+
+    assert all(not name.startswith("model.layers.") for name in prepared_roots)
+    assert not (tmp_path / "output" / "FINALIZED").exists()
+
+
+def test_prefetch_defers_when_current_writer_needs_host_capacity(tmp_path, monkeypatch):
+    from llmcompressor.streaming.loading import HostMemoryBudget, HostMemoryError
+
+    config = Qwen3Config(
+        vocab_size=32, hidden_size=8, intermediate_size=16,
+        num_hidden_layers=2, num_attention_heads=2, num_key_value_heads=1,
+        head_dim=4, max_position_embeddings=32, tie_word_embeddings=True,
+    )
+    checkpoint = tmp_path / "checkpoint"
+    Qwen3ForCausalLM(config).save_pretrained(checkpoint, safe_serialization=True)
+    deferred = []
+
+    class Budget(HostMemoryBudget):
+        def reserve(self, owner, required_bytes):
+            if owner.endswith("completion headroom"):
+                deferred.append(owner)
+                raise HostMemoryError("capacity needed for current checkpoint")
+            return super().reserve(owner, required_bytes)
+
+    def unexpected_prefetch(*_args, **_kwargs):
+        raise AssertionError("prefetch must defer when completion headroom is missing")
+
+    monkeypatch.setattr("llmcompressor.streaming.pipeline.HostMemoryBudget", Budget)
+    monkeypatch.setattr(SubgraphPrefetcher, "submit", unexpected_prefetch)
+    output = streaming_oneshot(
+        model=checkpoint, dataset=_calibration_data(),
+        dataset_fingerprint="prefetch-admission", recipe=_imatrix_recipe(),
+        output_dir=tmp_path / "output", work_dir=tmp_path / "work",
+        num_calibration_samples=2, max_seq_length=4,
+        target_dtype=torch.float32, device="cpu", async_save=True,
+    )
+
+    assert deferred
+    assert (output / "FINALIZED").exists()
+
+
 @pytest.mark.parametrize("quantizer_class", [QuantizationModifier, GPTQModifier])
 @pytest.mark.parametrize("fail_initialization", [False, True])
 def test_streaming_scopes_observers_to_resident_group_and_cleans_up(
@@ -515,6 +611,7 @@ def test_pretrained_streaming_writes_each_subgraph_as_final_shard(
         max_seq_length=4,
         target_dtype=torch.float32,
         async_save=True,
+        device="cpu",
     )
 
     assert (output / "FINALIZED").is_file()
@@ -928,7 +1025,15 @@ def test_streaming_gptq_matches_sequential_oneshot(tmp_path, monkeypatch):
     assert all(counts == (0, 0) for counts in remaining_statistics)
 
 
-def test_streaming_imatrix_rtn_matches_sequential_oneshot(tmp_path, monkeypatch):
+@pytest.mark.parametrize("use_imatrix", [False, True])
+def test_streaming_imatrix_rtn_matches_sequential_oneshot(
+    tmp_path, monkeypatch, use_imatrix
+):
+    def recipe():
+        return _imatrix_recipe() if use_imatrix else [
+            QuantizationModifier(scheme="W8A8", ignore=["lm_head"])
+        ]
+
     config = Qwen3Config(
         vocab_size=32,
         hidden_size=8,
@@ -950,7 +1055,7 @@ def test_streaming_imatrix_rtn_matches_sequential_oneshot(tmp_path, monkeypatch)
     oneshot(
         model=str(checkpoint),
         dataset=_calibration_data(),
-        recipe=_imatrix_recipe(),
+        recipe=recipe(),
         output_dir=baseline,
         num_calibration_samples=2,
         max_seq_length=4,
@@ -977,7 +1082,7 @@ def test_streaming_imatrix_rtn_matches_sequential_oneshot(tmp_path, monkeypatch)
         model=checkpoint,
         dataset=_calibration_data(),
         dataset_fingerprint="f" * 64,
-        recipe=_imatrix_recipe(),
+        recipe=recipe(),
         output_dir=tmp_path / "streamed",
         work_dir=tmp_path / "work",
         num_calibration_samples=2,

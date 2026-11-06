@@ -486,7 +486,9 @@ QAD、AutoRound、变换、KV cache 和其他并行组合分别经过能力评�
 
 ### E1：GPTQ 精确统计与内存优化
 
-优先级：P1，M4 后第一项。目标是降低同一子图内 Hessian 和 scratch 峰值。
+状态：按当前范围暂停。需要改动现有 GPTQ modifier 的 Hessian/workspace
+优化不实施；M4 只调用已有估算接口。以下保留为设计记录。
+目标是降低同一子图内 Hessian 和 scratch 峰值。
 
 Hessian（海森矩阵）是损失对参数的二阶导数矩阵。对 GPTQ 使用的局部线性
 输出重建损失，其每个输出行的 Hessian 与输入二阶矩 `X @ X.T` 成比例，
@@ -827,14 +829,14 @@ EP 延伸遵守 §3.7：全局发布完成后统一授权清理，不能由各 r
 - [x] 以 tiny dense 执行事务强杀/恢复验证；RTN+iMatrix 和 GPTQ 的完整矩阵继续扩展。
 - [ ] 记录真实执行结果，再更新 guide 支持范围。
 
-M2 当前进度（2026-11-05）：
+M2 当前进度（2026-11-06）：
 
 - [x] 已实现一次 committed subgraph 扫描和连续链校验。
 - [x] 已实现逐 batch frontier reader，恢复不再装入历史 boundary 列表。
 - [x] 已实现保留最近两个 boundary 的 retirement 记录和幂等删除。
 - [x] 已覆盖历史 boundary 合法回收、损坏 boundary、强杀恢复和 subgraph 回归。
 - [x] 已补充 8/32/128 子图扫描计数和读字节量测试。
-- [ ] 继续生成独立进程资源曲线报告。
+- [x] 已提供独立进程资源曲线报告工具，并实测 8/32/128 子图恢复。
 
 M3 当前进度（2026-11-05）：
 
@@ -842,14 +844,38 @@ M3 当前进度（2026-11-05）：
 - [x] finalize 重试可处理输出已备份、输出已安装和旧 backup 残留窗口。
 - [x] 覆盖重复 finalize、direct-writer publish-in-place 和配置/索引校验回归。
 
-M4 当前进度（2026-11-05）：
+M4 当前进度（2026-11-06）：
 
 - [x] 增加显式 `ModifierContract`，表达工作集估算、统计生命周期、传播、恢复和输出所有权。
 - [x] calibration output 复用通过 contract 判断，空 recipe 保持不复用。
 - [x] modifier contract 指纹纳入 manifest 和 run fingerprint。
-- [ ] 将 modifier contract 纳入资源 admission，补充各算法专项上界。
+- [x] 将 modifier contract 纳入资源 admission，补充 RTN/iMatrix/GPTQ/AWQ/SmoothQuant 的窄估算入口。
+- [x] host、device、临时 disk 分别 admission；prefetch 在当前 writer 余量不足时延后。
+- [x] 补充 observer 工作集、AWQ CPU cache、动态 target 估算及失败前不读权重回归。
+- [x] 五种算法分别在独立进程完成 tiny Qwen3 设备峰值实测。
+- [x] 预留 placement、统计同步范围、collective owner 和通信字节协议；多 rank 当前明确拒绝。
+- [ ] backend workspace、AWQ 任意额外 kwargs 和 GPTQ auto batching 的严格峰值上界仍需专项适配验证。
+
+M2/M4 实现边界：
+
+- M2 报告工具 `tools/measure_streaming_resource_curve.py` 为每个
+  `--case LABEL=CHECKPOINT_DIRECTORY` 启动独立 probe 进程，输出 checkpoint
+  bytes、incremental peak RSS、输出目录和失败诊断；曲线只包含成功 case。
+  `--depth 8 --depth 32 --depth 128` 单独测量恢复，每个 case 的准备和测量也分进程。
+- M4 在每个 target 读取权重前计算 materialized target bytes，并汇总 modifier
+  contract 的 held statistics 与 compression scratch，向设备预算申请带安全余量的
+  reservation。reservation 在 target 卸载时释放，prefetch 的 CPU preparation 使用
+  共享 host budget，并检查当前 writer 的 completion headroom。
+- modifier 必须提供 `estimate_sequential_memory()`，或声明静态
+  `memory_estimate=(held, scratch)`；需要 calibration data 但无法估算的 modifier
+  会在加载前以 `ModifierContractError` 拒绝。CPU 没有统一 free-memory provider
+  时只做显式 reservation 记账，不伪造设备可用量。
+- 这些估算用于已声明工作集的 admission，不宣称所有模型/算子的绝对峰值上界；
+  资源报告用于持续记录估算和实测的偏差。CPU modifier 资源另计入 host budget，
+  不伪造设备可用量。实现不修改 GPTQ modifier 源码。
+- 实测结果、复现命令和剩余边界见
+  [M2/M4 验证报告](streaming-m2-m4-validation.md)。
 
 核心完成后的下一优先级是 D/E：恢复和 GC 的收益覆盖全部 PTQ 算法。
-E1 的 GPTQ 优化和 E3 的 MoE 专家执行作为两个独立延伸验证，
-依据峰值、重算和质量数据决定后续投入。
+E1 暂停；E3 的 MoE 专家执行依据峰值、重算和质量数据决定后续投入。
 EP-B 不依赖这两项优化；在单设备事务和预算稳定后可优先交付。

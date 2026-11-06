@@ -33,6 +33,11 @@ class ModifierContract:
     recovery_state: str
     output_ownership: str
     memory_estimate: tuple[int, int] | None
+    memory_estimate_is_static: bool = False
+    parameter_placement: str = "single-device"
+    statistics_sync_scope: str = "single-participant"
+    collective_owner: str = "modifier"
+    communication_bytes: int = 0
 
     def __post_init__(self) -> None:
         if not self.modifier_type:
@@ -42,6 +47,9 @@ class ModifierContract:
             "propagation_mode",
             "recovery_state",
             "output_ownership",
+            "parameter_placement",
+            "statistics_sync_scope",
+            "collective_owner",
         ):
             if not getattr(self, name):
                 raise ValueError(f"{name} cannot be empty")
@@ -49,6 +57,8 @@ class ModifierContract:
             value < 0 for value in self.memory_estimate
         ):
             raise ValueError("memory_estimate values must be non-negative")
+        if self.communication_bytes < 0:
+            raise ValueError("communication_bytes must be non-negative")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -62,6 +72,11 @@ class ModifierContract:
             "recovery_state": self.recovery_state,
             "output_ownership": self.output_ownership,
             "memory_estimate": self.memory_estimate,
+            "memory_estimate_is_static": self.memory_estimate_is_static,
+            "parameter_placement": self.parameter_placement,
+            "statistics_sync_scope": self.statistics_sync_scope,
+            "collective_owner": self.collective_owner,
+            "communication_bytes": self.communication_bytes,
         }
 
 
@@ -118,7 +133,7 @@ def build_modifier_contracts(
                     _declared(modifier, "calibration_outputs_reusable", False)
                 ),
                 requires_calibration_data=bool(
-                    _declared(modifier, "requires_calibration_data", False)
+                    getattr(modifier, "requires_calibration_data", False)
                 ),
                 modifies_weights=bool(
                     _declared(modifier, "modifies_weights", True)
@@ -143,6 +158,19 @@ def build_modifier_contracts(
                     _declared(modifier, "output_ownership", "pipeline")
                 ),
                 memory_estimate=_memory_estimate(modifier),
+                memory_estimate_is_static=(
+                    _declared(modifier, "memory_estimate", None) is not None
+                ),
+                parameter_placement=str(
+                    _declared(modifier, "parameter_placement", "single-device")
+                ),
+                statistics_sync_scope=str(
+                    _declared(modifier, "statistics_sync_scope", "single-participant")
+                ),
+                collective_owner=str(
+                    _declared(modifier, "collective_owner", "modifier")
+                ),
+                communication_bytes=int(_declared(modifier, "communication_bytes", 0)),
             )
         )
     if not contracts:

@@ -67,6 +67,27 @@ class ModuleArgumentModel(nn.Module):
         self.unused = nn.Linear(4, 4)
 
 
+def test_materialized_estimate_excludes_decode_workspace_and_does_not_read(
+    tmp_path, monkeypatch
+):
+    reference = SessionModel()
+    checkpoint = checkpoint_for(reference, tmp_path)
+    source = SafetensorsWeightSource(checkpoint)
+    session = SubgraphWeightSession(build_meta_model(SessionModel), source)
+    plan = session.plan(subgraph_for("layers.0"))
+
+    def unexpected_read(*_args, **_kwargs):
+        raise AssertionError("estimating bytes must not read checkpoint tensors")
+
+    monkeypatch.setattr(source, "load_tensors_cpu", unexpected_read)
+    monkeypatch.setattr(source, "iter_tensor_groups_cpu", unexpected_read)
+    actual = session.estimate_materialized_bytes(plan, dtype=torch.float32)
+    expected = sum(value.nbytes for value in reference.layers[0].state_dict().values())
+
+    assert actual == expected
+    assert session.estimate_preparation(plan, dtype=torch.float32) > actual
+
+
 def test_loads_module_get_attr_passed_to_target(tmp_path):
     reference = ModuleArgumentModel()
     checkpoint = tmp_path / "model.safetensors"

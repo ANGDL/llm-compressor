@@ -1,0 +1,141 @@
+{
+  "schema": 1,
+  "date": "2026-11-06",
+  "environment": {
+    "host": "node16",
+    "container": "llm-quant-base",
+    "repository": "/data/quant/llm-compressor",
+    "python": "3.12",
+    "device": "cuda:0",
+    "device_interface": "torch_xmlir CUDA compatibility interface"
+  },
+  "recovery": {
+    "batch_count": 4,
+    "batch_shape": [1, 1024, 64],
+    "dtype": "float32",
+    "keep_recent": 2,
+    "cases": [
+      {
+        "depth": 8,
+        "pid": 945308,
+        "baseline_rss_bytes": 1055252480,
+        "peak_rss_bytes": 1058463744,
+        "incremental_peak_bytes": 3211264,
+        "metadata_bytes": 39184,
+        "payload_bytes": 131072,
+        "transaction_count": 8,
+        "boundary_bytes": 2110280,
+        "boundary_count": 8,
+        "retained_boundary_bytes": 2110280,
+        "frontier_batches": 4,
+        "peak_live_batches": 1,
+        "scan_seconds": 0.010486465878784657
+      },
+      {
+        "depth": 32,
+        "pid": 945811,
+        "baseline_rss_bytes": 1053724672,
+        "peak_rss_bytes": 1057247232,
+        "incremental_peak_bytes": 3522560,
+        "metadata_bytes": 156781,
+        "payload_bytes": 524288,
+        "transaction_count": 32,
+        "boundary_bytes": 2110280,
+        "boundary_count": 8,
+        "retained_boundary_bytes": 2110280,
+        "frontier_batches": 4,
+        "peak_live_batches": 1,
+        "scan_seconds": 0.017728894017636776
+      },
+      {
+        "depth": 128,
+        "pid": 946178,
+        "baseline_rss_bytes": 1052090368,
+        "peak_rss_bytes": 1057144832,
+        "incremental_peak_bytes": 5054464,
+        "metadata_bytes": 627238,
+        "payload_bytes": 2097152,
+        "transaction_count": 128,
+        "boundary_bytes": 2110280,
+        "boundary_count": 8,
+        "retained_boundary_bytes": 2110280,
+        "frontier_batches": 4,
+        "peak_live_batches": 1,
+        "scan_seconds": 0.04673011787235737
+      }
+    ]
+  },
+  "modifier_admission": {
+    "model": "random Qwen3ForCausalLM",
+    "seed": 7,
+    "config": {
+      "vocab_size": 128,
+      "hidden_size": 32,
+      "intermediate_size": 64,
+      "num_hidden_layers": 2,
+      "num_attention_heads": 4,
+      "num_key_value_heads": 2,
+      "head_dim": 8,
+      "max_position_embeddings": 64,
+      "tie_word_embeddings": true
+    },
+    "source_dtype": "bfloat16",
+    "target_dtype": "bfloat16",
+    "checkpoint_bytes": 47872,
+    "calibration_batches": 1,
+    "sequence_length": 8,
+    "scheme": "W8A8",
+    "cases": [
+      {
+        "algorithm": "rtn",
+        "targets_completed": 2,
+        "materialized_bytes_per_target": 18592,
+        "modifier_held_bytes_per_target": 8192,
+        "modifier_scratch_bytes_per_target": 73728,
+        "device_required_bytes_per_target": 100512,
+        "max_peak_allocated_bytes": 43008,
+        "incremental_peak_rss_bytes": 138645504
+      },
+      {
+        "algorithm": "imatrix",
+        "targets_completed": 2,
+        "materialized_bytes_per_target": 18592,
+        "modifier_held_bytes_per_target": 9272,
+        "modifier_scratch_bytes_per_target": 77824,
+        "device_required_bytes_per_target": 105688,
+        "max_peak_allocated_bytes": 74752,
+        "incremental_peak_rss_bytes": 141463552
+      },
+      {
+        "algorithm": "gptq",
+        "targets_completed": 2,
+        "materialized_bytes_per_target": 18592,
+        "modifier_held_bytes_per_target": 49152,
+        "modifier_scratch_bytes_per_target": 225280,
+        "device_required_bytes_per_target": 293024,
+        "max_peak_allocated_bytes": 231936,
+        "incremental_peak_rss_bytes": 325709824
+      },
+      {
+        "algorithm": "awq",
+        "targets_completed": 2,
+        "materialized_bytes_per_target": 18592,
+        "modifier_held_bytes_per_target": 10240,
+        "modifier_scratch_bytes_per_target": 82944,
+        "device_required_bytes_per_target": 111776,
+        "max_peak_allocated_bytes": 63488,
+        "incremental_peak_rss_bytes": 142057472
+      },
+      {
+        "algorithm": "smoothquant",
+        "targets_completed": 2,
+        "materialized_bytes_per_target": 18592,
+        "modifier_held_bytes_per_target": 8448,
+        "modifier_scratch_bytes_per_target": 77824,
+        "device_required_bytes_per_target": 104864,
+        "max_peak_allocated_bytes": 49152,
+        "incremental_peak_rss_bytes": 140726272
+      }
+    ]
+  }
+}
