@@ -18,8 +18,10 @@ from llmcompressor.streaming import (
     InMemoryBoundaryActivationStore,
     RoutedExpertBatch,
     SafetensorsWeightSource,
+    StandardTransformersMoEAdapter,
     SubgraphWeightSession,
     build_meta_model,
+    discover_standard_moe_adapters,
     execute_expert_group,
 )
 
@@ -248,6 +250,90 @@ def test_routing_rejects_unowned_expert_indices():
             torch.ones(1, 1),
             group,
         )
+
+
+class StandardRouter(nn.Module):
+    def __init__(self, hidden_size=3, num_experts=4, top_k=2):
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(num_experts, hidden_size))
+        self.top_k = top_k
+
+    def forward(self, hidden_states):
+        logits = hidden_states @ self.weight.t()
+        probabilities = torch.softmax(logits, dim=-1)
+        weights, indices = torch.topk(probabilities, self.top_k, dim=-1)
+        weights = weights / weights.sum(dim=-1, keepdim=True)
+        return logits, weights, indices
+
+
+class StandardMoeBlock(nn.Module):
+    def __init__(self, hidden_size=3, num_experts=4):
+        super().__init__()
+        self.gate = StandardRouter(hidden_size, num_experts)
+        self.experts = nn.ModuleList(
+            [
+                nn.Linear(hidden_size, hidden_size, bias=False)
+                for _ in range(num_experts)
+            ]
+        )
+
+    def forward(self, hidden_states):
+        shape = hidden_states.shape
+        flattened = hidden_states.reshape(-1, shape[-1])
+        _, weights, indices = self.gate(flattened)
+        output = torch.zeros_like(flattened)
+        plan = ExpertGroupPlan.from_num_experts("experts", len(self.experts), 99)
+        execute_expert_group(
+            self.experts,
+            flattened,
+            indices,
+            weights,
+            plan.groups[0],
+            output=output,
+        )
+        return output.reshape(shape)
+
+
+class StandardMoeModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.block = StandardMoeBlock()
+
+
+def test_standard_transformers_adapter_routes_and_restores_shape(tmp_path):
+    torch.manual_seed(19)
+    reference = StandardMoeModel()
+    checkpoint = tmp_path / "standard-moe.safetensors"
+    save_file(reference.state_dict(), checkpoint)
+    model = build_meta_model(StandardMoeModel)
+    session = SubgraphWeightSession(model, SafetensorsWeightSource(checkpoint))
+    adapter = StandardTransformersMoEAdapter.from_model(model, "block")
+    plan = adapter.build_plan(model, group_size=2)
+    executor = ExpertGroupExecutor(model, session, plan)
+    hidden_states = torch.randn(2, 5, 3)
+
+    output = executor.execute_with_adapter(
+        adapter,
+        hidden_states,
+        device="cpu",
+        dtype=torch.float32,
+    )
+    expected = reference.block(hidden_states)
+
+    torch.testing.assert_close(output, expected)
+    assert plan.experts_name == "block.experts"
+    assert adapter.router_module_names() == ("block.gate",)
+    assert all(parameter.is_meta for parameter in model.parameters())
+
+
+def test_standard_transformers_adapter_discovery_is_model_agnostic():
+    model = StandardMoeModel()
+
+    adapters = discover_standard_moe_adapters(model)
+
+    assert len(adapters) == 1
+    assert adapters[0].moe_name == "block"
+    assert adapters[0].adapter_id == "transformers-standard-v1"
 
 
 class GatedExpert(nn.Module):
