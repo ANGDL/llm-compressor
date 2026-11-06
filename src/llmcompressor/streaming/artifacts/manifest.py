@@ -29,9 +29,7 @@ def fingerprint_json(value: Any) -> str:
 
 
 def _require_sha256(value: str, field_name: str) -> None:
-    invalid_character = any(
-        character not in "0123456789abcdef" for character in value
-    )
+    invalid_character = any(character not in "0123456789abcdef" for character in value)
     if len(value) != 64 or invalid_character:
         raise ValueError(f"{field_name} must be a lowercase SHA-256 digest")
 
@@ -189,9 +187,7 @@ class ParallelInfo:
     ) -> ParallelInfo:
         return cls(
             context=tuple(
-                sorted(
-                    (str(name), int(value)) for name, value in context.items()
-                )
+                sorted((str(name), int(value)) for name, value in context.items())
             ),
             placement_fingerprint=placement_fingerprint,
         )
@@ -224,9 +220,7 @@ class StreamingRunManifest:
                 f"{self.schema_version!r}; expected {CURRENT_SCHEMA_VERSION}"
             )
         _require_sha256(self.recipe.normalized_sha256, "recipe.normalized_sha256")
-        _require_sha256(
-            self.materializer.config_sha256, "materializer.config_sha256"
-        )
+        _require_sha256(self.materializer.config_sha256, "materializer.config_sha256")
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

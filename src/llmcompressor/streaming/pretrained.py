@@ -56,6 +56,7 @@ from .tracing import trace_streaming_boundaries
 
 __all__ = ["streaming_oneshot_from_pretrained"]
 
+
 def _recipe_quantizer(recipe: Recipe):
     quantizers = [
         modifier
@@ -110,9 +111,7 @@ def _exact_schemes(
                     f"got {type(module).__name__} at {name!r}"
                 )
             if name in schemes:
-                raise ValueError(
-                    f"Overlapping quantization schemes match {name!r}"
-                )
+                raise ValueError(f"Overlapping quantization schemes match {name!r}")
             exact = deepcopy(scheme)
             exact.targets = [name]
             schemes[name] = exact
@@ -131,9 +130,7 @@ def _quantized_sequential_targets(
 ) -> tuple[str, ...]:
     """Select no-split ancestors that contain an exact quantization target."""
     patterns = infer_sequential_targets(model)
-    matched_names = {
-        name for name, _ in match_named_modules(model, patterns)
-    }
+    matched_names = {name for name, _ in match_named_modules(model, patterns)}
     relevant = {
         name
         for name in matched_names
@@ -258,17 +255,12 @@ def streaming_oneshot_from_pretrained(
             "output_dir must not be inside work_dir; use sibling directories"
         )
     resolved_checkpoint = checkpoint.resolve()
-    if (
-        resolved_work.is_relative_to(resolved_checkpoint)
-        or resolved_checkpoint.is_relative_to(resolved_work)
-    ):
+    if resolved_work.is_relative_to(
+        resolved_checkpoint
+    ) or resolved_checkpoint.is_relative_to(resolved_work):
         raise ValueError("work_dir and checkpoint must use separate directories")
     output.parent.mkdir(parents=True, exist_ok=True)
-    if (
-        output.exists()
-        and (output / "FINALIZED").is_file()
-        and not overwrite_output
-    ):
+    if output.exists() and (output / "FINALIZED").is_file() and not overwrite_output:
         return output
     if output.exists() and any(output.iterdir()) and not overwrite_output:
         raise FileExistsError(
@@ -381,8 +373,10 @@ def streaming_oneshot_from_pretrained(
                 "processor_files": {
                     name: hashlib.sha256((checkpoint / name).read_bytes()).hexdigest()
                     for name in (
-                        "preprocessor_config.json", "processor_config.json",
-                        "tokenizer_config.json", "special_tokens_map.json",
+                        "preprocessor_config.json",
+                        "processor_config.json",
+                        "tokenizer_config.json",
+                        "special_tokens_map.json",
                     )
                     if (checkpoint / name).is_file()
                 },
@@ -407,8 +401,7 @@ def streaming_oneshot_from_pretrained(
             name
             for name in schemes
             if any(
-                name == target or name.startswith(f"{target}.")
-                for target in targets
+                name == target or name.startswith(f"{target}.") for target in targets
             )
         )
         missing = sorted(set(schemes) - set(covered))

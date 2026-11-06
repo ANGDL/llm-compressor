@@ -46,7 +46,7 @@ def _directory_bytes(path: Path) -> int:
 def _resource_summary(device: torch.device, path: Path) -> str:
     rss_kib = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     gpu_peak = (
-        torch.cuda.max_memory_allocated(device)
+        torch.get_device_module(device).max_memory_allocated(device)
         if device.type == "cuda"
         else 0
     )
@@ -98,15 +98,13 @@ def _streaming_oneshot_from_boundaries(
     resolved_work = work.resolve()
     resolved_output = output.resolve()
     resolved_checkpoint = Path(checkpoint).expanduser().resolve()
-    if (
-        resolved_work.is_relative_to(resolved_output)
-        or resolved_output.is_relative_to(resolved_work)
+    if resolved_work.is_relative_to(resolved_output) or resolved_output.is_relative_to(
+        resolved_work
     ):
         raise ValueError("work_dir and output_dir must use separate directories")
-    if (
-        resolved_work.is_relative_to(resolved_checkpoint)
-        or resolved_checkpoint.is_relative_to(resolved_work)
-    ):
+    if resolved_work.is_relative_to(
+        resolved_checkpoint
+    ) or resolved_checkpoint.is_relative_to(resolved_work):
         raise ValueError("work_dir and checkpoint must use separate directories")
     if statistics_cache is not None:
         cache_root = statistics_cache.root.resolve()
@@ -129,7 +127,7 @@ def _streaming_oneshot_from_boundaries(
         return output
 
     if device.type == "cuda":
-        torch.cuda.reset_peak_memory_stats(device)
+        torch.get_device_module(device).reset_peak_memory_stats(device)
     started = time.monotonic()
     logger.info(f"streaming collect: starting {len(targets)} sequential targets")
     collect_calibration_statistics(

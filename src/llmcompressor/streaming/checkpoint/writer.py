@@ -216,10 +216,7 @@ def _boundary_records(boundary: Mapping[str, Any]) -> list[dict[str, Any]]:
             raise ValueError("Boundary batch records must be mappings")
         required = {"index", "path", "size", "sha256", "summary"}
         if set(value) != required:
-            raise ValueError(
-                "Boundary batch record fields must be "
-                f"{sorted(required)}"
-            )
+            raise ValueError(f"Boundary batch record fields must be {sorted(required)}")
         records.append(dict(value))
     return records
 
@@ -258,9 +255,7 @@ class _Transaction(AbstractContextManager["_Transaction"]):
         if not name or name in self.records:
             raise ValueError(f"Duplicate or empty tensor name {name!r}")
         if not output_shard.endswith(".safetensors"):
-            raise ValueError(
-                f"Output shard must end in .safetensors: {output_shard!r}"
-            )
+            raise ValueError(f"Output shard must end in .safetensors: {output_shard!r}")
         value = tensor.detach().to("cpu").contiguous()
         try:
             dtype_name = _SAFETENSORS_DTYPES[value.dtype]
@@ -271,9 +266,7 @@ class _Transaction(AbstractContextManager["_Transaction"]):
         # NumPy cannot expose every dtype supported by safetensors (notably
         # bfloat16). Viewing the contiguous tensor as bytes keeps the exact
         # storage representation without a full-size dtype conversion.
-        storage = memoryview(
-            value.reshape(-1).view(torch.uint8).numpy()
-        ).cast("B")
+        storage = memoryview(value.reshape(-1).view(torch.uint8).numpy()).cast("B")
         with payload.open("wb") as file:
             file.write(storage)
             digest.update(storage)
@@ -370,9 +363,7 @@ class _Transaction(AbstractContextManager["_Transaction"]):
                     f"Boundary batch indices must be contiguous from zero: "
                     f"{batch_indices}"
                 )
-            boundary_batches = [
-                self.boundary_records[index] for index in batch_indices
-            ]
+            boundary_batches = [self.boundary_records[index] for index in batch_indices]
             boundary_digest = fingerprint_json(boundary_batches)
         else:
             boundary_batches = []
@@ -382,8 +373,7 @@ class _Transaction(AbstractContextManager["_Transaction"]):
             "transaction_id": self.transaction_id,
             "run_fingerprint": self.writer.run_fingerprint,
             "records": [
-                record.to_dict(root=self.pending)
-                for record in self.records.values()
+                record.to_dict(root=self.pending) for record in self.records.values()
             ],
             "quantized_modules": self.quantized_modules,
             "omitted_tied_weights": self.omitted_tied_weights,
@@ -579,9 +569,7 @@ class StreamingCheckpointWriter:
         """Load one committed transaction after validating its objects."""
 
         if not self.is_transaction_complete(transaction_id):
-            raise RuntimeError(
-                f"Committed transaction {transaction_id!r} is corrupt"
-            )
+            raise RuntimeError(f"Committed transaction {transaction_id!r} is corrupt")
         path = self.transactions_dir / transaction_id / "metadata.json"
         return json.loads(path.read_text(encoding="utf-8"))
 
@@ -620,14 +608,11 @@ class StreamingCheckpointWriter:
                 pickle.UnpicklingError,
             ) as error:
                 raise RuntimeError(
-                    f"Cannot read committed boundary batch "
-                    f"{root / record['path']}"
+                    f"Cannot read committed boundary batch {root / record['path']}"
                 ) from error
             yield int(record["index"]), value
 
-    def committed_boundary(
-        self, transaction_id: str
-    ) -> tuple[int, list[Any]] | None:
+    def committed_boundary(self, transaction_id: str) -> tuple[int, list[Any]] | None:
         """Load a boundary committed with a subgraph transaction."""
 
         if not self.is_transaction_complete(transaction_id):
@@ -659,9 +644,7 @@ class StreamingCheckpointWriter:
                         f"Tensor {record.name!r} is produced by multiple transactions"
                     )
                 records_by_shard[record.output_shard][record.name] = record
-            self._merge_unique(
-                quantized_modules, metadata.get("quantized_modules", {})
-            )
+            self._merge_unique(quantized_modules, metadata.get("quantized_modules", {}))
             self._merge_unique(
                 omitted_tied_weights, metadata.get("omitted_tied_weights", {})
             )
@@ -710,9 +693,7 @@ class StreamingCheckpointWriter:
                 raise ValueError(f"Conflicting output metadata for {key!r}")
 
     @staticmethod
-    def _assemble_safetensors(
-        path: Path, records: Mapping[str, TensorRecord]
-    ) -> int:
+    def _assemble_safetensors(path: Path, records: Mapping[str, TensorRecord]) -> int:
         path.parent.mkdir(parents=True, exist_ok=True)
         offset = 0
         header = {}

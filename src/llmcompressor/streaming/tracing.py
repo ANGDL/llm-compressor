@@ -150,8 +150,8 @@ class TracedBoundaryAdapter:
                 sample_batch = next(batch_iterator)
             except StopIteration as error:
                 raise ValueError("Streaming calibration batches are empty") from error
-            self._prefix_runtime_parameters = (
-                self._declared_runtime_parameters("prefix")
+            self._prefix_runtime_parameters = self._declared_runtime_parameters(
+                "prefix"
             )
             self._prefix_runtime_modules = self._discover_prefix_runtime_modules(
                 prefix, sample_batch
@@ -260,9 +260,11 @@ class TracedBoundaryAdapter:
     def _execution_dependencies(self, stage):
         modules, parameters = [], []
         if self.execution is not None:
-            for name, module_names, parameter_names in (
-                self.execution.runtime_dependencies
-            ):
+            for (
+                name,
+                module_names,
+                parameter_names,
+            ) in self.execution.runtime_dependencies:
                 if name == stage:
                     modules.extend(module_names)
                     parameters.extend(parameter_names)
@@ -368,7 +370,8 @@ class TracedBoundaryAdapter:
         try:
             modules, _parameters = self._execution_dependencies(target_name)
             parameters = tuple(
-                name for name in self._declared_runtime_parameters(target_name)
+                name
+                for name in self._declared_runtime_parameters(target_name)
                 if not name.startswith(target_name + ".")
             )
             helper_plan = self.weight_session.plan(
@@ -440,9 +443,7 @@ def trace_streaming_boundaries(
     target_subgraphs.reverse()
     trace_consumed_names(target_subgraphs)
 
-    loader = TargetWeightLoader(
-        model, source, materializer, dtype_policy=dtype_policy
-    )
+    loader = TargetWeightLoader(model, source, materializer, dtype_policy=dtype_policy)
     weight_session = SubgraphWeightSession(
         model, source, materializer, dtype_policy=dtype_policy
     )

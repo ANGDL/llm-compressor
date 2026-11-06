@@ -67,9 +67,7 @@ def test_collects_each_target_and_releases_weights(tmp_path):
         built.append(model)
         return model
 
-    store = run_collect(
-        checkpoint, artifacts, batches, model_factory=model_factory
-    )
+    store = run_collect(checkpoint, artifacts, batches, model_factory=model_factory)
 
     assert store.is_target_complete(0)
     assert store.is_target_complete(1)
@@ -102,9 +100,7 @@ def test_resume_skips_completed_target_and_uses_persisted_boundary(tmp_path):
         checkpoint,
         artifacts,
         batches,
-        forward_target=lambda target, value: (
-            calls.append(target) or target(value)
-        ),
+        forward_target=lambda target, value: calls.append(target) or target(value),
     )
     assert len(calls) == 1
     assert ArtifactStore(artifacts).is_target_complete(1)
@@ -142,17 +138,22 @@ def test_collect_cache_skips_hooks_but_still_propagates_boundaries(
 
     def run(name):
         return collect_calibration_statistics(
-            model_factory=TwoLayer, checkpoint=str(checkpoint),
-            artifact_dir=str(tmp_path / name), calibration_batches=batches,
-            targets=("layers.0", "layers.1"), recipe={"GPTQModifier": {}},
-            dataset_fingerprint="a" * 64, target_dtype=torch.float32,
+            model_factory=TwoLayer,
+            checkpoint=str(checkpoint),
+            artifact_dir=str(tmp_path / name),
+            calibration_batches=batches,
+            targets=("layers.0", "layers.1"),
+            recipe={"GPTQModifier": {}},
+            dataset_fingerprint="a" * 64,
+            target_dtype=torch.float32,
             statistics_cache=cache,
         )
 
     first = run("first")
     for collector in (GPTQStatisticsCollector, IMatrixStatisticsCollector):
         monkeypatch.setattr(
-            collector, "attach",
+            collector,
+            "attach",
             lambda *_args: pytest.fail("cache hits must not attach collectors"),
         )
     second = run("second")
@@ -173,10 +174,13 @@ def test_collect_cache_resume_binds_actual_inputs_and_transform(tmp_path):
     checkpoint, _reference = checkpoint_for(tmp_path)
     batches = [torch.randn(2, 3, 4)]
     arguments = {
-        "model_factory": TwoLayer, "checkpoint": str(checkpoint),
+        "model_factory": TwoLayer,
+        "checkpoint": str(checkpoint),
         "artifact_dir": str(tmp_path / "artifacts"),
-        "calibration_batches": batches, "targets": ("layers.0",),
-        "recipe": {"GPTQModifier": {}}, "dataset_fingerprint": "a" * 64,
+        "calibration_batches": batches,
+        "targets": ("layers.0",),
+        "recipe": {"GPTQModifier": {}},
+        "dataset_fingerprint": "a" * 64,
         "target_dtype": torch.float32,
         "statistics_cache": CandidateStatisticsCache(tmp_path / "cache"),
     }

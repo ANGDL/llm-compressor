@@ -187,9 +187,8 @@ def evaluate_streaming_candidates(
         raise ValueError("Candidate work_dir and checkpoint must be separate")
     if statistics_cache is not None:
         cache_root = statistics_cache.root.resolve()
-        if (
-            cache_root.is_relative_to(work.resolve())
-            or work.resolve().is_relative_to(cache_root)
+        if cache_root.is_relative_to(work.resolve()) or work.resolve().is_relative_to(
+            cache_root
         ):
             raise ValueError("Candidate cache and work_dir must be separate")
     inputs = freeze_calibration_inputs(
