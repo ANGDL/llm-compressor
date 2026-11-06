@@ -62,9 +62,7 @@ def build_resume_plan(writer: StreamingCheckpointWriter) -> ResumePlan:
     committed = list(writer.committed_metadata())
     prefix = [value for value in committed if value["transaction_id"] == "prefix-00000"]
     metadata = [
-        value
-        for value in committed
-        if value["transaction_id"].startswith("subgraph-")
+        value for value in committed if value["transaction_id"].startswith("subgraph-")
     ]
     ordered = sorted(
         metadata,

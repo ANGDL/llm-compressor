@@ -108,9 +108,7 @@ def _invoke_target(target: nn.Module, value: Any) -> Any:
     return target(value)
 
 
-def _module_fingerprints(
-    source_fingerprint: str, target: nn.Module, target_name: str
-):
+def _module_fingerprints(source_fingerprint: str, target: nn.Module, target_name: str):
     names = []
     for local_name, _ in target.named_parameters(recurse=True):
         names.append(f"{target_name}.{local_name}" if local_name else target_name)
@@ -179,8 +177,7 @@ def collect_calibration_statistics(
     try:
         dataset_fingerprint = str(dataset_fingerprint)
         if len(dataset_fingerprint) != 64 or any(
-            character not in "0123456789abcdef"
-            for character in dataset_fingerprint
+            character not in "0123456789abcdef" for character in dataset_fingerprint
         ):
             raise ValueError
     except (TypeError, ValueError) as error:
@@ -197,7 +194,8 @@ def collect_calibration_statistics(
     ):
         frozen = freeze_calibration_inputs(
             calibration_batches()
-            if callable(calibration_batches) else calibration_batches,
+            if callable(calibration_batches)
+            else calibration_batches,
             f"{artifact_dir}/cache-inputs",
         )
         calibration_batches = frozen
@@ -223,7 +221,8 @@ def collect_calibration_statistics(
         software=SoftwareInfo.from_versions({"torch": torch.__version__}),
         execution=ExecutionInfo(
             execution_graph_sha256=fingerprint_json(input_identity)
-            if input_identity else ""
+            if input_identity
+            else ""
         ),
     )
     store = ArtifactStore(artifact_dir)
@@ -289,12 +288,14 @@ def collect_calibration_statistics(
                     ),
                     prefix_fingerprint=prefix_fingerprint,
                     algorithms=tuple(sorted(algorithms)),
-                    observer_fingerprint=fingerprint_json({
-                        "algorithms": sorted(algorithms),
-                        "counting": "raw-unmasked-input-v1",
-                        "torch": torch.__version__,
-                        "modules": sorted(modules),
-                    }),
+                    observer_fingerprint=fingerprint_json(
+                        {
+                            "algorithms": sorted(algorithms),
+                            "counting": "raw-unmasked-input-v1",
+                            "torch": torch.__version__,
+                            "modules": sorted(modules),
+                        }
+                    ),
                     transform_fingerprint=fingerprint_streaming_value(
                         {
                             "declared": candidate_config,
@@ -305,7 +306,8 @@ def collect_calibration_statistics(
                             ),
                             "classes": [
                                 (
-                                    name, type(module).__module__,
+                                    name,
+                                    type(module).__module__,
                                     type(module).__qualname__,
                                 )
                                 for name, module in target.named_modules()
@@ -331,9 +333,7 @@ def collect_calibration_statistics(
                 )
             )
             statistics = (
-                statistics_cache.get(
-                    key, expected_names=tuple(sorted(expected_names))
-                )
+                statistics_cache.get(key, expected_names=tuple(sorted(expected_names)))
                 if key is not None
                 else None
             )
@@ -380,6 +380,5 @@ def _boundary_fingerprint(
     batches: Sequence[int],
 ) -> str:
     return fingerprint_streaming_values(
-        (batch, boundaries.get(boundary, batch))
-        for batch in batches
+        (batch, boundaries.get(boundary, batch)) for batch in batches
     )

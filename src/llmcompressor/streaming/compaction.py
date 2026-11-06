@@ -53,9 +53,7 @@ class BoundaryCompactor:
             successor = _next_subgraph_id(transaction_id)
             if not (self.transactions_dir / successor).is_dir():
                 continue
-            metadata_path = (
-                self.transactions_dir / transaction_id / "metadata.json"
-            )
+            metadata_path = self.transactions_dir / transaction_id / "metadata.json"
             metadata = _read_json(metadata_path)
             boundary = metadata.get("boundary")
             if boundary is None or self.is_retired(transaction_id):
@@ -100,9 +98,7 @@ class BoundaryCompactor:
             "records_sha256",
         }
         if set(value) != required:
-            raise RuntimeError(
-                f"Retirement record {path} has invalid fields"
-            )
+            raise RuntimeError(f"Retirement record {path} has invalid fields")
         if value["transaction_id"] != transaction_id:
             raise RuntimeError(f"Retirement record {path} has invalid transaction")
         successor = str(value["successor_transaction_id"])
@@ -110,9 +106,7 @@ class BoundaryCompactor:
             raise RuntimeError(f"Retirement record {path} has invalid successor")
         successor_path = self.transactions_dir / successor / "metadata.json"
         if not successor_path.is_file():
-            raise RuntimeError(
-                f"Retirement record {path} has no committed successor"
-            )
+            raise RuntimeError(f"Retirement record {path} has no committed successor")
         successor_metadata = _read_json(successor_path)
         if successor_metadata.get("transaction_id") != successor:
             raise RuntimeError(
