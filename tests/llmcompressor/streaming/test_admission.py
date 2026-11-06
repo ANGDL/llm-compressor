@@ -1,12 +1,21 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from torch import nn
 
+from llmcompressor.core import create_session
+from llmcompressor.modifiers.gptq import GPTQModifier
+from llmcompressor.modifiers.quantization import QuantizationModifier
+from llmcompressor.modifiers.transform import AWQModifier
+from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
 from llmcompressor.streaming.admission import (
     DeviceMemoryBudget,
     DeviceMemoryError,
+    DiskSpaceBudget,
+    DiskSpaceError,
     estimate_modifier_memory,
 )
 from llmcompressor.streaming.modifier_contract import ModifierContractError
@@ -38,7 +47,7 @@ def test_modifier_memory_aggregates_held_and_scratch():
     )
 
     assert estimate.held_bytes == 3 + 11 + 5 + 11 + 13
-    assert estimate.scratch_bytes == 7 + 7 + 17
+    assert estimate.scratch_bytes == 7 + 17
     assert estimate.peak_bytes == estimate.held_bytes + estimate.scratch_bytes
 
 
@@ -70,4 +79,104 @@ def test_device_budget_rejects_invalid_inputs():
     with pytest.raises(ValueError, match="required_bytes"):
         DeviceMemoryBudget(available_bytes=1_000).reserve(
             "target", -1, device="cpu"
+        )
+
+
+def test_dynamic_estimate_is_not_replaced_by_identity_probe():
+    class ShapeModifier:
+        requires_calibration_data = True
+
+        def estimate_sequential_memory(self, module, _num_tokens):
+            weight = getattr(module, "weight", None)
+            return (0, 0) if weight is None else (weight.numel(), 42)
+
+    estimate = estimate_modifier_memory(
+        (modifier for modifier in [ShapeModifier()]),
+        [nn.Linear(4, 3, device="meta")],
+        num_tokens=5,
+    )
+
+    assert estimate.held_bytes == 12
+    assert estimate.scratch_bytes == 42
+
+
+@pytest.mark.parametrize("quantizer_class", [QuantizationModifier, GPTQModifier])
+def test_real_quantizer_estimates_on_initialized_meta_modules(quantizer_class):
+    model = nn.Sequential(nn.Linear(8, 4, bias=False, device="meta"))
+    recipe = [
+        IMatrixGatherer(),
+        quantizer_class(scheme="W8A8", targets=["Linear"]),
+    ]
+    with create_session() as session:
+        session.state.layerwise_calibration = True
+        session.initialize(model=model, recipe=recipe, start=-1)
+        estimate = estimate_modifier_memory(
+            session.lifecycle.recipe.modifiers, model.modules(), num_tokens=16
+        )
+
+    assert estimate.scratch_bytes > 0
+    if quantizer_class is GPTQModifier:
+        assert estimate.details[1]["held_bytes"] == 8 * 8 * torch.float32.itemsize
+
+
+def test_device_reservations_do_not_compete_across_devices():
+    budget = DeviceMemoryBudget(available_bytes=1_000, safety_reserve_fraction=0)
+    with budget.reserve("first", 1_000, device="cuda:0"):
+        with budget.reserve("other-device", 1_000, device="cuda:1"):
+            with pytest.raises(DeviceMemoryError):
+                budget.reserve("same-device", 1, device="cuda:0")
+
+
+def test_zero_available_budget_and_unknown_accelerator_are_explicit():
+    with pytest.raises(DeviceMemoryError):
+        DeviceMemoryBudget(available_bytes=0).reserve("target", 1, device="cpu")
+    with pytest.raises(DeviceMemoryError, match="Cannot determine"):
+        DeviceMemoryBudget(available_bytes=lambda _device: None).reserve(
+            "target", 1, device="cuda:0"
+        )
+
+
+def test_disk_budget_uses_work_filesystem_and_safety_reserve(tmp_path):
+    paths = []
+
+    def available(path):
+        paths.append(path)
+        return 1_000
+
+    budget = DiskSpaceBudget(
+        tmp_path / "new" / "work", available_bytes=available,
+        safety_reserve_fraction=0.1,
+    )
+    budget.check("target", 900)
+    with pytest.raises(DiskSpaceError, match="target"):
+        budget.check("target", 901)
+    assert paths == [tmp_path, tmp_path]
+
+
+def test_awq_offloaded_cache_is_charged_to_host_budget():
+    parent = nn.Identity()
+    balance = nn.Linear(8, 4, device="meta")
+    modifier = AWQModifier(offload_device=torch.device("cpu"))
+    modifier._mappings_by_parent = {
+        parent: [SimpleNamespace(balance_layers=[balance])]
+    }
+
+    estimate = estimate_modifier_memory([modifier], [parent], num_tokens=20)
+
+    assert estimate.held_bytes == 0
+    assert estimate.host_bytes == 20 * 8 * torch.float32.itemsize
+    assert estimate.scratch_bytes > 0
+
+
+@pytest.mark.parametrize("estimate", [(1.5, 2), (-1, 0), (1,), "unknown"])
+def test_invalid_dynamic_estimates_fail_with_contract_error(estimate):
+    class InvalidModifier:
+        requires_calibration_data = True
+
+        def estimate_sequential_memory(self, module, _num_tokens):
+            return (0, 0) if isinstance(module, nn.Identity) else estimate
+
+    with pytest.raises(ModifierContractError, match="non-negative"):
+        estimate_modifier_memory(
+            [InvalidModifier()], [nn.Linear(4, 3, device="meta")], num_tokens=1
         )

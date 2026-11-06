@@ -8,6 +8,8 @@ from .activations import (
 from .admission import (
     DeviceMemoryBudget,
     DeviceMemoryError,
+    DiskSpaceBudget,
+    DiskSpaceError,
     ModifierMemoryEstimate,
     estimate_modifier_memory,
 )
@@ -122,6 +124,8 @@ __all__ = [
     "DiskBoundaryActivationStore",
     "DeviceMemoryBudget",
     "DeviceMemoryError",
+    "DiskSpaceBudget",
+    "DiskSpaceError",
     "DeepSeekV4WeightMaterializer",
     "DeepSeekV4WeightSource",
     "DeepSeekV41WeightMaterializer",

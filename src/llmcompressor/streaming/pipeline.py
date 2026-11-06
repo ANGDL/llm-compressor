@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
 from contextlib import ExitStack
+from math import prod
 from pathlib import Path
 from time import perf_counter
 from typing import Any
@@ -29,6 +30,12 @@ from .activations import (
     DiskBoundaryActivationStore,
     InMemoryBoundaryActivationStore,
 )
+from .admission import (
+    DeviceMemoryBudget,
+    DeviceMemoryError,
+    DiskSpaceBudget,
+    estimate_modifier_memory,
+)
 from .artifacts import (
     ArtifactStore,
     CalibrationInfo,
@@ -48,13 +55,14 @@ from .checkpoint import (
     StreamingCheckpointWriter,
 )
 from .compaction import BoundaryCompactor
-from .loading import HostMemoryBudget, SubgraphPrefetcher
+from .loading import HostMemoryBudget, HostMemoryError, SubgraphPrefetcher
 from .materialization import (
     StreamingDTypePolicy,
     WeightMaterializer,
     materialize_weights,
 )
 from .modifier_contract import (
+    ModifierContractError,
     build_modifier_contracts,
     calibration_outputs_reusable,
 )
@@ -102,6 +110,28 @@ def _stage_logger(
 def _target_label(index: int, total: int, target: str) -> str:
     width = max(2, len(str(total)))
     return f"[{index + 1:0{width}d}/{total:0{width}d}] {target}"
+
+
+def _boundary_token_count(value: Any) -> int:
+    if isinstance(value, torch.Tensor):
+        if value.ndim < 2:
+            return 0
+        return prod(value.shape[:-1]) if value.is_floating_point() else value.numel()
+    if isinstance(value, Mapping):
+        return max((_boundary_token_count(item) for item in value.values()), default=0)
+    if isinstance(value, (list, tuple)):
+        return max((_boundary_token_count(item) for item in value), default=0)
+    return 0
+
+
+def _boundary_nbytes(value: Any) -> int:
+    if isinstance(value, torch.Tensor):
+        return value.nbytes
+    if isinstance(value, Mapping):
+        return sum(_boundary_nbytes(item) for item in value.values())
+    if isinstance(value, (tuple, list)):
+        return sum(_boundary_nbytes(item) for item in value)
+    return 0
 
 
 def _debug_tensor_summary(tensor: torch.Tensor) -> dict[str, Any]:
@@ -765,6 +795,15 @@ def run_subgraph_streaming_pipeline(
     """Calibrate, modify, propagate, and persist one subgraph at a time."""
 
     device = torch.device(device)
+    if (
+        torch.distributed.is_available()
+        and torch.distributed.is_initialized()
+        and torch.distributed.get_world_size() > 1
+    ):
+        raise ModifierContractError(
+            "Streaming admission currently requires a single participant; "
+            "multi-rank statistics and communication require an EP-B adapter"
+        )
     if checkpoint_progress and async_save:
         raise ValueError(
             "Asynchronous saving is not supported with checkpoint_progress=True"
@@ -811,6 +850,7 @@ def run_subgraph_streaming_pipeline(
     direct_writer = direct_writer_base
     async_direct_writer = None
     host_budget = HostMemoryBudget()
+    disk_budget = DiskSpaceBudget(work)
     boundaries: BoundaryActivationStore
     if checkpoint_progress:
         boundaries = DiskBoundaryActivationStore(
@@ -883,6 +923,8 @@ def run_subgraph_streaming_pipeline(
             for modifier in session.lifecycle.recipe.modifiers
             if isinstance(modifier, QuantizationMixin)
         ]
+        modifiers = tuple(session.lifecycle.recipe.modifiers)
+        device_budget = DeviceMemoryBudget()
         reuse_calibration_outputs = _can_reuse_calibration_outputs(recipe)
         streaming_logger.info(
             "setup | activation propagation | "
@@ -907,6 +949,7 @@ def run_subgraph_streaming_pipeline(
         pipeline_failed = True
         try:
             prefetch_pending = False
+            prefetched_plan = None
             for target_index, (target_name, subgraph) in enumerate(
                 zip(adapter.targets, adapter.target_subgraphs)
             ):
@@ -968,26 +1011,98 @@ def run_subgraph_streaming_pipeline(
                     f"batches={len(batches)} | device={device}"
                 )
                 target_started_at = perf_counter()
+                baseline_allocated = (
+                    torch.cuda.memory_allocated(device)
+                    if device.type == "cuda"
+                    else None
+                )
                 # A previous attempt can fail after publishing only part of the
                 # next external boundary but before committing its transaction.
                 # Rebuild it from scratch so stale batches are never consumed.
                 if target_index + 1 < len(adapter.targets):
                     boundaries.delete(target_index + 1)
                 weight_stack = ExitStack()
+                completion_reservation = None
                 try:
-                    if not prefetch_pending:
-                        with _stage_logger(
-                            adapter.model,
-                            f"{target_label} | plan weights",
-                            device,
-                        ):
-                            plan = adapter.weight_session.plan(subgraph)
-                            required = adapter.weight_session.estimate_preparation(
+                    resident_modules = tuple(
+                        subgraph.submodules(adapter.model)
+                    )
+                    num_tokens = 0
+                    max_batch_tokens = 0
+                    boundary_bytes = 0
+                    for batch_index in batches:
+                        value = boundaries.get(target_index, batch_index)
+                        batch_tokens = _boundary_token_count(
+                            {name: value[name] for name in subgraph.input_names}
+                        )
+                        num_tokens += batch_tokens
+                        max_batch_tokens = max(max_batch_tokens, batch_tokens)
+                        boundary_bytes += _boundary_nbytes(value)
+                        del value
+                    num_tokens = max(
+                        num_tokens, num_samples * (max_seq_length or 1), 1
+                    )
+                    max_batch_tokens = max(max_batch_tokens, max_seq_length or 1)
+                    with _stage_logger(
+                        adapter.model, f"{target_label} | plan weights", device
+                    ):
+                        plan = (
+                            prefetched_plan if prefetch_pending
+                            else adapter.weight_session.plan(subgraph)
+                        )
+                        modifier_memory = estimate_modifier_memory(
+                            modifiers, resident_modules, num_tokens=num_tokens,
+                            max_batch_tokens=max_batch_tokens,
+                        )
+                        materialized_bytes = (
+                            adapter.weight_session.estimate_materialized_bytes(
                                 plan, dtype=target_dtype
                             )
-                            reservation = host_budget.reserve(
-                                f"{target_label} weights", required
+                        )
+                        device_required = (
+                            materialized_bytes + modifier_memory.peak_bytes
+                        )
+                        disk_required = (
+                            (4 if async_save else 2) * materialized_bytes
+                            + (4 * boundary_bytes if checkpoint_progress else 0)
+                            + 1024 * 1024
+                        )
+                        disk_budget.check(target_label, disk_required)
+                        weight_stack.enter_context(
+                            device_budget.reserve(
+                                f"{target_label} device working set",
+                                device_required,
+                                device=device,
                             )
+                        )
+                        modifier_host_bytes = modifier_memory.host_bytes + (
+                            modifier_memory.peak_bytes if device.type == "cpu" else 0
+                        )
+                        if modifier_host_bytes:
+                            weight_stack.enter_context(
+                                host_budget.reserve(
+                                    f"{target_label} modifier working set",
+                                    modifier_host_bytes,
+                                )
+                            )
+                        streaming_logger.info(
+                            f"{target_label} | admission | "
+                            f"materialized_bytes={materialized_bytes} | "
+                            f"modifier_held_bytes={modifier_memory.held_bytes} | "
+                            f"modifier_scratch_bytes={modifier_memory.scratch_bytes} | "
+                            f"modifier_host_bytes={modifier_host_bytes} | "
+                            f"device_required_bytes={device_required} | "
+                            f"disk_required_bytes={disk_required} | "
+                            f"num_tokens={num_tokens}"
+                            f" | max_batch_tokens={max_batch_tokens}"
+                        )
+                    if not prefetch_pending:
+                        required = adapter.weight_session.estimate_preparation(
+                            plan, dtype=target_dtype
+                        )
+                        reservation = host_budget.reserve(
+                            f"{target_label} weights", required
+                        )
                         with _stage_logger(
                             adapter.model,
                             f"{target_label} | prepare weights",
@@ -1001,6 +1116,8 @@ def run_subgraph_streaming_pipeline(
                     else:
                         prepared = prefetcher.take()
                         prefetch_pending = False
+                        prefetched_plan = None
+                    weight_stack.callback(prepared.close)
                     with _stage_logger(
                         adapter.model,
                         f"{target_label} | load weights",
@@ -1030,20 +1147,56 @@ def run_subgraph_streaming_pipeline(
                                     next_plan, dtype=target_dtype
                                 )
                             )
-                            next_reservation = host_budget.reserve(
-                                f"{next_label} weights", next_required
+                            next_modifier_memory = estimate_modifier_memory(
+                                modifiers,
+                                adapter.target_subgraphs[next_index].submodules(
+                                    adapter.model
+                                ),
+                                num_tokens=num_tokens,
+                                max_batch_tokens=max_batch_tokens,
                             )
-                        prefetcher.submit(
-                            next_plan,
-                            dtype=target_dtype,
-                            reservation=next_reservation,
-                            label=f"{next_label} | prepare weights",
-                        )
-                        prefetch_pending = True
+                            completion_bytes = (
+                                _estimate_loaded_target_snapshot_bytes(
+                                    loaded, target_name, pack_to_int8=pack_to_int8
+                                )
+                            )
+                            next_reservation = None
+                            try:
+                                with device_budget.reserve(
+                                    f"{next_label} prefetch working set",
+                                    adapter.weight_session.estimate_materialized_bytes(
+                                        next_plan, dtype=target_dtype
+                                    ) + next_modifier_memory.peak_bytes,
+                                    device=device,
+                                ):
+                                    pass
+                                completion_reservation = host_budget.reserve(
+                                    f"{target_label} completion headroom",
+                                    completion_bytes,
+                                )
+                                next_reservation = host_budget.reserve(
+                                    f"{next_label} weights", next_required
+                                )
+                            except (HostMemoryError, DeviceMemoryError):
+                                if completion_reservation is not None:
+                                    completion_reservation.close()
+                                    completion_reservation = None
+                                streaming_logger.info(
+                                    f"{next_label} | prefetch deferred | "
+                                    f"completion_bytes={completion_bytes} | "
+                                    f"prefetch_bytes={next_required}"
+                                )
+                        if next_reservation is not None:
+                            weight_stack.callback(completion_reservation.close)
+                            prefetcher.submit(
+                                next_plan,
+                                dtype=target_dtype,
+                                reservation=next_reservation,
+                                label=f"{next_label} | prepare weights",
+                            )
+                            prefetch_pending = True
+                            prefetched_plan = next_plan
 
-                    resident_modules = tuple(
-                        subgraph.submodules(adapter.model)
-                    )
                     with _stage_logger(
                         adapter.model,
                         f"{target_label} | initialize quantization",
@@ -1186,6 +1339,8 @@ def run_subgraph_streaming_pipeline(
                         f"{target_label} | queue checkpoint",
                         device,
                     ):
+                        if completion_reservation is not None:
+                            completion_reservation.close()
                         if transaction_writer is not None:
                             with transaction_writer.transaction(
                                 transaction_id
@@ -1236,9 +1391,16 @@ def run_subgraph_streaming_pipeline(
                         weight_stack.close()
                         boundaries.delete(target_index)
                         _empty_device_cache(device)
+                peak_allocated = (
+                    torch.cuda.max_memory_allocated(device)
+                    if device.type == "cuda"
+                    else None
+                )
                 streaming_logger.info(
                     f"{target_label} | complete | "
-                    f"time={perf_counter() - target_started_at:.2f}s"
+                    f"time={perf_counter() - target_started_at:.2f}s | "
+                    f"baseline_allocated_bytes={baseline_allocated} | "
+                    f"peak_allocated_bytes={peak_allocated}"
                 )
             pipeline_failed = False
         finally:
