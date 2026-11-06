@@ -382,6 +382,29 @@ class TargetWeightLoader:
                     )
         return prepared_bytes, workspace_bytes
 
+    def estimate_materialized_bytes(
+        self, plan: TargetLoadPlan, *, dtype: torch.dtype
+    ) -> int:
+        """Return the bytes installed after CPU materialization."""
+        prepared_bytes = 0
+        for groups, sources in (
+            (plan.parameter_groups, plan.parameter_sources),
+            (plan.buffer_groups, plan.buffer_sources),
+        ):
+            for tensor, _aliases in groups:
+                source_name = sources[id(tensor)]
+                metadata = self.source.metadata(source_name)
+                output_dtype = self._resolved_dtype(
+                    source_name, metadata, dtype, tensor.dtype
+                )
+                output_elements = 1
+                for dimension in self.materializer.logical_shape(
+                    source_name, metadata
+                ):
+                    output_elements *= dimension
+                prepared_bytes += output_elements * output_dtype.itemsize
+        return prepared_bytes
+
     @staticmethod
     def _metadata_nbytes(metadata) -> int:
         elements = 1

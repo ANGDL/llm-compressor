@@ -389,6 +389,15 @@ class SubgraphWeightSession:
             workspace_bytes = max(workspace_bytes, target_workspace)
         return prepared_bytes + workspace_bytes
 
+    def estimate_materialized_bytes(
+        self, plan: SubgraphLoadPlan, *, dtype: torch.dtype
+    ) -> int:
+        """Return device bytes for the installed target aggregate."""
+        return sum(
+            self.loader.estimate_materialized_bytes(target, dtype=dtype)
+            for target in plan.targets
+        )
+
     def prepare(
         self,
         plan: SubgraphLoadPlan,

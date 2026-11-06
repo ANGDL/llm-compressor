@@ -72,6 +72,19 @@ def _declared(modifier: Any, name: str, default: Any) -> Any:
 
 
 def _memory_estimate(modifier: Any) -> tuple[int, int] | None:
+    declared = _declared(modifier, "memory_estimate", None)
+    if declared is not None:
+        if (
+            not isinstance(declared, tuple)
+            or len(declared) != 2
+            or any(not isinstance(value, int) for value in declared)
+        ):
+            raise ModifierContractError(
+                f"{type(modifier).__qualname__}.memory_estimate must "
+                "be a tuple of two integers"
+            )
+        return declared
+
     estimate = getattr(modifier, "estimate_sequential_memory", None)
     if estimate is None:
         return None
