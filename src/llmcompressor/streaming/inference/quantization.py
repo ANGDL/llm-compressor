@@ -75,13 +75,17 @@ def resolve_schemes(
                 or weights.type != "int"
                 or weights.num_bits not in (4, 8)
                 or not weights.symmetric
-                or weights.strategy not in ("channel", "tensor")
+                or weights.strategy not in ("channel", "tensor", "group")
                 or weights.dynamic
                 or weights.actorder is not None
+                or (
+                    weights.strategy == "group"
+                    and (weights.group_size is None or weights.group_size <= 0)
+                )
             ):
                 raise ValueError(
                     f"Unsupported weight scheme at {name!r}: initial support is "
-                    "symmetric channel/tensor INT4 or INT8"
+                    "symmetric channel/tensor/group INT4 or INT8"
                 )
             for activation in (group.input_activations, group.output_activations):
                 if activation is not None and (

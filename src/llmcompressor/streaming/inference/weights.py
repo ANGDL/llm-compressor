@@ -213,9 +213,16 @@ class StreamingWeights(Mapping[str, torch.Tensor]):
         if self._metadata(scale_name) is None:
             scale_name = f"{module_name}.scale"
         scale_metadata = self.source.metadata(scale_name)
-        scale_shape = (
-            (tensor.shape[0], 1) if scheme.weights.strategy == "channel" else (1,)
-        )
+        if scheme.weights.strategy == "channel":
+            scale_shape = (tensor.shape[0], 1)
+        elif scheme.weights.strategy == "group":
+            group_size = scheme.weights.group_size
+            scale_shape = (
+                tensor.shape[0],
+                math.ceil(tensor.shape[1] / group_size),
+            )
+        else:
+            scale_shape = (1,)
         if (
             scale_metadata.shape != scale_shape
             or not scale_metadata.dtype.is_floating_point
