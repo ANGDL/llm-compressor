@@ -50,7 +50,9 @@ def make_model(family="llama", *, tied=False):
     return AutoModelForCausalLM.from_config(config, dtype=torch.bfloat16).eval()
 
 
-def quantized_checkpoint(model, root, *, bits, format_name, mixed=False):
+def quantized_checkpoint(
+    model, root, *, bits, format_name, mixed=False, strategy="channel"
+):
     state = {name: value.detach().clone() for name, value in model.state_dict().items()}
     groups = {}
     for index, (name, module) in enumerate(model.named_modules()):
@@ -64,7 +66,8 @@ def quantized_checkpoint(model, root, *, bits, format_name, mixed=False):
                 num_bits=width,
                 type="int",
                 symmetric=True,
-                strategy="channel",
+                strategy=strategy,
+                group_size=4 if strategy == "group" else None,
             ),
             input_activations=QuantizationArgs(
                 num_bits=8,
@@ -76,7 +79,12 @@ def quantized_checkpoint(model, root, *, bits, format_name, mixed=False):
         )
         groups[name] = scheme
         weight = state.pop(f"{name}.weight")
-        scale = weight.float().abs().amax(-1, keepdim=True) / (2 ** (width - 1) - 1)
+        if strategy == "group":
+            group_size = 4
+            grouped = weight.float().reshape(weight.shape[0], -1, group_size)
+            scale = grouped.abs().amax(-1) / (2 ** (width - 1) - 1)
+        else:
+            scale = weight.float().abs().amax(-1, keepdim=True) / (2 ** (width - 1) - 1)
         scale = scale.clamp_min(1e-6).to(torch.bfloat16)
         compressor = BaseCompressor.get_value_from_registry(format_name)
         values = compressor.compress({"weight": weight, "weight_scale": scale}, scheme)
@@ -291,6 +299,24 @@ def test_mixed_precision_and_explicit_activation_bypass(tmp_path, monkeypatch):
         assert {w["weight_bits"] for w in stream.report()["weights"]} == {None, 4, 8}
         assert stream.report()["activation_mode"] == "dequantized_weights"
         assert torch.isfinite(stream(torch.tensor([[1, 3, 5]])).logits).all()
+
+
+def test_group_quantized_bf16_load_with_a8_prefill(tmp_path):
+    root = tmp_path / "group"
+    model = make_model("qwen3")
+    quantized_checkpoint(
+        model,
+        root,
+        bits=8,
+        format_name="pack-quantized",
+        strategy="group",
+    )
+    ids = torch.tensor([[1, 3, 5, 7]])
+    with load_streaming_model(root) as stream:
+        actual = stream(ids)
+        assert actual.logits.shape == (1, 4, model.config.vocab_size)
+        assert torch.isfinite(actual.logits).all()
+        assert stream.report()["materializations"] > 0
 
 
 def test_forward_failure_unloads_partial_block_and_invalidates_cache(tmp_path):
