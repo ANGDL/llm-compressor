@@ -248,6 +248,16 @@ class StreamingInference(AbstractContextManager):
             "peak_weight_module": self.weight_peak[1],
             "tensor_reads": self.weights.tensor_reads,
             "materializations": self.weights.materializations,
+            "source_read_seconds": self.weights.source_read_seconds,
+            "decode_seconds": self.weights.decode_seconds,
+            "fast_path_materializations": self.weights.fast_path_materializations,
+            "generic_decode_materializations": (
+                self.weights.generic_decode_materializations
+            ),
+            "weight_cache": self.weights.weight_cache,
+            "cache_hits": self.weights.cache_hits,
+            "cache_entries": self.weights.cache_entries,
+            "cache_bytes": self.weights.cache_bytes,
             "peak_estimated_preparation_bytes": self.weights.peak_preparation_bytes,
             "materializer": self.weights.materializer.identifier,
             "weights": self.weights.describe(),
@@ -258,6 +268,7 @@ class StreamingInference(AbstractContextManager):
             if self._closed:
                 return
             self._release_weights()
+            self.weights.clear_cache()
             remove_hook_from_module(self.model, recurse=True)
             for handle in self._handles:
                 handle.remove()
@@ -283,6 +294,7 @@ def load_streaming_model(
     max_device_weight_bytes: int | None = None,
     max_preparation_bytes: int | None = None,
     host_memory_budget: HostMemoryBudget | None = None,
+    weight_cache: str = "none",
 ) -> StreamingInference:
     """Build a local model on meta and load only the currently called modules.
 
@@ -351,6 +363,7 @@ def load_streaming_model(
         format_name=format_name,
         max_preparation_bytes=max_preparation_bytes,
         host_memory_budget=host_memory_budget,
+        weight_cache=weight_cache,
     )
     preload_classes = list(preload_module_classes or [])
     weight_peak = _check_weight_budget(

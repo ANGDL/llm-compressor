@@ -40,6 +40,9 @@ LLM Compressor is an open-source project that values community contributions. We
   recovery correctness, bounded activation retention, resource budgets, and
   extensions for GPTQ, MoE expert parallelism (EP), multimodal models, and
   modifier integration.
+- [Streaming inference performance plan](streaming-inference-performance-plan.md):
+  CPU packed-weight decoding, staged profiling, prefetch, and explicit weight
+  cache modes.
 
 ## MoE AWQ accuracy
 
