@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import math
+import sys
 from collections import Counter
 from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
+from time import perf_counter
 
 import torch
 from compressed_tensors.compressors import BaseCompressor
-from compressed_tensors.quantization import QuantizationScheme
+from compressed_tensors.quantization import QuantizationScheme, dequantize
 from torch import nn
 
 from llmcompressor.streaming.checkpoint import CheckpointWeightSource
@@ -48,6 +51,25 @@ class InferenceWeight:
         return result
 
 
+def _unpack_int8_from_int32(
+    value: torch.Tensor, shape: tuple[int, ...]
+) -> torch.Tensor:
+    """Decode little-endian signed INT8 values packed into int32 words."""
+
+    if value.dtype is not torch.int32:
+        raise ValueError(f"Expected torch.int32 packed weights, got {value.dtype}")
+    if value.device.type != "cpu" or sys.byteorder != "little":
+        raise ValueError("The INT8 byte-view path requires little-endian CPU storage")
+    if value.ndim == 0:
+        raise ValueError("Packed weights must have at least one dimension")
+
+    packed = value.contiguous().view(torch.uint8)
+    unpacked_shape = (*value.shape[:-1], value.shape[-1] * 4)
+    unpacked = packed.reshape(unpacked_shape).to(torch.int16)
+    unpacked.sub_(128)
+    return unpacked.to(torch.int8)[..., : shape[-1]]
+
+
 class StreamingWeights(Mapping[str, torch.Tensor]):
     """Decode only the tensor requested by an Accelerate module hook.
 
@@ -65,18 +87,29 @@ class StreamingWeights(Mapping[str, torch.Tensor]):
         format_name: str | None = None,
         host_memory_budget: HostMemoryBudget | None = None,
         max_preparation_bytes: int | None = None,
+        weight_cache: str = "none",
     ):
         if max_preparation_bytes is not None and max_preparation_bytes <= 0:
             raise ValueError("max_preparation_bytes must be positive")
+        if weight_cache not in ("none", "cpu"):
+            raise ValueError("weight_cache must be 'none' or 'cpu'")
         self.source = source
         self.materializer = materializer
         self.schemes = dict(schemes)
         self.host_memory_budget = host_memory_budget or HostMemoryBudget()
         self.max_preparation_bytes = max_preparation_bytes
+        self.weight_cache = weight_cache
         self.tensor_reads = 0
         self.materializations = 0
         self.loads: Counter[str] = Counter()
         self.peak_preparation_bytes = 0
+        self.source_read_seconds = 0.0
+        self.decode_seconds = 0.0
+        self.fast_path_materializations = 0
+        self.generic_decode_materializations = 0
+        self.cache_hits = 0
+        self._cache: dict[str, torch.Tensor] = {}
+        self._cache_reservations = {}
         self._weights: dict[str, InferenceWeight] = {}
         self._local_sources: dict[str, dict[str, str]] = {}
         self._aliases = self._tied_sources(model)
@@ -260,58 +293,126 @@ class StreamingWeights(Mapping[str, torch.Tensor]):
 
     def __getitem__(self, name: str) -> torch.Tensor:
         weight = self._weights[name]
-        with self.host_memory_budget.reserve(
-            f"inference weight {name!r}", weight.preparation_bytes
-        ):
-            raw = self.source.load_tensors_cpu(weight.sources)
-            self.tensor_reads += len(weight.sources)
-            if weight.weight_bits is not None:
-                local = {
-                    key: raw[value] for key, value in self._local_sources[name].items()
-                }
-                scale = local["weight_scale"]
-                if not torch.isfinite(scale).all() or not (scale > 0).all():
+        if self.weight_cache == "cpu" and name in self._cache:
+            self.cache_hits += 1
+            return self._cache[name]
+
+        preparation_bytes = weight.preparation_bytes
+        if self.weight_cache == "cpu":
+            preparation_bytes = max(0, preparation_bytes - weight.nbytes)
+        try:
+            with self._cache_slot(name, weight), self.host_memory_budget.reserve(
+                f"inference weight {name!r}", preparation_bytes
+            ):
+                return self._materialize(name, weight)
+        except BaseException:
+            self._cache_reservations.pop(name, None)
+            raise
+
+    @contextmanager
+    def _cache_slot(self, name: str, weight: InferenceWeight):
+        if self.weight_cache != "cpu":
+            yield
+            return
+        reservation = self.host_memory_budget.reserve(
+            f"inference cache {name!r}", weight.nbytes
+        )
+        try:
+            yield
+        except BaseException:
+            reservation.close()
+            raise
+        if name in self._cache:
+            self._cache_reservations[name] = reservation
+        else:
+            reservation.close()
+
+    def _materialize(self, name: str, weight: InferenceWeight) -> torch.Tensor:
+        started = perf_counter()
+        raw = self.source.load_tensors_cpu(weight.sources)
+        self.source_read_seconds += perf_counter() - started
+        self.tensor_reads += len(weight.sources)
+        started = perf_counter()
+        if weight.weight_bits is not None:
+            local = {
+                key: raw[value] for key, value in self._local_sources[name].items()
+            }
+            scale = local["weight_scale"]
+            if not torch.isfinite(scale).all() or not (scale > 0).all():
+                raise ValueError(f"Weight scales must be positive and finite: {name}")
+            if weight.packing == "signed_nibbles":
+                packed = local["weight"]
+                unpacked = torch.empty(weight.shape, dtype=torch.int8)
+                unpacked[..., 0::2] = ((packed & 15) ^ 8) - 8
+                unpacked[..., 1::2] = packed >> 4
+                local["weight"] = unpacked
+            if "weight_shape" in local:
+                if tuple(local["weight_shape"].tolist()) != weight.shape:
                     raise ValueError(
-                        f"Weight scales must be positive and finite: {name}"
+                        f"Packed weight_shape disagrees with model: {name}"
                     )
-                if weight.packing == "signed_nibbles":
-                    packed = local["weight"]
-                    unpacked = torch.empty(weight.shape, dtype=torch.int8)
-                    unpacked[..., 0::2] = ((packed & 15) ^ 8) - 8
-                    unpacked[..., 1::2] = packed >> 4
-                    local["weight"] = unpacked
-                if "weight_shape" in local:
-                    if tuple(local["weight_shape"].tolist()) != weight.shape:
-                        raise ValueError(
-                            f"Packed weight_shape disagrees with model: {name}"
-                        )
-                elif weight.weight_bits < 8:
-                    limit = 2 ** (weight.weight_bits - 1)
-                    if (local["weight"] < -limit).any() or (
-                        local["weight"] >= limit
-                    ).any():
-                        raise ValueError(
-                            f"Integer weight exceeds its bit range: {name}"
-                        )
-                scheme = self.schemes[name.removesuffix(".weight")]
+            elif weight.weight_bits < 8:
+                limit = 2 ** (weight.weight_bits - 1)
+                if (local["weight"] < -limit).any() or (
+                    local["weight"] >= limit
+                ).any():
+                    raise ValueError(f"Integer weight exceeds its bit range: {name}")
+            scheme = self.schemes[name.removesuffix(".weight")]
+            if (
+                weight.format == "pack-quantized"
+                and weight.weight_bits == 8
+                and weight.packing == "int32"
+                and scheme.weights.symmetric
+                and sys.byteorder == "little"
+            ):
+                unpacked = _unpack_int8_from_int32(
+                    local["weight_packed"], weight.shape
+                )
+                value = dequantize(
+                    unpacked,
+                    local["weight_scale"],
+                    args=scheme.weights,
+                ).to(weight.dtype)
+                self.fast_path_materializations += 1
+            else:
                 compressor = BaseCompressor.get_value_from_registry(weight.format)
                 value = compressor.decompress(local, scheme)["weight"].to(weight.dtype)
-            elif weight.dtype.is_floating_point:
-                value = self.materializer.materialize_cpu(
-                    weight.sources[0], raw, target_dtype=weight.dtype
-                )
-            else:
-                value = raw[weight.sources[0]].to(weight.dtype)
-            if value.device.type != "cpu" or tuple(value.shape) != weight.shape:
-                raise ValueError(f"Decoded tensor device/shape mismatch for {name!r}")
-            if value.dtype != weight.dtype:
-                raise ValueError(f"Decoded tensor dtype mismatch for {name!r}")
-            self.materializations += 1
-            self.loads[name] += 1
-            self.peak_preparation_bytes = max(
-                self.peak_preparation_bytes, weight.preparation_bytes
+                self.generic_decode_materializations += 1
+        elif weight.dtype.is_floating_point:
+            value = self.materializer.materialize_cpu(
+                weight.sources[0], raw, target_dtype=weight.dtype
             )
-            return value
+        else:
+            value = raw[weight.sources[0]].to(weight.dtype)
+        if value.device.type != "cpu" or tuple(value.shape) != weight.shape:
+            raise ValueError(f"Decoded tensor device/shape mismatch for {name!r}")
+        if value.dtype != weight.dtype:
+            raise ValueError(f"Decoded tensor dtype mismatch for {name!r}")
+        self.decode_seconds += perf_counter() - started
+        self.materializations += 1
+        self.loads[name] += 1
+        self.peak_preparation_bytes = max(
+            self.peak_preparation_bytes, weight.preparation_bytes
+        )
+        if self.weight_cache == "cpu":
+            self._cache[name] = value
+        return value
+
+    def clear_cache(self) -> None:
+        self._cache.clear()
+        for reservation in self._cache_reservations.values():
+            reservation.close()
+        self._cache_reservations.clear()
+
+    @property
+    def cache_bytes(self) -> int:
+        return sum(
+            value.numel() * value.element_size() for value in self._cache.values()
+        )
+
+    @property
+    def cache_entries(self) -> int:
+        return len(self._cache)
 
     def __iter__(self) -> Iterator[str]:
         return iter(self._weights)

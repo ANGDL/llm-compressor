@@ -28,6 +28,7 @@ from llmcompressor.streaming import (
     compare_cached_to_recompute,
     load_streaming_model,
 )
+from llmcompressor.streaming.inference.weights import _unpack_int8_from_int32
 from llmcompressor.utils.int4_packing import pack_int4_to_int8
 
 
@@ -317,6 +318,52 @@ def test_group_quantized_bf16_load_with_a8_prefill(tmp_path):
         assert actual.logits.shape == (1, 4, model.config.vocab_size)
         assert torch.isfinite(actual.logits).all()
         assert stream.report()["materializations"] > 0
+        assert stream.report()["fast_path_materializations"] > 0
+        assert stream.report()["generic_decode_materializations"] == 0
+
+
+def test_cpu_weight_cache_reuses_materialized_weights(tmp_path):
+    model = make_model("qwen3")
+    quantized_checkpoint(
+        model,
+        tmp_path / "group",
+        bits=8,
+        format_name="pack-quantized",
+        strategy="group",
+    )
+    ids = torch.tensor([[1, 3, 5, 7]])
+    with load_streaming_model(tmp_path / "group", weight_cache="cpu") as stream:
+        first = stream(ids)
+        report_after_first = stream.report()
+        second = stream(ids)
+        report_after_second = stream.report()
+        torch.testing.assert_close(first.logits, second.logits, rtol=0, atol=0)
+        assert report_after_first["cache_entries"] > 0
+        assert report_after_second["cache_hits"] > 0
+        assert report_after_second["materializations"] == report_after_first[
+            "materializations"
+        ]
+        assert report_after_second["tensor_reads"] == report_after_first["tensor_reads"]
+
+
+@pytest.mark.parametrize("shape", [(3, 7), (2, 3, 7), (4, 5, 33)])
+def test_int8_byte_view_unpack_matches_reference(shape):
+    from compressed_tensors.compressors.pack_quantized.helpers import (
+        pack_to_int32,
+        unpack_from_int32,
+    )
+
+    values = (
+        torch.arange(torch.tensor(shape).prod(), dtype=torch.int64)
+        .reshape(shape)
+        .remainder(256)
+        .sub(128)
+        .to(torch.int8)
+    )
+    packed = pack_to_int32(values, num_bits=8)
+    expected = unpack_from_int32(packed, 8, torch.Size(shape))
+    actual = _unpack_int8_from_int32(packed, shape)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 def test_forward_failure_unloads_partial_block_and_invalidates_cache(tmp_path):
