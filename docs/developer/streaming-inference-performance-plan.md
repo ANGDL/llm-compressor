@@ -43,8 +43,9 @@ safetensors 读取
 3. 数值路径保持与 `compressed_tensors` 一致；fast path 只替换等价的
    packed INT8 解包，反量化仍使用公开的 `dequantize` API。
 4. fast path 必须有明确条件，条件不满足时回退到当前通用 compressor。
-5. 默认继续保持无缓存和有界设备驻留。CPU/GPU 权重缓存只能通过显式选项启用，
-   不能悄悄改变内存上界。
+5. 默认继续保持无缓存和有界设备驻留。CPU 权重缓存只能通过显式选项启用，
+   不能悄悄改变设备内存上界。BF16/FP16 权重常驻 GPU 不属于本系统的优化
+   方向，因为它会破坏流式执行的设备内存边界。
 6. 每个优化阶段都记录硬件、checkpoint、输入、dtype、量化格式、峰值内存和
    数值对照结果。
 
@@ -96,19 +97,22 @@ P1 复测后，如果 CPU decode 占单次 forward 的显著比例，再增加�
 失败时释放 reservation 并回退到同步加载。不能在没有预算的情况下后台持有
 整层或整模型权重。该阶段先做单线程 CPU prefetch，再评估异步 H2D。
 
-### P3：显式权重缓存
+### P3：有界单层预取
 
-为 generation 提供显式缓存策略：
+为 generation 和长序列 forward 提供有界的单层预取：
 
 | 模式 | 语义 | 适用场景 |
 | --- | --- | --- |
-| `none` | 当前行为，每次调用后卸载 | 最小内存 |
-| `cpu` | 缓存已反量化 CPU 权重 | 主机内存充足，减少重复解码 |
-| `device` | 缓存 BF16/FP16 设备权重 | 设备显存足够，减少读取、解码和 H2D |
+| `none` | 当前行为，每次调用后卸载 | 最小内存、严格基线 |
+| `prefetch` | 只保留当前层和下一层的有界 CPU 准备结果 | CPU 解码可与 GPU forward 重叠 |
 
-32B 模型的 BF16 权重约需 60 GiB，缓存模式必须把权重、视觉塔、KV cache、
-激活和 workspace 一起纳入预算。缓存接口需要支持关闭、显式预算和上下文结束
-时释放；不实现隐式 LRU，除非能证明淘汰不会造成反复抖动。
+预取缓存按模块边界管理，最多保存一个下一模块的完整 CPU 准备结果；
+当前模块完成后立即释放旧结果。预取、当前模块解码 workspace 和输入状态
+共同计入 `HostMemoryBudget`，因此内存上界只随单层工作集增长，与模型总层数
+和总权重大小无关。模型单层也超过 host budget 时，preflight 必须拒绝，
+不能退化为整模型缓存或交换到磁盘。
+
+设备常驻权重和完整 CPU BF16 cache 都明确排除在本计划之外。
 
 ### P4：批量与服务侧调度
 
@@ -162,6 +166,6 @@ setup 时间混入 decode 时间。后续若需要服务侧观测，再增加显
 - [x] 增加 P1 数值与计时回归。
 - [ ] 在 node16 复测 P1 的端到端收益。
 - [ ] 依据 decode 占比决定是否实现 P2。
-- [x] 实现显式 CPU weight cache。
-- [ ] 设计并实现显式 device weight cache。
+- [x] 排除完整 CPU BF16 cache 和 device weight cache。
+- [ ] 实现有界单层 prefetch。
 - [ ] 评估 batch/continuous batching。
