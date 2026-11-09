@@ -30,7 +30,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mode", choices=("forward", "generate"), default="forward")
     parser.add_argument("--max-device-weight-gib", type=float, default=8.0)
     parser.add_argument("--max-preparation-gib", type=float, default=8.0)
-    parser.add_argument("--weight-cache", choices=("none", "cpu"), default="none")
     parser.add_argument("--report", type=Path)
     return parser.parse_args()
 
@@ -119,7 +118,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         ],
         max_device_weight_bytes=int(args.max_device_weight_gib * 2**30),
         max_preparation_bytes=int(args.max_preparation_gib * 2**30),
-        weight_cache=args.weight_cache,
     ) as stream:
         report["setup_seconds"] = time.monotonic() - started
         report["streaming_report"] = stream.report()

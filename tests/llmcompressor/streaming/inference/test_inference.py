@@ -322,30 +322,6 @@ def test_group_quantized_bf16_load_with_a8_prefill(tmp_path):
         assert stream.report()["generic_decode_materializations"] == 0
 
 
-def test_cpu_weight_cache_reuses_materialized_weights(tmp_path):
-    model = make_model("qwen3")
-    quantized_checkpoint(
-        model,
-        tmp_path / "group",
-        bits=8,
-        format_name="pack-quantized",
-        strategy="group",
-    )
-    ids = torch.tensor([[1, 3, 5, 7]])
-    with load_streaming_model(tmp_path / "group", weight_cache="cpu") as stream:
-        first = stream(ids)
-        report_after_first = stream.report()
-        second = stream(ids)
-        report_after_second = stream.report()
-        torch.testing.assert_close(first.logits, second.logits, rtol=0, atol=0)
-        assert report_after_first["cache_entries"] > 0
-        assert report_after_second["cache_hits"] > 0
-        assert report_after_second["materializations"] == report_after_first[
-            "materializations"
-        ]
-        assert report_after_second["tensor_reads"] == report_after_first["tensor_reads"]
-
-
 @pytest.mark.parametrize("shape", [(3, 7), (2, 3, 7), (4, 5, 33)])
 def test_int8_byte_view_unpack_matches_reference(shape):
     from compressed_tensors.compressors.pack_quantized.helpers import (
