@@ -104,7 +104,7 @@ leave room for these when selecting a weight budget.
 `max_preparation_bytes` limits the estimated CPU preparation footprint of one
 tensor, including packed inputs, decode workspace and the execution value.
 The existing `HostMemoryBudget` also checks system availability before reading.
-An opt-in one-layer CPU prefetch is available when explicit decoder-layer
+An opt-in one-layer CPU prefetch experiment is available when explicit decoder-layer
 preloading is configured. It keeps at most the next layer's decoded CPU values
 and releases them as the layer consumes them:
 
@@ -122,6 +122,10 @@ with load_streaming_model(
 Prefetch is bounded by `HostMemoryBudget` and is skipped when the next layer
 does not fit its explicit limit or available host capacity. It never caches the
 whole model and never keeps decoded weights on the execution device.
+On the current Qwen3-VL-32B node16 benchmark, this experiment is slower than
+the synchronous fast path because its CPU decode worker competes with the main
+execution path. Treat it as a profiling mode until a scheduler can demonstrate
+actual overlap.
 
 Nonpersistent derived buffers are initially kept on CPU, moved for their owning
 module's call, and returned to CPU on success or failure. This does not replace a

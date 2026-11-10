@@ -66,11 +66,11 @@ def _unpack_int8_from_int32(
     if value.ndim == 0:
         raise ValueError("Packed weights must have at least one dimension")
 
-    packed = value.contiguous().view(torch.uint8)
+    packed = value.contiguous().view(torch.uint8).clone()
     unpacked_shape = (*value.shape[:-1], value.shape[-1] * 4)
-    unpacked = packed.reshape(unpacked_shape).to(torch.int16)
+    unpacked = packed.reshape(unpacked_shape)
     unpacked.sub_(128)
-    return unpacked.to(torch.int8)[..., : shape[-1]]
+    return unpacked.view(torch.int8)[..., : shape[-1]]
 
 
 class StreamingWeights(Mapping[str, torch.Tensor]):
