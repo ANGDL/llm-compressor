@@ -104,7 +104,24 @@ leave room for these when selecting a weight budget.
 `max_preparation_bytes` limits the estimated CPU preparation footprint of one
 tensor, including packed inputs, decode workspace and the execution value.
 The existing `HostMemoryBudget` also checks system availability before reading.
-There is no weight prefetch or decoded CPU cache in this initial implementation.
+An opt-in one-layer CPU prefetch is available when explicit decoder-layer
+preloading is configured. It keeps at most the next layer's decoded CPU values
+and releases them as the layer consumes them:
+
+```python
+with load_streaming_model(
+    "/path/to/local/checkpoint",
+    device="cuda:0",
+    preload_module_classes=["LlamaDecoderLayer"],
+    prefetch=True,
+    max_prefetch_bytes=8 * 1024**3,
+) as inference:
+    output = inference(prompt, use_cache=True)
+```
+
+Prefetch is bounded by `HostMemoryBudget` and is skipped when the next layer
+does not fit its explicit limit or available host capacity. It never caches the
+whole model and never keeps decoded weights on the execution device.
 
 Nonpersistent derived buffers are initially kept on CPU, moved for their owning
 module's call, and returned to CPU on success or failure. This does not replace a

@@ -8,6 +8,7 @@ from collections import Counter
 from collections.abc import Iterator, Mapping
 from dataclasses import asdict, dataclass
 from time import perf_counter
+from typing import TYPE_CHECKING
 
 import torch
 from compressed_tensors.compressors import BaseCompressor
@@ -17,6 +18,9 @@ from torch import nn
 from llmcompressor.streaming.checkpoint import CheckpointWeightSource
 from llmcompressor.streaming.loading import HostMemoryBudget
 from llmcompressor.streaming.materialization import WeightMaterializer
+
+if TYPE_CHECKING:
+    from .prefetch import InferencePrefetcher
 
 
 @dataclass(frozen=True)
@@ -102,6 +106,7 @@ class StreamingWeights(Mapping[str, torch.Tensor]):
         self.decode_seconds = 0.0
         self.fast_path_materializations = 0
         self.generic_decode_materializations = 0
+        self.prefetcher: InferencePrefetcher | None = None
         self._weights: dict[str, InferenceWeight] = {}
         self._local_sources: dict[str, dict[str, str]] = {}
         self._aliases = self._tied_sources(model)
@@ -285,84 +290,84 @@ class StreamingWeights(Mapping[str, torch.Tensor]):
 
     def __getitem__(self, name: str) -> torch.Tensor:
         weight = self._weights[name]
+        if self.prefetcher is not None:
+            prepared = self.prefetcher.take(name)
+            if prepared is not None:
+                return prepared
         with self.host_memory_budget.reserve(
             f"inference weight {name!r}", weight.preparation_bytes
         ):
-            started = perf_counter()
-            raw = self.source.load_tensors_cpu(weight.sources)
-            self.source_read_seconds += perf_counter() - started
-            self.tensor_reads += len(weight.sources)
-            started = perf_counter()
-            if weight.weight_bits is not None:
-                local = {
-                    key: raw[value] for key, value in self._local_sources[name].items()
-                }
-                scale = local["weight_scale"]
-                if not torch.isfinite(scale).all() or not (scale > 0).all():
+            return self._materialize(name)
+
+    def _materialize(self, name: str) -> torch.Tensor:
+        weight = self._weights[name]
+        started = perf_counter()
+        raw = self.source.load_tensors_cpu(weight.sources)
+        self.source_read_seconds += perf_counter() - started
+        self.tensor_reads += len(weight.sources)
+        started = perf_counter()
+        if weight.weight_bits is not None:
+            local = {
+                key: raw[value] for key, value in self._local_sources[name].items()
+            }
+            scale = local["weight_scale"]
+            if not torch.isfinite(scale).all() or not (scale > 0).all():
+                raise ValueError(f"Weight scales must be positive and finite: {name}")
+            if weight.packing == "signed_nibbles":
+                packed = local["weight"]
+                unpacked = torch.empty(weight.shape, dtype=torch.int8)
+                unpacked[..., 0::2] = ((packed & 15) ^ 8) - 8
+                unpacked[..., 1::2] = packed >> 4
+                local["weight"] = unpacked
+            if "weight_shape" in local:
+                if tuple(local["weight_shape"].tolist()) != weight.shape:
                     raise ValueError(
-                        f"Weight scales must be positive and finite: {name}"
+                        f"Packed weight_shape disagrees with model: {name}"
                     )
-                if weight.packing == "signed_nibbles":
-                    packed = local["weight"]
-                    unpacked = torch.empty(weight.shape, dtype=torch.int8)
-                    unpacked[..., 0::2] = ((packed & 15) ^ 8) - 8
-                    unpacked[..., 1::2] = packed >> 4
-                    local["weight"] = unpacked
-                if "weight_shape" in local:
-                    if tuple(local["weight_shape"].tolist()) != weight.shape:
-                        raise ValueError(
-                            f"Packed weight_shape disagrees with model: {name}"
-                        )
-                elif weight.weight_bits < 8:
-                    limit = 2 ** (weight.weight_bits - 1)
-                    if (local["weight"] < -limit).any() or (
-                        local["weight"] >= limit
-                    ).any():
-                        raise ValueError(
-                            f"Integer weight exceeds its bit range: {name}"
-                        )
-                scheme = self.schemes[name.removesuffix(".weight")]
-                if (
-                    weight.format == "pack-quantized"
-                    and weight.weight_bits == 8
-                    and weight.packing == "int32"
-                    and scheme.weights.symmetric
-                    and sys.byteorder == "little"
-                ):
-                    unpacked = _unpack_int8_from_int32(
-                        local["weight_packed"], weight.shape
-                    )
-                    value = dequantize(
-                        unpacked,
-                        local["weight_scale"],
-                        args=scheme.weights,
-                    ).to(weight.dtype)
-                    self.fast_path_materializations += 1
-                else:
-                    compressor = BaseCompressor.get_value_from_registry(
-                        weight.format
-                    )
-                    value = compressor.decompress(local, scheme)["weight"].to(
-                        weight.dtype
-                    )
-                    self.generic_decode_materializations += 1
-            elif weight.dtype.is_floating_point:
-                value = self.materializer.materialize_cpu(
-                    weight.sources[0], raw, target_dtype=weight.dtype
+            elif weight.weight_bits < 8:
+                limit = 2 ** (weight.weight_bits - 1)
+                if (local["weight"] < -limit).any() or (
+                    local["weight"] >= limit
+                ).any():
+                    raise ValueError(f"Integer weight exceeds its bit range: {name}")
+            scheme = self.schemes[name.removesuffix(".weight")]
+            if (
+                weight.format == "pack-quantized"
+                and weight.weight_bits == 8
+                and weight.packing == "int32"
+                and scheme.weights.symmetric
+                and sys.byteorder == "little"
+            ):
+                unpacked = _unpack_int8_from_int32(
+                    local["weight_packed"], weight.shape
                 )
+                value = dequantize(
+                    unpacked,
+                    local["weight_scale"],
+                    args=scheme.weights,
+                ).to(weight.dtype)
+                self.fast_path_materializations += 1
             else:
-                value = raw[weight.sources[0]].to(weight.dtype)
-            if value.device.type != "cpu" or tuple(value.shape) != weight.shape:
-                raise ValueError(f"Decoded tensor device/shape mismatch for {name!r}")
-            if value.dtype != weight.dtype:
-                raise ValueError(f"Decoded tensor dtype mismatch for {name!r}")
-            self.decode_seconds += perf_counter() - started
-            self.materializations += 1
-            self.loads[name] += 1
-            self.peak_preparation_bytes = max(
-                self.peak_preparation_bytes, weight.preparation_bytes
+                compressor = BaseCompressor.get_value_from_registry(weight.format)
+                value = compressor.decompress(local, scheme)["weight"].to(weight.dtype)
+                self.generic_decode_materializations += 1
+        elif weight.dtype.is_floating_point:
+            value = self.materializer.materialize_cpu(
+                weight.sources[0], raw, target_dtype=weight.dtype
             )
-            return value
+        else:
+            value = raw[weight.sources[0]].to(weight.dtype)
+        if value.device.type != "cpu" or tuple(value.shape) != weight.shape:
+            raise ValueError(f"Decoded tensor device/shape mismatch for {name!r}")
+        if value.dtype != weight.dtype:
+            raise ValueError(f"Decoded tensor dtype mismatch for {name!r}")
+        self.decode_seconds += perf_counter() - started
+        self.materializations += 1
+        self.loads[name] += 1
+        self.peak_preparation_bytes = max(
+            self.peak_preparation_bytes, weight.preparation_bytes
+        )
+        return value
 
     def __iter__(self) -> Iterator[str]:
         return iter(self._weights)
