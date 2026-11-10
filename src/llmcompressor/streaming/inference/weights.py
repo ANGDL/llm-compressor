@@ -17,10 +17,7 @@ from torch import nn
 
 from llmcompressor.streaming.checkpoint import CheckpointWeightSource
 from llmcompressor.streaming.loading import HostMemoryBudget
-from llmcompressor.streaming.materialization import (
-    CastWeightMaterializer,
-    WeightMaterializer,
-)
+from llmcompressor.streaming.materialization import WeightMaterializer
 
 if TYPE_CHECKING:
     from .prefetch import InferencePrefetcher
@@ -74,17 +71,6 @@ def _unpack_int8_from_int32(
     unpacked = packed.reshape(unpacked_shape)
     unpacked.sub_(128)
     return unpacked.view(torch.int8)[..., : shape[-1]]
-
-
-def prefetch_materializer(
-    materializer: WeightMaterializer,
-) -> WeightMaterializer | None:
-    """Return a picklable decoder, or None when only quantized weights qualify."""
-
-    inner = getattr(materializer, "materializer", materializer)
-    if isinstance(inner, CastWeightMaterializer):
-        return CastWeightMaterializer()
-    return None
 
 
 class StreamingWeights(Mapping[str, torch.Tensor]):
@@ -157,19 +143,6 @@ class StreamingWeights(Mapping[str, torch.Tensor]):
             for name in names[1:]:
                 aliases.setdefault(name, names[0])
         return aliases
-
-    def __getstate__(self) -> dict:
-        """Pickle only the decoder state needed by a prefetch worker process."""
-
-        state = dict(self.__dict__)
-        state["prefetcher"] = None
-        state["host_memory_budget"] = None
-        state["materializer"] = prefetch_materializer(self.materializer)
-        return state
-
-    def __setstate__(self, state: dict) -> None:
-        self.__dict__.update(state)
-        self.host_memory_budget = HostMemoryBudget()
 
     def _metadata(self, name):
         try:

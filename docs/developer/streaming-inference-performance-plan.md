@@ -105,22 +105,15 @@ P1 复测后，如果 CPU decode 占单次 forward 的显著比例，再增加�
 2026-11-10 对 Qwen3-VL-32B W8A16 的单次多模态 forward 复测（`--mode forward`，
 8 GiB device/preparation/prefetch 预算）如下：
 
-| 配置 | forward 总耗时 | decode 合计 | prefetch prepare | prefetch wait | 命中 |
+| 配置 | forward 总耗时 | 主线程 decode | prefetch prepare | prefetch wait | 命中 |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | 关闭 prefetch | 18.35 s | 5.13 s | - | - | - |
-| 线程 prefetch | 27.97 s | 11.70 s | 13.52 s | 12.98 s | 969 |
-| 进程 prefetch（16 线程） | 33.52 s | 0.40 s（仅父进程） | 20.16 s | 20.89 s | 1005 |
+| 开启 prefetch | 27.97 s | 11.70 s | 13.52 s | 12.98 s | 969 |
 
 后台线程确实提交并执行了加载（89 个 group），但主线程等待时间接近 worker
 总准备时间，且主线程 decode 被 GIL/CPU 竞争拖慢约 2.3 倍。因此当前实现属于
-“有异步 prefetch，但没有形成有效的加载重叠”，仍不应作为默认配置。
-
-把 decode 放进独立进程后，GIL 竞争确实消失：`7.27 GiB` 权重的解码在 16
-PyTorch 线程下为 `1.71 s`，104 线程下为 `1.87 s`；两个并发线程为 `1.43 s`，
-而两个进程可达到接近线性的 `0.87 s/半`。但端到端进程 prefetch 仍需要
-`33.52 s`，因为每层解码结果要写入共享内存，消费者仍等待 `20.89 s`。该 W8A16
-推理是内存带宽受限，而不是单纯 GIL 受限；额外的共享内存写入抵消了 GIL 收益。
-下一步应优先减少解码字节数或使用 fused/native 解码，而不是继续增加并发。
+“有异步 prefetch，但没有形成有效的加载重叠”，仍不应作为默认配置。后续需要
+把 CPU decode 移出 GIL（例如 native 解码或独立进程），而不是继续增加线程。
 
 量化 pipeline 的 target 级预取与 inference prefetch 是两条独立路径，不在本文
 范围内；其调度与实测结果见 `docs/guides/streaming_ptq.md`。

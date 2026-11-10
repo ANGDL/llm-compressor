@@ -33,7 +33,7 @@ from llmcompressor.streaming.materialization import (
     apply_transformers_weight_conversions,
 )
 
-from .prefetch import InferencePrefetcher, ProcessInferencePrefetcher
+from .prefetch import InferencePrefetcher
 from .quantization import install_activation_qdq, resolve_schemes
 from .weights import StreamingWeights
 
@@ -100,21 +100,8 @@ def _group_module_hooks(model, class_names, device, before_forward=None):
     visit(model)
 
 
-def _install_prefetch(
-    model,
-    weights,
-    class_names,
-    max_bytes,
-    *,
-    process: bool = False,
-    threads: int | None = None,
-):
-    if process:
-        prefetcher = ProcessInferencePrefetcher(
-            weights, max_bytes, threads=threads
-        )
-    else:
-        prefetcher = InferencePrefetcher(weights, max_bytes)
+def _install_prefetch(model, weights, class_names, max_bytes):
+    prefetcher = InferencePrefetcher(weights, max_bytes)
     weights.prefetcher = prefetcher
     callbacks = {}
 
@@ -353,8 +340,6 @@ def load_streaming_model(
     host_memory_budget: HostMemoryBudget | None = None,
     prefetch: bool = False,
     max_prefetch_bytes: int | None = None,
-    prefetch_process: bool = False,
-    prefetch_threads: int | None = None,
 ) -> StreamingInference:
     """Build a local model on meta and load only the currently called modules.
 
@@ -369,10 +354,6 @@ def load_streaming_model(
     checkpoint = Path(checkpoint).expanduser().resolve()
     if max_prefetch_bytes is not None and max_prefetch_bytes <= 0:
         raise ValueError("max_prefetch_bytes must be positive")
-    if prefetch_process and not prefetch:
-        raise ValueError("prefetch_process requires prefetch=True")
-    if prefetch_threads is not None and prefetch_threads <= 0:
-        raise ValueError("prefetch_threads must be positive")
     if prefetch and not preload_module_classes:
         raise ValueError("prefetch requires explicit preload_module_classes")
     if not checkpoint.is_dir():
@@ -465,14 +446,7 @@ def load_streaming_model(
             for hook in _execution_hooks(getattr(module, "_hf_hook", None)):
                 hook.execution_device = device
         callbacks = (
-            _install_prefetch(
-                model,
-                weights,
-                preload_classes,
-                max_prefetch_bytes,
-                process=prefetch_process,
-                threads=prefetch_threads,
-            )
+            _install_prefetch(model, weights, preload_classes, max_prefetch_bytes)
             if prefetch
             else None
         )

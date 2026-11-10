@@ -31,8 +31,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-preparation-gib", type=float, default=8.0)
     parser.add_argument("--prefetch", action="store_true")
     parser.add_argument("--max-prefetch-gib", type=float, default=8.0)
-    parser.add_argument("--prefetch-process", action="store_true")
-    parser.add_argument("--prefetch-threads", type=int)
     parser.add_argument("--report", type=Path)
     return parser.parse_args()
 
@@ -123,8 +121,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         max_preparation_bytes=int(args.max_preparation_gib * 2**30),
         prefetch=args.prefetch,
         max_prefetch_bytes=int(args.max_prefetch_gib * 2**30),
-        prefetch_process=args.prefetch_process,
-        prefetch_threads=args.prefetch_threads,
     ) as stream:
         report["setup_seconds"] = time.monotonic() - started
         report["streaming_report"] = stream.report()
