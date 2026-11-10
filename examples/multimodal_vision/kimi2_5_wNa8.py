@@ -21,7 +21,6 @@ from llmcompressor.datasets import (
 from llmcompressor.modeling import load_kimi_k25_model
 from llmcompressor.modifiers.gptq import GPTQModifier
 from llmcompressor.modifiers.quantization import QuantizationModifier
-from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
 from llmcompressor.pipelines.basic import pipeline as basic_pipeline
 from llmcompressor.pipelines.data_free import pipeline as data_free_pipeline
 
@@ -258,7 +257,6 @@ recipes = []
 if args.observer == "imatrix_mse":
     experts_w4_scheme.weights.observer = "imatrix_mse"
     other_linear_w8_scheme.weights.observer = "imatrix_mse"
-    recipes.append(IMatrixGatherer(ignore=ignores))
     tail_name += "-IMatrix"
 
 if args.modifier == "GPTQ":

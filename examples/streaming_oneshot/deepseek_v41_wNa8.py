@@ -55,7 +55,6 @@ from llmcompressor.modeling.deepseekv41 import (
     ModelConfig,
 )
 from llmcompressor.modifiers.quantization import QuantizationModifier
-from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
 from llmcompressor.streaming import DeepSeekV41WeightMaterializer, streaming_oneshot
 
 _WO_A_PATTERN = r"re:.*\.attn\.wo_a$"
@@ -618,7 +617,6 @@ def main():
         dataset=_load_dataset(args, tokenizer, config),
         tokenizer=tokenizer,
         recipe=[
-            IMatrixGatherer(ignore=ignores),
             QuantizationModifier(config_groups=groups, ignore=ignores),
         ],
         output_dir=args.output_dir,

@@ -16,7 +16,6 @@ from llmcompressor.modifiers.quantization import QuantizationModifier
 from llmcompressor.modifiers.autosmooth import AutoSmoothModifier
 from llmcompressor.modifiers.transform.awq.mappings import AWQMapping
 from llmcompressor.modifiers.transform.smoothquant import SmoothQuantModifier
-from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
 from llmcompressor.pipelines.basic import pipeline as basic_pipeline
 from llmcompressor.pipelines.data_free import pipeline as data_free_pipeline
 from llmcompressor.utils.pytorch.module import get_module_to_name_dict
@@ -550,10 +549,6 @@ if args.observer == "imatrix_mse":
     scheme.weights.observer = "imatrix_mse"
     imatrix_fallback_stats = ImatrixFallbackStats()
     imatrix_fallback_stats.install_hooks()
-    imatrix_kwargs = dict(ignore=ignores)
-    if args.pipeline == "sequential":
-        imatrix_kwargs["attach_by_initialize"] = False
-    recipes.append(IMatrixGatherer(**imatrix_kwargs))
     tail_name += "-IMatrix"
 elif args.observer == "mse":
     if scheme.weights is None:

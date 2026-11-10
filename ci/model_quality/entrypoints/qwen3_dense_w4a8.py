@@ -10,7 +10,6 @@ from compressed_tensors.quantization import preset_name_to_scheme
 
 from datasets import load_dataset
 from llmcompressor.modifiers.quantization import QuantizationModifier
-from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
 from llmcompressor.streaming import streaming_oneshot
 
 
@@ -46,7 +45,6 @@ def main() -> None:
     scheme.weights.scale_dtype = torch.float32
     ignores = ["lm_head"]
     recipe = [
-        IMatrixGatherer(ignore=ignores),
         QuantizationModifier(
             config_groups={"group_0": scheme},
             ignore=ignores,

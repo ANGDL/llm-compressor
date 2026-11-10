@@ -10,7 +10,6 @@ from llmcompressor.core import create_session
 from llmcompressor.modifiers.gptq import GPTQModifier
 from llmcompressor.modifiers.quantization import QuantizationModifier
 from llmcompressor.modifiers.transform import AWQModifier
-from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
 from llmcompressor.streaming.admission import (
     DeviceMemoryBudget,
     DeviceMemoryError,
@@ -104,7 +103,6 @@ def test_dynamic_estimate_is_not_replaced_by_identity_probe():
 def test_real_quantizer_estimates_on_initialized_meta_modules(quantizer_class):
     model = nn.Sequential(nn.Linear(8, 4, bias=False, device="meta"))
     recipe = [
-        IMatrixGatherer(),
         quantizer_class(scheme="W8A8", targets=["Linear"]),
     ]
     with create_session() as session:
@@ -116,7 +114,12 @@ def test_real_quantizer_estimates_on_initialized_meta_modules(quantizer_class):
 
     assert estimate.scratch_bytes > 0
     if quantizer_class is GPTQModifier:
-        assert estimate.details[1]["held_bytes"] == 8 * 8 * torch.float32.itemsize
+            gptq = next(
+                detail
+                for detail in estimate.details
+                if detail["modifier_type"].endswith("GPTQModifier")
+            )
+            assert gptq["held_bytes"] == 8 * 8 * torch.float32.itemsize
 
 
 def test_device_reservations_do_not_compete_across_devices():

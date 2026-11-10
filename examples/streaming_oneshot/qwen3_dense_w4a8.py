@@ -11,7 +11,6 @@ import torch
 from compressed_tensors.quantization import preset_name_to_scheme
 from datasets import load_dataset
 from llmcompressor.modifiers.quantization import QuantizationModifier
-from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
 from llmcompressor.streaming import streaming_oneshot
 
 MODEL = "/path/to/models/Qwen3-0.6B"
@@ -31,7 +30,6 @@ w4a8_scheme.weights.observer = "imatrix_mse"
 w4a8_scheme.weights.scale_dtype = torch.float32
 
 recipe = [
-    IMatrixGatherer(ignore=["lm_head"]),
     QuantizationModifier(
         config_groups={"group_0": w4a8_scheme},
         ignore=["lm_head"],

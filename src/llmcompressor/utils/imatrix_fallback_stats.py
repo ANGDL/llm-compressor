@@ -36,14 +36,12 @@ class ImatrixFallbackStats:
 
     .. note::
 
-        ``install_hooks()`` monkey-patches ``IMatrixGatherer`` and
-        ``IMatrixMSEObserver`` at the class level. Only one active
-        tracking session is supported at a time.
+        ``install_hooks()`` monkey-patches ``IMatrixMSEObserver`` at the class
+        level. Only one active tracking session is supported at a time.
     """
 
-    # Class-level state shared across all instances because the
-    # monkey-patches operate at the class level on IMatrixMSEObserver
-    # and IMatrixGatherer.
+    # Class-level state shared across all instances because the monkey-patches
+    # operate at the class level on IMatrixMSEObserver.
     _no_importance: Counter = Counter()
     _all_zero: Counter = Counter()
     _other: Counter = Counter()
@@ -59,7 +57,7 @@ class ImatrixFallbackStats:
     # ------------------------------------------------------------------
 
     def install_hooks(self) -> None:
-        """Install loguru sink and monkey-patches on observer/gatherer classes.
+        """Install the loguru sink and observer monkey-patches.
 
         Idempotent: subsequent calls are no-ops. The monkey-patches are
         permanent (class-level), while the loguru sink can be removed
@@ -82,9 +80,8 @@ class ImatrixFallbackStats:
     def remove_hooks(self) -> None:
         """Remove the loguru warning sink.
 
-        Monkey-patches on ``IMatrixGatherer`` and ``IMatrixMSEObserver``
-        are left in place (they are harmless and removing them would
-        require storing originals globally).
+        Monkey-patches on ``IMatrixMSEObserver`` are left in place (they are
+        harmless and removing them would require storing originals globally).
         """
         if ImatrixFallbackStats._sink_id is not None:
             logger.remove(ImatrixFallbackStats._sink_id)
@@ -193,34 +190,18 @@ def _imatrix_warning_sink(message):
 
 
 def _install_class_patches():
-    """Monkey-patch IMatrixGatherer and IMatrixMSEObserver to track module names.
+    """Monkey-patch IMatrixMSEObserver to track module names.
 
     Patches apply at the class level and are guarded by a sentinel attribute
     so they are applied at most once per process.
     """
-    from compressed_tensors.utils import match_named_modules
-
-    from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
     from llmcompressor.observers.imatrix import IMatrixMSEObserver
 
     if getattr(IMatrixMSEObserver, "_imatrix_fallback_stats_installed", False):
         return
 
-    original_gatherer_init = IMatrixGatherer.on_initialize
     original_attach = IMatrixMSEObserver.attach
     original_validate = IMatrixMSEObserver._get_validated_importance
-
-    def _gatherer_init_with_module_names(self, state, **kwargs):
-        resolved_targets = (
-            self.targets if isinstance(self.targets, list) else [self.targets]
-        )
-        for module_name, module in match_named_modules(
-            state.model,
-            resolved_targets,
-            self.ignore,
-        ):
-            ImatrixFallbackStats._module_name_by_id[id(module)] = module_name
-        return original_gatherer_init(self, state, **kwargs)
 
     def _attach_with_module_name(self, module):
         self._imatrix_script_module_name = (
@@ -241,7 +222,6 @@ def _install_class_patches():
         finally:
             ImatrixFallbackStats._current_module.reset(token)
 
-    IMatrixGatherer.on_initialize = _gatherer_init_with_module_names
     IMatrixMSEObserver.attach = _attach_with_module_name
     IMatrixMSEObserver._get_validated_importance = _validate_with_stats
     IMatrixMSEObserver._imatrix_fallback_stats_installed = True

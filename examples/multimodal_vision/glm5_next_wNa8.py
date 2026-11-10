@@ -75,7 +75,6 @@ from llmcompressor.modeling.glm5_next import attach_mtp_layer
 from llmcompressor.modeling.moe.linearize import linearize_moe
 from llmcompressor.modifiers.gptq import GPTQModifier
 from llmcompressor.modifiers.quantization import QuantizationModifier
-from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
 from llmcompressor.utils import ImatrixFallbackStats
 
 # Routed experts are matched separately with W4A8. The W8A8 targets are built
@@ -777,13 +776,6 @@ recipes = []
 if args.observer == "imatrix_mse":
     fallback_stats = ImatrixFallbackStats()
     fallback_stats.install_hooks()
-    recipes.append(
-        IMatrixGatherer(
-            targets=GLM5_NEXT_W8A8_TARGETS + GLM5_NEXT_W4A8_EXPERT_TARGETS,
-            ignore=GLM5_NEXT_W8A8_IGNORES,
-            attach_by_initialize=args.pipeline != "sequential",
-        )
-    )
     tail_name += "-IMatrix"
 
 modifier_kwargs = {

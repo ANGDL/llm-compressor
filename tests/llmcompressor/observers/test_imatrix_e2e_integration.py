@@ -177,7 +177,7 @@ class TestIMatrixObserverIntegration:
 
     @pytest.mark.smoke
     @pytest.mark.integration
-    def test_observer_completes_without_separate_gatherer(self):
+    def test_observer_collects_importance_during_calibration(self):
         """imatrix_mse runs directly through QuantizationModifier."""
         model = AutoModelForCausalLM.from_pretrained(MODEL_ID)
 

@@ -77,7 +77,6 @@ def _recipe_quantizer(recipe: Recipe):
         )
     supported_transforms = {
         "AWQModifier",
-        "IMatrixGatherer",
         "SmoothQuantModifier",
     }
     unsupported = [
@@ -303,9 +302,6 @@ def streaming_oneshot_from_pretrained(
     if dataloader is None:
         raise ValueError("Streaming PTQ requires calibration data")
 
-    for modifier in parsed_recipe.modifiers:
-        if type(modifier).__name__ == "IMatrixGatherer":
-            modifier.attach_by_initialize = False
     factory = model_factory or AutoModelForCausalLM.from_config
     meta_model = build_meta_model(
         factory,

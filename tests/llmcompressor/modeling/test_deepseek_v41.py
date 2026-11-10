@@ -29,7 +29,6 @@ from llmcompressor.modeling.deepseekv41.model import (
 )
 from llmcompressor.modeling.moe_context import moe_calibration_context
 from llmcompressor.modifiers.quantization import QuantizationModifier
-from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
 from llmcompressor.pipelines.sequential.plan import trace_sequential_plan
 from llmcompressor.streaming import (
     DeepSeekV41WeightMaterializer,
@@ -1108,7 +1107,6 @@ def test_bf16_calibration_preserves_requested_weight_scale_dtype(
         dataset=DataLoader([{"input_ids": torch.arange(1, 9)}], batch_size=1),
         dataset_fingerprint="b" * 64,
         recipe=[
-            IMatrixGatherer(ignore=ignored),
             QuantizationModifier(
                 config_groups=groups,
                 ignore=ignored,
@@ -1197,7 +1195,6 @@ def test_streaming_quantizes_modern_bf16_checkpoint_and_reloads_engram(
         dataset=DataLoader([{"input_ids": torch.arange(1, 9)}], batch_size=1),
         dataset_fingerprint="c" * 64,
         recipe=[
-            IMatrixGatherer(ignore=ignored),
             QuantizationModifier(config_groups=groups, ignore=ignored),
         ],
         output_dir=tmp_path / "output",
@@ -1349,7 +1346,6 @@ def test_streaming_quantizes_backbone_and_dspark_preserving_engram(
             dataset=data,
             dataset_fingerprint="a" * 64,
             recipe=[
-                IMatrixGatherer(ignore=ignored),
                 QuantizationModifier(
                     config_groups=schemes,
                     ignore=ignored,

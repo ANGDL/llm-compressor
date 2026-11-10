@@ -36,7 +36,6 @@ from llmcompressor import oneshot
 from llmcompressor.modifiers.autosmooth import AutoSmoothModifier
 from llmcompressor.modifiers.gptq import GPTQModifier
 from llmcompressor.modifiers.quantization import QuantizationModifier
-from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
 from llmcompressor.utils import ImatrixFallbackStats
 
 from llmcompressor.logger import LoggerConfig, configure_logger
@@ -93,9 +92,9 @@ parser.add_argument(
     default="imatrix_mse",
     choices=["", "mse", "imatrix_mse"],
     help=(
-        "Observer for weight quantization. 'imatrix_mse' inserts an IMatrixGatherer "
-        "before the quantizer; 'mse' just sets the observer on the scheme; '' keeps "
-        "the preset default."
+        "Observer for weight quantization. 'imatrix_mse' sets the imatrix observer "
+        "on the quantizer; 'mse' uses the plain MSE observer; '' keeps the preset "
+        "default."
     ),
 )
 parser.add_argument(
@@ -267,7 +266,6 @@ if args.transform == "AutoSmooth":
 if args.observer == "imatrix_mse":
     imatrix_fallback_stats = ImatrixFallbackStats()
     imatrix_fallback_stats.install_hooks()
-    recipe.append(IMatrixGatherer(ignore=ignores))
     tail_name += "-IMatrix"
 elif args.observer == "mse":
     tail_name += "-MSE"

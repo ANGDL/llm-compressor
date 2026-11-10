@@ -17,7 +17,6 @@ from llmcompressor.modeling.deepseek_v4 import CalibrationDeepseekV4MoE  # noqa:
 from llmcompressor.modeling.deepseekv4.model import DeepseekV4NativeForCausalLM
 from llmcompressor.modifiers.gptq import GPTQModifier
 from llmcompressor.modifiers.quantization import QuantizationModifier
-from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
 from llmcompressor.pipelines.basic import pipeline as basic_pipeline
 from llmcompressor.pipelines.data_free import pipeline as data_free_pipeline
 from llmcompressor.streaming.materialization.deepseek_v4 import (
@@ -839,8 +838,8 @@ elif args.quant_mode == "w4a8":
 else:
     raise ValueError(f"Unknown quant_mode: {args.quant_mode}")
 
-# AutoRound performs its own weight calibration and does not use the separate
-# IMatrixGatherer pass. Keep observer settings out of its saved scheme metadata.
+# AutoRound performs its own weight calibration. Keep observer settings out of
+# its saved scheme metadata.
 if args.modifier == "AutoRound":
     if args.observer:
         logger.warning(
@@ -860,10 +859,6 @@ if args.observer in ("imatrix_mse", "mse") and args.modifier != "AutoRound":
 if use_imatrix:
     imatrix_fallback_stats = ImatrixFallbackStats()
     imatrix_fallback_stats.install_hooks()
-    imatrix_kwargs = dict(ignore=ignores)
-    if args.pipeline == "sequential":
-        imatrix_kwargs["attach_by_initialize"] = False
-    recipes.append(IMatrixGatherer(**imatrix_kwargs))
 
 # Quantization modifier.
 if args.modifier == "GPTQ":

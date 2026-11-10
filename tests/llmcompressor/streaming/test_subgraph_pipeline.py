@@ -18,7 +18,6 @@ from llmcompressor.modifiers.gptq import GPTQModifier
 from llmcompressor.modifiers.quantization import QuantizationModifier
 from llmcompressor.modifiers.quantization.quantization.mixin import QuantizationMixin
 from llmcompressor.modifiers.transform import AWQModifier, SmoothQuantModifier
-from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
 from llmcompressor.pipelines.sequential.helpers import Subgraph
 from llmcompressor.recipe import Recipe
 from llmcompressor.streaming import (
@@ -273,9 +272,6 @@ def test_streaming_scopes_observers_to_resident_group_and_cleans_up(
 
 def _imatrix_recipe():
     return [
-        IMatrixGatherer(
-            ignore=["lm_head"], attach_by_initialize=False
-        ),
         QuantizationModifier(
             scheme="W8A8",
             targets=["Linear"],
@@ -304,7 +300,6 @@ def _imatrix_recipe_with_scale_dtype(scale_dtype: torch.dtype | None):
         ),
     )
     return [
-        IMatrixGatherer(ignore=["lm_head"], attach_by_initialize=False),
         QuantizationModifier(config_groups={"group_0": scheme}, ignore=["lm_head"]),
     ]
 
@@ -469,7 +464,6 @@ def test_pretrained_streaming_packs_w4a8_final_shard(tmp_path, async_save):
         dataset=_calibration_data(),
         dataset_fingerprint="7" * 64,
         recipe=[
-            IMatrixGatherer(ignore=["lm_head"]),
             QuantizationModifier(
                 config_groups={"group_0": scheme}, ignore=["lm_head"]
             ),
@@ -610,7 +604,6 @@ def test_pretrained_streaming_writes_each_subgraph_as_final_shard(
         dataset=dataset,
         dataset_fingerprint="d" * 64,
         recipe=[
-            IMatrixGatherer(ignore=["lm_head"]),
             QuantizationModifier(
                 scheme="W8A8",
                 targets=["Linear"],
@@ -630,10 +623,7 @@ def test_pretrained_streaming_writes_each_subgraph_as_final_shard(
     assert (output / "FINALIZED").is_file()
     saved_recipe = yaml.safe_load((output / "recipe.yaml").read_text())
     saved_modifiers = saved_recipe["default_stage"]["default_modifiers"]
-    assert set(saved_modifiers) == {
-        "IMatrixGatherer",
-        "QuantizationModifier",
-    }
+    assert set(saved_modifiers) == {"QuantizationModifier"}
     staging = tmp_path / "work" / "staging"
     assert not (staging / "transactions").exists()
     assert not list(staging.rglob("*.bin"))
@@ -656,7 +646,6 @@ def test_pretrained_streaming_writes_each_subgraph_as_final_shard(
         dataset=dataset,
         dataset_fingerprint="d" * 64,
         recipe=[
-            IMatrixGatherer(ignore=["lm_head"]),
             QuantizationModifier(
                 scheme="W8A8",
                 targets=["Linear"],

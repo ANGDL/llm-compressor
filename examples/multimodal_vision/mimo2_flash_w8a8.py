@@ -13,7 +13,6 @@ from llmcompressor.pipelines.basic import pipeline as basic_pipeline
 from llmcompressor.pipelines.data_free import pipeline as data_free_pipeline
 from llmcompressor.modifiers.quantization import QuantizationModifier
 from llmcompressor.modifiers.gptq import GPTQModifier
-from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
 from compressed_tensors.quantization import preset_name_to_scheme
 from compressed_tensors.offload.dispatch import dispatch_model as _dispatch_model
 
@@ -306,7 +305,6 @@ def quantize_model(args):
         if scheme.weights is None:
             raise ValueError("W8A8 scheme is missing weight quantization settings")
         scheme.weights.observer = "imatrix_mse"
-        recipes.append(IMatrixGatherer(ignore=ignores))
         tail_name += "-IMatrix"
 
     if args.modifier == "GPTQ":

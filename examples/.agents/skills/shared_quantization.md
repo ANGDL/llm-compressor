@@ -182,7 +182,7 @@ Key `QuantizationArgs` fields:
   - `"static_minmax"` — computes scale once from the first batch, then freezes
   - `"mse"` — minimizes mean squared error between quantized and original values
   - `"memoryless_mse"` — MSE without history
-  - `"imatrix_mse"` — MSE weighted by importance matrix (use with `IMatrixGatherer` transform)
+  - `"imatrix_mse"` — MSE weighted by importance matrix (set `weight_observer="imatrix_mse"` on the quantization modifier)
 
 Custom parameters work with `GPTQModifier` the same way — replace `QuantizationModifier` with `GPTQModifier` and use `config_groups`.
 

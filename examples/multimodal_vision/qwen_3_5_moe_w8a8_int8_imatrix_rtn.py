@@ -6,7 +6,7 @@ from contextvars import ContextVar
 
 import torch
 from compressed_tensors.quantization import preset_name_to_scheme
-from compressed_tensors.utils import match_named_modules, save_mtp_tensors_to_checkpoint
+from compressed_tensors.utils import save_mtp_tensors_to_checkpoint
 from loguru import logger
 from qwen_vl_utils import process_vision_info
 from transformers import AutoProcessor, Qwen3_5MoeForConditionalGeneration
@@ -18,7 +18,6 @@ from llmcompressor.datasets import (
     load_calibration_datasets,
 )
 from llmcompressor.modifiers.quantization import QuantizationModifier
-from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
 from llmcompressor.observers.imatrix import IMatrixMSEObserver
 
 parser = argparse.ArgumentParser()
@@ -71,20 +70,6 @@ def _install_imatrix_all_zero_stats_hooks():
 
     original_attach = IMatrixMSEObserver.attach
     original_validate = IMatrixMSEObserver._get_validated_importance
-    original_gatherer_init = IMatrixGatherer.on_initialize
-
-    def _gatherer_init_with_module_names(self, state, **kwargs):
-        resolved_targets = (
-            self.targets if isinstance(self.targets, list) else [self.targets]
-        )
-        for module_name, module in match_named_modules(
-            state.model,
-            resolved_targets,
-            self.ignore,
-        ):
-            IMATRIX_MODULE_NAME_BY_ID[id(module)] = module_name
-
-        return original_gatherer_init(self, state, **kwargs)
 
     def _attach_with_module_name(self, module):
         self._imatrix_script_module_name = IMATRIX_MODULE_NAME_BY_ID.get(
@@ -105,7 +90,6 @@ def _install_imatrix_all_zero_stats_hooks():
         finally:
             IMATRIX_CURRENT_MODULE.reset(token)
 
-    IMatrixGatherer.on_initialize = _gatherer_init_with_module_names
     IMatrixMSEObserver.attach = _attach_with_module_name
     IMatrixMSEObserver._get_validated_importance = _validate_with_stats
     IMatrixMSEObserver._script_all_zero_stats_installed = True
@@ -270,7 +254,6 @@ ignore=[
 ]
 
 recipe = [
-    IMatrixGatherer(ignore=ignore),
     QuantizationModifier(
         config_groups={"group_0": scheme},
         ignore=ignore,

@@ -10,8 +10,11 @@ The working configuration is:
 
 ```python
 recipe = [
-    IMatrixGatherer(ignore=ignores),
-    QuantizationModifier(config_groups=config_groups, ignore=ignores),
+    QuantizationModifier(
+        config_groups=config_groups,
+        ignore=ignores,
+        weight_observer="imatrix_mse",
+    ),
 ]
 
 oneshot(
@@ -128,12 +131,11 @@ non-finite. With finite weights, that fallback produces finite qparams.
 
 The independent pipeline runs each modifier in its own calibration epoch.
 
-1. `IMatrixGatherer` uses its default `attach_by_initialize=True` behavior and
-   gathers importance statistics during its pass.
-2. `QuantizationModifier` runs in a separate pass.
-3. The basic calibration pass used by each modifier sends
+1. The `QuantizationModifier` attaches the `imatrix_mse` observer and gathers
+   importance statistics during its calibration pass.
+2. The basic calibration pass sends
    `list(model.modules())` to the boundary callback.
-4. Every quantized expert projection is observed and receives updated weight
+3. Every quantized expert projection is observed and receives updated weight
    qparams, including experts with no usable iMatrix data.
 
 This is also why the working W8 example did not reproduce the W4 failure: it
