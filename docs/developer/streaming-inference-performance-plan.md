@@ -102,6 +102,19 @@ P1 复测后，如果 CPU decode 占单次 forward 的显著比例，再增加�
 `323.69s/10 tokens`；预取命中率高，但 CPU 解码线程竞争使总耗时增加约
 `10.7%`。因此预取当前不作为默认推荐配置。
 
+2026-11-10 对 Qwen3-VL-32B W8A16 的单次多模态 forward 复测（`--mode forward`，
+8 GiB device/preparation/prefetch 预算）如下：
+
+| 配置 | forward 总耗时 | 主线程 decode | prefetch prepare | prefetch wait | 命中 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 关闭 prefetch | 18.35 s | 5.13 s | - | - | - |
+| 开启 prefetch | 27.97 s | 11.70 s | 13.52 s | 12.98 s | 969 |
+
+后台线程确实提交并执行了加载（89 个 group），但主线程等待时间接近 worker
+总准备时间，且主线程 decode 被 GIL/CPU 竞争拖慢约 2.3 倍。因此当前实现属于
+“有异步 prefetch，但没有形成有效的加载重叠”，仍不应作为默认配置。后续需要
+把 CPU decode 移出 GIL（例如 native 解码或独立进程），而不是继续增加线程。
+
 量化 pipeline 的 target 级预取与 inference prefetch 是两条独立路径，不在本文
 范围内；其调度与实测结果见 `docs/guides/streaming_ptq.md`。
 

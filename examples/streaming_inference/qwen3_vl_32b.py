@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 """Run native StreamingInference on a local Qwen3-VL checkpoint."""
 
 from __future__ import annotations
@@ -17,8 +16,8 @@ from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 
 from llmcompressor.streaming import load_streaming_model
 
-DEFAULT_CHECKPOINT = "/data/quant/e2e/qwen3-vl-32b-streaming/output-rtn-w8a16"
-DEFAULT_MODEL = "/ssd4/models/Qwen3-VL-32B-Instruct"
+DEFAULT_CHECKPOINT = "/path/to/models/Qwen3-VL-32B-Instruct-W8A16"
+DEFAULT_MODEL = "/path/to/models/Qwen3-VL-32B-Instruct"
 
 
 def parse_args() -> argparse.Namespace:
@@ -125,6 +124,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     ) as stream:
         report["setup_seconds"] = time.monotonic() - started
         report["streaming_report"] = stream.report()
+        inference_started = time.monotonic()
         with torch.inference_mode():
             if args.mode == "forward":
                 output = stream(**inputs, use_cache=False)
@@ -147,6 +147,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     continuation,
                     skip_special_tokens=True,
                 )
+        report["inference_seconds"] = time.monotonic() - inference_started
         report["streaming_report_after"] = stream.report()
         report["memory"] = snapshot(device)
     gc.collect()
@@ -169,6 +170,7 @@ if __name__ == "__main__":
                     "checkpoint",
                     "input_shapes",
                     "setup_seconds",
+                    "inference_seconds",
                     "forward_shape",
                     "next_token_id",
                     "next_token_text",
@@ -186,6 +188,7 @@ if __name__ == "__main__":
                     "estimated_peak_weight_bytes",
                     "peak_weight_module",
                     "activation_mode",
+                    "prefetch",
                 )
             },
             ensure_ascii=False,

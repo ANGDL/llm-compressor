@@ -127,6 +127,13 @@ the synchronous fast path because its CPU decode worker competes with the main
 execution path. Treat it as a profiling mode until a scheduler can demonstrate
 actual overlap.
 
+For a single multimodal forward, the synchronous fast path takes `18.35 s`; with
+`prefetch=True` the prefetcher reports `969` hits but takes `27.97 s`. The worker
+spends `13.52 s` preparing groups while the main thread blocks for `12.98 s`.
+`report()["prefetch"]` exposes `prepare_seconds` and `wait_seconds`, so
+`wait_seconds` close to `prepare_seconds` means the background load is not
+actually hidden and the prefetch should stay disabled.
+
 Nonpersistent derived buffers are initially kept on CPU, moved for their owning
 module's call, and returned to CPU on success or failure. This does not replace a
 model's request-cache contract. Models with hidden parameter access, fused
