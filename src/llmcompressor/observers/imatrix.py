@@ -233,7 +233,6 @@ class IMatrixMSEObserver(Observer):
             expand=self.expand,
             importance_weights=importance_weights,
             chunk_size=self.chunk_size,
-            use_imatrix_error=True,
             magnitude_normalization=self.magnitude_normalization,
             grid_type=self.grid_type,
         )
