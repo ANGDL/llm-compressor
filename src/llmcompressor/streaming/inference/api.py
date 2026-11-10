@@ -94,8 +94,11 @@ class _PrefetchNextGroup(ModelHook):
         self.names = names
 
     def pre_forward(self, _module, *args, **kwargs):
-        self.prefetcher.submit(self.names)
         return args, kwargs
+
+    def post_forward(self, _module, output):
+        self.prefetcher.submit(self.names)
+        return output
 
 
 def _install_prefetch_hooks(model, weights, class_names, max_bytes):
