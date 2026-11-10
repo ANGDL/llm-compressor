@@ -134,6 +134,21 @@ spends `13.52 s` preparing groups while the main thread blocks for `12.98 s`.
 `wait_seconds` close to `prepare_seconds` means the background load is not
 actually hidden and the prefetch should stay disabled.
 
+`prefetch_process=True` runs decoding in a spawned worker process instead of a
+thread, so decoding no longer holds the parent's GIL. With
+`prefetch_threads=16` the same forward takes `33.52 s`: `prepare_seconds` is
+`20.16 s` and `wait_seconds` is `20.89 s`. The process removes GIL contention,
+but every decoded tensor still has to be written into a shared buffer and the
+consumer still catches up with the producer. On this memory-bound W8A16 model
+the extra shared-memory traffic costs more than the GIL it removes, so the
+process mode is also experimental and should stay disabled by default.
+It requires a spawn-safe Python entrypoint and POSIX shared memory.
+
+Thread-count tuning shows the same effect: decoding `7.27 GiB` takes `1.71 s`
+with 16 PyTorch threads and `1.87 s` with 104 threads; two concurrent decodes
+take `1.43 s` versus `2.07 s`. Process isolation reaches near-linear scaling
+for decode itself, but the shared-memory handoff erases the end-to-end gain.
+
 Nonpersistent derived buffers are initially kept on CPU, moved for their owning
 module's call, and returned to CPU on success or failure. This does not replace a
 model's request-cache contract. Models with hidden parameter access, fused
