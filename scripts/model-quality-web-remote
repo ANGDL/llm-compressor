@@ -142,6 +142,7 @@ service_healthy() {
 start_service() {
     container_ok || die "container ${MQ_CONTAINER} is missing or stopped; update MQ_CONTAINER or start it"
     discover_python
+    remote "docker exec '${MQ_CONTAINER}' mkdir -p '${MQ_RUNTIME_DIR}' '${MQ_RUNS_ROOT}'"
     if service_healthy; then
         return
     fi
@@ -164,6 +165,7 @@ start_worker() {
         return 0
     fi
     worker_healthy && return
+    remote "docker exec '${MQ_CONTAINER}' mkdir -p '${MQ_RUNTIME_DIR}'"
     local kinds=""
     if [[ -n ${MQ_WORKER_KINDS} ]]; then
         kinds=" --kinds ${MQ_WORKER_KINDS}"
@@ -194,6 +196,7 @@ start_inference_worker() {
     [[ -n ${MQ_INFERENCE_WORKER_CONTAINER} ]] || die "MQ_INFERENCE_WORKER_ENABLED=1 requires MQ_INFERENCE_WORKER_CONTAINER (or MQ_INFERENCE_CONTAINERS)"
     inference_worker_healthy && return
     discover_inference_python
+    remote "docker exec '${MQ_INFERENCE_WORKER_CONTAINER}' mkdir -p '${MQ_RUNS_ROOT}'"
     info "starting runtime-smoke worker in ${MQ_INFERENCE_WORKER_CONTAINER}"
     # The serve script invokes ``sglang`` by bare name, so the worker (whose env
     # the serve subprocess inherits) must have the interpreter's conda bin dir on
