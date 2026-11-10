@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Generator, Iterable, Iterator, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
+from time import perf_counter
 from typing import Any
 
 import torch
@@ -17,6 +18,7 @@ from llmcompressor.streaming.materialization import (
     WeightMaterializer,
 )
 
+from .._logging import streaming_logger
 from .host_memory import HostMemoryBudget, HostMemoryReservation
 from .target import (
     PreparedTargetWeights,
@@ -116,7 +118,11 @@ class PreparedSubgraphWeights:
     plan: SubgraphLoadPlan
     targets: list[PreparedTargetWeights]
     reservation: HostMemoryReservation | None = None
+    device_reservation: Any | None = None
+    transfer_reservation: HostMemoryReservation | None = None
     _device: torch.device = torch.device("cpu")
+    _transfer_event: Any | None = None
+    _transfer_sources: list[torch.Tensor] | None = None
 
     @property
     def device(self) -> torch.device:
@@ -126,12 +132,102 @@ class PreparedSubgraphWeights:
     def nbytes(self) -> int:
         return sum(target.nbytes for target in self.targets)
 
+    def _close_device_reservation(self) -> None:
+        if self.device_reservation is not None:
+            self.device_reservation.close()
+            self.device_reservation = None
+
+    def wait_for_transfer(self) -> None:
+        """Wait for a background CUDA transfer, if one is active."""
+
+        if self._transfer_event is not None:
+            started_at = perf_counter()
+            self._transfer_event.synchronize()
+            streaming_logger.info(
+                f"prepared weights | transfer wait | device={self._device} | "
+                f"bytes={self.nbytes} | time={perf_counter() - started_at:.2f}s"
+            )
+            self._transfer_event = None
+            if self._transfer_sources is not None:
+                self._transfer_sources.clear()
+                self._transfer_sources = None
+            if self.transfer_reservation is not None:
+                self.transfer_reservation.close()
+                self.transfer_reservation = None
+
+    def move_to_async(
+        self,
+        device: torch.device | str,
+        *,
+        device_reservation: Any | None = None,
+        transfer_reservation: HostMemoryReservation | None = None,
+    ) -> PreparedSubgraphWeights:
+        """Enqueue a bounded CPU-to-CUDA transfer without installing the model."""
+
+        resolved = torch.device(device)
+        if resolved.type != "cuda":
+            self.move_to(resolved)
+            if device_reservation is not None:
+                self.device_reservation = device_reservation
+            if transfer_reservation is not None:
+                transfer_reservation.close()
+            return self
+        if self._device.type != "cpu":
+            raise RuntimeError(f"Prepared weights are already on {self._device}")
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA is required for asynchronous weight transfer")
+        if device_reservation is not None:
+            self.device_reservation = device_reservation
+        if transfer_reservation is None:
+            raise ValueError(
+                "Asynchronous CUDA transfer requires a pinned host reservation"
+            )
+        self.transfer_reservation = transfer_reservation
+        transfer_sources: list[torch.Tensor] = []
+
+        stream = torch.cuda.Stream(device=resolved)
+        try:
+            with torch.cuda.stream(stream):
+                for target in self.targets:
+                    for values in (target.parameter_values, target.buffer_values):
+                        for name, value in tuple(values.items()):
+                            size = value.numel() * value.element_size()
+                            pinned = (
+                                value
+                                if value.is_pinned()
+                                else value.pin_memory()
+                            )
+                            transfer_reservation.commit(size)
+                            transfer_sources.append(pinned)
+                            values[name] = pinned.to(
+                                device=resolved, non_blocking=True
+                            )
+                            del value, pinned
+                            if self.reservation is not None:
+                                self.reservation.release_committed(size)
+                    target.device = resolved
+            self._transfer_sources = transfer_sources
+            self._transfer_event = stream.record_event()
+            self._device = resolved
+            if self.reservation is not None:
+                self.reservation.close()
+                self.reservation = None
+            return self
+        except Exception:
+            stream.synchronize()
+            transfer_sources.clear()
+            self.close()
+            raise
+
     def move_to(self, device: torch.device | str) -> PreparedSubgraphWeights:
         """Move the complete aggregate, releasing CPU ownership incrementally."""
 
         resolved = torch.device(device)
         if resolved.type == "meta":
             raise ValueError("Prepared weights cannot move to the meta device")
+        if self._device == resolved:
+            self.wait_for_transfer()
+            return self
         if self._device.type != "cpu":
             raise RuntimeError(f"Prepared weights are already on {self._device}")
         if resolved.type == "cpu":
@@ -157,12 +253,17 @@ class PreparedSubgraphWeights:
             raise
 
     def close(self) -> None:
+        self.wait_for_transfer()
         for target in self.targets:
             target.close()
         self.targets.clear()
         if self.reservation is not None:
             self.reservation.close()
             self.reservation = None
+        self._close_device_reservation()
+        if self.transfer_reservation is not None:
+            self.transfer_reservation.close()
+            self.transfer_reservation = None
 
 
 class SubgraphWeightSession:
@@ -451,6 +552,7 @@ class SubgraphWeightSession:
     ) -> Generator[LoadedSubgraph, None, None]:
         """Install prepared weights and restore the model on context exit."""
 
+        prepared.wait_for_transfer()
         if any(target.device != prepared.device for target in prepared.targets):
             prepared.close()
             raise ValueError("Prepared subgraph tensors must share one device")

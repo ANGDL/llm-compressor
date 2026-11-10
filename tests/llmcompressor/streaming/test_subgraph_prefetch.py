@@ -5,6 +5,7 @@ import threading
 import pytest
 import torch
 
+from llmcompressor.streaming.admission import DeviceMemoryBudget
 from llmcompressor.streaming.checkpoint import SafetensorsWeightSource
 from llmcompressor.streaming.loading import (
     HostMemoryBudget,
@@ -98,3 +99,51 @@ def test_prefetch_allows_only_one_pending_result(tmp_path):
                 label="second",
             )
         assert second.closed
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_prefetch_can_enqueue_bounded_cuda_transfer(tmp_path):
+    reference = SessionModel()
+    checkpoint = checkpoint_for(reference, tmp_path)
+    model = build_meta_model(SessionModel)
+    session = SubgraphWeightSession(
+        model, SafetensorsWeightSource(checkpoint)
+    )
+    plan = session.plan(subgraph_for("layers.0"))
+    prepared_bytes = session.estimate_preparation(plan, dtype=torch.float32)
+    materialized_bytes = session.estimate_materialized_bytes(
+        plan, dtype=torch.float32
+    )
+    host_budget = HostMemoryBudget(
+        safety_reserve_bytes=0,
+        system_available=lambda: 1 << 30,
+        cgroup_available=lambda: None,
+    )
+    device_budget = DeviceMemoryBudget(
+        available_bytes=1 << 40, safety_reserve_fraction=0
+    )
+    prefetcher = SubgraphPrefetcher(session)
+    try:
+        prepared = host_budget.reserve("prepared", prepared_bytes)
+        device_reservation = device_budget.reserve(
+            "device", materialized_bytes, device="cuda"
+        )
+        transfer_reservation = host_budget.reserve(
+            "pinned", materialized_bytes
+        )
+        prefetcher.submit(
+            plan,
+            dtype=torch.float32,
+            reservation=prepared,
+            label="test/cuda_transfer",
+            device="cuda",
+            device_reservation=device_reservation,
+            transfer_reservation=transfer_reservation,
+        )
+        loaded = prefetcher.take()
+        assert loaded.device.type == "cuda"
+        with session.installed(loaded):
+            assert not next(model.layers[0].parameters()).is_meta
+    finally:
+        prefetcher.close(suppress_errors=True)
+    assert_all_meta(model)

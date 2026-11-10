@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterable, Mapping, Sequence
 from contextlib import ExitStack, nullcontext
 from dataclasses import replace
@@ -102,6 +103,16 @@ def _empty_device_cache(device: torch.device) -> None:
 def _reset_peak_memory(device: torch.device) -> None:
     if device.type == "cuda":
         torch.get_device_module(device).reset_peak_memory_stats(device)
+
+
+_ASYNC_H2D_ENV = "LLMCOMPRESSOR_STREAMING_ASYNC_H2D"
+
+
+def _async_h2d_enabled() -> bool:
+    """Return whether prefetch may enqueue a background CPU-to-CUDA copy."""
+
+    value = os.environ.get(_ASYNC_H2D_ENV, "1").strip().lower()
+    return value not in {"0", "false", "no", "off"}
 
 
 def _stage_logger(
@@ -1007,7 +1018,6 @@ def run_subgraph_streaming_pipeline(
         pipeline_failed = True
         try:
             prefetch_pending = False
-            prefetched_plan = None
             for target_index, (target_name, subgraph) in enumerate(
                 zip(adapter.targets, adapter.target_subgraphs)
             ):
@@ -1091,7 +1101,12 @@ def run_subgraph_streaming_pipeline(
                     boundaries.delete(target_index + 1)
                 weight_stack = ExitStack()
                 completion_reservation = None
+                prefetched_prepared = None
                 try:
+                    if prefetch_pending:
+                        prefetched_prepared = prefetcher.take()
+                        prefetch_pending = False
+                        weight_stack.callback(prefetched_prepared.close)
                     resident_modules = tuple(subgraph.submodules(adapter.model))
                     if runtime_adapters:
                         weight_stack.enter_context(
@@ -1117,8 +1132,8 @@ def run_subgraph_streaming_pipeline(
                         adapter.model, f"{target_label} | plan weights", device
                     ):
                         plan = (
-                            prefetched_plan
-                            if prefetch_pending
+                            prefetched_prepared.plan
+                            if prefetched_prepared is not None
                             else adapter.plan_target(target_index)
                         )
                         modifier_memory = estimate_modifier_memory(
@@ -1141,13 +1156,30 @@ def run_subgraph_streaming_pipeline(
                             + 1024 * 1024
                         )
                         disk_budget.check(target_label, disk_required)
-                        weight_stack.enter_context(
-                            device_budget.reserve(
-                                f"{target_label} device working set",
-                                device_required,
-                                device=device,
+                        if prefetched_prepared is None:
+                            weight_stack.enter_context(
+                                device_budget.reserve(
+                                    f"{target_label} device working set",
+                                    device_required,
+                                    device=device,
+                                )
                             )
-                        )
+                        elif prefetched_prepared.device_reservation is None:
+                            weight_stack.enter_context(
+                                device_budget.reserve(
+                                    f"{target_label} device working set",
+                                    device_required,
+                                    device=device,
+                                )
+                            )
+                        elif (
+                            prefetched_prepared.device_reservation.reserved_bytes
+                            < device_required
+                        ):
+                            raise DeviceMemoryError(
+                                f"Prefetched device reservation is too small for "
+                                f"{target_label}: required {device_required} bytes"
+                            )
                         modifier_host_bytes = modifier_memory.host_bytes + (
                             modifier_memory.peak_bytes if device.type == "cpu" else 0
                         )
@@ -1169,7 +1201,7 @@ def run_subgraph_streaming_pipeline(
                             f"num_tokens={num_tokens}"
                             f" | max_batch_tokens={max_batch_tokens}"
                         )
-                    if not prefetch_pending:
+                    if prefetched_prepared is None:
                         required = adapter.weight_session.estimate_preparation(
                             plan, dtype=target_dtype
                         )
@@ -1187,9 +1219,7 @@ def run_subgraph_streaming_pipeline(
                                 reservation=reservation,
                             )
                     else:
-                        prepared = prefetcher.take()
-                        prefetch_pending = False
-                        prefetched_plan = None
+                        prepared = prefetched_prepared
                     weight_stack.callback(prepared.close)
                     with _stage_logger(
                         adapter.model,
@@ -1226,16 +1256,9 @@ def run_subgraph_streaming_pipeline(
                                 loaded, target_name, pack_to_int8=pack_to_int8
                             )
                             next_reservation = None
+                            next_device_reservation = None
+                            next_transfer_reservation = None
                             try:
-                                with device_budget.reserve(
-                                    f"{next_label} prefetch working set",
-                                    adapter.weight_session.estimate_materialized_bytes(
-                                        next_plan, dtype=target_dtype
-                                    )
-                                    + next_modifier_memory.peak_bytes,
-                                    device=device,
-                                ):
-                                    pass
                                 completion_reservation = host_budget.reserve(
                                     f"{target_label} completion headroom",
                                     completion_bytes,
@@ -1243,7 +1266,47 @@ def run_subgraph_streaming_pipeline(
                                 next_reservation = host_budget.reserve(
                                     f"{next_label} weights", next_required
                                 )
-                            except (HostMemoryError, DeviceMemoryError):
+                                next_materialized_bytes = (
+                                    adapter.weight_session.estimate_materialized_bytes(
+                                        next_plan, dtype=target_dtype
+                                    )
+                                )
+                                try:
+                                    next_device_reservation = device_budget.reserve(
+                                        f"{next_label} prefetch working set",
+                                        next_materialized_bytes
+                                        + next_modifier_memory.peak_bytes,
+                                        device=device,
+                                    )
+                                except DeviceMemoryError:
+                                    streaming_logger.info(
+                                        f"{next_label} | async H2D deferred | "
+                                        "device working set does not fit"
+                                    )
+                                if (
+                                    next_device_reservation is not None
+                                    and device.type == "cuda"
+                                    and _async_h2d_enabled()
+                                ):
+                                    try:
+                                        next_transfer_reservation = (
+                                            host_budget.reserve(
+                                                f"{next_label} pinned transfer",
+                                                next_materialized_bytes,
+                                            )
+                                        )
+                                    except HostMemoryError:
+                                        next_device_reservation.close()
+                                        next_device_reservation = None
+                                        streaming_logger.info(
+                                            f"{next_label} | async H2D deferred | "
+                                            "pinned host staging does not fit"
+                                        )
+                            except HostMemoryError:
+                                if next_device_reservation is not None:
+                                    next_device_reservation.close()
+                                if next_transfer_reservation is not None:
+                                    next_transfer_reservation.close()
                                 if completion_reservation is not None:
                                     completion_reservation.close()
                                     completion_reservation = None
@@ -1259,9 +1322,11 @@ def run_subgraph_streaming_pipeline(
                                 dtype=target_dtype,
                                 reservation=next_reservation,
                                 label=f"{next_label} | prepare weights",
+                                device=device,
+                                device_reservation=next_device_reservation,
+                                transfer_reservation=next_transfer_reservation,
                             )
                             prefetch_pending = True
-                            prefetched_plan = next_plan
 
                     with _stage_logger(
                         adapter.model,

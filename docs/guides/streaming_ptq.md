@@ -218,16 +218,18 @@ implementation. Cast and DeepSeek-V4 materializers implement the same CPU-only
 
 The class contracts fix the following ownership decisions:
 
-1. `SubgraphPrefetcher` always calls `prepare` for CPU. Its `submit` method has
-   no device argument and owns at most one future.
+1. `SubgraphPrefetcher` always calls `prepare` for CPU and owns at most one
+   future. CUDA mode may attach a bounded transfer reservation to that future.
 2. The pipeline reserves host memory before `submit`. Ownership of that
    reservation moves to the prefetch task and then to
    `PreparedSubgraphWeights`; every failure path closes it.
-3. `PreparedSubgraphWeights.move_to(device)` is the only pipeline-facing weight
-   transfer method. It iterates through its `PreparedTargetWeights`, replaces one
-   CPU tensor at a time in place, and releases the corresponding committed bytes
-   after each successful copy. A partially moved object never escapes; any
-   failure closes the complete aggregate after its tensors are released.
+3. `PreparedSubgraphWeights.move_to(device)` is the synchronous
+   pipeline-facing transfer method. CUDA prefetch may use
+   `move_to_async(device)` followed by `wait_for_transfer()` before install.
+   Both paths replace one CPU tensor at a time and release source ownership
+   after the copy is safely queued or completed. A partially moved object never
+   escapes; any failure closes the complete aggregate after its tensors are
+   released.
 4. `SubgraphWeightSession.installed()` accepts only a completely prepared,
    single-device aggregate. Installation and restoration to meta remain on the
    main thread.
@@ -235,8 +237,8 @@ The class contracts fix the following ownership decisions:
    CPU batch before deleting the matching source batch. The pipeline does not
    call `delete_batch` directly.
 6. `CheckpointWeightSource` and `WeightMaterializer` expose CPU-only load and
-   materialization methods. The sole weight H2D boundary is
-   `PreparedSubgraphWeights.move_to()`.
+   materialization methods. Weight H2D is owned by
+   `PreparedSubgraphWeights.move_to()` or its bounded asynchronous variant.
 7. Before creating an output snapshot, the pipeline reserves its estimated CPU
    bytes. Ownership moves to the asynchronous writer and is released after the
    direct writer commits or fails. The writer never owns live model parameters
@@ -262,9 +264,10 @@ The target transition is ordered:
 
 1. Finish all execution and snapshot ownership transfers for target N.
 2. Restore target N to meta tensors and release its execution-device storage.
-3. Wait for the prepared CPU state for target N + 1.
-4. Move the prepared tensors to the execution device, releasing each CPU source
-   tensor as ownership transfers.
+3. Wait for the prepared state for target N + 1; when a background H2D was
+   admitted, wait for its completion event.
+4. If the target is still CPU-prepared, move the prepared tensors to the
+   execution device, releasing each CPU source tensor as ownership transfers.
 5. Atomically install the complete prepared target into the meta model.
 6. Start CPU materialization of target N + 2.
 7. Execute target N + 1.
@@ -273,8 +276,41 @@ The first target is prepared synchronously because there is no preceding
 computation to overlap. Every later target uses the same CPU prepare and device
 transfer path; model-specific materializers do not bypass this lifecycle.
 
-This is target-level prefetch, not pipeline parallelism. There is no second
+When the execution device is CUDA, the prepared next target can also enqueue its
+CPU-to-device copies on a private CUDA stream. The transfer is admitted as a
+second, bounded device working set and is waited on immediately before atomic
+installation. If the device or pinned host budget cannot reserve that working
+set, the pipeline keeps the target CPU-prepared and uses the synchronous
+transfer path. When capacity allows, the steady-state schedule is:
+
+```text
+target N execution || target N+1 CPU preparation and H2D || target N-1 write
+```
+
+The device-transfer stage is capacity-gated. It may temporarily hold the
+current and next target on the execution device, so devices that cannot fit both
+working sets retain the one-target memory-minimal behavior. There is still one
 execution device and no alternating model placement.
+
+Set `LLMCOMPRESSOR_STREAMING_ASYNC_H2D=0` to disable background device transfers
+and always wait for the CPU-to-device copy at the target boundary. The switch is
+useful for memory-constrained hosts, for debugging, and for A/B measurements.
+
+### Measured pipeline behavior
+
+Measured on node16 (`llm-quant-base`), one 96 GiB GPU, with Qwen3-VL-32B-Instruct
+RTN W8A16, 8 synthetic multimodal calibration samples, `max_seq_length=512`, 64
+targets, and asynchronous checkpoint saving enabled:
+
+| Configuration | Wall time | `load weights` total | Async transfer enqueue | Transfer wait | GPU peak |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `LLMCOMPRESSOR_STREAMING_ASYNC_H2D=0` | 154.7 s | 17.05 s | 0.00 s | 0.00 s | 2.87 GiB |
+| `LLMCOMPRESSOR_STREAMING_ASYNC_H2D=1` | 141.0 s | 0.19 s | 8.04 s (overlapped) | 0.00 s | 3.84 GiB |
+
+The asynchronous path transferred 57.22 GiB across 63 targets with no deferred
+transfers, reduced wall time by 8.9%, and produced a byte-identical checkpoint.
+The extra device peak of about 1 GiB is the bounded overlap of the current and
+next target working sets.
 
 ## System sequence
 
@@ -671,11 +707,12 @@ read.
 
 The prefetch worker has depth one. It receives an immutable `SubgraphLoadPlan`
 and calls `SubgraphWeightSession.prepare(plan, dtype, reservation)`. Preparation
-is CPU-only by contract; neither the prefetcher nor the session accepts a
-preparation device. The worker never installs parameters, invokes Modifier
+is CPU-only by contract. After preparation, CUDA mode may enqueue a bounded
+pinned H2D transfer, but the worker never installs parameters, invokes Modifier
 callbacks, or runs model code.
 
-`SubgraphPrefetcher` is a CPU-only prepared-target prefetcher. Its public
+`SubgraphPrefetcher` is a prepared-target prefetcher with a CPU materialization
+stage and an optional CUDA transfer stage. Its public
 operations are:
 
 ```text
@@ -684,9 +721,10 @@ take()                                  -> transfer prepared-state ownership
 close()                                 -> drain or release the pending result
 ```
 
-`submit` must not accept a device. `CheckpointWeightSource.load_tensors_cpu()`
-and `WeightMaterializer.materialize_cpu()` make the CPU preparation boundary
-explicit all the way down the call stack.
+`CheckpointWeightSource.load_tensors_cpu()` and
+`WeightMaterializer.materialize_cpu()` make the CPU preparation boundary
+explicit all the way down the call stack. CUDA transfer uses a separately
+reserved pinned staging buffer and never installs parameters from the worker.
 
 ## CPU-to-device ownership transfer
 
@@ -697,6 +735,14 @@ its target tensors without mutating the model:
 
 ```text
 prepared_subgraph_cpu.move_to(execution_device)
+```
+
+The pipelined CUDA path may instead use:
+
+```text
+prepared_subgraph_cpu.move_to_async(execution_device)
+    -> wait_for_transfer()
+    -> installed(prepared_subgraph)
 ```
 
 The move mutates the aggregate in place. It must process one tensor at a time,
@@ -721,8 +767,9 @@ drop their tensor references immediately. Otherwise replacing a BF16 parameter
 during compression leaves the original storage alive until target unload, causing
 the complete BF16 and compressed target to overlap on the execution device.
 
-Pinned staging and asynchronous H2D may be added later, but a bounded pinned
-buffer is required. Pinning an entire large MoE target is not acceptable.
+Pinned staging is bounded by the next target's materialized bytes and is
+released after the CUDA transfer event completes. Pinning an entire model or
+more than one pending target is not allowed.
 
 ## Materializer contract
 
