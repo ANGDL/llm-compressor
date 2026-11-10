@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import threading
 import warnings
@@ -9,10 +10,13 @@ from functools import wraps
 from importlib.metadata import entry_points
 from typing import Callable
 
+logger = logging.getLogger(__name__)
+
 _ENTRY_POINT_GROUP = "llmcompressor.ops"
 _PROTOCOL_VERSION = 1
 _PROVIDERS: tuple | None = None
 _PROVIDER_LOCK = threading.RLock()
+_LOGGED_PROVIDERS: set[tuple[str, str, str]] = set()
 
 
 def _operators() -> tuple:
@@ -75,6 +79,22 @@ def available_hardware_ops() -> tuple[dict, ...]:
     )
 
 
+def _log_selected_provider(candidate) -> None:
+    key = (candidate.name, candidate.backend, candidate.implementation)
+    with _PROVIDER_LOCK:
+        if key in _LOGGED_PROVIDERS:
+            return
+        _LOGGED_PROVIDERS.add(key)
+    logger.info(
+        "Using precompiled native operator %r (backend=%r, implementation=%r, "
+        "contract_version=%d)",
+        candidate.name,
+        candidate.backend,
+        candidate.implementation,
+        candidate.contract_version,
+    )
+
+
 def optional_hardware_backend(name: str, contract_version: int = 1) -> Callable:
     """Try prebuilt providers before the unchanged internal backend entrypoint."""
 
@@ -99,6 +119,7 @@ def optional_hardware_backend(name: str, contract_version: int = 1) -> Callable:
                 if mode != "auto" and candidate.backend != mode:
                     continue
                 if candidate.supports(*args, **kwargs):
+                    _log_selected_provider(candidate)
                     return candidate.invoke(*args, **kwargs)
             if mode != "auto":
                 raise RuntimeError(
