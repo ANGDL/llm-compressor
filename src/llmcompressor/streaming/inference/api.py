@@ -54,13 +54,16 @@ class _ModuleWeightGroup(ModelHook):
     ambiguity and keeps derived-buffer movement at the owning child.
     """
 
-    def __init__(self, hooks, device):
+    def __init__(self, hooks, device, before_forward=None):
         self.hooks = hooks
         self.device = device
+        self.before_forward = before_forward
 
     def pre_forward(self, _module, *args, **kwargs):
         for child, hook in self.hooks:
             hook.pre_forward(child)
+        if self.before_forward is not None:
+            self.before_forward()
         return send_to_device(args, self.device), send_to_device(kwargs, self.device)
 
     def post_forward(self, _module, output):
@@ -69,8 +72,8 @@ class _ModuleWeightGroup(ModelHook):
         return output
 
 
-def _group_module_hooks(model, class_names, device):
-    def visit(module):
+def _group_module_hooks(model, class_names, device, before_forward=None):
+    def visit(module, prefix=""):
         if type(module).__name__ in class_names:
             hooks = []
             for child in module.modules():
@@ -80,35 +83,29 @@ def _group_module_hooks(model, class_names, device):
                 if hook is not None:
                     remove_hook_from_module(child)
                     hooks.append((child, hook))
-            add_hook_to_module(module, _ModuleWeightGroup(hooks, device), append=True)
+            callback = (
+                before_forward.get(id(module))
+                if before_forward is not None
+                else None
+            )
+            add_hook_to_module(
+                module,
+                _ModuleWeightGroup(hooks, device, before_forward=callback),
+                append=True,
+            )
             return
-        for child in module.children():
-            visit(child)
+        for name, child in module.named_children():
+            visit(child, f"{prefix}.{name}" if prefix else name)
 
     visit(model)
 
 
-class _PrefetchNextGroup(ModelHook):
-    def __init__(self, prefetcher, names):
-        self.prefetcher = prefetcher
-        self.names = names
-
-    def pre_forward(self, _module, *args, **kwargs):
-        return args, kwargs
-
-    def post_forward(self, _module, output):
-        self.prefetcher.submit(self.names)
-        return output
-
-
-def _install_prefetch_hooks(model, weights, class_names, max_bytes):
+def _install_prefetch(model, weights, class_names, max_bytes):
     prefetcher = InferencePrefetcher(weights, max_bytes)
     weights.prefetcher = prefetcher
-    candidates = []
+    callbacks = {}
 
     def visit(module, prefix=""):
-        if type(module).__name__ in class_names:
-            return
         if isinstance(module, nn.ModuleList):
             children = list(module.named_children())
             for (current_name, current), (next_name, following) in zip(
@@ -120,14 +117,14 @@ def _install_prefetch_hooks(model, weights, class_names, max_bytes):
                 ):
                     root = f"{prefix}.{next_name}."
                     names = tuple(name for name in weights if name.startswith(root))
-                    candidates.append((current, names))
+                    callbacks[id(current)] = lambda names=names: prefetcher.submit(
+                        names
+                    )
         for name, child in module.named_children():
             visit(child, f"{prefix}.{name}" if prefix else name)
 
     visit(model)
-    for module, names in candidates:
-        add_hook_to_module(module, _PrefetchNextGroup(prefetcher, names), append=True)
-    return prefetcher
+    return callbacks
 
 
 def _buffer_hooks(model: nn.Module, device: torch.device) -> list:
@@ -448,9 +445,12 @@ def load_streaming_model(
         for module in model.modules():
             for hook in _execution_hooks(getattr(module, "_hf_hook", None)):
                 hook.execution_device = device
-        _group_module_hooks(model, preload_classes, device)
-        if prefetch:
-            _install_prefetch_hooks(model, weights, preload_classes, max_prefetch_bytes)
+        callbacks = (
+            _install_prefetch(model, weights, preload_classes, max_prefetch_bytes)
+            if prefetch
+            else None
+        )
+        _group_module_hooks(model, preload_classes, device, before_forward=callbacks)
         handles.extend(_buffer_hooks(model, device))
         generation_path = checkpoint / "generation_config.json"
         if generation_path.is_file():
