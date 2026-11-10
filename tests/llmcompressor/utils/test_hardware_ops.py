@@ -10,6 +10,7 @@ from llmcompressor.utils import hardware_ops
 @pytest.fixture(autouse=True)
 def reset_providers(monkeypatch):
     monkeypatch.setattr(hardware_ops, "_PROVIDERS", None)
+    monkeypatch.setattr(hardware_ops, "_LOGGED_PROVIDERS", set())
     monkeypatch.delenv("LLMCOMPRESSOR_OPS_BACKEND", raising=False)
     monkeypatch.setattr(hardware_ops, "entry_points", lambda **kwargs: ())
 
@@ -166,6 +167,23 @@ def test_provider_discovery_is_cached(monkeypatch):
     assert entrypoint()(1) == "hardware"
     monkeypatch.setattr(hardware_ops, "entry_points", lambda **kwargs: ())
     assert entrypoint()(1) == "hardware"
+
+
+def test_native_selection_logs_once(monkeypatch, caplog):
+    install(monkeypatch, descriptor())
+    dispatch = entrypoint()
+    with caplog.at_level("INFO", logger=hardware_ops.__name__):
+        assert dispatch(1) == "hardware"
+        assert dispatch(1) == "hardware"
+
+    records = [
+        record
+        for record in caplog.records
+        if record.name == hardware_ops.__name__
+        and "precompiled native operator" in record.getMessage()
+    ]
+    assert len(records) == 1
+    assert records[0].levelname == "INFO"
 
 
 def test_duplicate_priority_is_an_error(monkeypatch):
