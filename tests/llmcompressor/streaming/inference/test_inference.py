@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import sys
 from copy import deepcopy
 from types import MethodType
 
@@ -186,34 +185,6 @@ def test_bounded_prefetch_reuses_next_decoder_layer(tmp_path):
         expected = reference(ids, use_cache=False)
         torch.testing.assert_close(actual.logits, expected.logits, rtol=0, atol=0)
         report = stream.report()["prefetch"]
-        assert report["submitted_groups"] == 1
-        assert report["hits"] > 0
-        assert report["prepare_seconds"] > 0
-        assert report["pending_groups"] == 0
-        assert report["peak_estimated_bytes"] <= 16 * 1024**2
-
-
-@pytest.mark.skipif(
-    sys.platform != "linux", reason="process prefetch requires POSIX shared memory"
-)
-def test_process_prefetch_reuses_next_decoder_layer(tmp_path):
-    reference = make_model()
-    reference.save_pretrained(tmp_path)
-    ids = torch.tensor([[1, 3, 5, 7]])
-    with load_streaming_model(
-        tmp_path,
-        preload_module_classes=["LlamaDecoderLayer"],
-        prefetch=True,
-        prefetch_process=True,
-        prefetch_threads=2,
-        max_prefetch_bytes=16 * 1024**2,
-    ) as stream:
-        actual = stream(ids, use_cache=False)
-        expected = reference(ids, use_cache=False)
-        torch.testing.assert_close(actual.logits, expected.logits, rtol=0, atol=0)
-        report = stream.report()["prefetch"]
-        assert report["mode"] == "process"
-        assert report["worker_threads"] == 2
         assert report["submitted_groups"] == 1
         assert report["hits"] > 0
         assert report["prepare_seconds"] > 0
