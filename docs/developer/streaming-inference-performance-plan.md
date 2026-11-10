@@ -2,8 +2,9 @@
 
 日期：2026-11-09。
 
-状态：P1（INT8 CPU 解码 fast path）和有界单层预取已实现，正在进行端到端
-复测；完整 CPU/GPU 权重缓存已明确排除，batch 调度仍未实现。本文只规划
+状态：P1（INT8 CPU 解码 fast path）已验证；有界单层预取已作为 opt-in
+实验能力实现，但当前 Qwen3-VL-32B 端到端测试未取得收益，仍需重新设计
+调度；完整 CPU/GPU 权重缓存已明确排除，batch 调度仍未实现。本文只规划
 `StreamingInference` 的运行时优化，
 不修改 `modifiers/gptq/*`，也不改变 GPTQ 的统计或量化语义。
 
@@ -79,8 +80,8 @@ packed tensor；4-bit、非对称量化、其他 packed dimension 和非 little-
   时间；
 - 实际模型复测至少包含 forward、1/8/16 token generation。
 
-本地 `torch 2.12.1 + compressed-tensors 0.20.2a` 的初步单 tensor 基准：
-典型 `4096×14336` INT8 group 权重的完整 CPU 解码约提升 2–3 倍；这是
+本地 `torch 2.12.1 + compressed-tensors 0.20.2a` 的单 tensor 基准：
+典型 `4096×14336` INT8 group 权重的完整 CPU 解码约提升 3.6 倍；这是
 microbenchmark 结果，不能直接当作端到端提升，具体结果随 CPU 线程数和内存
 带宽变化。
 
@@ -97,6 +98,9 @@ P1 复测后，如果 CPU decode 占单次 forward 的显著比例，再增加�
 预取必须复用现有 host memory budget，最多保留一个 pending module，
 失败时释放 reservation 并回退到同步加载。不能在没有预算的情况下后台持有
 整层或整模型权重。该阶段先做单线程 CPU prefetch，再评估异步 H2D。
+当前实现的 node16 结果是 `358.24s/10 tokens`，无预取 fast path 基线为
+`323.69s/10 tokens`；预取命中率高，但 CPU 解码线程竞争使总耗时增加约
+`10.7%`。因此预取当前不作为默认推荐配置。
 
 ### P3：有界单层预取
 
@@ -168,5 +172,5 @@ setup 时间混入 decode 时间。后续若需要服务侧观测，再增加显
 - [ ] 在 node16 复测 P1 的端到端收益。
 - [x] 依据 decode 占比确定 P2 为有界单层预取。
 - [x] 排除完整 CPU BF16 cache 和 device weight cache。
-- [x] 实现有界单层 prefetch。
+- [x] 实现有界单层 prefetch（opt-in，当前端到端未加速）。
 - [ ] 评估 batch/continuous batching。
