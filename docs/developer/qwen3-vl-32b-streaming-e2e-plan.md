@@ -17,7 +17,7 @@ GPU：8 × 96 GiB
 测试脚本：
 
 ```text
-scripts/e2e_qwen3_vl32b_streaming.py
+examples/streaming_oneshot/qwen3_vl_32b_w8a16.py
 scripts/run_qwen3_vl32b_e2e_node16.sh
 ```
 

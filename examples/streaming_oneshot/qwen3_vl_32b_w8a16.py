@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 """End-to-end streaming PTQ validation for a local Qwen3-VL-32B checkpoint.
 
 The default run intentionally uses a small deterministic synthetic image set.
@@ -35,8 +34,8 @@ from llmcompressor.modifiers.quantization import QuantizationModifier
 from llmcompressor.streaming import streaming_oneshot
 
 SCRIPT_VERSION = "qwen3-vl-32b-e2e-v1"
-DEFAULT_MODEL = "/ssd4/models/Qwen3-VL-32B-Instruct"
-DEFAULT_ROOT = "/data/quant/e2e/qwen3-vl-32b-streaming"
+DEFAULT_MODEL = "/path/to/models/Qwen3-VL-32B-Instruct"
+DEFAULT_ROOT = "/path/to/streaming-e2e/qwen3-vl-32b"
 
 
 def parse_args() -> argparse.Namespace:
@@ -54,6 +53,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-new-tokens", type=int, default=32)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--seed", type=int, default=20261106)
+    parser.add_argument("--async-save", action="store_true")
+    parser.add_argument("--async-h2d", choices=("on", "off"), default="on")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--skip-baseline", action="store_true")
     return parser.parse_args()
@@ -380,6 +381,9 @@ def run(args: argparse.Namespace) -> None:
             shutil.rmtree(output)
         if work.exists() and args.overwrite:
             shutil.rmtree(work)
+        os.environ["LLMCOMPRESSOR_STREAMING_ASYNC_H2D"] = (
+            "1" if args.async_h2d == "on" else "0"
+        )
         log(f"starting streaming {args.algorithm} W8A16 quantization")
         started = time.monotonic()
         reset_cuda(device)
@@ -405,7 +409,8 @@ def run(args: argparse.Namespace) -> None:
             shuffle_calibration_samples=False,
             device=device,
             target_dtype=torch.bfloat16,
-            checkpoint_progress=True,
+            checkpoint_progress=not args.async_save,
+            async_save=args.async_save,
             overwrite_output=args.overwrite,
             validate_config=True,
         )

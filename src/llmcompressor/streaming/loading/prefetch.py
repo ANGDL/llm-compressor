@@ -36,15 +36,42 @@ class SubgraphPrefetcher(AbstractContextManager):
         plan: SubgraphLoadPlan,
         dtype: torch.dtype,
         reservation: HostMemoryReservation,
+        device: torch.device | str | None,
+        device_reservation,
+        transfer_reservation: HostMemoryReservation | None,
     ) -> PreparedSubgraphWeights:
         started_at = perf_counter()
         streaming_logger.info(f"{label} | started | device=cpu")
-        prepared = self.session.prepare(
-            plan, dtype=dtype, reservation=reservation
-        )
+        try:
+            prepared = self.session.prepare(
+                plan, dtype=dtype, reservation=reservation
+            )
+            prepared_at = perf_counter()
+            if device is not None and transfer_reservation is not None:
+                prepared.move_to_async(
+                    device,
+                    device_reservation=device_reservation,
+                    transfer_reservation=transfer_reservation,
+                )
+                device_reservation = None
+                transfer_reservation = None
+            elif device_reservation is not None:
+                prepared.device_reservation = device_reservation
+                device_reservation = None
+                if transfer_reservation is not None:
+                    transfer_reservation.close()
+                    transfer_reservation = None
+        except BaseException:
+            if device_reservation is not None:
+                device_reservation.close()
+            if transfer_reservation is not None:
+                transfer_reservation.close()
+            raise
+        transfer_seconds = perf_counter() - prepared_at
         streaming_logger.info(
-            f"{label} | complete | device=cpu | "
-            f"time={perf_counter() - started_at:.2f}s"
+            f"{label} | complete | device={prepared.device.type} | "
+            f"prepare={prepared_at - started_at:.2f}s | "
+            f"transfer_enqueue={transfer_seconds:.2f}s"
         )
         return prepared
 
@@ -55,21 +82,43 @@ class SubgraphPrefetcher(AbstractContextManager):
         dtype: torch.dtype,
         reservation: HostMemoryReservation,
         label: str,
+        device: torch.device | str | None = None,
+        device_reservation=None,
+        transfer_reservation: HostMemoryReservation | None = None,
     ) -> None:
         """Schedule one plan after the previous result has been consumed."""
 
         if self._closed:
             reservation.close()
+            if device_reservation is not None:
+                device_reservation.close()
+            if transfer_reservation is not None:
+                transfer_reservation.close()
             raise RuntimeError("Subgraph prefetcher is closed")
         if self._pending is not None:
             reservation.close()
+            if device_reservation is not None:
+                device_reservation.close()
+            if transfer_reservation is not None:
+                transfer_reservation.close()
             raise RuntimeError("A subgraph prefetch is already pending")
         try:
             future = self._executor.submit(
-                self._prepare, label, plan, dtype, reservation
+                self._prepare,
+                label,
+                plan,
+                dtype,
+                reservation,
+                device,
+                device_reservation,
+                transfer_reservation,
             )
         except Exception:
             reservation.close()
+            if device_reservation is not None:
+                device_reservation.close()
+            if transfer_reservation is not None:
+                transfer_reservation.close()
             raise
         self._pending = (label, future)
         streaming_logger.info(f"{label} | queued | device=cpu")

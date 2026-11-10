@@ -33,6 +33,7 @@ from llmcompressor.streaming.loading import (
 )
 from llmcompressor.streaming.output import prepare_quantized_tensor_for_save
 from llmcompressor.streaming.pipeline import (
+    _async_h2d_enabled,
     _can_reuse_calibration_outputs,
     _debug_boundary,
     _debug_value_summary,
@@ -41,6 +42,18 @@ from llmcompressor.streaming.pipeline import (
     _stage_logger,
     _write_loaded_target_direct,
 )
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(None, True), ("1", True), ("true", True), ("0", False), ("off", False)],
+)
+def test_async_h2d_env_switch(monkeypatch, value, expected):
+    if value is None:
+        monkeypatch.delenv("LLMCOMPRESSOR_STREAMING_ASYNC_H2D", raising=False)
+    else:
+        monkeypatch.setenv("LLMCOMPRESSOR_STREAMING_ASYNC_H2D", value)
+    assert _async_h2d_enabled() is expected
 
 
 def test_calibration_output_reuse_requires_each_modifier_to_opt_in():

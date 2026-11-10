@@ -102,6 +102,9 @@ P1 复测后，如果 CPU decode 占单次 forward 的显著比例，再增加�
 `323.69s/10 tokens`；预取命中率高，但 CPU 解码线程竞争使总耗时增加约
 `10.7%`。因此预取当前不作为默认推荐配置。
 
+量化 pipeline 的 target 级预取与 inference prefetch 是两条独立路径，不在本文
+范围内；其调度与实测结果见 `docs/guides/streaming_ptq.md`。
+
 ### P3：有界单层预取
 
 为 generation 和长序列 forward 提供有界的单层预取：
