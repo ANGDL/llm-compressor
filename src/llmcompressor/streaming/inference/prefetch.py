@@ -34,6 +34,7 @@ class InferencePrefetcher:
         self.skipped_groups = 0
         self.discarded_groups = 0
         self.peak_estimated_bytes = 0
+        self.prepare_seconds = 0.0
         self.wait_seconds = 0.0
         self._executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="inference-weight-prefetch"
@@ -42,6 +43,7 @@ class InferencePrefetcher:
 
     def _prepare(self, names, reservation):
         prepared = _PreparedGroup({}, reservation)
+        started = perf_counter()
         try:
             with torch.inference_mode():
                 for name in names:
@@ -54,6 +56,8 @@ class InferencePrefetcher:
         except BaseException:
             prepared.close()
             raise
+        finally:
+            self.prepare_seconds += perf_counter() - started
 
     def submit(self, names: tuple[str, ...]):
         self.clear()
@@ -124,6 +128,7 @@ class InferencePrefetcher:
             "skipped_groups": self.skipped_groups,
             "discarded_groups": self.discarded_groups,
             "peak_estimated_bytes": self.peak_estimated_bytes,
+            "prepare_seconds": self.prepare_seconds,
             "wait_seconds": self.wait_seconds,
             "pending_groups": int(self._pending is not None),
         }

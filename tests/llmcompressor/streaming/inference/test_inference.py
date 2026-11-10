@@ -187,6 +187,7 @@ def test_bounded_prefetch_reuses_next_decoder_layer(tmp_path):
         report = stream.report()["prefetch"]
         assert report["submitted_groups"] == 1
         assert report["hits"] > 0
+        assert report["prepare_seconds"] > 0
         assert report["pending_groups"] == 0
         assert report["peak_estimated_bytes"] <= 16 * 1024**2
 
