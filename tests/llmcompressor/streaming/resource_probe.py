@@ -15,7 +15,6 @@ from torch.utils.data import DataLoader
 from llmcompressor.modifiers.gptq import GPTQModifier
 from llmcompressor.modifiers.quantization import QuantizationModifier
 from llmcompressor.modifiers.transform import AWQModifier, SmoothQuantModifier
-from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
 from llmcompressor.streaming import streaming_oneshot
 
 
@@ -57,7 +56,7 @@ def main() -> None:
     )
     recipe = {
         "rtn": [quantizer],
-        "imatrix": [IMatrixGatherer(ignore=["lm_head"]), quantizer],
+        "imatrix": [quantizer],
         "gptq": [GPTQModifier(scheme="W8A8", ignore=["lm_head"])],
         "awq": [AWQModifier(), quantizer],
         "smoothquant": [SmoothQuantModifier(), quantizer],

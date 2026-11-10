@@ -33,7 +33,6 @@
 /src/llmcompressor/modifiers/smoothquant/ @kylesayrs @HDCharles @Roderick-Wu
 /src/llmcompressor/modifiers/transform/ @kylesayrs @HDCharles @Roderick-Wu
 /src/llmcompressor/modifiers/transform/awq/ @kylesayrs @HDCharles @Roderick-Wu
-/src/llmcompressor/modifiers/transform/imatrix/ @kylesayrs @HDCharles @Roderick-Wu
 /src/llmcompressor/modifiers/transform/quip/ @kylesayrs @HDCharles @Roderick-Wu
 /src/llmcompressor/modifiers/transform/smoothquant/ @kylesayrs @HDCharles @Roderick-Wu
 /src/llmcompressor/modifiers/transform/spinquant/ @kylesayrs @HDCharles @Roderick-Wu
@@ -74,7 +73,6 @@
 /tests/llmcompressor/modifiers/quantization/ @kylesayrs @dsikka @HDCharles @Roderick-Wu
 /tests/llmcompressor/modifiers/transform/ @kylesayrs @HDCharles @Roderick-Wu
 /tests/llmcompressor/modifiers/transform/awq/ @kylesayrs @HDCharles @Roderick-Wu
-/tests/llmcompressor/modifiers/transform/imatrix/ @kylesayrs @HDCharles @Roderick-Wu
 /tests/llmcompressor/modifiers/transform/smoothquant/ @kylesayrs @HDCharles @Roderick-Wu
 /tests/llmcompressor/modifiers/utils/ @kylesayrs @dsikka @HDCharles @Roderick-Wu
 

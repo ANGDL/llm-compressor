@@ -16,7 +16,6 @@ from transformers import (
 )
 
 from llmcompressor.modifiers.quantization import QuantizationModifier
-from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
 from llmcompressor.recipe import Recipe
 from llmcompressor.streaming import (
     DeepSeekV4WeightMaterializer,
@@ -296,7 +295,6 @@ def test_qwen3_pretrained_mode_hides_boundary_construction(tmp_path, monkeypatch
         dataset=dataset,
         dataset_fingerprint="a" * 64,
         recipe=[
-            IMatrixGatherer(ignore=["lm_head"]),
             QuantizationModifier(
                 scheme="W8A8",
                 targets=["Linear"],
@@ -366,7 +364,6 @@ def test_pretrained_boundary_tracing_is_not_model_specific(
         dataset=dataset,
         dataset_fingerprint="b" * 64,
         recipe=[
-            IMatrixGatherer(ignore=["lm_head"]),
             QuantizationModifier(
                 scheme="W8A8",
                 targets=["Linear"],
@@ -422,7 +419,6 @@ def test_deepseek_v4_preserves_input_ids_and_collects_all_experts(
             dataset=dataset,
             dataset_fingerprint="c" * 64,
             recipe=[
-                IMatrixGatherer(ignore=["model.lm_head"]),
                 QuantizationModifier(
                     scheme="W8A8",
                     targets=["Linear"],
@@ -516,7 +512,6 @@ def test_deepseek_v4_missing_mtp_norms_fail_before_calibration(tmp_path):
             dataset=dataset,
             dataset_fingerprint="m" * 64,
             recipe=[
-                IMatrixGatherer(ignore=["model.lm_head"]),
                 QuantizationModifier(
                     scheme="W8A8",
                     targets=["Linear"],
@@ -640,7 +635,6 @@ def test_deepseek_v4_0731_dspark_streaming_checkpoint_contract(tmp_path):
             dataset=dataset,
             dataset_fingerprint="d" * 64,
             recipe=[
-                IMatrixGatherer(ignore=ignored),
                 QuantizationModifier(
                     scheme="W8A8",
                     targets=["Linear"],

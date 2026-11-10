@@ -17,7 +17,6 @@ from llmcompressor.modeling.glm_moe_dsa import CalibrationGlmMoeDsaMoE  # noqa: 
 from llmcompressor.modeling.glm_moe_dsa_mtp import attach_mtp_layer
 from llmcompressor.modifiers.gptq import GPTQModifier
 from llmcompressor.modifiers.quantization import QuantizationModifier
-from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
 from llmcompressor.pipelines.basic import pipeline as basic_pipeline
 from llmcompressor.pipelines.data_free import pipeline as data_free_pipeline
 from llmcompressor.utils import ImatrixFallbackStats
@@ -453,10 +452,6 @@ if args.observer == "imatrix_mse":
     weights_args_8.observer = "imatrix_mse"
     imatrix_fallback_stats = ImatrixFallbackStats()
     imatrix_fallback_stats.install_hooks()
-    imatrix_kwargs = dict(ignore=ignores)
-    if args.pipeline == "sequential":
-        imatrix_kwargs["attach_by_initialize"] = False
-    recipes.append(IMatrixGatherer(**imatrix_kwargs))
     tail_name += "-IMatrix"
 elif args.observer == "mse":
     weights_args_4.observer = "mse"

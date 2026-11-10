@@ -213,7 +213,7 @@ qparams 更新策略：
 
 ## 12) Qwen3.5 MoE 多模态脚本接入模板
 
-你当前多模态脚本使用的是 GPTQModifier + IMatrixGatherer 组合，接入 KV Cache 量化时，核心是给 GPTQModifier 增加 kv_cache_scheme。
+你当前多模态脚本使用 GPTQModifier 的 `weight_observer="imatrix_mse"`，接入 KV Cache 量化时，核心是给 GPTQModifier 增加 kv_cache_scheme。
 
 参考脚本：
 
@@ -237,9 +237,9 @@ kv_cache_args = QuantizationArgs(
 )
 
 recipe = [
-  IMatrixGatherer(ignore=["lm_head"]),
   GPTQModifier(
     targets="Linear",
+    weight_observer="imatrix_mse",
     offload_hessians=True,
     config_groups={"group_0": scheme},
     kv_cache_scheme=kv_cache_args,

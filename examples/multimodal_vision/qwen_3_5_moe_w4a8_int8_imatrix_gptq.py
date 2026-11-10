@@ -10,7 +10,6 @@ from qwen_vl_utils import process_vision_info
 
 from llmcompressor import oneshot
 from llmcompressor.modifiers.quantization import GPTQModifier
-from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
 
 from compressed_tensors.quantization import QuantizationScheme
 from compressed_tensors.quantization.quant_args import (
@@ -125,7 +124,6 @@ scheme = QuantizationScheme(
 scheme.weights.observer = "imatrix_mse"
 
 recipe = [
-    IMatrixGatherer(ignore=["lm_head"]),
     GPTQModifier(
         targets="Linear",
         config_groups={"group_0": scheme},

@@ -7,8 +7,8 @@ as MXFP4 ``weight_packed`` + ``weight_scale`` and uses SITU activation.  The
 expert target set below is generated from the K3 safetensors index, so a layer
 is quantized to INT4 only when its native checkpoint contains a scale tensor.
 
-The recipe is deliberately fixed to IMatrixGatherer + QuantizationModifier
-(RTN).  Activation and weight quantization are symmetric; weights are static
+The recipe is deliberately fixed to QuantizationModifier (RTN) with the
+``imatrix_mse`` weight observer.  Activation and weight quantization are symmetric; weights are static
 per-channel and activations are dynamic per-token.  ``pack_to_int8=True`` is
 also fixed because K3's downstream compressed-tensors/vLLM loaders consume the
 packed INT4 layout.  Decoder residual projections, the model-level
@@ -66,7 +66,6 @@ from llmcompressor.modeling.kimi_k3 import (
     patch_kimi_k3_transformers_compat,
 )
 from llmcompressor.modifiers.quantization import QuantizationModifier
-from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
 from llmcompressor.streaming import KimiK3WeightMaterializer, streaming_oneshot
 from llmcompressor.utils import ImatrixFallbackStats
 
@@ -428,7 +427,6 @@ def main() -> None:
         "other_linear_w8a8": _int_scheme(8, [other_pattern], scale_dtype),
     }
     recipe = [
-        IMatrixGatherer(ignore=ignores),
         QuantizationModifier(config_groups=config_groups, ignore=ignores),
     ]
 

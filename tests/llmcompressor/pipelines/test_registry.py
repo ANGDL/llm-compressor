@@ -1,7 +1,4 @@
-from types import SimpleNamespace
-
 import pytest
-import torch
 
 from llmcompressor.modifiers.autoround import AutoRoundModifier
 from llmcompressor.modifiers.autosmooth import AutoSmoothModifier
@@ -13,7 +10,6 @@ from llmcompressor.modifiers.transform import (
     SmoothQuantModifier,
     SpinQuantModifier,
 )
-from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
 from llmcompressor.pipelines import (
     CalibrationPipeline,
     DataFreePipeline,
@@ -39,7 +35,6 @@ from llmcompressor.pipelines import (
         ([SmoothQuantModifier(), GPTQModifier(scheme="W4A16")], SequentialPipeline),
         ([AWQModifier(), QuantizationModifier(scheme="W4A16")], SequentialPipeline),
         ([AWQModifier(), QuantizationModifier(scheme="FP8")], SequentialPipeline),
-        ([IMatrixGatherer()], SequentialPipeline),
         (
             [REAPPruningModifier(sparsity=0.5, report_path="reap.json")],
             SequentialPipeline,
@@ -55,22 +50,3 @@ from llmcompressor.pipelines import (
 def test_infer_pipeline(modifiers, exp_pipeline):
     pipeline = CalibrationPipeline.from_modifiers(modifiers)
     assert isinstance(pipeline, exp_pipeline)
-
-
-def test_legacy_imatrix_gatherer_is_a_noop():
-    model = torch.nn.Sequential(torch.nn.Linear(4, 4))
-    modifier = IMatrixGatherer(
-        targets=["Linear"],
-        ignore=[],
-        weight_observer="imatrix_mse",
-        attach_by_initialize=False,
-    )
-
-    assert modifier.on_initialize(SimpleNamespace(model=model))
-    assert modifier.requires_calibration_data
-    assert modifier.targets == ["Linear"]
-    assert modifier.ignore == []
-    assert modifier.weight_observer == "imatrix_mse"
-    assert modifier.attach_by_initialize is False
-    assert not model[0]._forward_pre_hooks
-    assert not hasattr(model[0], "weight_observer")

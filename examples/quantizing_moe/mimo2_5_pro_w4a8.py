@@ -18,7 +18,6 @@ from llmcompressor.pipelines.basic import pipeline as basic_pipeline
 from llmcompressor.pipelines.data_free import pipeline as data_free_pipeline
 from llmcompressor.modifiers.quantization import QuantizationModifier
 from llmcompressor.modifiers.gptq import GPTQModifier
-from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
 from compressed_tensors.quantization import QuantizationScheme
 from compressed_tensors.quantization.quant_args import (
     QuantizationArgs,
@@ -637,7 +636,6 @@ def quantize_model(args):
     if args.observer == "imatrix_mse":
         weights_args_4.observer = "imatrix_mse"
         weights_args_8.observer = "imatrix_mse"
-        recipes.append(IMatrixGatherer(ignore=ignores))
         tail_name += "-IMatrix"
 
     if args.modifier == "GPTQ":

@@ -47,7 +47,6 @@ from llmcompressor.datasets import (
 )
 from llmcompressor.modeling.glm5_next import attach_mtp_layer
 from llmcompressor.modifiers.quantization import QuantizationModifier
-from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
 from llmcompressor.streaming import streaming_oneshot
 
 
@@ -285,7 +284,6 @@ def main() -> None:
     }
 
     recipe = [
-        IMatrixGatherer(ignore=ignores),
         QuantizationModifier(config_groups=schemes, ignore=ignores),
     ]
 

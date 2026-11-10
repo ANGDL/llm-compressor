@@ -46,7 +46,6 @@ from llmcompressor.datasets import load_calibration_dataset
 from llmcompressor.modeling.deepseekv4.config import ModelConfig
 from llmcompressor.modeling.deepseekv4.model import DeepseekV4NativeForCausalLM
 from llmcompressor.modifiers.quantization import QuantizationModifier
-from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
 from llmcompressor.streaming import DeepSeekV4WeightMaterializer, streaming_oneshot
 from llmcompressor.utils import ImatrixFallbackStats
 
@@ -320,7 +319,6 @@ def main() -> None:
         scale_dtype=(torch.float32 if args.use_float32_scale_dtype else None),
     )
     recipe = [
-        IMatrixGatherer(ignore=ignores),
         QuantizationModifier(
             config_groups=config_groups,
             ignore=ignores,

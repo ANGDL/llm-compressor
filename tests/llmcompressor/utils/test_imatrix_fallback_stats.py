@@ -1,9 +1,7 @@
 import io
 from contextlib import redirect_stdout
-from unittest.mock import MagicMock, patch
 
 import pytest
-import torch
 from torch import nn
 
 from llmcompressor.utils.imatrix_fallback_stats import (
@@ -204,7 +202,7 @@ class TestContextManager:
         _reset_class_state()
         buf = io.StringIO()
         with redirect_stdout(buf):
-            with ImatrixFallbackStats() as stats:
+            with ImatrixFallbackStats():
                 token = ImatrixFallbackStats._current_module.set("mod")
                 try:
                     _imatrix_warning_sink(
@@ -312,9 +310,10 @@ class TestIntegrationWithObserver:
         _reset_class_state()
 
     def test_no_importance_fallback_is_tracked(self):
-        """Observer without gatherer falls back and the warning is counted."""
-        from llmcompressor.observers.imatrix import IMatrixMSEObserver
+        """Observer without importance data falls back and is counted."""
         from compressed_tensors.quantization import QuantizationArgs
+
+        from llmcompressor.observers.imatrix import IMatrixMSEObserver
 
         stats = ImatrixFallbackStats()
         stats.install_hooks()
@@ -341,8 +340,9 @@ class TestIntegrationWithObserver:
 
     def test_attach_without_module_name_uses_class_name(self):
         """When no module name is recorded, observer uses class name as fallback."""
-        from llmcompressor.observers.imatrix import IMatrixMSEObserver
         from compressed_tensors.quantization import QuantizationArgs
+
+        from llmcompressor.observers.imatrix import IMatrixMSEObserver
 
         stats = ImatrixFallbackStats()
         stats.install_hooks()
@@ -415,10 +415,8 @@ class TestClassPatches:
 
     def test_patches_are_applied_once(self):
         from llmcompressor.observers.imatrix import IMatrixMSEObserver
-        from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
 
         # Store originals before first call
-        original_gatherer_init = IMatrixGatherer.on_initialize
         original_attach = IMatrixMSEObserver.attach
         original_validate = IMatrixMSEObserver._get_validated_importance
 
@@ -426,17 +424,14 @@ class TestClassPatches:
         stats.install_hooks()
 
         # After first install, methods should be patched
-        assert IMatrixGatherer.on_initialize is not original_gatherer_init
         assert IMatrixMSEObserver.attach is not original_attach
         assert IMatrixMSEObserver._get_validated_importance is not original_validate
 
-        patched_gatherer_init = IMatrixGatherer.on_initialize
         patched_attach = IMatrixMSEObserver.attach
         patched_validate = IMatrixMSEObserver._get_validated_importance
 
         # Second install should not re-patch
         stats.install_hooks()
-        assert IMatrixGatherer.on_initialize is patched_gatherer_init
         assert IMatrixMSEObserver.attach is patched_attach
         assert IMatrixMSEObserver._get_validated_importance is patched_validate
 

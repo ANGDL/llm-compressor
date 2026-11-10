@@ -4,7 +4,6 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from llmcompressor import oneshot
 from llmcompressor.modifiers.quantization import QuantizationModifier
-from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
 from datasets import load_dataset
 
 import os
@@ -53,14 +52,13 @@ def tokenize(sample):
 ds = ds.map(tokenize, remove_columns=ds.column_names)
 
 # Configure the quantization algorithm to run.
-#   * trigger a calibration pass with IMatrixGatherer so the observer can collect E[x²]
+#   * calibrate the imatrix_mse observer so it can collect E[x²]
 #   * quantize the weights to 4 bit with group size 128
 #   * use imatrix_mse observer to weight quantization error by channel importance
 scheme = preset_name_to_scheme("W8A8", ["Linear"])
 scheme.weights.observer = "imatrix_mse"
 
 recipe = [
-    IMatrixGatherer(ignore=["lm_head"]),
     QuantizationModifier(
         config_groups={"group_0": scheme},
         ignore=["lm_head"],

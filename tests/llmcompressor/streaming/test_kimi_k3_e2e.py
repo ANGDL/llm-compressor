@@ -12,7 +12,6 @@ from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM
 
 from llmcompressor.modifiers.quantization import QuantizationModifier
-from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
 from llmcompressor.streaming import KimiK3WeightMaterializer, streaming_oneshot
 from tools.create_tiny_kimi_k3 import create_tiny_checkpoint, kda_import_stubs
 
@@ -54,7 +53,6 @@ def test_tiny_kimi_k3_streaming_wna8_end_to_end(tmp_path):
             r"re:.*\.lm_head$",
         ]
         recipe = [
-            IMatrixGatherer(ignore=ignores),
             QuantizationModifier(
                 config_groups={
                     "routed_experts_w4a8": KIMI_K3_WNA8._int_scheme(
