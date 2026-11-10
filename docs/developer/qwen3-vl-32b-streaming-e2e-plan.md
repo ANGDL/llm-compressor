@@ -18,7 +18,6 @@ GPU：8 × 96 GiB
 
 ```text
 examples/streaming_oneshot/qwen3_vl_32b_w8a16.py
-scripts/run_qwen3_vl32b_e2e_node16.sh
 ```
 
 脚本使用确定性合成图像，避免端到端测试依赖外部数据集。图像尺寸在
@@ -35,8 +34,10 @@ token、processor identity 和 decoder-only 量化。
 可用，并记录 checkpoint 大小、GPU 和模型架构。不加载 32B 权重。
 
 ```bash
-STAGE=preflight \
-scripts/run_qwen3_vl32b_e2e_node16.sh
+python examples/streaming_oneshot/qwen3_vl_32b_w8a16.py \
+  --model /ssd4/models/Qwen3-VL-32B-Instruct \
+  --root /data/quant/e2e/qwen3-vl-32b-streaming \
+  --stage preflight
 ```
 
 ### 1. Processor 与 calibration snapshot
@@ -45,8 +46,10 @@ scripts/run_qwen3_vl32b_e2e_node16.sh
 预处理，记录字段 shape、图像尺寸及校准身份摘要。
 
 ```bash
-STAGE=prepare \
-scripts/run_qwen3_vl32b_e2e_node16.sh
+python examples/streaming_oneshot/qwen3_vl_32b_w8a16.py \
+  --model /ssd4/models/Qwen3-VL-32B-Instruct \
+  --root /data/quant/e2e/qwen3-vl-32b-streaming \
+  --stage prepare
 ```
 
 验收：所有样本都包含图像输入；`image_grid_thw` 与 `pixel_values` 存在；
@@ -59,8 +62,10 @@ embedding、norm 和 `lm_head` 保留原始权重。启用 `checkpoint_progress=
 验证 prefix boundary 事务、decoder 子图事务、输出组装和最终配置。
 
 ```bash
-STAGE=quantize \
-scripts/run_qwen3_vl32b_e2e_node16.sh
+python examples/streaming_oneshot/qwen3_vl_32b_w8a16.py \
+  --model /ssd4/models/Qwen3-VL-32B-Instruct \
+  --root /data/quant/e2e/qwen3-vl-32b-streaming \
+  --stage quantize
 ```
 
 默认输出：
@@ -86,8 +91,10 @@ scripts/run_qwen3_vl32b_e2e_node16.sh
 和 greedy continuation；释放原始模型后加载量化模型，重复同一输入。
 
 ```bash
-STAGE=validate \
-scripts/run_qwen3_vl32b_e2e_node16.sh
+python examples/streaming_oneshot/qwen3_vl_32b_w8a16.py \
+  --model /ssd4/models/Qwen3-VL-32B-Instruct \
+  --root /data/quant/e2e/qwen3-vl-32b-streaming \
+  --stage validate
 ```
 
 验收分三层：
@@ -103,8 +110,11 @@ RTN 路径通过后再运行 GPTQ，避免首轮同时引入统计算法和多�
 GPTQ 使用同一组固定输入，输出目录和 report 自动切换到 `gptq-w8a16`。
 
 ```bash
-ALGORITHM=gptq \
-scripts/run_qwen3_vl32b_e2e_node16.sh
+python examples/streaming_oneshot/qwen3_vl_32b_w8a16.py \
+  --model /ssd4/models/Qwen3-VL-32B-Instruct \
+  --root /data/quant/e2e/qwen3-vl-32b-streaming \
+  --algorithm gptq \
+  --stage quantize
 ```
 
 GPTQ 额外验收 Hessian 统计完成、目标层不出现空样本，并比较 RTN/GPTQ 的
