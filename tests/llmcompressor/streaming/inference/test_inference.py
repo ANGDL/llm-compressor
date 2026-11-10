@@ -171,6 +171,26 @@ def test_native_prefill_decode_generate_and_one_block_residency(tmp_path, family
         stream(ids)
 
 
+def test_bounded_prefetch_reuses_next_decoder_layer(tmp_path):
+    reference = make_model()
+    reference.save_pretrained(tmp_path)
+    ids = torch.tensor([[1, 3, 5, 7]])
+    with load_streaming_model(
+        tmp_path,
+        preload_module_classes=["LlamaDecoderLayer"],
+        prefetch=True,
+        max_prefetch_bytes=16 * 1024**2,
+    ) as stream:
+        actual = stream(ids, use_cache=False)
+        expected = reference(ids, use_cache=False)
+        torch.testing.assert_close(actual.logits, expected.logits, rtol=0, atol=0)
+        report = stream.report()["prefetch"]
+        assert report["submitted_groups"] == 1
+        assert report["hits"] > 0
+        assert report["pending_groups"] == 0
+        assert report["peak_estimated_bytes"] <= 16 * 1024**2
+
+
 def test_cache_comparison_accepts_replacement_cache_objects():
     class ReplacingCacheModel(torch.nn.Module):
         def __init__(self):

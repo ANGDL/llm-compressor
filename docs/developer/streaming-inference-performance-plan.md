@@ -2,8 +2,9 @@
 
 日期：2026-11-09。
 
-状态：P1（INT8 CPU 解码 fast path）已实现，正在进行回归和端到端复测；
-P2–P4 仍未实现。本文只规划 `StreamingInference` 的运行时优化，
+状态：P1（INT8 CPU 解码 fast path）和有界单层预取已实现，正在进行端到端
+复测；完整 CPU/GPU 权重缓存已明确排除，batch 调度仍未实现。本文只规划
+`StreamingInference` 的运行时优化，
 不修改 `modifiers/gptq/*`，也不改变 GPTQ 的统计或量化语义。
 
 ## 1. 基线与问题
@@ -43,9 +44,9 @@ safetensors 读取
 3. 数值路径保持与 `compressed_tensors` 一致；fast path 只替换等价的
    packed INT8 解包，反量化仍使用公开的 `dequantize` API。
 4. fast path 必须有明确条件，条件不满足时回退到当前通用 compressor。
-5. 默认继续保持无缓存和有界设备驻留。CPU 权重缓存只能通过显式选项启用，
-   不能悄悄改变设备内存上界。BF16/FP16 权重常驻 GPU 不属于本系统的优化
-   方向，因为它会破坏流式执行的设备内存边界。
+5. 默认继续保持无缓存和有界设备驻留。预取只能保留一个下一层的 CPU
+   准备结果，不能悄悄改变设备或主机内存上界。BF16/FP16 权重常驻 GPU
+   不属于本系统的优化方向，因为它会破坏流式执行的设备内存边界。
 6. 每个优化阶段都记录硬件、checkpoint、输入、dtype、量化格式、峰值内存和
    数值对照结果。
 
@@ -131,7 +132,7 @@ decode_seconds
 materializations
 fast_path_materializations
 generic_decode_materializations
-cache_hits
+prefetch.hits
 ```
 
 设备搬运和 GPU forward 时间由端到端脚本单独记录。当前 report 的计时器按
@@ -148,7 +149,7 @@ setup 时间混入 decode 时间。后续若需要服务侧观测，再增加显
 | 数值 | streaming logits 与现有 reference compressor 对照 |
 | 性能 | 典型 MLP/attention projection 矩阵的 read/decode benchmark |
 | 端到端 | Qwen3-VL-32B 多模态 prefill、1/8/16 token decode |
-| 内存 | no-cache 基线与显式 cache 模式分别记录 RSS、设备峰值和 host budget |
+| 内存 | no-cache 与 bounded-prefetch 分别记录 RSS、设备峰值和 host budget |
 
 性能优化完成的判定需要同时满足：
 
@@ -165,7 +166,7 @@ setup 时间混入 decode 时间。后续若需要服务侧观测，再增加显
 - [x] 实现 P1 fast path 和通用回退。
 - [x] 增加 P1 数值与计时回归。
 - [ ] 在 node16 复测 P1 的端到端收益。
-- [ ] 依据 decode 占比决定是否实现 P2。
+- [x] 依据 decode 占比确定 P2 为有界单层预取。
 - [x] 排除完整 CPU BF16 cache 和 device weight cache。
-- [ ] 实现有界单层 prefetch。
+- [x] 实现有界单层 prefetch。
 - [ ] 评估 batch/continuous batching。

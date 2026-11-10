@@ -33,6 +33,7 @@ from llmcompressor.streaming.materialization import (
     apply_transformers_weight_conversions,
 )
 
+from .prefetch import InferencePrefetcher
 from .quantization import install_activation_qdq, resolve_schemes
 from .weights import StreamingWeights
 
@@ -85,6 +86,45 @@ def _group_module_hooks(model, class_names, device):
             visit(child)
 
     visit(model)
+
+
+class _PrefetchNextGroup(ModelHook):
+    def __init__(self, prefetcher, names):
+        self.prefetcher = prefetcher
+        self.names = names
+
+    def pre_forward(self, _module, *args, **kwargs):
+        self.prefetcher.submit(self.names)
+        return args, kwargs
+
+
+def _install_prefetch_hooks(model, weights, class_names, max_bytes):
+    prefetcher = InferencePrefetcher(weights, max_bytes)
+    weights.prefetcher = prefetcher
+    candidates = []
+
+    def visit(module, prefix=""):
+        if type(module).__name__ in class_names:
+            return
+        if isinstance(module, nn.ModuleList):
+            children = list(module.named_children())
+            for (current_name, current), (next_name, following) in zip(
+                children, children[1:]
+            ):
+                if (
+                    type(current).__name__ in class_names
+                    and type(following).__name__ in class_names
+                ):
+                    root = f"{prefix}.{next_name}."
+                    names = tuple(name for name in weights if name.startswith(root))
+                    candidates.append((current, names))
+        for name, child in module.named_children():
+            visit(child, f"{prefix}.{name}" if prefix else name)
+
+    visit(model)
+    for module, names in candidates:
+        add_hook_to_module(module, _PrefetchNextGroup(prefetcher, names), append=True)
+    return prefetcher
 
 
 def _buffer_hooks(model: nn.Module, device: torch.device) -> list:
@@ -203,6 +243,8 @@ class StreamingInference(AbstractContextManager):
             finally:
                 # Accelerate's forward wrapper does not run post_forward when
                 # the native forward raises. Clean up partially installed groups.
+                if self.weights.prefetcher is not None:
+                    self.weights.prefetcher.clear()
                 self._release_weights()
 
     def __call__(self, *args, **kwargs):
@@ -254,6 +296,11 @@ class StreamingInference(AbstractContextManager):
             "generic_decode_materializations": (
                 self.weights.generic_decode_materializations
             ),
+            "prefetch": (
+                self.weights.prefetcher.report()
+                if self.weights.prefetcher is not None
+                else None
+            ),
             "peak_estimated_preparation_bytes": self.weights.peak_preparation_bytes,
             "materializer": self.weights.materializer.identifier,
             "weights": self.weights.describe(),
@@ -263,6 +310,8 @@ class StreamingInference(AbstractContextManager):
         with self._lock:
             if self._closed:
                 return
+            if self.weights.prefetcher is not None:
+                self.weights.prefetcher.close()
             self._release_weights()
             remove_hook_from_module(self.model, recurse=True)
             for handle in self._handles:
@@ -289,6 +338,8 @@ def load_streaming_model(
     max_device_weight_bytes: int | None = None,
     max_preparation_bytes: int | None = None,
     host_memory_budget: HostMemoryBudget | None = None,
+    prefetch: bool = False,
+    max_prefetch_bytes: int | None = None,
 ) -> StreamingInference:
     """Build a local model on meta and load only the currently called modules.
 
@@ -301,6 +352,10 @@ def load_streaming_model(
     offload can be requested through ``generate(cache_implementation="offloaded")``.
     """
     checkpoint = Path(checkpoint).expanduser().resolve()
+    if max_prefetch_bytes is not None and max_prefetch_bytes <= 0:
+        raise ValueError("max_prefetch_bytes must be positive")
+    if prefetch and not preload_module_classes:
+        raise ValueError("prefetch requires explicit preload_module_classes")
     if not checkpoint.is_dir():
         raise ValueError(
             "Streaming model loading requires a local checkpoint directory"
@@ -391,6 +446,8 @@ def load_streaming_model(
             for hook in _execution_hooks(getattr(module, "_hf_hook", None)):
                 hook.execution_device = device
         _group_module_hooks(model, preload_classes, device)
+        if prefetch:
+            _install_prefetch_hooks(model, weights, preload_classes, max_prefetch_bytes)
         handles.extend(_buffer_hooks(model, device))
         generation_path = checkpoint / "generation_config.json"
         if generation_path.is_file():
@@ -398,6 +455,8 @@ def load_streaming_model(
                 checkpoint, local_files_only=True
             )
     except BaseException:
+        if weights.prefetcher is not None:
+            weights.prefetcher.close()
         remove_hook_from_module(model, recurse=True)
         for handle in handles:
             handle.remove()
