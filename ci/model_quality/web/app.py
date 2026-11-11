@@ -665,6 +665,14 @@ class ModelQualityAPI:
                     "application/json",
                     [],
                 )
+            if suffix == ["artifacts", "cleanup"]:
+                return (
+                    control().cleanup_failed_artifacts(
+                        run_id, model_id, body, principal
+                    ),
+                    "application/json",
+                    [],
+                )
             if len(parts) == 8 and parts[5] == "jobs" and parts[7] == "cancel":
                 return (
                     control().cancel_job(run_id, model_id, parts[6], body, principal),

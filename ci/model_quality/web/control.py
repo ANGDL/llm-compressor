@@ -19,6 +19,7 @@ from .audit import (
     request_fingerprint,
     timestamp_token,
 )
+from .cleanup import quantized_remnants, remove_quantized_remnants
 from .executors import DispatchResult, ExecutorAdapter, LaunchSpec, create_executor
 from .jobs import (
     ACTIVE_JOB_STATUSES,
@@ -28,9 +29,9 @@ from .jobs import (
     settle_model_group,
 )
 from .plans import (
+    SKIPPABLE_STAGES,
     LaunchPolicy,
     PlanService,
-    SKIPPABLE_STAGES,
     build_eval_command,
     validate_evaluation_command,
     validate_inference_config,
@@ -460,6 +461,123 @@ class ControlPlane:
             details=response,
         )
         self.idempotency.complete(key, response)
+        return response
+
+    def cleanup_failed_artifacts(
+        self,
+        run_id: str,
+        model_id: str,
+        request: dict[str, Any],
+        principal: Principal,
+    ) -> dict[str, Any]:
+        """Delete partial quantized tensors left by a failed quantization.
+
+        The operation is intentionally narrow: only tensor files under the
+        model output directory and the transient ``work`` directory are
+        removed. Logs, reports, configuration and attempt state survive so the
+        failure remains inspectable.
+        """
+
+        principal.require("retry")
+        model = self.store.get_model(run_id, model_id)
+        active = [
+            job["job_id"]
+            for job in self.jobs.list_jobs(run_id, model_id=model_id)
+            if job.get("status") in ACTIVE_JOB_STATUSES
+        ]
+        if active:
+            raise ConflictError(
+                "cannot delete artifacts while jobs are active: "
+                + ", ".join(sorted(active))
+            )
+
+        attempts = model.get("attempts") or []
+        requested_attempt = request.get("attempt_id")
+        if requested_attempt:
+            requested_attempt = safe_component(requested_attempt, "attempt_id")
+            attempt = next(
+                (
+                    item
+                    for item in attempts
+                    if item.get("attempt_id") == requested_attempt
+                ),
+                None,
+            )
+            if attempt is None:
+                raise NotFoundError(
+                    f"attempt {requested_attempt!r} was not found for {model_id!r}"
+                )
+        else:
+            attempt = next(
+                (
+                    item
+                    for item in attempts
+                    if str((item.get("stages") or {}).get("quantize", "")).upper()
+                    in {"FAIL", "FAILED", "CANCELED"}
+                ),
+                attempts[0] if attempts else None,
+            )
+
+        attempt_stages = (attempt or {}).get("stages") or {}
+        quantize_status = str(
+            attempt_stages.get("quantize", model["stages"].get("quantize", "PENDING"))
+        ).upper()
+        model_status = str(model.get("status", "UNKNOWN")).upper()
+        force = bool(request.get("force"))
+        succeeded = {"PASS", "PASSED", "SUCCESS", "SUCCEEDED"}
+        failed = (
+            quantize_status in {"FAIL", "FAILED", "CANCELED"}
+            or model_status in {"FAIL", "FAILED", "CANCELED"}
+        )
+        if quantize_status in succeeded and not force:
+            raise ConflictError(
+                "quantization already produced a complete artifact; "
+                "use force only after confirming it can be discarded"
+            )
+        if not failed and not force:
+            raise ConflictError("only failed or canceled tasks can be cleaned")
+
+        model_dir = self.root / safe_component(run_id, "run_id") / safe_component(
+            model_id, "model_id"
+        )
+        preview = bool(request.get("preview"))
+        if preview:
+            result = quantized_remnants(model_dir)
+        else:
+            key = self._resolve_key(
+                request,
+                action="model.artifacts.cleanup",
+                target=f"{run_id}/{model_id}",
+            )
+            claim = self.idempotency.begin(key, {"run_id": run_id, **request})
+            if claim["replayed"]:
+                return claim["response"]
+            try:
+                result = remove_quantized_remnants(model_dir)
+            except Exception as error:
+                self.idempotency.fail(key, str(error))
+                raise
+
+        response = {
+            "run_id": run_id,
+            "model_id": model_id,
+            "attempt_id": (attempt or {}).get("attempt_id"),
+            "model_status": model_status,
+            "quantize_status": quantize_status,
+            "preview": preview,
+            "deleted": not preview,
+            **result,
+        }
+        if not preview:
+            self.audit.record(
+                actor=principal.actor,
+                action="model.artifacts.cleanup",
+                target=f"{run_id}/{model_id}",
+                result="ACCEPTED",
+                request=request,
+                details=response,
+            )
+            self.idempotency.complete(key, response)
         return response
 
     # ------------------------------------------------------------------- jobs

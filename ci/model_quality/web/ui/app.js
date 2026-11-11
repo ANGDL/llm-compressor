@@ -613,7 +613,11 @@ function renderModels() {
     const scores = metrics.length
       ? `<div class="eval-scores"><p class="eyebrow">Evaluation scores · review manually</p><table class="eval-score-table"><thead><tr><th>Metric</th><th>Score</th></tr></thead><tbody>${metrics.map((metric) => `<tr><td>${escapeHtml(metric.name)}</td><td><code>${escapeHtml(formatNumber(metric.compressed_value))}</code></td></tr>`).join("")}</tbody></table></div>`
       : "";
-    return `<article class="model-card"><div class="model-head"><div><h3>${escapeHtml(model.model_id)}</h3><span class="muted">${escapeHtml(attempts || "No attempt history")}</span></div>${badge(model.status)}</div><div class="fingerprints"><span>Artifact <code>${escapeHtml(model.artifact_fingerprint || "not finalized")}</code></span><span>Evaluation <code>${escapeHtml(model.evaluation_fingerprint || "not finalized")}</code></span><span>Quality report <code>${escapeHtml(report.status || "not available")}</code></span></div>${scores}</article>`;
+    const quantizeStatus = String(model.stages?.quantize || "").toUpperCase();
+    const cleanup = ["FAIL", "FAILED", "CANCELED"].includes(quantizeStatus) && canControlPipeline()
+      ? `<button class="button danger" data-model-action="cleanup" data-model="${escapeHtml(model.model_id)}">Delete tensor remnants</button>`
+      : "";
+    return `<article class="model-card"><div class="model-head"><div><h3>${escapeHtml(model.model_id)}</h3><span class="muted">${escapeHtml(attempts || "No attempt history")}</span></div>${badge(model.status)}</div><div class="fingerprints"><span>Artifact <code>${escapeHtml(model.artifact_fingerprint || "not finalized")}</code></span><span>Evaluation <code>${escapeHtml(model.evaluation_fingerprint || "not finalized")}</code></span><span>Quality report <code>${escapeHtml(report.status || "not available")}</code></span></div>${scores}${cleanup ? `<div class="model-actions">${cleanup}</div>` : ""}</article>`;
   }).join("");
 }
 
@@ -801,6 +805,10 @@ async function applyCloneRequest(req) {
   if (inf.port != null) form.elements.inference_port.value = inf.port;
   if (Array.isArray(inf.arguments)) form.elements.inference_arguments.value = inf.arguments.join("\n");
   if (req.evaluation_tool) form.elements.evaluation_tool.value = req.evaluation_tool;
+  const upload = req.upload || {};
+  if (upload.remote_prefix != null && form.elements.upload_remote_prefix) {
+    form.elements.upload_remote_prefix.value = upload.remote_prefix;
+  }
   updateStageSections();
   updateEvalDatasets();
   if (req.evaluation_dataset) form.elements.evaluation_dataset.value = req.evaluation_dataset;
@@ -849,6 +857,28 @@ async function runAction(action) {
   if (action === "cancel" && request.reason === null) return;
   const result = await api(`/api/runs/${runId}/${action}`, { method: "POST", body: JSON.stringify(request) });
   notify(`${action} accepted for ${result.run_id || state.run.run_id}.`);
+  await loadRun(state.run.run_id);
+}
+
+async function cleanupModelArtifacts(modelId) {
+  const runId = encodeURIComponent(state.run.run_id);
+  const path = `/api/runs/${runId}/models/${encodeURIComponent(modelId)}/artifacts/cleanup`;
+  const preview = await api(path, { method: "POST", body: JSON.stringify({ preview: true }) });
+  if (!preview.files) {
+    notify("No quantized tensor remnants were found.");
+    return;
+  }
+  const gib = (Number(preview.bytes || 0) / 1024 ** 3).toFixed(2);
+  const confirmed = await confirmAction(
+    "Delete tensor remnants",
+    `Delete ${preview.files} files (${gib} GiB) from ${modelId}? Logs, reports, config and attempt state are preserved.`
+  );
+  if (!confirmed) return;
+  const result = await api(path, {
+    method: "POST",
+    body: JSON.stringify({ preview: false, idempotency_key: `ui-cleanup-${key()}` })
+  });
+  notify(`Deleted ${result.files} tensor remnants (${(Number(result.bytes || 0) / 1024 ** 3).toFixed(2)} GiB).`);
   await loadRun(state.run.run_id);
 }
 
@@ -1128,6 +1158,7 @@ $("#log-follow").addEventListener("change", (event) => {
   if (state.logFollow) { loadLog({ quiet: true }); startLogFollow(); } else stopLogFollow();
 });
 $("#run-actions").addEventListener("click", async (event) => { const action = event.target.closest("[data-action]")?.dataset.action; if (action) try { await runAction(action); } catch (error) { notify(error.message, true); } });
+$("#model-list").addEventListener("click", async (event) => { const button = event.target.closest("[data-model-action='cleanup']"); if (!button) return; try { await cleanupModelArtifacts(button.dataset.model); } catch (error) { notify(error.message, true); } });
 $("#pipeline").addEventListener("click", async (event) => {
   const actionButton = event.target.closest("[data-node-action]");
   if (actionButton) {

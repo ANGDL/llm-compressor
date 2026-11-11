@@ -306,6 +306,105 @@ def test_cancel_before_first_stage_reports_canceled(web_env) -> None:
     assert listed["updated_at"] is not None
 
 
+def _failed_quantize_run(
+    env, *, quantize_status: str = "FAIL", write_log: bool = True
+) -> tuple[str, Path]:
+    run_id = "run-cleanup"
+    model_dir = env.root / run_id / env.model_id
+    (model_dir / "state").mkdir(parents=True)
+    (model_dir / "model").mkdir()
+    (model_dir / "work" / "artifacts" / "statistics").mkdir(parents=True)
+    if write_log:
+        (model_dir / "logs" / "attempt-1").mkdir(parents=True)
+    (model_dir / "reports").mkdir()
+    atomic_write_json(
+        env.root / run_id / "execution-plan.json",
+        {"run_mode": "quantize", "selected": [{"id": env.model_id}]},
+    )
+    atomic_write_json(
+        model_dir / "state" / "quantize.json",
+        {
+            "stage": "quantize",
+            "status": quantize_status,
+            "attempt_id": "attempt-1",
+        },
+    )
+    (model_dir / "model" / "model-00001-of-00002.safetensors").write_bytes(b"x" * 64)
+    (model_dir / "model" / "model.safetensors.index.json").write_text("{}")
+    (model_dir / "model" / "FINALIZED").write_text("")
+    (model_dir / "model" / "config.json").write_text("{}")
+    (model_dir / "work" / "publish" / "model-00001.safetensors").parent.mkdir()
+    (model_dir / "work" / "publish" / "model-00001.safetensors").write_bytes(
+        b"y" * 32
+    )
+    (model_dir / "work" / "artifacts" / "statistics" / "layer0.pt").write_bytes(
+        b"z" * 16
+    )
+    if write_log:
+        (model_dir / "logs" / "attempt-1" / "quantization.log").write_text("failure")
+    (model_dir / "reports" / "summary.json").write_text("{}")
+    return run_id, model_dir
+
+
+def test_cleanup_failed_quantize_removes_only_tensor_remnants(web_env) -> None:
+    control = make_control(web_env)
+    run_id, model_dir = _failed_quantize_run(web_env)
+
+    preview = control.cleanup_failed_artifacts(
+        run_id,
+        web_env.model_id,
+        {"preview": True},
+        OPERATOR,
+    )
+    assert preview["preview"] is True
+    assert preview["deleted"] is False
+    assert preview["files"] == 5
+    assert preview["bytes"] == 114
+    assert (model_dir / "model" / "model-00001-of-00002.safetensors").exists()
+    assert (model_dir / "work").exists()
+
+    result = control.cleanup_failed_artifacts(
+        run_id,
+        web_env.model_id,
+        {"idempotency_key": "cleanup-1"},
+        OPERATOR,
+    )
+    assert result["deleted"] is True
+    assert result["remaining_files"] == 0
+    assert not (model_dir / "model" / "model-00001-of-00002.safetensors").exists()
+    assert not (model_dir / "model" / "FINALIZED").exists()
+    assert not (model_dir / "work").exists()
+    assert (model_dir / "model" / "config.json").exists()
+    assert (model_dir / "logs" / "attempt-1" / "quantization.log").exists()
+    assert (model_dir / "reports" / "summary.json").exists()
+    assert (model_dir / "state" / "quantize.json").exists()
+    assert control.audit.read(action="model.artifacts.cleanup")["total"] == 1
+
+
+def test_cleanup_rejects_active_jobs(web_env) -> None:
+    control = make_control(web_env)
+    run_id, _ = _failed_quantize_run(web_env)
+    control.jobs.create(
+        run_id=run_id,
+        model_id=web_env.model_id,
+        attempt_id="attempt-1",
+        kind="quantize",
+        executor="dry-run",
+        status="RUNNING",
+    )
+    with pytest.raises(ConflictError, match="jobs are active"):
+        control.cleanup_failed_artifacts(run_id, web_env.model_id, {}, OPERATOR)
+
+
+def test_cleanup_rejects_completed_quantization(web_env) -> None:
+    control = make_control(web_env)
+    run_id, _ = _failed_quantize_run(
+        web_env, quantize_status="PASS", write_log=False
+    )
+    with pytest.raises(ConflictError, match="complete artifact"):
+        control.cleanup_failed_artifacts(run_id, web_env.model_id, {}, OPERATOR)
+
+
 def test_retry_job_requires_retryable_failure(web_env) -> None:
     control = make_control(web_env)
     preview = control.preview_plan({"run_mode": "quantize"}, OPERATOR)
@@ -756,6 +855,31 @@ def test_wsgi_rerun_stage_route_enforces_roles(web_env) -> None:
     assert {job["model_id"] for job in payload["jobs"]} == {web_env.model_id}
 
 
+def test_wsgi_cleanup_failed_artifacts_route(web_env) -> None:
+    run_id, model_dir = _failed_quantize_run(web_env)
+    app = create_app(
+        RunStore(web_env.root), config_path=web_env.config, git_sha="git:abc1234"
+    )
+    path = f"/api/runs/{run_id}/models/{web_env.model_id}/artifacts/cleanup"
+    headers = {"X-Model-Quality-Actor": "alice", "X-Model-Quality-Roles": "operator"}
+
+    status, payload = call(app, "POST", path, {"preview": True}, headers=headers)
+    assert status["status"] == "200 OK"
+    assert payload["files"] == 5
+    assert (model_dir / "model" / "model-00001-of-00002.safetensors").exists()
+
+    status, payload = call(
+        app,
+        "POST",
+        path,
+        {"idempotency_key": "route-cleanup-1"},
+        headers=headers,
+    )
+    assert status["status"] == "200 OK"
+    assert payload["deleted"] is True
+    assert not (model_dir / "work").exists()
+
+
 def test_preview_persists_skip_stages_and_rejects_non_optional(web_env) -> None:
     control = make_control(web_env)
     preview = control.preview_plan(
@@ -795,7 +919,9 @@ def test_launch_with_skipped_stage_omits_job_and_records_skipped(web_env) -> Non
 
     # A SKIPPED record is persisted so the pipeline shows the node as skipped.
     record = json.loads(
-        (web_env.root / run_id / web_env.model_id / "state" / "evaluate.json").read_text()
+        (
+            web_env.root / run_id / web_env.model_id / "state" / "evaluate.json"
+        ).read_text()
     )
     assert record["status"] == "SKIPPED"
     assert record["reason"] == "operator skip"
@@ -835,7 +961,9 @@ def test_skip_stage_cancels_job_and_persists(web_env) -> None:
 
     # SKIPPED record written and the plan updated for future re-runs.
     record = json.loads(
-        (web_env.root / run_id / web_env.model_id / "state" / "evaluate.json").read_text()
+        (
+            web_env.root / run_id / web_env.model_id / "state" / "evaluate.json"
+        ).read_text()
     )
     assert record["status"] == "SKIPPED"
     plan = json.loads((web_env.root / run_id / "execution-plan.json").read_text())
