@@ -83,7 +83,17 @@ stop_server() {
   SERVER_STARTED=0
 }
 trap stop_server EXIT
-trap 'stop_server; exit 130' INT TERM
+cancel_smoke() {
+  # A superseded/canceled attempt must still leave an explicit result instead
+  # of ending with only "Terminated" in the stage log. Preserve an already
+  # written PASS/FAIL result if the signal lands during shutdown.
+  if [ ! -s "$RESULT" ]; then
+    write_result FAIL "smoke canceled"
+  fi
+  stop_server
+  exit 130
+}
+trap cancel_smoke INT TERM
 
 echo "[harness] waiting for 127.0.0.1:$PORT (model load can take many minutes)"
 ready=0
