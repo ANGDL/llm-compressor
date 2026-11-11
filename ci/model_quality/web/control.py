@@ -107,6 +107,33 @@ def _timestamp(value: Any) -> float:
     return parsed.timestamp()
 
 
+def _run_launch_defaults(
+    run_dir: Path, plan: dict[str, Any], request: dict[str, Any]
+) -> tuple[Any, Any]:
+    """Resolve inference/evaluation settings for retries and stage reruns.
+
+    A stage rerun often receives only an idempotency key from the UI/API. Reuse
+    the original run settings so runtime-smoke keeps targeting the prestarted
+    container instead of silently dropping to the in-executor path.
+    """
+
+    marker = read_json(run_dir / "run.json")
+    marker = marker if isinstance(marker, dict) else {}
+    source = plan.get("source_request")
+    source = source if isinstance(source, dict) else {}
+
+    def first(key: str) -> Any:
+        value = request.get(key)
+        if value is not None:
+            return value
+        value = marker.get(key)
+        if value is not None:
+            return value
+        return source.get(key)
+
+    return first("inference"), first("evaluation_command")
+
+
 class ControlPlane:
     """Write-side API for model quality runs.
 
@@ -316,11 +343,8 @@ class ControlPlane:
         # evaluation configuration so stages like runtime-smoke still target the
         # prestarted container instead of silently dropping to the in-executor
         # path. The request may still override either.
-        marker = read_json(run_dir / "run.json")
-        marker = marker if isinstance(marker, dict) else {}
-        inference = request.get("inference", marker.get("inference"))
-        evaluation_command = request.get(
-            "evaluation_command", marker.get("evaluation_command")
+        inference, evaluation_command = _run_launch_defaults(
+            run_dir, plan, request
         )
         return self._launch(
             plan=plan,
@@ -844,13 +868,19 @@ class ControlPlane:
         evaluation_command = request.get("evaluation_command")
         if evaluation_command is None and request.get("evaluation_tool"):
             evaluation_command = build_eval_command(request, policy=self.policy)
+        default_inference, default_evaluation = _run_launch_defaults(
+            run_dir, plan, request
+        )
+        inference = request.get("inference") or default_inference
+        if evaluation_command is None:
+            evaluation_command = default_evaluation
         return self._launch(
             plan=plan,
             plan_hash=plan.get("plan_hash"),
             attempt_id=attempt_id,
             run_mode=run_mode,
             git_sha=plan.get("git_sha", "local"),
-            inference=request.get("inference"),
+            inference=inference,
             evaluation_command=evaluation_command,
             principal=principal,
             reason="rerun",
@@ -1176,6 +1206,8 @@ class ControlPlane:
                 "created_at": utc_now(),
             }
         )
+        previous_inference = run_record.get("inference")
+        previous_evaluation = run_record.get("evaluation_command")
         run_record.update(
             {
                 "run_id": run_id,
@@ -1184,8 +1216,14 @@ class ControlPlane:
                 "plan_hash": plan_hash,
                 "updated_at": utc_now(),
                 "last_actor": principal.actor,
-                "inference": inference,
-                "evaluation_command": evaluation_command,
+                "inference": (
+                    inference if inference is not None else previous_inference
+                ),
+                "evaluation_command": (
+                    evaluation_command
+                    if evaluation_command is not None
+                    else previous_evaluation
+                ),
                 "canceled": False,
             }
         )
