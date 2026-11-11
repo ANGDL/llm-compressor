@@ -534,15 +534,20 @@ class ControlPlane:
                     f"attempt {requested_attempt!r} was not found for {model_id!r}"
                 )
         else:
+            current_id = model.get("attempt_id")
             attempt = next(
                 (
                     item
                     for item in attempts
-                    if str((item.get("stages") or {}).get("quantize", "")).upper()
-                    in {"FAIL", "FAILED", "CANCELED"}
+                    if current_id and item.get("attempt_id") == current_id
                 ),
-                attempts[0] if attempts else None,
+                None,
             )
+            if attempt is None:
+                attempt = next(
+                    (item for item in attempts if item.get("current")),
+                    attempts[0] if attempts else None,
+                )
 
         attempt_stages = (attempt or {}).get("stages") or {}
         quantize_status = str(
