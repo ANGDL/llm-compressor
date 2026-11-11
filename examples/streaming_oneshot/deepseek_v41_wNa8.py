@@ -563,7 +563,12 @@ def main():
     )
     parser.add_argument("--moe-calibrate-all-experts", action="store_true")
     parser.add_argument("--checkpoint-progress", action="store_true")
-    parser.add_argument("--async-save", action="store_true")
+    parser.add_argument(
+        "--async-save",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Overlap checkpoint writes with the next layer (default: enabled).",
+    )
     parser.add_argument(
         "--save-raw-checkpoint-format",
         action=argparse.BooleanOptionalAction,
