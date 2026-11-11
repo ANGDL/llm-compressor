@@ -112,11 +112,13 @@ def _estimate_observer_memory(
         else:
             groups = weight.numel()
         held += 8 * groups * torch.float32.itemsize
+        # Weight observers see one module weight at a time. Token counts only
+        # size activation workspaces; charging them here overestimates large
+        # MoE weights and can reject a target that fits on the device.
         module_scratch = 8 * weight.numel() * torch.float32.itemsize
         if observer == "imatrix_mse":
             in_features = weight.shape[-1]
             held += in_features * torch.float32.itemsize + torch.int64.itemsize
-            module_scratch += 2 * num_tokens * in_features * torch.float32.itemsize
         scratch = max(scratch, module_scratch)
     return held, scratch
 
