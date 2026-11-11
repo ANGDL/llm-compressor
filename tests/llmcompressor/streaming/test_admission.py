@@ -122,6 +122,34 @@ def test_real_quantizer_estimates_on_initialized_meta_modules(quantizer_class):
             assert gptq["held_bytes"] == 8 * 8 * torch.float32.itemsize
 
 
+def test_imatrix_weight_observer_scratch_ignores_token_count():
+    model = nn.Sequential(nn.Linear(128, 64, bias=False, device="meta"))
+    recipe = [
+        QuantizationModifier(
+            scheme="W8A8",
+            targets=["Linear"],
+            weight_observer="imatrix_mse",
+        )
+    ]
+    with create_session() as session:
+        session.state.layerwise_calibration = True
+        session.initialize(model=model, recipe=recipe, start=-1)
+        small = estimate_modifier_memory(
+            session.lifecycle.recipe.modifiers,
+            model.modules(),
+            num_tokens=16,
+            max_batch_tokens=16,
+        )
+        large = estimate_modifier_memory(
+            session.lifecycle.recipe.modifiers,
+            model.modules(),
+            num_tokens=10_000_000,
+            max_batch_tokens=1_600_000,
+        )
+
+    assert small.scratch_bytes == large.scratch_bytes
+
+
 def test_device_reservations_do_not_compete_across_devices():
     budget = DeviceMemoryBudget(available_bytes=1_000, safety_reserve_fraction=0)
     with budget.reserve("first", 1_000, device="cuda:0"):
