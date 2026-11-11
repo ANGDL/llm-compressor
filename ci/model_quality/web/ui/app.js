@@ -875,7 +875,6 @@ async function cleanupModelArtifacts(modelId) {
   if (state.cleanupBusy.has(modelId)) return;
   const runId = encodeURIComponent(state.run.run_id);
   const path = `/api/runs/${runId}/models/${encodeURIComponent(modelId)}/artifacts/cleanup`;
-  const started = Date.now();
   let timer = null;
   state.cleanupBusy.add(modelId);
   state.cleanupPhase.set(modelId, "Scanning…");
@@ -897,11 +896,12 @@ async function cleanupModelArtifacts(modelId) {
       notify("Cleanup canceled.");
       return;
     }
+    const deleteStarted = Date.now();
     state.cleanupPhase.set(modelId, "Deleting… 0s");
     renderModels();
     notify(`Deleting ${preview.files} files (${gib} GiB)…`);
     timer = window.setInterval(() => {
-      const seconds = Math.floor((Date.now() - started) / 1000);
+      const seconds = Math.floor((Date.now() - deleteStarted) / 1000);
       const button = $$("[data-model-action='cleanup']").find((item) => item.dataset.model === modelId);
       if (button) button.textContent = `Deleting… ${seconds}s`;
     }, 1000);
