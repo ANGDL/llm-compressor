@@ -44,8 +44,46 @@ if ! curl -sf "http://127.0.0.1:$PORT/v1/models" >/dev/null 2>&1; then
   echo "[harness] launching serve script (output -> $SERVE_LOG)"
   # Capture the serve script's own output so a failed launch (e.g. a missing
   # binary) is visible in the reports dir instead of vanishing to /dev/null.
-  nohup bash "$SERVE_SCRIPT" "$@" > "$SERVE_LOG" 2>&1 &
+  # ``setsid`` gives the serve script its own process group so the harness can
+  # stop the server (and every TP/EP worker it spawned) as soon as the probe
+  # finishes, instead of leaving a multi-GPU SGLang instance running.
+  SERVER_STARTED=1
+  if command -v setsid >/dev/null 2>&1; then
+    setsid nohup bash "$SERVE_SCRIPT" "$@" > "$SERVE_LOG" 2>&1 &
+  else
+    nohup bash "$SERVE_SCRIPT" "$@" > "$SERVE_LOG" 2>&1 &
+  fi
+  SERVE_PID=$!
 fi
+
+stop_server() {
+  if [ "${SERVER_STARTED:-0}" != "1" ]; then
+    return
+  fi
+  echo "[harness] stopping inference server"
+  if [ -n "${SERVE_PID:-}" ]; then
+    kill -TERM -- "-$SERVE_PID" 2>/dev/null || kill -TERM "$SERVE_PID" 2>/dev/null || true
+  fi
+  for _ in $(seq 1 20); do
+    if ! curl -sf "http://127.0.0.1:$PORT/v1/models" >/dev/null 2>&1; then
+      break
+    fi
+    sleep 0.5
+  done
+  if curl -sf "http://127.0.0.1:$PORT/v1/models" >/dev/null 2>&1; then
+    if [ -n "${SERVE_PID:-}" ]; then
+      kill -KILL -- "-$SERVE_PID" 2>/dev/null || kill -KILL "$SERVE_PID" 2>/dev/null || true
+    fi
+    if command -v fuser >/dev/null 2>&1; then
+      fuser -k -TERM "${PORT}/tcp" >/dev/null 2>&1 || true
+      sleep 1
+      fuser -k -KILL "${PORT}/tcp" >/dev/null 2>&1 || true
+    fi
+  fi
+  SERVER_STARTED=0
+}
+trap stop_server EXIT
+trap 'stop_server; exit 130' INT TERM
 
 echo "[harness] waiting for 127.0.0.1:$PORT (model load can take many minutes)"
 ready=0
