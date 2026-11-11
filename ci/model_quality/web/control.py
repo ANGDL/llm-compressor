@@ -487,19 +487,21 @@ class ControlPlane:
         self.idempotency.complete(key, response)
         return response
 
-    def cleanup_failed_artifacts(
+    def cleanup_artifacts(
         self,
         run_id: str,
         model_id: str,
         request: dict[str, Any],
         principal: Principal,
     ) -> dict[str, Any]:
-        """Delete partial quantized tensors left by a failed quantization.
+        """Delete quantized tensors left by a failed or completed task.
 
         The operation is intentionally narrow: only tensor files under the
         model output directory and the transient ``work`` directory are
         removed. Logs, reports, configuration and attempt state survive so the
-        failure remains inspectable.
+        failure remains inspectable. A completed artifact requires ``force``
+        because removing it makes the model unavailable for validation,
+        inference, evaluation and publish.
         """
 
         principal.require("retry")
@@ -556,7 +558,7 @@ class ControlPlane:
         if quantize_status in succeeded and not force:
             raise ConflictError(
                 "quantization already produced a complete artifact; "
-                "use force only after confirming it can be discarded"
+                "pass force=true after confirming it can be discarded"
             )
         if not failed and not force:
             raise ConflictError("only failed or canceled tasks can be cleaned")
@@ -603,6 +605,10 @@ class ControlPlane:
             )
             self.idempotency.complete(key, response)
         return response
+
+    # Backward-compatible name for callers created before successful artifacts
+    # could also be cleaned.
+    cleanup_failed_artifacts = cleanup_artifacts
 
     # ------------------------------------------------------------------- jobs
 
