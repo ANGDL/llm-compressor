@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 import os
 import threading
 import warnings
@@ -10,7 +9,7 @@ from functools import wraps
 from importlib.metadata import entry_points
 from typing import Callable
 
-logger = logging.getLogger(__name__)
+from llmcompressor.logger import logger
 
 _ENTRY_POINT_GROUP = "llmcompressor.ops"
 _PROTOCOL_VERSION = 1
@@ -86,12 +85,10 @@ def _log_selected_provider(candidate) -> None:
             return
         _LOGGED_PROVIDERS.add(key)
     logger.info(
-        "Using precompiled native operator %r (backend=%r, implementation=%r, "
-        "contract_version=%d)",
-        candidate.name,
-        candidate.backend,
-        candidate.implementation,
-        candidate.contract_version,
+        "Using precompiled native operator "
+        f"{candidate.name!r} (backend={candidate.backend!r}, "
+        f"implementation={candidate.implementation!r}, "
+        f"contract_version={candidate.contract_version})"
     )
 
 
