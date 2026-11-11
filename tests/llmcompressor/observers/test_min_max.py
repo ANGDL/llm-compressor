@@ -46,6 +46,19 @@ def test_min_max_observer_symmetric_scale_range():
     assert round(zero_point.item(), 4) == 0
 
 
+def test_observer_accepts_requires_grad_weights():
+    tensor = torch.randn(4, 4, requires_grad=True)
+    args = QuantizationArgs(
+        num_bits=8, symmetric=True, strategy="tensor", observer="minmax"
+    )
+    observer = Observer.load_from_registry("minmax", base_name="weight", args=args)
+
+    qparams = observer(tensor).get_qparams()
+
+    assert qparams["scale"].requires_grad is False
+    assert qparams["zero_point"].requires_grad is False
+
+
 def test_min_max_observer_value_update():
     inp = torch.tensor([[1, 1, 1, 1, 1]])
     inp_update_max = torch.tensor([[127, 1, 1, 1, 1]])

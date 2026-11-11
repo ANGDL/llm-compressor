@@ -141,6 +141,7 @@ class Observer(InternalModule, RegistryMixin):
         :param observed: value being observed
         :return: self for method chaining
         """
+        observed = observed.detach()
         if observed.numel() == 0:
             return self
 
