@@ -175,7 +175,11 @@ tbody tr:hover { background: #f8faf7; }
 .failure-age { margin-left: 5px; color: var(--muted); font-size: 9px; font-weight: 800; text-transform: uppercase; }
 .model-card { padding: 18px 0; border-top: 1px solid var(--line); }
 .model-card:first-child { border-top: 0; padding-top: 0; }
-.model-head { display: flex; justify-content: space-between; gap: 20px; align-items: center; }
+.model-head { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 12px 20px; align-items: center; }
+.model-head > div:first-child { min-width: 0; }
+.model-head-actions { display: flex; flex-shrink: 0; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 10px; }
+.model-head-actions .button { min-height: 32px; padding: 6px 11px; border-color: #efb7ba; background: transparent; color: var(--red); font-size: 12px; font-weight: 650; white-space: nowrap; }
+.model-head-actions .button:hover { border-color: var(--red); background: var(--red); color: #fff; }
 .model-card h3 { margin: 0 0 4px; font-size: 16px; }
 .fingerprints { margin-top: 14px; display: grid; gap: 6px; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
 .eval-scores { margin-top: 14px; }

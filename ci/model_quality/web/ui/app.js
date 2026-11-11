@@ -617,7 +617,7 @@ function renderModels() {
     const cleanup = ["FAIL", "FAILED", "CANCELED"].includes(quantizeStatus) && canControlPipeline()
       ? `<button class="button danger" data-model-action="cleanup" data-model="${escapeHtml(model.model_id)}">Delete tensor remnants</button>`
       : "";
-    return `<article class="model-card"><div class="model-head"><div><h3>${escapeHtml(model.model_id)}</h3><span class="muted">${escapeHtml(attempts || "No attempt history")}</span></div>${badge(model.status)}</div><div class="fingerprints"><span>Artifact <code>${escapeHtml(model.artifact_fingerprint || "not finalized")}</code></span><span>Evaluation <code>${escapeHtml(model.evaluation_fingerprint || "not finalized")}</code></span><span>Quality report <code>${escapeHtml(report.status || "not available")}</code></span></div>${scores}${cleanup ? `<div class="model-actions">${cleanup}</div>` : ""}</article>`;
+    return `<article class="model-card"><div class="model-head"><div><h3>${escapeHtml(model.model_id)}</h3><span class="muted">${escapeHtml(attempts || "No attempt history")}</span></div><div class="model-head-actions">${cleanup}${badge(model.status)}</div></div><div class="fingerprints"><span>Artifact <code>${escapeHtml(model.artifact_fingerprint || "not finalized")}</code></span><span>Evaluation <code>${escapeHtml(model.evaluation_fingerprint || "not finalized")}</code></span><span>Quality report <code>${escapeHtml(report.status || "not available")}</code></span></div>${scores}</article>`;
   }).join("");
 }
 
