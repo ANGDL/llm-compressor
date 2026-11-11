@@ -29,6 +29,24 @@ from llmcompressor.streaming.materialization import (
 from llmcompressor.streaming.pipeline import _write_remaining_direct_shards
 
 
+def test_target_install_freezes_parameters():
+    target = torch.nn.Linear(4, 3)
+    assert target.weight.requires_grad
+    groups = TargetWeightLoader._group_tensors(target, parameters=True)
+    sources = {id(original): aliases[0] for original, aliases in groups}
+    values = {
+        aliases[0]: original.detach().clone() for original, aliases in groups
+    }
+
+    installed = TargetWeightLoader._install_parameters(
+        target, groups, sources, values
+    )
+
+    assert target.weight.requires_grad is False
+    assert target.bias.requires_grad is False
+    assert all(requires_grad is False for _, requires_grad, _, _ in installed)
+
+
 def test_streaming_dtype_policy_preserves_control_state_by_default():
     policy = StreamingDTypePolicy.for_quantized_modules(torch.bfloat16, ("layer.proj",))
 

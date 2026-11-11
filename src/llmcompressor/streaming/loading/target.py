@@ -908,7 +908,7 @@ class TargetWeightLoader:
         installed = []
         for original, aliases in groups:
             parameter = nn.Parameter(
-                values[sources[id(original)]], requires_grad=original.requires_grad
+                values[sources[id(original)]], requires_grad=False
             )
             for alias in aliases:
                 owner, name = _owner_and_name(target, alias)
@@ -916,7 +916,7 @@ class TargetWeightLoader:
             installed.append(
                 (
                     aliases,
-                    original.requires_grad,
+                    False,
                     original.dtype,
                     tuple(original.shape),
                 )
