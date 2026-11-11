@@ -449,6 +449,31 @@ def test_cleanup_completed_quantization_with_force(web_env) -> None:
     assert (model_dir / "model" / "config.json").exists()
 
 
+def test_cleanup_preview_prefers_current_attempt(web_env) -> None:
+    control = make_control(web_env)
+    run_id, model_dir = _failed_quantize_run(
+        web_env, quantize_status="PASS", write_log=False
+    )
+    for attempt_id, status in (("old-attempt", "FAIL"), ("current-attempt", "PASS")):
+        atomic_write_json(
+            model_dir / "attempts" / attempt_id / "state" / "quantize.json",
+            {"stage": "quantize", "status": status, "attempt_id": attempt_id},
+        )
+    atomic_write_json(
+        model_dir / "current-attempt.json", {"attempt_id": "current-attempt"}
+    )
+
+    result = control.cleanup_artifacts(
+        run_id,
+        web_env.model_id,
+        {"preview": True, "force": True},
+        OPERATOR,
+    )
+
+    assert result["attempt_id"] == "current-attempt"
+    assert result["quantize_status"] == "PASS"
+
+
 def test_retry_job_requires_retryable_failure(web_env) -> None:
     control = make_control(web_env)
     preview = control.preview_plan({"run_mode": "quantize"}, OPERATOR)
