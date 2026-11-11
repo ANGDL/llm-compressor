@@ -19,6 +19,7 @@ from compressed_tensors.utils.impl_backend import ImplBackend
 from compressed_tensors.utils.triton import tl, triton
 
 from llmcompressor.observers.base import MinMaxTuple
+from llmcompressor.utils.hardware_ops import optional_hardware_backend
 from llmcompressor.utils.triton_utils import (
     TritonDType,
     calculate_candidate_scale,
@@ -52,6 +53,7 @@ def _resolve_grid_type(grid_type: str | None, args: QuantizationArgs) -> str:
 
 
 # This is the eager implementation registered as the default backend.
+@optional_hardware_backend("imatrix_search", contract_version=1)
 @ImplBackend.entrypoint("_grid_search_observer")
 @torch.no_grad()
 def _grid_search_observer(

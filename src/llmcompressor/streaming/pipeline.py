@@ -1015,6 +1015,18 @@ def run_subgraph_streaming_pipeline(
         prefetcher = (
             SubgraphPrefetcher(adapter.weight_session) if adapter.targets else None
         )
+        streaming_logger.info(
+            "setup | checkpoint write | "
+            + ("asynchronous" if async_save else "synchronous")
+        )
+        streaming_logger.info(
+            "setup | weight prefetch | "
+            + (
+                "prepare + pinned async H2D"
+                if _async_h2d_enabled() and device.type == "cuda"
+                else "prepare only"
+            )
+        )
         pipeline_failed = True
         try:
             prefetch_pending = False
@@ -1332,6 +1344,14 @@ def run_subgraph_streaming_pipeline(
                                 device=device,
                                 device_reservation=next_device_reservation,
                                 transfer_reservation=next_transfer_reservation,
+                            )
+                            streaming_logger.info(
+                                f"{next_label} | prefetch submitted | "
+                                + (
+                                    "prepare + pinned async H2D"
+                                    if next_transfer_reservation is not None
+                                    else "prepare"
+                                )
                             )
                             prefetch_pending = True
 
