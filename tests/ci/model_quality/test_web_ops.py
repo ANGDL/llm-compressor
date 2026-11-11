@@ -724,6 +724,29 @@ def test_worker_filters_queue_by_job_kind(web_env) -> None:
     )
 
 
+def test_worker_skips_container_smoke_without_runtime(web_env) -> None:
+    jobs = JobStore(web_env.root)
+    jobs.create(
+        run_id="run-a",
+        model_id=web_env.model_id,
+        attempt_id="attempt-1",
+        kind="inference",
+        executor="queue",
+        stages=["runtime-smoke"],
+        container_name="demo-container",
+    )
+
+    assert (
+        run_once(
+            root=web_env.root,
+            config_path=web_env.config,
+            jobs=jobs,
+            container_runtime=("definitely-missing-runtime",),
+        )
+        is None
+    )
+
+
 def test_worker_defers_a_lane_until_earlier_jobs_are_terminal(web_env) -> None:
     """A kind-split worker must not start report while the smoke is still queued.
 

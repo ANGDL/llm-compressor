@@ -12,6 +12,7 @@ import functools
 import json
 import os
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -540,9 +541,25 @@ def run_once(
 
     jobs = jobs or JobStore(root)
     ledger = ledger or ReservationLedger(root, capacity_gpu_hours=capacity_gpu_hours)
-    queued = [
-        job for job in jobs.queued() if kinds is None or job.get("kind") in kinds
-    ]
+    runtime_available = container_runtime == ("direct",) or bool(
+        shutil.which(container_runtime[0])
+    )
+
+    def _claimable(job: dict[str, Any]) -> bool:
+        if kinds is not None and job.get("kind") not in kinds:
+            return False
+        # A worker that cannot invoke its container runtime must not claim a
+        # prestarted-container smoke; otherwise it immediately fails with
+        # RESOURCE_UNAVAILABLE and starves the dedicated inference worker.
+        if (
+            job.get("kind") == "inference"
+            and job.get("container_name")
+            and not runtime_available
+        ):
+            return False
+        return True
+
+    queued = [job for job in jobs.queued() if _claimable(job)]
     ready = next((job for job in queued if _dependencies_settled(job, jobs)), None)
     if ready is None:
         return None
