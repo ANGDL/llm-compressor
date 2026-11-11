@@ -284,7 +284,14 @@ class DeviceMemoryBudget:
     @staticmethod
     def _query_available(device: torch.device) -> int | None:
         if device.type == "cuda" and torch.cuda.is_available():
-            return int(torch.cuda.mem_get_info(device)[0])
+            free = int(torch.cuda.mem_get_info(device)[0])
+            try:
+                cached = torch.cuda.memory_reserved(
+                    device
+                ) - torch.cuda.memory_allocated(device)
+            except (AttributeError, RuntimeError):
+                return free
+            return free + max(0, int(cached))
         device_module = getattr(torch, device.type, None)
         mem_get_info = getattr(device_module, "mem_get_info", None)
         if callable(mem_get_info):
