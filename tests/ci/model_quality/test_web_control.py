@@ -27,9 +27,33 @@ from ci.model_quality.web import (
     validate_evaluation_command,
     validate_inference_config,
 )
+from ci.model_quality.web.control import _run_launch_defaults
 
 OPERATOR = Principal(actor="alice", roles=frozenset({"operator"}), authenticated=True)
 VIEWER = Principal(actor="bob", roles=frozenset({"viewer"}), authenticated=True)
+
+
+def test_rerun_defaults_reuse_source_request_inference(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    atomic_write_json(run_dir / "run.json", {"inference": None})
+    inference = {"container_name": "demo", "script": "/workspace/run.sh"}
+    plan = {
+        "source_request": {
+            "inference": inference,
+            "evaluation_command": ["python3", "eval.py"],
+        }
+    }
+
+    assert _run_launch_defaults(run_dir, plan, {}) == (
+        inference,
+        ["python3", "eval.py"],
+    )
+    override = {"container_name": "override", "script": "/workspace/other.sh"}
+    assert _run_launch_defaults(run_dir, plan, {"inference": override}) == (
+        override,
+        ["python3", "eval.py"],
+    )
 
 
 def make_control(env, *, capacity: float = 80.0, policy: LaunchPolicy | None = None):
