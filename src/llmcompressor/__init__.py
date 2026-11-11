@@ -17,11 +17,13 @@ from llmcompressor._torch_accelerator_compat import ensure_torch_accelerator
 
 ensure_torch_accelerator()
 
-from ._version import __version__, version
+from ._version import __commit__, __commit_short__, __version__, version
 from .logger import LoggerConfig, configure_logger, logger
 
 __all__ = [
     "__version__",
+    "__commit__",
+    "__commit_short__",
     "version",
     "configure_logger",
     "logger",
