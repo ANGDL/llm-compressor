@@ -169,21 +169,25 @@ def test_provider_discovery_is_cached(monkeypatch):
     assert entrypoint()(1) == "hardware"
 
 
-def test_native_selection_logs_once(monkeypatch, caplog):
+def test_native_selection_logs_once(monkeypatch):
     install(monkeypatch, descriptor())
     dispatch = entrypoint()
-    with caplog.at_level("INFO", logger=hardware_ops.__name__):
+    messages = []
+    sink_id = hardware_ops.logger.add(
+        messages.append, level="INFO", format="{message}"
+    )
+    try:
         assert dispatch(1) == "hardware"
         assert dispatch(1) == "hardware"
+    finally:
+        hardware_ops.logger.remove(sink_id)
 
     records = [
-        record
-        for record in caplog.records
-        if record.name == hardware_ops.__name__
-        and "precompiled native operator" in record.getMessage()
+        message
+        for message in messages
+        if "precompiled native operator" in str(message)
     ]
     assert len(records) == 1
-    assert records[0].levelname == "INFO"
 
 
 def test_duplicate_priority_is_an_error(monkeypatch):
