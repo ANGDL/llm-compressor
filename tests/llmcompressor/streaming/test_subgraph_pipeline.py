@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from contextlib import contextmanager
+from dataclasses import replace
 from unittest.mock import Mock
 
 import pytest
@@ -194,6 +195,76 @@ def test_prefetch_defers_when_current_writer_needs_host_capacity(tmp_path, monke
 
     assert deferred
     assert (output / "FINALIZED").exists()
+
+
+@pytest.mark.parametrize("allow_growth", [False, True])
+def test_prefetch_rechecks_working_set_when_target_estimate_grows(
+    tmp_path, monkeypatch, allow_growth
+):
+    from llmcompressor.streaming import pipeline
+    from llmcompressor.streaming.admission import DeviceMemoryBudget, DeviceMemoryError
+
+    config = Qwen3Config(
+        vocab_size=32,
+        hidden_size=8,
+        intermediate_size=16,
+        num_hidden_layers=3,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=4,
+        max_position_embeddings=32,
+        tie_word_embeddings=True,
+    )
+    checkpoint = tmp_path / "checkpoint"
+    Qwen3ForCausalLM(config).save_pretrained(checkpoint, safe_serialization=True)
+    estimates = {}
+    growth_reservations = []
+    budget = DeviceMemoryBudget(available_bytes=1 << 30, safety_reserve_fraction=0)
+    original_reserve = budget.reserve
+    original_estimate = pipeline.estimate_modifier_memory
+
+    def growing_estimate(modifiers, modules, **kwargs):
+        modules = tuple(modules)
+        estimate = original_estimate(modifiers, modules, **kwargs)
+        previous = estimates.get(modules, 0)
+        estimates[modules] = previous + 1
+        return replace(
+            estimate, scratch_bytes=estimate.scratch_bytes + previous * (1 << 20)
+        )
+
+    def reserve(owner, required_bytes, **kwargs):
+        if owner.endswith("additional device working set"):
+            growth_reservations.append(required_bytes)
+            if not allow_growth:
+                raise DeviceMemoryError("injected capacity limit")
+        return original_reserve(owner, required_bytes, **kwargs)
+
+    monkeypatch.setattr(budget, "reserve", reserve)
+    monkeypatch.setattr(pipeline, "DeviceMemoryBudget", lambda: budget)
+    monkeypatch.setattr(pipeline, "estimate_modifier_memory", growing_estimate)
+    arguments = {
+        "model": checkpoint,
+        "dataset": _calibration_data(),
+        "dataset_fingerprint": "growing-prefetch-estimate",
+        "recipe": _imatrix_recipe(),
+        "output_dir": tmp_path / "output",
+        "work_dir": tmp_path / "work",
+        "num_calibration_samples": 2,
+        "max_seq_length": 4,
+        "target_dtype": torch.float32,
+        "device": "cpu",
+    }
+    if allow_growth:
+        output = streaming_oneshot(**arguments)
+        assert (output / "FINALIZED").is_file()
+        assert len(growth_reservations) == 2
+    else:
+        with pytest.raises(DeviceMemoryError, match="injected capacity limit"):
+            streaming_oneshot(**arguments)
+        assert not (tmp_path / "output" / "FINALIZED").exists()
+    assert growth_reservations
+    assert all(required > 0 for required in growth_reservations)
+    assert not budget._reservations
 
 
 @pytest.mark.parametrize("quantizer_class", [QuantizationModifier, GPTQModifier])

@@ -1,5 +1,5 @@
 import operator
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 import pytest
 import torch
@@ -26,9 +26,16 @@ from llmcompressor.streaming.checkpoint.writer import _Transaction
 from llmcompressor.streaming.execution import (
     fingerprint_execution_graph,
     freeze_calibration_inputs,
+    streaming_input_contract,
 )
 from llmcompressor.streaming.loading import SubgraphWeightSession, TargetWeightLoader
 from llmcompressor.streaming.pipeline import run_subgraph_streaming_pipeline
+
+
+@dataclass
+class _CalibrationMetadata:
+    frames: int
+    gain: float
 
 
 class BranchModel(nn.Module):
@@ -395,6 +402,45 @@ def test_graph_identity_ignores_placeholder_order_but_binds_operations():
     changed = fingerprint_execution_graph([graph(("first", "second"), operator.mul)])
     assert first == reordered
     assert first != changed
+
+
+def test_numeric_metadata_varies_without_changing_native_types(tmp_path):
+    batches = [
+        {
+            "pixels": torch.ones(1, length, 4),
+            "metadata": {"size": [length, length + 1], "gain": gain},
+            "auxiliary": _CalibrationMetadata(length, gain),
+            "enabled": True,
+            "mode": "image",
+        }
+        for length, gain in ((2, 0.5), (9, 1.25))
+    ]
+    frozen = freeze_calibration_inputs(batches, tmp_path)
+    assert streaming_input_contract(batches[0]) == streaming_input_contract(batches[1])
+    assert fingerprint_streaming_value(batches[0]) != fingerprint_streaming_value(
+        batches[1]
+    )
+    for original, replayed in zip(batches, frozen):
+        assert replayed["metadata"] == original["metadata"]
+        assert replayed["auxiliary"] == original["auxiliary"]
+        assert type(replayed["metadata"]["size"][0]) is int
+        assert type(replayed["metadata"]["gain"]) is float
+
+
+@pytest.mark.parametrize("changed", [False, 1, 1.0, None, "other", [1, 2]])
+def test_input_contract_preserves_branch_flags_and_structure(tmp_path, changed):
+    with pytest.raises(ValueError, match="branch changed"):
+        freeze_calibration_inputs(
+            [{"metadata": True}, {"metadata": changed}], tmp_path
+        )
+
+
+def test_numeric_input_contract_preserves_type():
+    assert streaming_input_contract(1) != streaming_input_contract(1.0)
+    assert streaming_input_contract(1) != streaming_input_contract(True)
+    assert streaming_input_contract(1, specialize_numeric=True) != (
+        streaming_input_contract(2, specialize_numeric=True)
+    )
 
 
 def test_transformers_llava_decoder_only_export_and_reload(tmp_path):

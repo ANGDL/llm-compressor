@@ -997,6 +997,50 @@ def test_raw_image_inputs_match_prebuilt_image_embeddings():
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+def test_streaming_calibrates_images_with_different_native_geometry(tmp_path):
+    config = tiny_config(vision=True, dspark=False)
+    checkpoint = tmp_path / "source"
+    previous = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(torch.bfloat16)
+        write_checkpoint(checkpoint, config)
+    finally:
+        torch.set_default_dtype(previous)
+    samples = []
+    for height, width in ((4, 4), (4, 6)):
+        token_types = [-1, 0] + ([1] * (width // 2) + [2]) * (height // 2) + [3]
+        samples.append(
+            {
+                "input_ids": torch.arange(1, len(token_types) + 1),
+                "attention_mask": torch.ones(len(token_types), dtype=torch.bool),
+                "image_mask": torch.tensor(token_types).ge(0),
+                "image_token_types": torch.tensor(token_types),
+                "image_patches": torch.randn(
+                    height * width, 3, 2, 2, dtype=torch.bfloat16
+                ),
+                "image_height": height,
+                "image_width": width,
+            }
+        )
+    groups, ignored = EXAMPLE._schemes("wna8", quantize_engram_wkv=False)
+    output = streaming_oneshot(
+        model=checkpoint,
+        model_config=config,
+        model_factory=DeepseekV41NativeForCausalLM,
+        dataset=DataLoader(samples, batch_size=1, collate_fn=EXAMPLE.data_collator),
+        dataset_fingerprint="variable-native-image-geometry",
+        recipe=[QuantizationModifier(config_groups=groups, ignore=ignored)],
+        output_dir=tmp_path / "output",
+        work_dir=tmp_path / "work",
+        num_calibration_samples=2,
+        max_seq_length=16,
+        target_dtype=torch.bfloat16,
+        device="cpu",
+        materializer=DeepSeekV41WeightMaterializer(),
+    )
+    assert (output / "FINALIZED").is_file()
+
+
 def test_vision_model_declares_prefix_parameter_dependencies():
     model = DeepseekV41NativeForCausalLM(tiny_config(vision=True))
     assert model.streaming_runtime_parameter_dependencies("prefix") == (

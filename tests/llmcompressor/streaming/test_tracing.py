@@ -1,9 +1,11 @@
 from operator import getitem
 
+import pytest
 import torch
 from safetensors.torch import save_file
 from torch import nn
 from torch.fx import Graph
+from transformers import PretrainedConfig
 
 from llmcompressor.pipelines.sequential.helpers import (
     Subgraph,
@@ -43,6 +45,66 @@ class _DeclaredParameterPrefixModel(_MultimodalPrefixModel):
         if stage == "prefix":
             return ("prefix_bias",)
         return ()
+
+
+def _specialized_offset(value, offset):
+    if offset > 0:
+        return value + offset
+    return value - offset
+
+
+class _NumericMetadataModel(_MultimodalPrefixModel):
+    def __init__(self, specialize=False):
+        super().__init__()
+        self.config = PretrainedConfig()
+        self.device = torch.device("cpu")
+        self.specialize = specialize
+
+    def forward(self, input_ids, offset, gain):
+        hidden = self.embed_tokens(input_ids) * gain
+        if self.specialize:
+            hidden = _specialized_offset(hidden, offset)
+        else:
+            hidden = hidden + offset
+        return self.layers[0](hidden)
+
+
+@pytest.mark.parametrize("specialize", [False, True])
+def test_traced_numeric_metadata_preserves_values_and_specialized_branches(
+    tmp_path, specialize
+):
+    reference = _NumericMetadataModel(specialize)
+    checkpoint = tmp_path / "model.safetensors"
+    save_file(reference.state_dict(), checkpoint)
+    batches = [
+        {"input_ids": torch.tensor([[1, 2]]), "offset": 2, "gain": 0.5},
+        {"input_ids": torch.tensor([[3, 4, 5]]), "offset": -3, "gain": 1.25},
+    ]
+    model = build_meta_model(_NumericMetadataModel, specialize)
+    adapter = trace_streaming_boundaries(
+        model=model,
+        source=SafetensorsWeightSource(checkpoint),
+        sample_batch=batches[0],
+        sequential_targets=["layers.0"],
+        device="cpu",
+        dtype=torch.float32,
+    )
+    assert ("offset" in adapter.specialized_input_names) is specialize
+    if specialize:
+        with pytest.raises(ValueError, match="traced input contract"):
+            list(adapter.calibration_boundaries(batches))
+    else:
+        boundaries = list(adapter.calibration_boundaries(batches))
+        for batch, boundary in zip(batches, boundaries):
+            subgraph = adapter.target_subgraphs[0]
+            with adapter.weight_session.loaded(
+                subgraph, device="cpu", dtype=torch.float32
+            ):
+                output = subgraph.forward(
+                    model, **{name: boundary[name] for name in subgraph.input_names}
+                )
+            torch.testing.assert_close(next(iter(output.values())), reference(**batch))
+    assert all(parameter.is_meta for parameter in model.parameters())
 
 
 def test_target_projection_preserves_tuple_unpack_nodes():

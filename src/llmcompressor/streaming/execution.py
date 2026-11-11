@@ -152,25 +152,35 @@ def fingerprint_execution_graph(subgraphs) -> str:
     return fingerprint_streaming_value(graphs)
 
 
-def streaming_input_contract(value: Any) -> Any:
-    """Permit variable tensor lengths while fixing traced non-tensor branches."""
+def streaming_input_contract(value: Any, *, specialize_numeric: bool = False) -> Any:
+    """Permit tensor lengths and numeric metadata to vary, preserving branch flags."""
     if isinstance(value, torch.Tensor):
         return ("tensor", str(value.dtype), value.ndim)
     if isinstance(value, Mapping):
-        return {key: streaming_input_contract(item) for key, item in value.items()}
+        return {
+            key: streaming_input_contract(item, specialize_numeric=specialize_numeric)
+            for key, item in value.items()
+        }
     if is_dataclass(value) and not isinstance(value, type):
         return (
             f"{type(value).__module__}.{type(value).__qualname__}",
             {
-                field.name: streaming_input_contract(getattr(value, field.name))
+                field.name: streaming_input_contract(
+                    getattr(value, field.name), specialize_numeric=specialize_numeric
+                )
                 for field in fields(value)
             },
         )
     if isinstance(value, (tuple, list)):
         return (
             type(value).__name__,
-            tuple(streaming_input_contract(item) for item in value),
+            tuple(
+                streaming_input_contract(item, specialize_numeric=specialize_numeric)
+                for item in value
+            ),
         )
+    if type(value) in (int, float) and not specialize_numeric:
+        return (type(value).__name__,)
     if value is None or isinstance(value, (bool, int, float, str)):
         return (type(value).__name__, value)
     raise TypeError(f"Unsupported traced input type {type(value).__name__}")
