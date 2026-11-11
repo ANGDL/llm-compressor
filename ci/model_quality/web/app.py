@@ -667,9 +667,7 @@ class ModelQualityAPI:
                 )
             if suffix == ["artifacts", "cleanup"]:
                 return (
-                    control().cleanup_failed_artifacts(
-                        run_id, model_id, body, principal
-                    ),
+                    control().cleanup_artifacts(run_id, model_id, body, principal),
                     "application/json",
                     [],
                 )

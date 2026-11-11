@@ -619,13 +619,14 @@ function renderModels() {
       ? `<div class="eval-scores"><p class="eyebrow">Evaluation scores · review manually</p><table class="eval-score-table"><thead><tr><th>Metric</th><th>Score</th></tr></thead><tbody>${metrics.map((metric) => `<tr><td>${escapeHtml(metric.name)}</td><td><code>${escapeHtml(formatNumber(metric.compressed_value))}</code></td></tr>`).join("")}</tbody></table></div>`
       : "";
     const quantizeStatus = String(model.stages?.quantize || "").toUpperCase();
+    const quantizeSucceeded = ["PASS", "PASSED", "SUCCESS", "SUCCEEDED"].includes(quantizeStatus);
     const cleanupBusy = state.cleanupBusy.has(model.model_id);
     const cleanupEmpty = state.cleanupEmpty.has(model.model_id);
     const cleanupState = cleanupBusy ? "busy" : cleanupEmpty ? "empty" : "ready";
     const cleanupLabel = cleanupBusy
       ? state.cleanupPhase.get(model.model_id) || "Working…"
-      : cleanupEmpty ? "No tensor remnants" : "Delete tensor remnants";
-    const cleanup = ["FAIL", "FAILED", "CANCELED"].includes(quantizeStatus) && canControlPipeline()
+      : cleanupEmpty ? "No tensor remnants" : quantizeSucceeded ? "Clean tensor files" : "Delete tensor remnants";
+    const cleanup = (["FAIL", "FAILED", "CANCELED"].includes(quantizeStatus) || quantizeSucceeded) && canControlPipeline()
       ? `<button class="button danger" data-model-action="cleanup" data-model="${escapeHtml(model.model_id)}" data-cleanup-state="${cleanupState}" aria-busy="${cleanupBusy}" ${cleanupBusy || cleanupEmpty ? "disabled" : ""}>${escapeHtml(cleanupLabel)}</button>`
       : "";
     return `<article class="model-card"><div class="model-head"><div><h3>${escapeHtml(model.model_id)}</h3><span class="muted">${escapeHtml(attempts || "No attempt history")}</span></div><div class="model-head-actions">${cleanup}${badge(model.status)}</div></div><div class="fingerprints"><span>Artifact <code>${escapeHtml(model.artifact_fingerprint || "not finalized")}</code></span><span>Evaluation <code>${escapeHtml(model.evaluation_fingerprint || "not finalized")}</code></span><span>Quality report <code>${escapeHtml(report.status || "not available")}</code></span></div>${scores}</article>`;
@@ -873,6 +874,9 @@ async function runAction(action) {
 
 async function cleanupModelArtifacts(modelId) {
   if (state.cleanupBusy.has(modelId)) return;
+  const model = (state.run?.models || []).find((item) => item.model_id === modelId);
+  const quantizeStatus = String(model?.stages?.quantize || "").toUpperCase();
+  const force = ["PASS", "PASSED", "SUCCESS", "SUCCEEDED"].includes(quantizeStatus);
   const runId = encodeURIComponent(state.run.run_id);
   const path = `/api/runs/${runId}/models/${encodeURIComponent(modelId)}/artifacts/cleanup`;
   let timer = null;
@@ -881,7 +885,10 @@ async function cleanupModelArtifacts(modelId) {
   renderModels();
   notify(`Scanning ${modelId} for tensor remnants…`);
   try {
-    const preview = await api(path, { method: "POST", body: JSON.stringify({ preview: true }) });
+    const preview = await api(path, {
+      method: "POST",
+      body: JSON.stringify({ preview: true, force })
+    });
     if (!preview.files) {
       state.cleanupEmpty.add(modelId);
       notify("No quantized tensor remnants were found.");
@@ -890,7 +897,7 @@ async function cleanupModelArtifacts(modelId) {
     const gib = (Number(preview.bytes || 0) / 1024 ** 3).toFixed(2);
     const confirmed = await confirmAction(
       "Delete tensor remnants",
-      `Delete ${preview.files} files (${gib} GiB) from ${modelId}? Logs, reports, config and attempt state are preserved.`
+      `${force ? `This removes the completed quantized artifact for ${modelId}; it will no longer be loadable, evaluable or publishable. ` : ""}Delete ${preview.files} files (${gib} GiB) from ${modelId}? Logs, reports, config and attempt state are preserved.`
     );
     if (!confirmed) {
       notify("Cleanup canceled.");
@@ -907,7 +914,7 @@ async function cleanupModelArtifacts(modelId) {
     }, 1000);
     const result = await api(path, {
       method: "POST",
-      body: JSON.stringify({ preview: false, idempotency_key: `ui-cleanup-${key()}` })
+      body: JSON.stringify({ preview: false, force, idempotency_key: `ui-cleanup-${key()}` })
     });
     state.cleanupEmpty.add(modelId);
     notify(`Deleted ${result.files} tensor remnants (${(Number(result.bytes || 0) / 1024 ** 3).toFixed(2)} GiB).`);

@@ -429,6 +429,26 @@ def test_cleanup_rejects_completed_quantization(web_env) -> None:
         control.cleanup_failed_artifacts(run_id, web_env.model_id, {}, OPERATOR)
 
 
+def test_cleanup_completed_quantization_with_force(web_env) -> None:
+    control = make_control(web_env)
+    run_id, model_dir = _failed_quantize_run(
+        web_env, quantize_status="PASS", write_log=False
+    )
+
+    result = control.cleanup_artifacts(
+        run_id,
+        web_env.model_id,
+        {"force": True, "idempotency_key": "cleanup-success-1"},
+        OPERATOR,
+    )
+
+    assert result["deleted"] is True
+    assert result["quantize_status"] == "PASS"
+    assert not (model_dir / "model" / "model-00001-of-00002.safetensors").exists()
+    assert not (model_dir / "work").exists()
+    assert (model_dir / "model" / "config.json").exists()
+
+
 def test_retry_job_requires_retryable_failure(web_env) -> None:
     control = make_control(web_env)
     preview = control.preview_plan({"run_mode": "quantize"}, OPERATOR)
