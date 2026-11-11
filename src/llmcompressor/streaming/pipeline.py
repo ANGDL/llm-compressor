@@ -821,6 +821,8 @@ def run_subgraph_streaming_pipeline(
     """Calibrate, modify, propagate, and persist one subgraph at a time."""
 
     device = torch.device(device)
+    # Quantization observes/modifies weights; no parameter needs autograd.
+    adapter.model.requires_grad_(False)
     if (
         torch.distributed.is_available()
         and torch.distributed.is_initialized()

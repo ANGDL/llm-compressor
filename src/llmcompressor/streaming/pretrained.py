@@ -309,6 +309,9 @@ def streaming_oneshot_from_pretrained(
         keep_nonpersistent_buffers=True,
     )
     meta_model.eval()
+    # Streaming PTQ is inference-only. Freeze the meta parameters before any
+    # materialization so installed/restored weights never carry autograd state.
+    meta_model.requires_grad_(False)
     model_was_linearized = len(get_non_linearized_moes(meta_model)) > 0
     if model_was_linearized:
         linearize_moe(meta_model)
