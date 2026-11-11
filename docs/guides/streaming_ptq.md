@@ -54,6 +54,22 @@ modules obtained through FX `get_attr` nodes and passed to another module (for
 example, an embedding passed to an MTP layer). These dependencies are loaded for
 the same lifecycle as the target and restored to meta afterward.
 
+Calibration batches preserve their native Python numeric metadata, including image
+dimensions, frame counts, and floating-point coefficients. These values and tensor
+lengths may vary between samples while their types and container structure stay
+fixed. Boolean flags, string modes, and optional input presence must remain
+consistent. If tracing specializes a branch using numeric metadata, that input's
+numeric values must also remain fixed; the streaming adapter rejects a mismatched
+batch before executing its traced prefix. Input fingerprints still include the
+actual metadata values, so changing calibration data invalidates cached results.
+
+Next-target prefetch estimates the device working set from the current activation
+boundary. Before installing the next target, the pipeline recomputes its requirement
+from the actual input boundary and modifier state. If the requirement grew, it
+reserves the additional capacity while retaining the prefetch reservation. A
+capacity failure releases the prepared weights and reservations before target
+execution.
+
 ## Class model
 
 The following class diagram is the normative implementation contract.

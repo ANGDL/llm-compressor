@@ -696,11 +696,13 @@ class HFProxy(Proxy):
 
     def __len__(self):
         if hasattr(self, "_metadata") and self._metadata is not None:
+            self._record_input_specialization()
             return len(self._metadata)
         return super().__len__()
 
     def __bool__(self):
         if hasattr(self, "_metadata") and self._metadata is not None:
+            self._record_input_specialization()
             return self._metadata
         return super().__bool__()
 
@@ -718,8 +720,14 @@ class HFProxy(Proxy):
 
     def __contains__(self, key):
         if hasattr(self, "_metadata") and self._metadata is not None:
+            self._record_input_specialization()
             return key in self._metadata
         return super().__contains__(key)
+
+    def _record_input_specialization(self):
+        record = getattr(self.tracer, "record_input_specialization", None)
+        if record is not None:
+            record(self.node)
 
 
 class HFAttribute(HFProxy):

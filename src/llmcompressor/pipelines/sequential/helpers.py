@@ -47,6 +47,7 @@ __all__ = ["trace_subgraphs", "Subgraph", "handle_sequential_oom"]
 # autowrapped `forward`) never appear as `call_module` nodes, so this is the only
 # record of which subgraph owns them (#3261)
 INVOKED_SUBMODULES_META_KEY = "llmcompressor.invoked_submodules"
+SPECIALIZED_INPUT_META_KEY = "llmcompressor.specialized_input"
 
 
 @dataclass
@@ -503,6 +504,19 @@ class SequentialTracer(HFTracer):
             return proxy
         finally:
             self._invoked = outer
+
+    def record_input_specialization(self, node: Node) -> None:
+        pending = [node]
+        visited = set()
+        while pending:
+            current = pending.pop()
+            if current in visited:
+                continue
+            visited.add(current)
+            if current.op == "placeholder":
+                current.meta[SPECIALIZED_INPUT_META_KEY] = True
+            else:
+                pending.extend(current.all_input_nodes)
 
     def call_module(self, module: Module, forward, args, kwargs):
         """

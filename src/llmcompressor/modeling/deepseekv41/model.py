@@ -946,8 +946,6 @@ class Transformer(nn.Module):
         if h.shape[0] != 1:
             raise ValueError("Native V4.1 image inputs currently require batch size 1")
 
-        image_height = int(image_height)
-        image_width = int(image_width)
         image_token_types = image_token_types.to(device=h.device)
         image_patches = image_patches.to(
             dtype=self.vision.patch_embed.proj.weight.dtype

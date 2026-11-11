@@ -29,13 +29,16 @@ def calibration_row(height, width):
     }
 
 
-def test_collator_keeps_image_geometry_as_variable_tensor_metadata():
+def test_collator_preserves_native_image_geometry():
     first = MODULE.data_collator([calibration_row(48, 32)])
     second = MODULE.data_collator([calibration_row(34, 45)])
 
     for batch in (first, second):
         for key in ("image_height", "image_width"):
-            assert batch[key].shape == ()
-            assert batch[key].dtype == torch.int64
+            assert type(batch[key]) is int
 
+    assert first["image_height"] == 48
+    assert second["image_height"] == 34
+    assert first["image_width"] == 32
+    assert second["image_width"] == 45
     assert streaming_input_contract(first) == streaming_input_contract(second)

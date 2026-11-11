@@ -1176,9 +1176,16 @@ def run_subgraph_streaming_pipeline(
                             prefetched_prepared.device_reservation.reserved_bytes
                             < device_required
                         ):
-                            raise DeviceMemoryError(
-                                f"Prefetched device reservation is too small for "
-                                f"{target_label}: required {device_required} bytes"
+                            additional_bytes = (
+                                device_required
+                                - prefetched_prepared.device_reservation.reserved_bytes
+                            )
+                            weight_stack.enter_context(
+                                device_budget.reserve(
+                                    f"{target_label} additional device working set",
+                                    additional_bytes,
+                                    device=device,
+                                )
                             )
                         modifier_host_bytes = modifier_memory.host_bytes + (
                             modifier_memory.peak_bytes if device.type == "cpu" else 0

@@ -12,7 +12,11 @@ import torch
 from torch import nn
 from torch.fx import Graph
 
-from llmcompressor.pipelines.sequential.helpers import Subgraph, trace_consumed_names
+from llmcompressor.pipelines.sequential.helpers import (
+    SPECIALIZED_INPUT_META_KEY,
+    Subgraph,
+    trace_consumed_names,
+)
 from llmcompressor.pipelines.sequential.plan import (
     SequentialExecutionPlan,
     trace_sequential_plan,
@@ -125,6 +129,23 @@ class TracedBoundaryAdapter:
     _prefix_runtime_parameters: tuple[str, ...] | None = None
     execution: StreamingExecutionDescriptor | None = None
     input_contract: Any = None
+    specialized_input_names: tuple[str, ...] = ()
+
+    def _input_contract(self, batch):
+        return {
+            name: streaming_input_contract(
+                value, specialize_numeric=name in self.specialized_input_names
+            )
+            for name, value in batch.items()
+        }
+
+    def _validate_input_contract(self, batch):
+        if not isinstance(batch, Mapping):
+            raise TypeError("Traced streaming calibration batches must be mappings")
+        if self.input_contract is not None and (
+            self._input_contract(batch) != self.input_contract
+        ):
+            raise ValueError("Calibration inputs differ from the traced input contract")
 
     @property
     def targets(self) -> tuple[str, ...]:
@@ -150,6 +171,7 @@ class TracedBoundaryAdapter:
                 sample_batch = next(batch_iterator)
             except StopIteration as error:
                 raise ValueError("Streaming calibration batches are empty") from error
+            self._validate_input_contract(sample_batch)
             self._prefix_runtime_parameters = self._declared_runtime_parameters(
                 "prefix"
             )
@@ -174,17 +196,7 @@ class TracedBoundaryAdapter:
                 disable_hf_kernels(self.model),
             ):
                 for batch in batch_iterator:
-                    if not isinstance(batch, Mapping):
-                        raise TypeError(
-                            "Traced streaming calibration batches must be mappings"
-                        )
-                    if (
-                        self.input_contract is not None
-                        and streaming_input_contract(batch) != self.input_contract
-                    ):
-                        raise ValueError(
-                            "Calibration inputs differ from the traced input contract"
-                        )
+                    self._validate_input_contract(batch)
                     values = _move_tensors(dict(batch), self.device)
                     inputs = {name: values[name] for name in prefix.input_names}
                     yield prefix.forward(self.model, **inputs)
@@ -448,7 +460,15 @@ def trace_streaming_boundaries(
         model, source, materializer, dtype_policy=dtype_policy
     )
 
-    return TracedBoundaryAdapter(
+    specialized_input_names = tuple(
+        dict.fromkeys(
+            str(node.target)
+            for subgraph in plan.subgraphs
+            for node in subgraph.graph.nodes
+            if node.op == "placeholder" and node.meta.get(SPECIALIZED_INPUT_META_KEY)
+        )
+    )
+    adapter = TracedBoundaryAdapter(
         model=model,
         plan=plan,
         loader=loader,
@@ -457,5 +477,7 @@ def trace_streaming_boundaries(
         dtype=dtype,
         _target_subgraphs=tuple(target_subgraphs),
         execution=execution,
-        input_contract=streaming_input_contract(sample_batch),
+        specialized_input_names=specialized_input_names,
     )
+    adapter.input_contract = adapter._input_contract(sample_batch)
+    return adapter

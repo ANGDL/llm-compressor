@@ -458,6 +458,9 @@ def data_collator(batch: list[dict[str, Any]]) -> dict[str, Any]:
     for key, value in batch[0].items():
         if value is None:
             continue
+        if key in {"image_height", "image_width"}:
+            result[key] = int(value)
+            continue
         if key in {"attention_mask", "image_mask"}:
             tensor = torch.as_tensor(value, dtype=torch.bool)
         elif key in {"input_ids", "image_token_types"}:
