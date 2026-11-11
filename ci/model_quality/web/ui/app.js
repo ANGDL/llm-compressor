@@ -3,7 +3,7 @@
 const STAGES = ["preflight", "quantize", "validate", "runtime-smoke", "evaluate", "report", "publish"];
 const ACTIVE_JOB = new Set(["CREATED", "QUEUED", "ALLOCATED", "RUNNING"]);
 const TERMINAL_STAGE = new Set(["PASS", "WARN", "FAIL", "FAILED", "SUCCESS", "SUCCEEDED", "SKIPPED", "RESOURCE_TIMEOUT", "CANCELED"]);
-const state = { models: [], runs: [], run: null, jobs: [], plan: null, scriptParams: [], cloneRequest: null, eventTimer: null, logTimer: null, opsTimer: null, logFollow: true, nodeMenu: null, nodeMenuKey: null, lanesExpanded: false, knownModelIds: new Set() };
+const state = { models: [], runs: [], run: null, jobs: [], plan: null, scriptParams: [], cloneRequest: null, eventTimer: null, logTimer: null, opsTimer: null, logFollow: true, nodeMenu: null, nodeMenuKey: null, lanesExpanded: false, knownModelIds: new Set(), cleanupBusy: new Set(), cleanupEmpty: new Set(), cleanupPhase: new Map() };
 const EVAL_PRESETS = { lm_eval: ["gsm8k", "mmlu"], evalscope: ["gsm8k", "ceval"] };
 const ROLE_HELP = {
   viewer: "Viewer · read-only: browse runs, logs, and the GPU/ops dashboards. Cannot plan, launch, retry, cancel, skip, or publish.",
@@ -305,6 +305,11 @@ async function loadRuns(options = {}) {
 }
 
 async function loadRun(runId) {
+  if (state.run?.run_id !== runId) {
+    state.cleanupBusy.clear();
+    state.cleanupEmpty.clear();
+    state.cleanupPhase.clear();
+  }
   $("#run-title").textContent = runId;
   try {
     const run = await api(`/api/runs/${encodeURIComponent(runId)}`);
@@ -614,8 +619,14 @@ function renderModels() {
       ? `<div class="eval-scores"><p class="eyebrow">Evaluation scores · review manually</p><table class="eval-score-table"><thead><tr><th>Metric</th><th>Score</th></tr></thead><tbody>${metrics.map((metric) => `<tr><td>${escapeHtml(metric.name)}</td><td><code>${escapeHtml(formatNumber(metric.compressed_value))}</code></td></tr>`).join("")}</tbody></table></div>`
       : "";
     const quantizeStatus = String(model.stages?.quantize || "").toUpperCase();
+    const cleanupBusy = state.cleanupBusy.has(model.model_id);
+    const cleanupEmpty = state.cleanupEmpty.has(model.model_id);
+    const cleanupState = cleanupBusy ? "busy" : cleanupEmpty ? "empty" : "ready";
+    const cleanupLabel = cleanupBusy
+      ? state.cleanupPhase.get(model.model_id) || "Working…"
+      : cleanupEmpty ? "No tensor remnants" : "Delete tensor remnants";
     const cleanup = ["FAIL", "FAILED", "CANCELED"].includes(quantizeStatus) && canControlPipeline()
-      ? `<button class="button danger" data-model-action="cleanup" data-model="${escapeHtml(model.model_id)}">Delete tensor remnants</button>`
+      ? `<button class="button danger" data-model-action="cleanup" data-model="${escapeHtml(model.model_id)}" data-cleanup-state="${cleanupState}" aria-busy="${cleanupBusy}" ${cleanupBusy || cleanupEmpty ? "disabled" : ""}>${escapeHtml(cleanupLabel)}</button>`
       : "";
     return `<article class="model-card"><div class="model-head"><div><h3>${escapeHtml(model.model_id)}</h3><span class="muted">${escapeHtml(attempts || "No attempt history")}</span></div><div class="model-head-actions">${cleanup}${badge(model.status)}</div></div><div class="fingerprints"><span>Artifact <code>${escapeHtml(model.artifact_fingerprint || "not finalized")}</code></span><span>Evaluation <code>${escapeHtml(model.evaluation_fingerprint || "not finalized")}</code></span><span>Quality report <code>${escapeHtml(report.status || "not available")}</code></span></div>${scores}</article>`;
   }).join("");
@@ -861,25 +872,54 @@ async function runAction(action) {
 }
 
 async function cleanupModelArtifacts(modelId) {
+  if (state.cleanupBusy.has(modelId)) return;
   const runId = encodeURIComponent(state.run.run_id);
   const path = `/api/runs/${runId}/models/${encodeURIComponent(modelId)}/artifacts/cleanup`;
-  const preview = await api(path, { method: "POST", body: JSON.stringify({ preview: true }) });
-  if (!preview.files) {
-    notify("No quantized tensor remnants were found.");
-    return;
+  const started = Date.now();
+  let timer = null;
+  state.cleanupBusy.add(modelId);
+  state.cleanupPhase.set(modelId, "Scanning…");
+  renderModels();
+  notify(`Scanning ${modelId} for tensor remnants…`);
+  try {
+    const preview = await api(path, { method: "POST", body: JSON.stringify({ preview: true }) });
+    if (!preview.files) {
+      state.cleanupEmpty.add(modelId);
+      notify("No quantized tensor remnants were found.");
+      return;
+    }
+    const gib = (Number(preview.bytes || 0) / 1024 ** 3).toFixed(2);
+    const confirmed = await confirmAction(
+      "Delete tensor remnants",
+      `Delete ${preview.files} files (${gib} GiB) from ${modelId}? Logs, reports, config and attempt state are preserved.`
+    );
+    if (!confirmed) {
+      notify("Cleanup canceled.");
+      return;
+    }
+    state.cleanupPhase.set(modelId, "Deleting… 0s");
+    renderModels();
+    notify(`Deleting ${preview.files} files (${gib} GiB)…`);
+    timer = window.setInterval(() => {
+      const seconds = Math.floor((Date.now() - started) / 1000);
+      const button = $$("[data-model-action='cleanup']").find((item) => item.dataset.model === modelId);
+      if (button) button.textContent = `Deleting… ${seconds}s`;
+    }, 1000);
+    const result = await api(path, {
+      method: "POST",
+      body: JSON.stringify({ preview: false, idempotency_key: `ui-cleanup-${key()}` })
+    });
+    state.cleanupEmpty.add(modelId);
+    notify(`Deleted ${result.files} tensor remnants (${(Number(result.bytes || 0) / 1024 ** 3).toFixed(2)} GiB).`);
+    await loadRun(state.run.run_id);
+  } catch (error) {
+    notify(error.message, true);
+  } finally {
+    if (timer) window.clearInterval(timer);
+    state.cleanupBusy.delete(modelId);
+    state.cleanupPhase.delete(modelId);
+    renderModels();
   }
-  const gib = (Number(preview.bytes || 0) / 1024 ** 3).toFixed(2);
-  const confirmed = await confirmAction(
-    "Delete tensor remnants",
-    `Delete ${preview.files} files (${gib} GiB) from ${modelId}? Logs, reports, config and attempt state are preserved.`
-  );
-  if (!confirmed) return;
-  const result = await api(path, {
-    method: "POST",
-    body: JSON.stringify({ preview: false, idempotency_key: `ui-cleanup-${key()}` })
-  });
-  notify(`Deleted ${result.files} tensor remnants (${(Number(result.bytes || 0) / 1024 ** 3).toFixed(2)} GiB).`);
-  await loadRun(state.run.run_id);
 }
 
 function showPreview(payload, title) {
