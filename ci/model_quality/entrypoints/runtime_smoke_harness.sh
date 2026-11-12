@@ -111,14 +111,35 @@ fi
 MODEL_ID=$(curl -sf "http://127.0.0.1:$PORT/v1/models" \
   | python3 -c 'import sys,json;print(json.load(sys.stdin)["data"][0]["id"])' 2>/dev/null)
 [ -z "$MODEL_ID" ] && MODEL_ID="$OUTPUT_DIR"
-echo "[harness] model id=$MODEL_ID; sending probe completion"
-RESP=$(curl -sf "http://127.0.0.1:$PORT/v1/completions" -H "Content-Type: application/json" \
-  -d "{\"model\":\"$MODEL_ID\",\"prompt\":\"1+1=\",\"max_tokens\":8,\"temperature\":0}" 2>/dev/null)
-if [ -n "$RESP" ] && printf "%s" "$RESP" | grep -q '"text"'; then
-  write_result PASS "completion ok"
+echo "[harness] model id=$MODEL_ID; sending chat probe"
+# Use the chat endpoint: a raw completion prompt such as "1+1=" can legally
+# degenerate into repeated tokens on chat-tuned checkpoints and still look like
+# a pass. A chat turn with a numeric question gives the gate a real signal.
+RESP=$(curl -sf "http://127.0.0.1:$PORT/v1/chat/completions" \
+  -H "Content-Type: application/json" \
+  -d "{\"model\":\"$MODEL_ID\",\"messages\":[{\"role\":\"user\",\"content\":\"What is 2+2? Answer with one number.\"}],\"max_tokens\":16,\"temperature\":0}" \
+  2>/dev/null)
+CONTENT=$(printf "%s" "$RESP" | python3 -c '
+import json
+import sys
+
+try:
+    data = json.load(sys.stdin)
+    print(data["choices"][0]["message"]["content"].strip())
+except Exception:
+    print("")
+' 2>/dev/null)
+if [ -n "$CONTENT" ] && printf "%s" "$CONTENT" | python3 -c '
+import re
+import sys
+
+text = sys.stdin.read()
+raise SystemExit(0 if re.search(r"(^|[^0-9])(4|four)([^0-9]|$)", text, re.I) else 1)
+'; then
+  write_result PASS "chat completion ok: $CONTENT"
   echo "[harness] PASS: $(printf "%s" "$RESP" | head -c 300)"
   exit 0
 fi
-write_result FAIL "probe completion failed"
+write_result FAIL "chat probe did not return 4"
 echo "[harness] FAIL: $(printf "%s" "$RESP" | head -c 300)"
 exit 1
