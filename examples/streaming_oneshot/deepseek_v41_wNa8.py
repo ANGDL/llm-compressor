@@ -54,6 +54,7 @@ from llmcompressor.modeling.deepseekv41 import (
     DeepseekV41NativeForCausalLM,
     ModelConfig,
 )
+from llmcompressor.modifiers.gptq import GPTQModifier
 from llmcompressor.modifiers.quantization import QuantizationModifier
 from llmcompressor.streaming import DeepSeekV41WeightMaterializer, streaming_oneshot
 
@@ -575,6 +576,12 @@ def main():
         default=True,
         help="Use raw DeepSeek tensor names and quantization targets in the output.",
     )
+    parser.add_argument(
+        "--use-gptq-quantization",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use GPTQ quantization instead of PTQ (default: disabled).",
+    )
     args = parser.parse_args()
     if (
         min(args.num_calibration_samples, args.max_sequence_length, args.batch_size)
@@ -615,15 +622,20 @@ def main():
         tokenizer=tokenizer,
         engram_checkpoint=args.model_id,
     )
+
+    modifier = (
+        GPTQModifier(config_groups=groups, ignore=ignores)
+        if args.use_gptq_quantization
+        else QuantizationModifier(config_groups=groups, ignore=ignores)
+    )
+
     result = streaming_oneshot(
         model=args.model_id,
         model_config=config,
         model_factory=factory,
         dataset=_load_dataset(args, tokenizer, config),
         tokenizer=tokenizer,
-        recipe=[
-            QuantizationModifier(config_groups=groups, ignore=ignores),
-        ],
+        recipe=[modifier],
         output_dir=args.output_dir,
         work_dir=args.work_dir,
         num_calibration_samples=args.num_calibration_samples,
