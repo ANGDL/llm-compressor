@@ -22,7 +22,8 @@ with FP32 weight scales in every quantization mode.
 Attention ``wo_a`` projections are quantized with the other attention
 projections by default.
 Pass ``--no-quantize-wo-a`` to keep them in execution precision instead.
-Pass ``--use-float32-scale-dtype`` to use FP32 weight scales for all PTQ groups.
+FP32 weight scales are used by default for all PTQ groups; pass
+``--no-use-float32-scale-dtype`` to store scales in execution dtype instead.
 Output tensor names and quantization selectors use the original checkpoint
 namespace unless ``--no-save-raw-checkpoint-format`` is set.
 """
@@ -540,7 +541,7 @@ def main():
     parser.add_argument(
         "--use-float32-scale-dtype",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help="Use float32 for all PTQ weight scale tensors instead of bfloat16.",
     )
     parser.add_argument("--num-calibration-samples", type=int, default=128)
