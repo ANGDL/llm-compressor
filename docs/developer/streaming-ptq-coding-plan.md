@@ -819,8 +819,43 @@ git diff --check: passed
 - HIGGS 的 `pulp`/ILP 求解属于全局配置决策，可以在所有 layer 的小型
   MSE 摘要收集完成后执行；不应保存完整权重、Hessian 或 activation。
 
-优先级放在 GPTQ Hessian 生命周期、AutoRound 兼容和通用 target grouping
-之后。QAD 仍是最低优先级。
+HIGGS 的 streaming provider 需要复用上述有界权重生命周期，因此优先级
+高于 MTP wrapper 和 QAD。它不应把 HIGGS 变成一个持有全模型权重的 modifier，
+而应作为“候选 scheme 评估与配置生成”阶段，按 logical target 读取并释放权重。
+QAD 仍是最低优先级。
+
+### 18.1.1 HIGGS streaming provider 契约
+
+新增 `StreamingHiggsConfigProvider`（具体模块位置可根据最终依赖方向调整），
+公开职责包括：
+
+1. 复用 HIGGS 现有的 scheme 解析、单层/融合层 MSE、MoE expert 拆分、ILP
+   求解和 config group 生成；
+2. 通过 `CheckpointWeightSource` 和 `WeightMaterializer` 按 logical target
+   读取权重，而不是按完整 source shard 读取；
+3. 每次只保留当前 target 或 fused group 的权重，完成所有 candidate scheme
+   的 MSE 摘要后立即释放；
+4. 在所有 target 的摘要（MSE、参数量、融合关系）收集完成后再执行一次 ILP，
+   只在内存中保留小型摘要，不保留权重、Hessian 或 activation；
+5. 返回可直接交给 streaming GPTQ、streaming RTN/iMatrix、普通 `oneshot`
+   和 `model_free_ptq` 的 `QuantizationConfig`。
+
+provider 必须遵守以下边界：
+
+- fused group 的 candidate scheme 选择必须保持一致，不能将融合权重拆成彼此
+  独立的 ILP 决策；
+- 3-D fused expert tensor 必须按 expert slice 或其他 bounded logical group
+  处理，不能为了调用已有 helper 而加载整个 checkpoint shard；
+- DSV4.1、DeepSeek V4、Kimi K3 等 checkpoint 特化布局只能由
+  `WeightMaterializer`/`WeightSource` 负责解码，provider 不判断模型名；
+- `ignore`、候选 scheme 和 target 的匹配必须与 streaming quantizer 使用同一套
+  module/tensor 语义；
+- provider 的结果应包含稳定的 scheme/config fingerprint，便于 streaming
+  artifacts 恢复和跨阶段校验。
+
+第一版先覆盖普通 dense Linear、标准 fused group 和标准 MoE expert；每个
+logical target 的峰值由该 target 的权重、融合 partner 和 MSE 临时 workspace
+决定，不得随总 checkpoint shard 大小增长。
 
 ## 18.2 upstream oneshot 特性适配清单
 
@@ -864,21 +899,21 @@ MTP 的新增输入、输出和 checkpoint tensor 不能污染基础模型的 GP
 
 ## 19. 当前实施顺序
 
-本阶段按以下顺序实现，代码改动必须在本节写入后开始：
+GPTQ Hessian 生命周期、AutoRound 兼容和显式 target grouping 已经落地；
+本阶段按以下顺序继续实现：
 
-1. **AutoRound 兼容**：适配 `reference_output` 版本差异，优先使用当前
-   boundary/reference，旧版库回退 `collect_reference`，并保持 reference
-   数量受 boundary store 限制。
-2. **通用 target grouping**：引入显式 target group execution unit，保证
-   每组一次 admission、一次 modifier lifecycle、一次
-   `sequential_epoch_end`、一次量化后传播和一次 transaction commit。
-3. **GPTQ admission policy**：默认将 DSV4.1 routed experts 拆成单 Linear
-   target；对普通模型允许在预算内自动合组；Hessian 只在当前 target/group
-   存活，禁止 CPU Hessian offload。
-4. **特化模型 MTP wrapper**：只包裹 MTP ownership 和 extra tensor 处理，
-   不改变通用 target grouping，也不影响 DSV4.1 基础路径。
-5. **HIGGS 配置层**：评估是否能复用 streaming materializer 做 bounded
-   MSE 摘要收集；在此之前只保证 HIGGS 生成的 config 可被 streaming
-   quantizer 消费。
-6. **QAD**：最低优先级，保留现有窄适配，待前述 lifecycle 和 grouping 稳定
-   后再评估 block-wise/shared-data 的泛化。
+1. **HIGGS streaming provider**：先完成有界 MSE 摘要收集、fused/MoE
+   grouping、全局 ILP 求解、稳定 fingerprint 和 config 输出，避免重新引入
+   完整 shard 常驻或 CPU Hessian offload。
+2. **特化模型 MTP wrapper**：先检查并优先复用 upstream 的 GLM5
+   `MtpModel`/checkpoint conversion 适配；wrapper 只在检测到 MTP ownership
+   时扩展 target plan、working set 和 finalizer，普通模型与 DSV4.1 无 MTP
+   路径保持不变。
+3. **QAD streaming 泛化**：最低优先级，参考 upstream 的 block-wise shared
+   data、multiple sequential targets per subgraph 和 weight re-observation，
+   在前两个 wrapper/lifecycle 契约稳定后实现，不把 QAD 特化逻辑散落到主
+   pipeline。
+4. **组合验证**：覆盖 HIGGS 配置交给 streaming GPTQ/RTN 的路径、MTP 与
+   特化 materializer 的组合，以及 QAD 与 grouped target 的资源边界。
+5. **自动 target grouping**：`sequential_targets_per_subgraph="auto"` 作为
+   后续独立工作，复用已有显式 grouping execution unit 和 admission 预算。

@@ -48,6 +48,7 @@ from .materialization import (
     apply_transformers_weight_conversions,
 )
 from .modifier_adapters import get_modifier_adapter, validate_streaming_modifiers
+from .mtp import StreamingMTPWrapper
 from .output import build_quantization_config
 from .pipeline import (
     _complete_direct_writer_staging,
@@ -98,7 +99,10 @@ def _recipe_quantizer(recipe: Recipe):
 
 
 def _exact_schemes(
-    model: nn.Module, quantizer: QuantizationModifier | GPTQModifier
+    model: nn.Module,
+    quantizer: QuantizationModifier | GPTQModifier,
+    *,
+    excluded_prefixes: Sequence[str] = (),
 ) -> dict[str, QuantizationScheme]:
     config = quantizer.resolved_config
     if config.kv_cache_scheme is not None:
@@ -106,6 +110,11 @@ def _exact_schemes(
     schemes = {}
     for scheme in config.config_groups.values():
         for name, module in match_named_modules(model, scheme.targets, config.ignore):
+            if any(
+                name == prefix or name.startswith(f"{prefix}.")
+                for prefix in excluded_prefixes
+            ):
+                continue
             if not isinstance(module, nn.Linear):
                 raise ValueError(
                     "Pretrained streaming mode supports dense Linear targets only; "
@@ -378,7 +387,12 @@ def streaming_oneshot_from_pretrained(
     if model_was_linearized:
         linearize_moe(meta_model)
 
-    schemes = _exact_schemes(meta_model, quantizer)
+    mtp_wrapper = StreamingMTPWrapper.attach(meta_model)
+    schemes = _exact_schemes(
+        meta_model,
+        quantizer,
+        excluded_prefixes=("mtp",) if mtp_wrapper.attached else (),
+    )
     dtype_policy = dtype_policy or StreamingDTypePolicy.for_quantized_modules(
         target_dtype, schemes
     )
@@ -413,6 +427,7 @@ def streaming_oneshot_from_pretrained(
         materializer = apply_transformers_weight_conversions(
             materializer,
             meta_model,
+            extra_conversions=mtp_wrapper.weight_conversions,
         )
         target_patterns = sequential_targets
         automatic_gptq_targets = (
@@ -555,6 +570,12 @@ def streaming_oneshot_from_pretrained(
                 )
             )
         qconfig = build_quantization_config(quantizer.resolved_config)
+        if mtp_wrapper.attached:
+            ignored = list(qconfig.get("ignore") or [])
+            for pattern in mtp_wrapper.ignored_targets:
+                if pattern not in ignored:
+                    ignored.append(pattern)
+            qconfig["ignore"] = ignored
         result = finalize_streaming_checkpoint(
             checkpoint=checkpoint,
             artifact_dir=artifact_dir,

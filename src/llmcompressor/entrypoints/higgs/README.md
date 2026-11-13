@@ -32,6 +32,25 @@ model_free_ptq(
 `model_free_ptq` when every selected scheme is data-free, or with `oneshot` and
 a `QuantizationModifier` or `GPTQModifier` when calibration is required.
 
+For sharded checkpoints that must stay out of memory, use the streaming provider.
+It evaluates one dense layer, fused group, or stacked expert slice at a time while
+retaining only the MSE summaries needed by the final ILP:
+
+```python
+from llmcompressor.entrypoints.higgs import get_higgs_config_streaming
+
+config = get_higgs_config_streaming(
+    "./model",
+    candidate_schemes=["NVFP4A16", "FP8_DYNAMIC"],
+    targets="Linear",
+    ignore=["lm_head"],
+    target_avg_bitwidth=6.0,
+)
+```
+
+The provider uses the same `WeightMaterializer` and checkpoint source interfaces
+as streaming PTQ, so special packed layouts remain owned by their materializer.
+
 ## Optimization
 
 For every matched weight tensor, HIGGS:

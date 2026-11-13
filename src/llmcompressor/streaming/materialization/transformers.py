@@ -497,13 +497,21 @@ class TransformersWeightMaterializer(WeightMaterializer):
 def apply_transformers_weight_conversions(
     materializer: WeightMaterializer,
     model: nn.Module,
+    *,
+    extra_conversions: Sequence[Any] = (),
 ) -> WeightMaterializer:
     """Wrap a materializer with the conversions registered for ``model``."""
     if isinstance(materializer, TransformersWeightMaterializer):
         return materializer
     if get_model_conversion_mapping is None:
         return materializer
-    conversions = get_model_conversion_mapping(model, None, None)
+    conversions = list(get_model_conversion_mapping(model, None, None))
+    existing = {repr(conversion) for conversion in conversions}
+    conversions.extend(
+        conversion
+        for conversion in extra_conversions
+        if repr(conversion) not in existing
+    )
     if not conversions:
         return materializer
     return TransformersWeightMaterializer(materializer, model, conversions)

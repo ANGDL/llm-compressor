@@ -14,6 +14,7 @@ from transformers import Qwen3Config, Qwen3ForCausalLM
 
 from llmcompressor import oneshot
 from llmcompressor.modifiers.autosmooth import AutoSmoothModifier
+from llmcompressor.modifiers.gptq import GPTQModifier
 from llmcompressor.modifiers.qad import QADModifier
 from llmcompressor.modifiers.quantization import QuantizationModifier
 from llmcompressor.modifiers.transform import QuIPModifier, SpinQuantModifier
@@ -132,7 +133,7 @@ def test_e5_contracts_fingerprint_algorithm_ownership():
     qad = build_modifier_contracts([QADModifier()])[0]
     smooth = build_modifier_contracts([AutoSmoothModifier()])[0]
 
-    assert qad.streaming_adapter == "qad-local-training-v1"
+    assert qad.streaming_adapter == "qad-local-training-v2"
     assert qad.propagation_mode == "post-update-quantized"
     assert not qad.calibration_outputs_reusable
     assert smooth.modifies_norms
@@ -328,6 +329,14 @@ def test_qad_adapter_reports_training_and_cpu_cache_memory():
     assert estimate.scratch_bytes > 0
     assert estimate.host_bytes > 0
     assert get_modifier_adapter(qad).minimum_batches == 2
+
+
+def test_qad_accepts_gptq_as_the_preceding_quantizer():
+    quantizer = GPTQModifier(scheme="W8A16", ignore=["lm_head"])
+    qad = QADModifier()
+    adapter = get_modifier_adapter(qad)
+
+    adapter.validate_recipe([quantizer, qad], quantizer)
 
 
 def test_qad_rejects_insufficient_validation_data(tmp_path):
