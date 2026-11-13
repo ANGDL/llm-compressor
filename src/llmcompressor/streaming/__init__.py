@@ -59,6 +59,7 @@ from .execution import (
     fingerprint_streaming_values,
 )
 from .finalize import finalize_streaming_checkpoint
+from .higgs import StreamingHiggsConfigProvider, get_higgs_config_streaming
 from .inference import (
     StreamingInference,
     compare_cached_to_recompute,
@@ -101,6 +102,7 @@ from .moe import (
     discover_standard_moe_adapters,
     execute_expert_group,
 )
+from .mtp import StreamingMTPWrapper
 from .oneshot import streaming_oneshot
 from .parallel import (
     ParallelContext,
@@ -196,6 +198,7 @@ __all__ = [
     "TransactionCoordinationError",
     "WeightMap",
     "WeightMaterializer",
+    "StreamingMTPWrapper",
     "fingerprint_checkpoint",
     "fingerprint_json",
     "execute_expert_group",
@@ -206,6 +209,8 @@ __all__ = [
     "collect_calibration_statistics",
     "compare_cached_to_recompute",
     "finalize_streaming_checkpoint",
+    "StreamingHiggsConfigProvider",
+    "get_higgs_config_streaming",
     "materialize_weights",
     "StreamingExecutionDescriptor",
     "describe_streaming_execution",

@@ -7,6 +7,7 @@ Keep model loading, offloading, and saving in mtp.py.
 from contextlib import ExitStack
 from copy import deepcopy
 
+from accelerate import init_empty_weights
 from compressed_tensors.utils import patch_attr
 from transformers import PretrainedConfig, PreTrainedModel, modeling_layers
 from transformers.modeling_layers import MtpModel
@@ -54,3 +55,44 @@ def load_mtp_model(model: PreTrainedModel, config: PretrainedConfig, device_map=
                 )
             )
         return adapter.from_pretrained(model, device_map=device_map)
+
+
+def build_mtp_model(model: PreTrainedModel, config: PretrainedConfig):
+    """Construct an MTP module without reading checkpoint tensors.
+
+    Streaming owns checkpoint reads, so it needs the same architecture and
+    conversion behavior as ``load_mtp_model`` while leaving every parameter on
+    meta until a target weight session installs it.
+    """
+
+    adapter = _MTP_ADAPTERS.get(model.config.get_text_config().model_type)
+    load_config = deepcopy(model.config)
+    load_config.get_mtp_config = lambda: deepcopy(config)
+    load_config.get_text_config().num_mtp_layers = config.num_hidden_layers
+    with patch_attr(model, "config", load_config), init_empty_weights(
+        include_buffers=False
+    ):
+        mtp_cls = adapter or MtpModel
+        return mtp_cls(model, config.num_hidden_layers)
+
+
+def get_streaming_mtp_weight_conversions(
+    model: PreTrainedModel,
+    mtp_model: PreTrainedModel,
+):
+    """Return MTP source-key conversions scoped below ``model.mtp``."""
+
+    adapter = _MTP_ADAPTERS.get(model.config.get_text_config().model_type)
+    if adapter is not None:
+        conversions = mtp_model.get_weight_conversions(model)
+    else:
+        conversions = modeling_layers.get_model_conversion_mapping(
+            mtp_model, None, None
+        )
+    conversions = deepcopy(conversions)
+    for conversion in conversions:
+        conversion.scope_prefix = "mtp"
+        conversion.base_model_prefix = ""
+    from transformers.core_model_loading import PrefixChange
+
+    return [PrefixChange(prefix_to_add="mtp"), *conversions]

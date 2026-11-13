@@ -16,8 +16,18 @@ from llmcompressor.entrypoints.higgs.utils import (
     generate_config_groups,
 )
 
+
+def get_higgs_config_streaming(*args, **kwargs):
+    """Build a HIGGS config while keeping checkpoint residency bounded."""
+
+    from llmcompressor.streaming.higgs import get_higgs_config_streaming as _get
+
+    return _get(*args, **kwargs)
+
+
 __all__ = [
     "get_higgs_config",
+    "get_higgs_config_streaming",
     "HiggsMSECollectorConverter",
     "compute_layer_mse",
     "compute_fused_layer_mse",

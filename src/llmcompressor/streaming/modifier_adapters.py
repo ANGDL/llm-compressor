@@ -16,6 +16,7 @@ import torch
 from compressed_tensors.quantization import apply_quantization_config
 
 from llmcompressor.modifiers.autosmooth import AutoSmoothModifier
+from llmcompressor.modifiers.gptq import GPTQModifier
 from llmcompressor.modifiers.qad import QADModifier
 from llmcompressor.modifiers.quantization import QuantizationModifier
 from llmcompressor.modifiers.quantization.calibration import apply_calibration_status
@@ -117,20 +118,21 @@ class StreamingModifierAdapter:
 
 
 class QADStreamingAdapter(StreamingModifierAdapter):
-    identifier = "qad-local-training-v1"
+    identifier = "qad-local-training-v2"
     propagation_mode = "post-update-quantized"
     minimum_batches = 2
 
     def validate_recipe(self, modifiers: Sequence[Any], quantizer: Any) -> None:
         if (
-            type(quantizer) is not QuantizationModifier
+            type(quantizer) not in (QuantizationModifier, GPTQModifier)
             or len(modifiers) != 2
             or modifiers[0] is not quantizer
             or modifiers[1] is not self.modifier
         ):
             raise ModifierContractError(
-                "Streaming QAD requires [QuantizationModifier, QADModifier]; "
-                "other algorithm combinations require a separate adapter"
+                "Streaming QAD requires [QuantizationModifier|GPTQModifier, "
+                "QADModifier]; other algorithm combinations require a separate "
+                "adapter"
             )
         if not _on_cpu(self.modifier.offload_device):
             raise ModifierContractError("Streaming QAD currently requires CPU cache")
