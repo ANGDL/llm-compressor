@@ -539,6 +539,14 @@ streaming_oneshot(
 )
 ```
 
+For pretrained GPTQ models with expert collections, streaming automatically uses
+the same fine-grained `Linear` target policy as `oneshot(...,
+pipeline="sequential", sequential_targets="Linear")`. Each quantized Linear,
+or an attention module that the shared tracer keeps as a leaf, reaches
+`sequential_epoch_end` before the next target is loaded. Pass
+`sequential_targets=` to override this policy when a model requires a custom
+trace boundary.
+
 `pipeline_devices` is removed rather than deprecated. It described a bounded
 two-GPU weight-prefetch implementation, not pipeline parallel execution, and it
 would conflict with a future expert-placement API. Callers provide exactly one

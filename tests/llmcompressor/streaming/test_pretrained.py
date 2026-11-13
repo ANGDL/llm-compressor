@@ -23,6 +23,7 @@ from llmcompressor.streaming import (
 )
 from llmcompressor.streaming.pretrained import (
     _cleanup_successful_work_dir,
+    _has_expert_collection,
     _quantized_sequential_targets,
     _recipe_quantizer,
 )
@@ -42,6 +43,20 @@ class _DecoderLayer(torch.nn.Module):
         self.proj = torch.nn.Linear(2, 2)
 
 
+class _Attention(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.q_proj = torch.nn.Linear(2, 2)
+        self.k_proj = torch.nn.Linear(2, 2)
+
+
+class _AttentionDecoderLayer(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.attention = _Attention()
+        self.mlp = torch.nn.Linear(2, 2)
+
+
 class _MultimodalModel(torch.nn.Module):
     _no_split_modules = ["_VisionBlock", "_DecoderLayer", "Linear"]
 
@@ -49,6 +64,20 @@ class _MultimodalModel(torch.nn.Module):
         super().__init__()
         self.vision_tower = torch.nn.ModuleList([_VisionBlock()])
         self.layers = torch.nn.ModuleList([_DecoderLayer(), _DecoderLayer()])
+
+
+class _AttentionModel(torch.nn.Module):
+    _no_split_modules = ["_AttentionDecoderLayer"]
+
+    def __init__(self):
+        super().__init__()
+        self.layers = torch.nn.ModuleList([_AttentionDecoderLayer()])
+
+
+class _ExpertModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.experts = torch.nn.ModuleList([_DecoderLayer(), _DecoderLayer()])
 
 
 def _write_raw_deepseek_v4_checkpoint(checkpoint, *, omit_names=()):
@@ -238,6 +267,41 @@ def test_sequential_targets_include_registered_glm5_mtp_layer():
         "layers.1",
         "layers.2",
     )
+
+
+def test_gptq_targets_split_quantized_modules_within_decoder():
+    model = _MultimodalModel()
+    schemes = {
+        "layers.0.proj": Mock(),
+        "layers.1.proj": Mock(),
+    }
+
+    assert _quantized_sequential_targets(
+        model, schemes, sequential_targets="Linear"
+    ) == (
+        "layers.0.proj",
+        "layers.1.proj",
+    )
+
+
+def test_gptq_targets_promote_attention_leaf():
+    model = _AttentionModel()
+    schemes = {
+        "layers.0.attention.q_proj": Mock(),
+        "layers.0.mlp": Mock(),
+    }
+
+    assert _quantized_sequential_targets(
+        model, schemes, sequential_targets="Linear"
+    ) == (
+        "layers.0.attention",
+        "layers.0.mlp",
+    )
+
+
+def test_expert_collection_detection_is_model_agnostic():
+    assert not _has_expert_collection(_MultimodalModel())
+    assert _has_expert_collection(_ExpertModel())
 
 
 def test_successful_work_cleanup_preserves_unknown_files(tmp_path):

@@ -246,6 +246,7 @@ def streaming_oneshot(
     async_save: bool = False,
     pack_to_int8: bool = True,
     finalize_only: bool = False,
+    sequential_targets: Sequence[str] | str | None = None,
     statistics_cache: CandidateStatisticsCache | None = None,
     candidate_config: Any | None = None,
     prefix_fingerprint: str = "",
@@ -261,6 +262,12 @@ def streaming_oneshot(
     By default, INT4 weights using the ``int-quantized`` W4A8 layout are packed
     two values per INT8 immediately before checkpoint I/O. Set
     ``pack_to_int8=False`` to retain the legacy unpacked layout.
+
+    GPTQ pretrained runs with expert collections automatically use the same
+    fine-grained ``Linear`` target policy as
+    ``oneshot(..., pipeline="sequential", sequential_targets="Linear")`` unless
+    ``sequential_targets`` is supplied. This lets GPTQ release each module's
+    Hessian at its sequential boundary, which is required for large MoE layers.
 
     Set ``finalize_only=True`` to validate and publish completed direct-writer
     shards after a previous normal-mode run failed during finalization.
@@ -319,6 +326,7 @@ def streaming_oneshot(
             async_save=async_save,
             pack_to_int8=pack_to_int8,
             finalize_only=finalize_only,
+            sequential_targets=sequential_targets,
             processor_identity=processor_identity,
         )
 
@@ -326,6 +334,8 @@ def streaming_oneshot(
         raise ValueError("async_save currently requires pretrained mode")
     if finalize_only:
         raise ValueError("finalize_only currently requires pretrained mode")
+    if sequential_targets is not None:
+        raise ValueError("sequential_targets currently requires pretrained mode")
     if processor_identity is not None:
         raise ValueError(
             "Boundary mode records processor identity in candidate_config; "
