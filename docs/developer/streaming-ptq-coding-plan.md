@@ -829,6 +829,8 @@ git diff --check: passed
 
 | upstream 提交/特性 | oneshot 行为 | streaming 处理 |
 |---|---|---|
+| `b3faa86f3`（upstream/main 当前最新）observer 数值统一 | MSE/iMatrix 共享 FP32/FP64 error numerics、scale rounding 和 patience 语义 | 直接复用共享 observer；streaming 只需补 checkpoint/qparams 等价回归，不能保留另一套误差数学 |
+| `176df1cdd`（upstream/main 当前第二新）REAP DDP diagnostics | 增强 REAP router 的 DDP 诊断测试 | REAP 是结构修改型 modifier，当前 streaming 不支持；该测试提交不改变 streaming contract，也不应引入 REAP 特化分支 |
 | `179140f73` AutoRound `fp_ref` 预填充 | `IntermediatesCache` 可提供 FP16 reference，跳过 AutoRound 的 `collect_reference` | 复用 boundary store 的当前 target reference；检测旧版 `auto-round` API，不传不支持的 keyword，并回退原生 reference 收集 |
 | `f2adfbdaa` `sequential_targets_per_subgraph="auto"` | 按 node memory 自动把多个 target 放进一个 subgraph | streaming 必须实现真正的 target group execution unit，统一 admission、lifecycle、传播和 checkpoint boundary；不能只把 tracer 参数改成大于 1 |
 | `8ea12bd63` sequential pipeline offloading | oneshot 可按 subgraph 管理 offload/prefetch | streaming 继续使用 checkpoint-backed session；只借鉴 working-set 和生命周期语义，不恢复淘汰的 CPU Hessian offload |
