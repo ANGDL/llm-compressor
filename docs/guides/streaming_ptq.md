@@ -1,6 +1,8 @@
 # Streaming PTQ
 
-Streaming PTQ quantizes one sequential model target at a time. It preserves the
+Streaming PTQ quantizes one sequential model target group at a time. The default
+group contains one target, while compatible recipes may group consecutive traced
+targets when their combined working set fits admission. It preserves the
 Modifier lifecycle and output format of `oneshot()` without requiring the full
 uncompressed model to remain resident on the execution device.
 
@@ -19,8 +21,8 @@ It reuses native Transformers inference and Accelerate weight offload.
 
 The pretrained streaming path must satisfy these invariants:
 
-1. Only the current sequential target is resident on the execution device.
-2. All weights in the current target remain resident for its complete
+1. Only the current sequential target group is resident on the execution device.
+2. All weights in the current target group remain resident for its complete
    calibration, Modifier update, propagation, compression, and save lifecycle.
 3. In normal mode, complete activation boundaries remain in CPU memory. Recovery
    mode may persist them on disk, but stages only one batch through CPU. The
@@ -28,7 +30,7 @@ The pretrained streaming path must satisfy these invariants:
 4. Each calibration and propagation forward transfers exactly one boundary
    batch from CPU to the execution device. The number of stored samples must not
    increase execution-device residency.
-5. At most one next target is materialized in CPU memory.
+5. At most one next target group is materialized in CPU memory.
 6. Checkpoint decoding and casting finish before a prepared target enters the
    execution-device transfer boundary.
 7. Model mutation and forward execution remain on the main thread.
@@ -546,6 +548,13 @@ or an attention module that the shared tracer keeps as a leaf, reaches
 `sequential_epoch_end` before the next target is loaded. Pass
 `sequential_targets=` to override this policy when a model requires a custom
 trace boundary.
+
+`sequential_targets_per_subgraph` controls how many consecutive traced targets
+share one streaming lifecycle. The default is `1`, which is the recommended
+setting for GPTQ on large MoE models. Grouped execution shares admission,
+modifier update, propagation, checkpoint transaction, and output shard
+boundaries. AutoRound remains single target because it independently tunes one
+decoder block at a time.
 
 `pipeline_devices` is removed rather than deprecated. It described a bounded
 two-GPU weight-prefetch implementation, not pipeline parallel execution, and it

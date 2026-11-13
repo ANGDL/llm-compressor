@@ -289,9 +289,18 @@ def streaming_oneshot_from_pretrained(
     finalize_only: bool = False,
     dtype_policy: StreamingDTypePolicy | None = None,
     sequential_targets: Sequence[str] | str | None = None,
+    sequential_targets_per_subgraph: int = 1,
     processor_identity: Any = None,
 ) -> Path:
     """Run traced streaming PTQ with an oneshot-like model/dataset interface."""
+    if (
+        not isinstance(sequential_targets_per_subgraph, int)
+        or isinstance(sequential_targets_per_subgraph, bool)
+        or sequential_targets_per_subgraph < 1
+    ):
+        raise ValueError(
+            "sequential_targets_per_subgraph must be a positive integer"
+        )
     checkpoint = Path(model).expanduser()
     output = Path(output_dir).expanduser()
     work = Path(work_dir).expanduser()
@@ -440,6 +449,7 @@ def streaming_oneshot_from_pretrained(
             device=device,
             dtype=target_dtype,
             tracing_ignore=dataset_args.tracing_ignore,
+            targets_per_subgraph=sequential_targets_per_subgraph,
         )
         adapter.execution = adapter.execution.with_inputs(
             dataloader.fingerprint,
@@ -499,6 +509,7 @@ def streaming_oneshot_from_pretrained(
                 recipe=parsed_recipe,
                 dataset_fingerprint=fingerprint,
                 targets=adapter.targets,
+                targets_per_subgraph=sequential_targets_per_subgraph,
                 materializer=materializer,
                 dtype_policy=dtype_policy,
                 target_dtype=target_dtype,
@@ -539,6 +550,7 @@ def streaming_oneshot_from_pretrained(
                     checkpoint_progress=checkpoint_progress,
                     async_save=async_save,
                     pack_to_int8=pack_to_int8,
+                    targets_per_subgraph=sequential_targets_per_subgraph,
                     execution=adapter.execution,
                 )
             )

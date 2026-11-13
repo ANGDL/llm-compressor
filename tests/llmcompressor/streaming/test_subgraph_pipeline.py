@@ -1258,9 +1258,12 @@ def test_rtn_reuses_calibration_forward_and_preserves_quantized_checkpoint(
 
 
 def _assert_streaming_matches_oneshot(
-    tmp_path, *, transform, quantizer, fingerprint
+    tmp_path, *, transform, quantizer, fingerprint, targets_per_subgraph=1
 ):
-    transform_name = type(transform()).__name__
+    transform_instance = transform() if transform is not None else None
+    transform_name = (
+        type(transform_instance).__name__ if transform_instance is not None else ""
+    )
     config = Qwen3Config(
         vocab_size=32,
         hidden_size=8,
@@ -1282,24 +1285,34 @@ def _assert_streaming_matches_oneshot(
     oneshot(
         model=str(checkpoint),
         dataset=_calibration_data(),
-        recipe=[transform(), quantizer()],
+        recipe=(
+            [quantizer()]
+            if transform_instance is None
+            else [transform_instance, quantizer()]
+        ),
         output_dir=baseline,
         num_calibration_samples=2,
         max_seq_length=4,
         precision="float32",
         pipeline="sequential",
         sequential_targets=["Qwen3DecoderLayer"],
+        sequential_targets_per_subgraph=targets_per_subgraph,
     )
     streamed = streaming_oneshot(
         model=checkpoint,
         dataset=_calibration_data(),
         dataset_fingerprint=fingerprint * 64,
-        recipe=[transform(), quantizer()],
+        recipe=(
+            [quantizer()]
+            if transform_instance is None
+            else [transform(), quantizer()]
+        ),
         output_dir=tmp_path / "streamed",
         work_dir=tmp_path / "work",
         num_calibration_samples=2,
         max_seq_length=4,
         target_dtype=torch.float32,
+        sequential_targets_per_subgraph=targets_per_subgraph,
     )
 
     expected = _checkpoint_tensors(baseline)
@@ -1343,6 +1356,18 @@ def test_streaming_smoothquant_matches_sequential_oneshot(tmp_path):
             scheme="W8A8", ignore=["lm_head"]
         ),
         fingerprint="6",
+    )
+
+
+def test_streaming_grouped_targets_match_sequential_oneshot(tmp_path):
+    _assert_streaming_matches_oneshot(
+        tmp_path,
+        transform=lambda: None,
+        quantizer=lambda: QuantizationModifier(
+            scheme="W8A8", ignore=["lm_head"]
+        ),
+        fingerprint="8",
+        targets_per_subgraph=2,
     )
 
 

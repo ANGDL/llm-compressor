@@ -247,6 +247,7 @@ def streaming_oneshot(
     pack_to_int8: bool = True,
     finalize_only: bool = False,
     sequential_targets: Sequence[str] | str | None = None,
+    sequential_targets_per_subgraph: int = 1,
     statistics_cache: CandidateStatisticsCache | None = None,
     candidate_config: Any | None = None,
     prefix_fingerprint: str = "",
@@ -268,6 +269,8 @@ def streaming_oneshot(
     ``oneshot(..., pipeline="sequential", sequential_targets="Linear")`` unless
     ``sequential_targets`` is supplied. This lets GPTQ release each module's
     Hessian at its sequential boundary, which is required for large MoE layers.
+    ``sequential_targets_per_subgraph`` controls how many consecutive traced
+    targets share one streaming lifecycle; GPTQ MoE runs default to one target.
 
     Set ``finalize_only=True`` to validate and publish completed direct-writer
     shards after a previous normal-mode run failed during finalization.
@@ -327,6 +330,7 @@ def streaming_oneshot(
             pack_to_int8=pack_to_int8,
             finalize_only=finalize_only,
             sequential_targets=sequential_targets,
+            sequential_targets_per_subgraph=sequential_targets_per_subgraph,
             processor_identity=processor_identity,
         )
 
@@ -336,6 +340,10 @@ def streaming_oneshot(
         raise ValueError("finalize_only currently requires pretrained mode")
     if sequential_targets is not None:
         raise ValueError("sequential_targets currently requires pretrained mode")
+    if sequential_targets_per_subgraph != 1:
+        raise ValueError(
+            "sequential_targets_per_subgraph currently requires pretrained mode"
+        )
     if processor_identity is not None:
         raise ValueError(
             "Boundary mode records processor identity in candidate_config; "
