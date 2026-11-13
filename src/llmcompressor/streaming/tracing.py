@@ -159,6 +159,21 @@ class TracedBoundaryAdapter:
     def target_subgraphs(self):
         return self._target_subgraphs
 
+    @property
+    def target_groups(self) -> tuple[tuple[int, ...], ...]:
+        """Return consecutive target indices owned by one traced subgraph."""
+
+        groups: list[list[int]] = []
+        previous_subgraph_index = None
+        for target_index, subgraph_index in enumerate(
+            self.plan.target_subgraph_indices
+        ):
+            if subgraph_index != previous_subgraph_index:
+                groups.append([])
+                previous_subgraph_index = subgraph_index
+            groups[-1].append(target_index)
+        return tuple(tuple(group) for group in groups)
+
     def calibration_boundaries(
         self, batches: Sequence[Mapping[str, Any]] | Any
     ) -> Iterator[dict[str, Any]]:
@@ -310,6 +325,23 @@ class TracedBoundaryAdapter:
             include_parameters=parameters,
         )
 
+    def plan_group(self, indices: Sequence[int]):
+        """Plan the union working set for one multi-target execution unit."""
+
+        if not indices:
+            raise ValueError("A streaming target group cannot be empty")
+        if len(indices) == 1:
+            return self.plan_target(indices[0])
+        plans = [self.plan_target(index) for index in indices]
+        module_names = tuple(
+            module_name
+            for plan in plans
+            for module_name in plan.module_names
+        )
+        return self.weight_session.plan_modules(
+            module_names, allow_missing_state=True
+        )
+
     def _prefix_dependency_candidates(self) -> tuple[str, ...]:
         target_ancestors = {""}
         for target_name in self.plan.target_names:
@@ -418,6 +450,7 @@ def trace_streaming_boundaries(
     device: torch.device | str = "cpu",
     dtype: torch.dtype = torch.bfloat16,
     tracing_ignore: Sequence[str] = (),
+    targets_per_subgraph: int = 1,
 ) -> TracedBoundaryAdapter:
     """Trace model boundaries with the same implementation used by oneshot."""
 
@@ -426,7 +459,7 @@ def trace_streaming_boundaries(
         dict(sample_batch),
         sequential_targets,
         tracing_ignore,
-        targets_per_subgraph=1,
+        targets_per_subgraph=targets_per_subgraph,
     )
     if target_names is not None and tuple(target_names) != plan.target_names:
         raise ValueError(

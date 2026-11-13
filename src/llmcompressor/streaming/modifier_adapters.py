@@ -68,6 +68,7 @@ class StreamingModifierAdapter:
     identifier = "streaming-modifier-v1"
     owns_quantization = False
     calibration_outputs_reusable = False
+    supports_target_groups = True
     propagation_mode = "post-update-full-precision"
     minimum_batches = 1
 
@@ -289,6 +290,7 @@ class AutoRoundStreamingAdapter(StreamingModifierAdapter):
     identifier = "autoround-independent-block-output-v1"
     owns_quantization = True
     calibration_outputs_reusable = True
+    supports_target_groups = False
     propagation_mode = "calibration-full-precision"
 
     @contextmanager

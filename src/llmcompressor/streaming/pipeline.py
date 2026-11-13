@@ -21,6 +21,7 @@ from llmcompressor.modifiers.quantization.calibration import (
 )
 from llmcompressor.modifiers.quantization.quantization.mixin import QuantizationMixin
 from llmcompressor.modifiers.utils.hooks import HooksMixin
+from llmcompressor.pipelines.cache import IntermediatesCache, IntermediateValue
 from llmcompressor.recipe import Recipe
 from llmcompressor.utils.helpers import DisableQuantization
 from llmcompressor.utils.int4_packing import DEFAULT_INT4_PACKING_WORKSPACE_BYTES
@@ -282,6 +283,7 @@ def _initialize_run(
     recipe: Recipe,
     dataset_fingerprint: str,
     targets: tuple[str, ...],
+    targets_per_subgraph: int = 1,
     materializer: WeightMaterializer,
     target_dtype: torch.dtype,
     num_samples: int,
@@ -308,6 +310,7 @@ def _initialize_run(
             "recipe": normalized_recipe,
             "dataset": dataset_fingerprint,
             "targets": targets,
+            "targets_per_subgraph": targets_per_subgraph,
             "materializer": materializer.manifest_info(
                 target_dtype=target_dtype, dtype_policy=dtype_policy
             ).config_sha256,
@@ -335,7 +338,9 @@ def _initialize_run(
             max_seq_length=max_seq_length,
             seed=seed,
         ),
-        sequential=SequentialInfo(targets),
+        sequential=SequentialInfo(
+            targets, targets_per_subgraph=targets_per_subgraph
+        ),
         materializer=materializer.manifest_info(
             target_dtype=target_dtype, dtype_policy=dtype_policy
         ),
@@ -387,24 +392,38 @@ def _is_under_any(module_name: str, roots: Sequence[str]) -> bool:
     )
 
 
+def _target_roots(target_name: str | Sequence[str]) -> tuple[str, ...]:
+    if isinstance(target_name, str):
+        return (target_name,)
+    roots = tuple(target_name)
+    if not roots:
+        raise ValueError("At least one target root is required")
+    return roots
+
+
 def _write_loaded_target(
     transaction,
     loaded,
-    target_name: str,
+    target_name: str | Sequence[str],
     source,
     materializer: WeightMaterializer,
     *,
     pack_to_int8: bool,
     exclude_modules: Sequence[str] = (),
 ) -> set[str]:
+    target_roots = _target_roots(target_name)
     written = set()
-    formats = quantized_module_formats(loaded.model.named_modules(), prefix=target_name)
+    formats = {}
+    for root in target_roots:
+        formats.update(
+            quantized_module_formats(loaded.model.named_modules(), prefix=root)
+        )
     formats = {
         name: value
         for name, value in formats.items()
         if not _is_under_any(name, exclude_modules)
     }
-    for name, tensor in loaded.state_tensors_under((target_name,)):
+    for name, tensor in loaded.state_tensors_under(target_roots):
         owner_name = name.rpartition(".")[0]
         if _is_under_any(owner_name, exclude_modules):
             continue
@@ -438,13 +457,18 @@ def _write_loaded_target(
 
 def _loaded_target_delta(
     loaded,
-    target_name: str,
+    target_name: str | Sequence[str],
     materializer: WeightMaterializer | None = None,
     *,
     pack_to_int8: bool,
     exclude_modules: Sequence[str] = (),
 ):
-    formats = quantized_module_formats(loaded.model.named_modules(), prefix=target_name)
+    target_roots = _target_roots(target_name)
+    formats = {}
+    for root in target_roots:
+        formats.update(
+            quantized_module_formats(loaded.model.named_modules(), prefix=root)
+        )
     formats = {
         name: value
         for name, value in formats.items()
@@ -453,7 +477,7 @@ def _loaded_target_delta(
     tensors = {}
     written = set()
     owned_cpu_tensors = set()
-    for name, tensor in loaded.state_tensors_under((target_name,)):
+    for name, tensor in loaded.state_tensors_under(target_roots):
         if _is_under_any(name.rpartition(".")[0], exclude_modules):
             continue
         prepared = _prepare_loaded_tensor_for_save(
@@ -486,15 +510,20 @@ def _loaded_target_delta(
 
 def _estimate_loaded_target_snapshot_bytes(
     loaded,
-    target_name: str,
+    target_name: str | Sequence[str],
     *,
     pack_to_int8: bool,
     exclude_modules: Sequence[str] = (),
 ) -> int:
-    formats = quantized_module_formats(loaded.model.named_modules(), prefix=target_name)
+    target_roots = _target_roots(target_name)
+    formats = {}
+    for root in target_roots:
+        formats.update(
+            quantized_module_formats(loaded.model.named_modules(), prefix=root)
+        )
     total = 0
     workspace = 0
-    for name, tensor in loaded.state_tensors_under((target_name,)):
+    for name, tensor in loaded.state_tensors_under(target_roots):
         owner_name, _, local_name = name.rpartition(".")
         if _is_under_any(owner_name, exclude_modules):
             continue
@@ -522,7 +551,7 @@ def _estimate_loaded_target_snapshot_bytes(
 def _write_loaded_target_direct(
     writer: DirectSafetensorsWriter,
     loaded,
-    target_name: str,
+    target_name: str | Sequence[str],
     shard_id: str,
     materializer: WeightMaterializer | None = None,
     *,
@@ -583,6 +612,67 @@ def _modifier_update(
         adapter.after_update(modules)
     for quantizer in quantizers:
         quantizer.end_layerwise_calibration(list(modules))
+
+
+def _forward_target_group(
+    adapter: TracedBoundaryAdapter,
+    target_indices: Sequence[int],
+    value: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Execute consecutive target subgraphs without publishing internal boundaries."""
+
+    current = dict(value)
+    for target_index in target_indices:
+        subgraph = adapter.target_subgraphs[target_index]
+        inputs = {name: current[name] for name in subgraph.input_names}
+        output = subgraph.forward(adapter.model, **inputs)
+        next_value = {**current, **output}
+        for consumed in subgraph.consumed_names:
+            next_value.pop(consumed, None)
+        current = next_value
+    return current
+
+
+def _reference_tensor(value: Any) -> torch.Tensor | None:
+    """Find a floating decoder output in a boundary value."""
+
+    if isinstance(value, torch.Tensor):
+        return value if value.is_floating_point() and value.ndim >= 2 else None
+    if isinstance(value, Mapping):
+        for name in ("hidden_states", "inputs_embeds"):
+            if name in value:
+                reference = _reference_tensor(value[name])
+                if reference is not None:
+                    return reference
+        for item in value.values():
+            reference = _reference_tensor(item)
+            if reference is not None:
+                return reference
+    elif isinstance(value, (tuple, list)):
+        for item in value:
+            reference = _reference_tensor(item)
+            if reference is not None:
+                return reference
+    return None
+
+
+def _streaming_reference_cache(
+    boundaries: BoundaryActivationStore,
+    boundary_index: int,
+    batches: Sequence[int],
+) -> IntermediatesCache | None:
+    """Expose bounded next-boundary outputs using the oneshot cache protocol."""
+
+    intermediates = []
+    for batch_index in batches:
+        value = boundaries.get(boundary_index, batch_index, device="cpu")
+        reference = _reference_tensor(value)
+        if reference is None:
+            return None
+        intermediates.append(
+            {"hidden_states": IntermediateValue(value=reference, device=None)}
+        )
+    return IntermediatesCache(intermediates, offload_device=None)
 
 
 def _can_reuse_calibration_outputs(recipe: Recipe) -> bool:
@@ -702,7 +792,7 @@ def _complete_direct_writer_staging(
     states = writer.committed_metadata()
     required_target_shards = {
         f"model-subgraph-{index:05d}.safetensors"
-        for index in range(len(adapter.targets))
+        for index in range(len(adapter.target_groups))
     }
     available_target_shards = {
         state["output_shard"]
@@ -817,6 +907,7 @@ def run_subgraph_streaming_pipeline(
     pack_to_int8: bool = True,
     dtype_policy: StreamingDTypePolicy | None = None,
     execution: StreamingExecutionDescriptor | None = None,
+    targets_per_subgraph: int = 1,
 ) -> tuple[Path, Path, str]:
     """Calibrate, modify, propagate, and persist one subgraph at a time."""
 
@@ -853,14 +944,35 @@ def run_subgraph_streaming_pipeline(
     execution = replace(execution, input_fingerprint=calibration_batches.fingerprint)
     adapter.execution = execution
     execution.validate(adapter.model, adapter.targets)
-    for index in range(len(adapter.targets)):
-        adapter.plan_target(index)
+    target_groups = adapter.target_groups
+    if not target_groups:
+        raise ValueError("Streaming execution plan contains no target groups")
+    if any(len(group) > targets_per_subgraph for group in target_groups):
+        raise ValueError(
+            "Streaming trace produced a target group larger than the requested "
+            f"targets_per_subgraph={targets_per_subgraph}"
+        )
+    unsupported_grouped_adapters = [
+        type(adapter).__name__
+        for adapter in modifier_adapters(recipe.modifiers)
+        if not adapter.supports_target_groups
+        and any(len(group) > 1 for group in target_groups)
+    ]
+    if unsupported_grouped_adapters:
+        raise ModifierContractError(
+            "Streaming target grouping is incompatible with "
+            f"{', '.join(unsupported_grouped_adapters)}; use "
+            "sequential_targets_per_subgraph=1"
+        )
+    for group in target_groups:
+        adapter.plan_group(group)
     run_fingerprint = _initialize_run(
         checkpoint=checkpoint,
         artifact_dir=artifact_dir,
         recipe=recipe,
         dataset_fingerprint=dataset_fingerprint,
         targets=adapter.targets,
+        targets_per_subgraph=targets_per_subgraph,
         materializer=materializer,
         dtype_policy=dtype_policy,
         target_dtype=target_dtype,
@@ -1032,23 +1144,32 @@ def run_subgraph_streaming_pipeline(
         pipeline_failed = True
         try:
             prefetch_pending = False
-            for target_index, (target_name, subgraph) in enumerate(
-                zip(adapter.targets, adapter.target_subgraphs)
-            ):
-                transaction_id = f"subgraph-{target_index:05d}"
+            target_count = len(target_groups)
+            for group_index, target_indices in enumerate(target_groups):
+                group_start = target_indices[0]
+                group_end = target_indices[-1]
+                next_boundary = group_end + 1
+                has_next = group_index + 1 < target_count
+                target_names = tuple(adapter.targets[index] for index in target_indices)
+                target_name = " + ".join(target_names)
+                subgraphs = tuple(
+                    adapter.target_subgraphs[index] for index in target_indices
+                )
+                transaction_id = f"subgraph-{group_index:05d}"
                 if (
                     transaction_writer is not None
                     and resume_plan is not None
                     and transaction_id in resume_metadata
                 ):
                     label = _target_label(
-                        target_index, len(adapter.targets), target_name
+                        group_index, target_count, target_name
                     )
                     streaming_logger.info(f"{label} | restoring checkpoint")
                     metadata = resume_metadata[transaction_id]
                     written.update(record["name"] for record in metadata["records"])
                     written.update(
                         f"{name}.weight"
+                        for subgraph in subgraphs
                         for name in subgraph.submodule_dict(adapter.model)
                         if materializer.output_module_name(name)
                         in metadata.get("quantized_modules", {})
@@ -1070,11 +1191,12 @@ def run_subgraph_streaming_pipeline(
                                 batch_index,
                                 value,
                             )
-                    boundaries.delete(target_index)
-                    for modifier_adapter in runtime_adapters:
-                        modifier_adapter.restore_target(
-                            adapter.model.get_submodule(target_name)
-                        )
+                    boundaries.delete(group_start)
+                    for name in target_names:
+                        for modifier_adapter in runtime_adapters:
+                            modifier_adapter.restore_target(
+                                adapter.model.get_submodule(name)
+                            )
                     continue
                 if (
                     transaction_writer is not None
@@ -1084,10 +1206,10 @@ def run_subgraph_streaming_pipeline(
                         f"Committed transaction {transaction_id!r} is corrupt; "
                         "refusing to replace durable output"
                     )
-                batches = boundaries.batch_indices(target_index)
+                batches = boundaries.batch_indices(group_start)
                 if not batches:
                     raise RuntimeError(
-                        f"Missing boundary {target_index} for {target_name!r}"
+                        f"Missing boundary {group_start} for {target_name!r}"
                     )
                 if any(
                     len(batches) < modifier_adapter.minimum_batches
@@ -1096,8 +1218,7 @@ def run_subgraph_streaming_pipeline(
                     raise ModifierContractError(
                         "Streaming QAD validation requires at least two batches"
                     )
-                target_count = len(adapter.targets)
-                target_label = _target_label(target_index, target_count, target_name)
+                target_label = _target_label(group_index, target_count, target_name)
                 _reset_peak_memory(device)
                 streaming_logger.info(
                     f"{target_label} | start | batches={len(batches)} | device={device}"
@@ -1111,8 +1232,8 @@ def run_subgraph_streaming_pipeline(
                 # A previous attempt can fail after publishing only part of the
                 # next external boundary but before committing its transaction.
                 # Rebuild it from scratch so stale batches are never consumed.
-                if target_index + 1 < len(adapter.targets):
-                    boundaries.delete(target_index + 1)
+                if has_next:
+                    boundaries.delete(next_boundary)
                 weight_stack = ExitStack()
                 completion_reservation = None
                 prefetched_prepared = None
@@ -1121,10 +1242,16 @@ def run_subgraph_streaming_pipeline(
                         prefetched_prepared = prefetcher.take()
                         prefetch_pending = False
                         weight_stack.callback(prefetched_prepared.close)
-                    resident_modules = tuple(subgraph.submodules(adapter.model))
+                    resident_modules = tuple(
+                        dict.fromkeys(
+                            module
+                            for subgraph in subgraphs
+                            for module in subgraph.submodules(adapter.model)
+                        )
+                    )
                     if runtime_adapters:
                         weight_stack.enter_context(
-                            target_rng_scope(seed, target_index, device)
+                            target_rng_scope(seed, group_index, device)
                         )
                     for modifier_adapter in runtime_adapters:
                         modifier_adapter.before_target(resident_modules)
@@ -1132,9 +1259,12 @@ def run_subgraph_streaming_pipeline(
                     max_batch_tokens = 0
                     boundary_bytes = 0
                     for batch_index in batches:
-                        value = boundaries.get(target_index, batch_index)
+                        value = boundaries.get(group_start, batch_index)
                         batch_tokens = _boundary_token_count(
-                            {name: value[name] for name in subgraph.input_names}
+                            {
+                                name: value[name]
+                                for name in subgraphs[0].input_names
+                            }
                         )
                         num_tokens += batch_tokens
                         max_batch_tokens = max(max_batch_tokens, batch_tokens)
@@ -1148,7 +1278,7 @@ def run_subgraph_streaming_pipeline(
                         plan = (
                             prefetched_prepared.plan
                             if prefetched_prepared is not None
-                            else adapter.plan_target(target_index)
+                            else adapter.plan_group(target_indices)
                         )
                         modifier_memory = estimate_modifier_memory(
                             modifiers,
@@ -1252,29 +1382,41 @@ def run_subgraph_streaming_pipeline(
                             adapter.weight_session.installed(prepared)
                         )
 
-                    next_index = target_index + 1
-                    if prefetcher is not None and next_index < target_count:
-                        next_name = adapter.targets[next_index]
-                        next_label = _target_label(next_index, target_count, next_name)
+                    if prefetcher is not None and has_next:
+                        next_indices = target_groups[group_index + 1]
+                        next_names = tuple(
+                            adapter.targets[index] for index in next_indices
+                        )
+                        next_name = " + ".join(next_names)
+                        next_label = _target_label(
+                            group_index + 1, target_count, next_name
+                        )
                         with _stage_logger(
                             adapter.model,
                             f"{next_label} | plan weights",
                             device,
                         ):
-                            next_plan = adapter.plan_target(next_index)
+                            next_plan = adapter.plan_group(next_indices)
                             next_required = adapter.weight_session.estimate_preparation(
                                 next_plan, dtype=target_dtype
                             )
+                            next_modules = tuple(
+                                dict.fromkeys(
+                                    module
+                                    for index in next_indices
+                                    for module in adapter.target_subgraphs[
+                                        index
+                                    ].submodules(adapter.model)
+                                )
+                            )
                             next_modifier_memory = estimate_modifier_memory(
                                 modifiers,
-                                adapter.target_subgraphs[next_index].submodules(
-                                    adapter.model
-                                ),
+                                next_modules,
                                 num_tokens=num_tokens,
                                 max_batch_tokens=max_batch_tokens,
                             )
                             completion_bytes = _estimate_loaded_target_snapshot_bytes(
-                                loaded, target_name, pack_to_int8=pack_to_int8
+                                loaded, target_names, pack_to_int8=pack_to_int8
                             )
                             next_reservation = None
                             next_device_reservation = None
@@ -1388,59 +1530,82 @@ def run_subgraph_streaming_pipeline(
                             for batch_index in batches:
                                 session.state.current_batch_idx = batch_index
                                 value = boundaries.get(
-                                    target_index,
+                                    group_start,
                                     batch_index,
                                     device=device,
                                 )
-                                inputs = {
-                                    name: value[name] for name in subgraph.input_names
-                                }
                                 if batch_index == batches[0]:
                                     _debug_boundary(
                                         "calibration input",
-                                        boundary=target_index,
+                                        boundary=group_start,
                                         batch=batch_index,
                                         producer=(
-                                            adapter.targets[target_index - 1]
-                                            if target_index
+                                            adapter.targets[group_start - 1]
+                                            if group_start
                                             else "<dataset>"
                                         ),
                                         consumer=target_name,
-                                        value=inputs,
+                                        value={
+                                            name: value[name]
+                                            for name in subgraphs[0].input_names
+                                        },
                                     )
-                                output = subgraph.forward(adapter.model, **inputs)
+                                next_value = _forward_target_group(
+                                    adapter, target_indices, value
+                                )
                                 if (
-                                    reuse_calibration_outputs
-                                    and target_index + 1 < target_count
+                                    reuse_calibration_outputs and has_next
                                 ):
                                     # These modifiers only collect statistics
                                     # and compute qparams. Snapshot the output
                                     # now, before the next batch can mutate it,
                                     # and consume each input batch as usual.
-                                    next_value = {**value, **output}
-                                    for consumed in subgraph.consumed_names:
-                                        next_value.pop(consumed, None)
                                     boundaries.commit_propagated_batch(
-                                        target_index,
-                                        target_index + 1,
+                                        group_start,
+                                        next_boundary,
                                         batch_index,
                                         next_value,
                                     )
-                                    del next_value
-                                del inputs, output, value
+                                del next_value, value
                     with _stage_logger(
                         adapter.model,
                         f"{target_label} | modifier update",
                         device,
                     ):
-                        _modifier_update(resident_modules, quantizers, runtime_adapters)
+                        reference_cache = None
+                        previous_activations = session.state.sequential_activations
+                        previous_propagate_error = (
+                            session.state.sequential_propagate_error
+                        )
+                        if (
+                            reuse_calibration_outputs and has_next
+                        ):
+                            reference_cache = _streaming_reference_cache(
+                                boundaries, next_boundary, batches
+                            )
+                            if reference_cache is not None:
+                                session.state.sequential_activations = (
+                                    reference_cache
+                                )
+                                session.state.sequential_propagate_error = False
+                        try:
+                            _modifier_update(
+                                resident_modules, quantizers, runtime_adapters
+                            )
+                        finally:
+                            session.state.sequential_activations = (
+                                previous_activations
+                            )
+                            session.state.sequential_propagate_error = (
+                                previous_propagate_error
+                            )
+                            del reference_cache
                     # Algorithms that update weights need a fresh forward for
                     # the next target. Statistics-only recipes have already
                     # committed that boundary during calibration. The final
                     # target has no successor and never needs propagation.
                     if (
-                        not reuse_calibration_outputs
-                        and target_index + 1 < target_count
+                        not reuse_calibration_outputs and has_next
                     ):
                         with _stage_logger(
                             adapter.model,
@@ -1451,7 +1616,6 @@ def run_subgraph_streaming_pipeline(
                             # modified full-precision output (or an algorithm's
                             # in-place weight update), without adding fake-quant
                             # QDQ to every quantized module.
-                            consumed_names = subgraph.consumed_names
                             with (
                                 HooksMixin.disable_hooks(),
                                 (
@@ -1467,34 +1631,36 @@ def run_subgraph_streaming_pipeline(
                             ):
                                 for batch_index in batches:
                                     value = boundaries.get(
-                                        target_index,
+                                        group_start,
                                         batch_index,
                                         device=device,
                                     )
-                                    inputs = {
-                                        name: value[name]
-                                        for name in subgraph.input_names
-                                    }
-                                    output = subgraph.forward(adapter.model, **inputs)
-                                    next_value = {**value, **output}
-                                    for consumed in consumed_names:
-                                        next_value.pop(consumed, None)
+                                    next_value = _forward_target_group(
+                                        adapter, target_indices, value
+                                    )
                                     boundaries.commit_propagated_batch(
-                                        target_index,
-                                        target_index + 1,
+                                        group_start,
+                                        next_boundary,
                                         batch_index,
                                         next_value,
                                     )
                                     if batch_index == batches[0]:
                                         _debug_boundary(
                                             "propagated",
-                                            boundary=target_index + 1,
+                                            boundary=next_boundary,
                                             batch=batch_index,
                                             producer=target_name,
-                                            consumer=adapter.targets[target_index + 1],
+                                            consumer=(
+                                                " + ".join(
+                                                    adapter.targets[index]
+                                                    for index in target_groups[
+                                                        group_index + 1
+                                                    ]
+                                                )
+                                            ),
                                             value=next_value,
                                         )
-                                    del next_value, inputs, output, value
+                                    del next_value, value
 
                     with _stage_logger(
                         adapter.model,
@@ -1513,21 +1679,21 @@ def run_subgraph_streaming_pipeline(
                             with transaction_writer.transaction(
                                 transaction_id
                             ) as transaction:
-                                if target_index + 1 < len(adapter.targets):
+                                if has_next:
                                     for batch_index in batches:
                                         transaction.write_boundary(
                                             batch_index,
                                             boundaries.get(
-                                                target_index + 1, batch_index
+                                                next_boundary, batch_index
                                             ),
-                                            boundary=target_index + 1,
+                                            boundary=next_boundary,
                                             expected_batch_count=len(batches),
                                         )
                                 written.update(
                                     _write_loaded_target(
                                         transaction,
                                         loaded,
-                                        target_name,
+                                        target_names,
                                         source,
                                         materializer,
                                         pack_to_int8=pack_to_int8,
@@ -1543,7 +1709,7 @@ def run_subgraph_streaming_pipeline(
                                 _write_loaded_target_direct(
                                     direct_writer,
                                     loaded,
-                                    target_name,
+                                    target_names,
                                     transaction_id,
                                     materializer,
                                     pack_to_int8=pack_to_int8,
@@ -1557,7 +1723,7 @@ def run_subgraph_streaming_pipeline(
                         device,
                     ):
                         weight_stack.close()
-                        boundaries.delete(target_index)
+                        boundaries.delete(group_start)
                         _empty_device_cache(device)
                 peak_allocated = (
                     torch.get_device_module(device).max_memory_allocated(device)

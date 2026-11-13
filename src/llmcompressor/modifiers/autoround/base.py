@@ -1,3 +1,4 @@
+import inspect
 import os
 from contextlib import contextmanager
 from typing import Any
@@ -21,13 +22,13 @@ from compressed_tensors.quantization import (
 from compressed_tensors.utils import align_module_device, match_named_modules
 from loguru import logger
 from pydantic import PrivateAttr
+from torch.utils._pytree import tree_map
+
 from llmcompressor._torch_accelerator_compat import (
     accelerator_is_available,
     current_accelerator_type,
     current_device_index,
 )
-from torch.utils._pytree import tree_map
-
 from llmcompressor.core import Event, State, active_session
 from llmcompressor.modifiers import Modifier
 from llmcompressor.modifiers.autoround.utils import (
@@ -41,6 +42,17 @@ from llmcompressor.utils.dev import get_main_device
 from llmcompressor.utils.pytorch import infer_sequential_targets
 
 __all__ = ["AutoRoundModifier", "fix_batch_if_needed"]
+
+
+def _supports_reference_output(quantizer: Any) -> bool:
+    """Return whether an AutoRound implementation accepts reference outputs."""
+
+    try:
+        return "reference_output" in inspect.signature(
+            quantizer.quantize_block
+        ).parameters
+    except (TypeError, ValueError, AttributeError):
+        return False
 
 
 class _LLModelWrapper(torch.nn.Module):
@@ -430,13 +442,18 @@ class AutoRoundModifier(Modifier, QuantizationMixin):
                 if len(_refs) == len(cur_inputs):
                     _fp_ref = _refs
 
+            quantize_kwargs = {
+                "block": decoding_layer,
+                "inputs": ar_inputs,
+                "q_input": self._q_input,
+                "device": str(device),
+                "auto_offload": auto_offload,
+            }
+            if _fp_ref is not None and _supports_reference_output(ar):
+                quantize_kwargs["reference_output"] = _fp_ref
+
             q_input, _ = ar.quantize_block(
-                block=decoding_layer,
-                inputs=ar_inputs,
-                q_input=self._q_input,
-                device=str(device),
-                auto_offload=auto_offload,
-                reference_output=_fp_ref,
+                **quantize_kwargs,
             )
             self._q_input = q_input
 
