@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import shutil
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import ExitStack
 from copy import deepcopy
 from pathlib import Path
@@ -12,7 +12,9 @@ from typing import Any
 
 import torch
 from compressed_tensors.quantization import QuantizationScheme
+from compressed_tensors.quantization.lifecycle.initialize import _is_attention_module
 from compressed_tensors.utils import match_named_modules
+from loguru import logger
 from torch import nn
 from torch.utils.data import DataLoader
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
@@ -123,22 +125,72 @@ def _is_module_or_descendant(name: str, ancestor: str) -> bool:
     return name == ancestor or name.startswith(f"{ancestor}.")
 
 
+def _target_contains_scheme(target_name: str, schemes: dict[str, QuantizationScheme]):
+    return any(
+        scheme_name == target_name or scheme_name.startswith(f"{target_name}.")
+        for scheme_name in schemes
+    )
+
+
+def _attention_ancestor(model: nn.Module, module_name: str) -> str | None:
+    current = module_name
+    while current:
+        current, _, _ = current.rpartition(".")
+        if current and _is_attention_module(model.get_submodule(current)):
+            return current
+    return None
+
+
+def _has_expert_collection(model: nn.Module) -> bool:
+    """Return whether the model exposes multiple routed expert modules."""
+    for name, module in model.named_modules():
+        if "expert" not in name.lower():
+            continue
+        if isinstance(module, (nn.ModuleList, nn.ModuleDict)) and len(module) > 1:
+            return True
+        count = getattr(module, "num_experts", None)
+        if isinstance(count, int) and count > 1:
+            return True
+    return False
+
+
 def _quantized_sequential_targets(
     model: nn.Module,
     schemes: dict[str, QuantizationScheme],
+    sequential_targets: Sequence[str] | str | None = None,
 ) -> tuple[str, ...]:
-    """Select no-split ancestors that contain an exact quantization target."""
-    patterns = infer_sequential_targets(model)
+    """Select trace targets which cover every exact quantization target.
+
+    The fine-grained GPTQ policy uses the same target semantics as the oneshot
+    sequential pipeline's ``sequential_targets="Linear"`` mode. This is
+    important for MoE layers: keeping a whole decoder block alive until
+    ``sequential_epoch_end`` retains one Hessian per expert and can exceed
+    device memory before GPTQ gets a chance to compress anything.
+
+    Attention modules are retained as a single target when the sequential tracer
+    treats them as leaves. Their nested quantized linears are then compressed at
+    the attention boundary, matching oneshot's tracing behavior.
+    """
+    patterns = infer_sequential_targets(model, sequential_targets)
+    if isinstance(patterns, str):
+        patterns = [patterns]
     matched_names = {name for name, _ in match_named_modules(model, patterns)}
-    relevant = {
+    candidates = {
         name
         for name in matched_names
-        if any(_is_module_or_descendant(scheme_name, name) for scheme_name in schemes)
+        if _target_contains_scheme(name, schemes)
     }
+
+    promoted = set(candidates)
+    for name in candidates:
+        ancestor = _attention_ancestor(model, name)
+        if ancestor is not None:
+            promoted.discard(name)
+            promoted.add(ancestor)
 
     selected = []
     for name, _ in model.named_modules():
-        if name not in relevant:
+        if name not in promoted:
             continue
         if any(_is_module_or_descendant(name, ancestor) for ancestor in selected):
             continue
@@ -236,6 +288,7 @@ def streaming_oneshot_from_pretrained(
     pack_to_int8: bool,
     finalize_only: bool = False,
     dtype_policy: StreamingDTypePolicy | None = None,
+    sequential_targets: Sequence[str] | str | None = None,
     processor_identity: Any = None,
 ) -> Path:
     """Run traced streaming PTQ with an oneshot-like model/dataset interface."""
@@ -352,7 +405,30 @@ def streaming_oneshot_from_pretrained(
             materializer,
             meta_model,
         )
-        sequential_targets = _quantized_sequential_targets(meta_model, schemes)
+        target_patterns = sequential_targets
+        automatic_gptq_targets = (
+            target_patterns is None
+            and isinstance(quantizer, GPTQModifier)
+            and _has_expert_collection(meta_model)
+        )
+        if automatic_gptq_targets:
+            target_patterns = ["Linear"]
+        sequential_targets = _quantized_sequential_targets(
+            meta_model,
+            schemes,
+            sequential_targets=target_patterns,
+        )
+        target_mode = (
+            "automatic GPTQ Linear"
+            if automatic_gptq_targets
+            else "explicit"
+            if target_patterns is not None
+            else "inferred"
+        )
+        logger.info(
+            "Streaming sequential targets: "
+            f"{len(sequential_targets)} target(s) ({target_mode})"
+        )
         adapter = trace_streaming_boundaries(
             model=meta_model,
             source=materializer.create_source(str(checkpoint)),
