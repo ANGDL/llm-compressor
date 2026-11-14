@@ -42,3 +42,14 @@ def test_collator_preserves_native_image_geometry():
     assert first["image_width"] == 32
     assert second["image_width"] == 45
     assert streaming_input_contract(first) == streaming_input_contract(second)
+
+
+def test_higgs_candidate_schemes_are_dynamic_weight_activation_schemes():
+    schemes = MODULE._higgs_candidate_schemes([4, 8], scale_dtype=torch.float32)
+
+    assert [scheme.weights.num_bits for scheme in schemes] == [4, 8]
+    for scheme in schemes:
+        assert scheme.weights.scale_dtype == torch.float32
+        assert scheme.input_activations.num_bits == 8
+        assert scheme.input_activations.dynamic
+        assert scheme.targets == ["Linear"]

@@ -55,14 +55,18 @@ def test_streaming_higgs_reads_only_current_logical_group(tmp_path):
 
     source = SafetensorsWeightSource(checkpoint)
     reads = []
-    original_load = source.load_tensors_cpu
+    iterator_calls = 0
+    original_iter = source.iter_tensor_groups_cpu
 
-    def record_load(names):
-        names = tuple(names)
-        reads.append(names)
-        return original_load(names)
+    def record_iter(groups):
+        nonlocal iterator_calls
+        iterator_calls += 1
+        for names in groups:
+            names = tuple(names)
+            reads.append(names)
+            yield from original_iter([names])
 
-    source.load_tensors_cpu = record_load
+    source.iter_tensor_groups_cpu = record_iter
     provider = StreamingHiggsConfigProvider(
         [_scheme(4), _scheme(8)],
         ignore=["lm_head"],
@@ -89,4 +93,5 @@ def test_streaming_higgs_reads_only_current_logical_group(tmp_path):
         "model.layers.0.self_attn.k_proj.weight",
     }
     assert all(len(names) <= 2 for names in reads)
+    assert iterator_calls == 1
     assert len(provider.config_fingerprint) == 64

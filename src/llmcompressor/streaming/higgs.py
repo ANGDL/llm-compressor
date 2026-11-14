@@ -267,35 +267,16 @@ class StreamingHiggsConfigProvider:
             return expert[:split_width]
         return expert[split_width:]
 
-    def _load_group(
+    def _materialize_group(
         self,
         source: CheckpointWeightSource,
         records: Mapping[str, _LogicalWeight],
         names: Sequence[str],
+        raw_values: Mapping[str, torch.Tensor],
     ) -> dict[str, torch.Tensor]:
         physical_names = tuple(
             dict.fromkeys(records[name].physical_name for name in names)
         )
-        requests = []
-        for physical_name in physical_names:
-            metadata = source.metadata(physical_name)
-            requests.append(
-                (
-                    physical_name,
-                    (
-                        physical_name,
-                        *self.materializer.dependencies(
-                            physical_name,
-                            metadata,
-                        ),
-                    ),
-                )
-            )
-
-        raw_values: dict[str, torch.Tensor] = {}
-        for _, request in requests:
-            raw_values.update(source.load_tensors_cpu(request))
-
         decoded: dict[str, torch.Tensor] = {}
         try:
             for physical_name in physical_names:
@@ -321,9 +302,28 @@ class StreamingHiggsConfigProvider:
                             record, decoded_physical
                         )
         finally:
-            raw_values.clear()
             decoded_physical = None
         return decoded
+
+    def _group_requests(
+        self,
+        source: CheckpointWeightSource,
+        records: Mapping[str, _LogicalWeight],
+        names: Sequence[str],
+    ) -> tuple[str, ...]:
+        physical_names = tuple(
+            dict.fromkeys(records[name].physical_name for name in names)
+        )
+        requests = []
+        for physical_name in physical_names:
+            metadata = source.metadata(physical_name)
+            requests.extend(
+                (
+                    physical_name,
+                    *self.materializer.dependencies(physical_name, metadata),
+                )
+            )
+        return tuple(dict.fromkeys(requests))
 
     def collect(
         self,
@@ -354,8 +354,14 @@ class StreamingHiggsConfigProvider:
         matched_names = [tensor_name for _, tensor_name in matched]
         collector.set_weight_names(set(matched_names))
 
-        for group in self._group_records(matched_names):
-            values = self._load_group(source, records, group)
+        groups = self._group_records(matched_names)
+        requests = (
+            self._group_requests(source, records, group) for group in groups
+        )
+        for group, raw_values in zip(
+            groups, source.iter_tensor_groups_cpu(requests)
+        ):
+            values = self._materialize_group(source, records, group, raw_values)
             try:
                 collector.process(values)
             finally:
