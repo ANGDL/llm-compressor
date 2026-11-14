@@ -16,7 +16,10 @@ from llmcompressor.entrypoints.higgs import (
     compute_heuristic_alphas,
     compute_layer_mse,
 )
-from llmcompressor.entrypoints.higgs.utils import UNQUANTIZED_SCHEME
+from llmcompressor.entrypoints.higgs.utils import (
+    UNQUANTIZED_SCHEME,
+    generate_config_groups,
+)
 from llmcompressor.entrypoints.model_free.validate import validate_config
 
 
@@ -79,6 +82,25 @@ def test_mse_collector_basic(candidate_schemes, sample_tensors, require_higgs_cb
     assert len(config.config_groups) > 0
     assert config.config_groups is not None
     assert validate_config(config=config, scheme=None, ignore=[]) is config
+
+
+def test_mixed_expert_assignments_generate_disjoint_targets(candidate_schemes):
+    solution = {
+        "model.layers.0.ffn.experts.0.w1": "W4A16",
+        "model.layers.0.ffn.experts.1.w1": "W8A8",
+    }
+
+    config_groups = generate_config_groups(solution, candidate_schemes)
+
+    targets = [
+        target
+        for scheme in config_groups.values()
+        for target in scheme.targets
+    ]
+    assert targets == [
+        r"re:^model\.layers\.0\.ffn\.experts\.0\.w1$",
+        r"re:^model\.layers\.0\.ffn\.experts\.1\.w1$",
+    ]
 
 
 def test_mse_collector_uses_heuristic(
