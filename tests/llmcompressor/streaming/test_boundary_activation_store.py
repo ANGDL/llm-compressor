@@ -80,6 +80,16 @@ def test_memory_and_disk_round_trip_nested_values(store):
     assert store.batch_indices(1) == (0,)
 
 
+def test_round_trip_torch_dtype_metadata(store):
+    value = {"dtype": torch.bfloat16, "hidden_states": torch.ones(2)}
+
+    store.put(0, 0, value)
+    loaded = store.get(0, 0)
+
+    assert loaded["dtype"] is torch.bfloat16
+    assert torch.equal(loaded["hidden_states"], value["hidden_states"])
+
+
 def test_put_detaches_and_snapshots_tensors(store):
     tensor = torch.arange(4.0, requires_grad=True)
     value = {"hidden_states": tensor}

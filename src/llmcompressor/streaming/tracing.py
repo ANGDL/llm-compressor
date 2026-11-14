@@ -461,10 +461,14 @@ def trace_streaming_boundaries(
         tracing_ignore,
         targets_per_subgraph=targets_per_subgraph,
     )
-    if target_names is not None and tuple(target_names) != plan.target_names:
+    requested_target_names = tuple(target_names) if target_names is not None else None
+    if requested_target_names is not None and (
+        len(requested_target_names) != len(plan.target_names)
+        or set(requested_target_names) != set(plan.target_names)
+    ):
         raise ValueError(
             "Explicit target names differ from the shared sequential trace: "
-            f"expected {plan.target_names}, got {tuple(target_names)}"
+            f"expected {plan.target_names}, got {requested_target_names}"
         )
     execution = replace(
         describe_streaming_execution(model, plan.target_names, sample_batch),

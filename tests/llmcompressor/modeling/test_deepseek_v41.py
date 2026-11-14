@@ -8,9 +8,11 @@ import pytest
 import torch
 from safetensors import safe_open
 from safetensors.torch import load_file, save_file
+from torch.fx import Tracer
 from torch.utils.data import DataLoader
 from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForImageTextToText
 
+from llmcompressor.modeling.deepseek_v41 import CalibrationDeepseekV41MoE
 from llmcompressor.modeling.deepseekv41 import (
     DeepseekV41Cache,
     DeepseekV41NativeForCausalLM,
@@ -257,6 +259,50 @@ def test_moe_sorted_routes_preserve_outputs_and_expert_calibration_inputs(
             handle.remove()
         for name, observer in observers.items():
             observer.detach(linears[name])
+
+
+def test_moe_fx_trace_exposes_all_expert_targets():
+    config = tiny_config(dspark=False).text_config
+    config.n_routed_experts = 4
+    model = DeepseekV41MoE(config).eval()
+
+    class ExpertLeafTracer(Tracer):
+        def is_leaf_module(self, module, qualname):
+            return isinstance(module, type(model.experts[0])) or super().is_leaf_module(
+                module, qualname
+            )
+
+    graph = ExpertLeafTracer().trace(model, concrete_args={"image_mask": None})
+    expert_targets = {
+        node.target
+        for node in graph.nodes
+        if node.op == "call_module" and str(node.target).startswith("experts.")
+    }
+
+    assert expert_targets == {f"experts.{index}" for index in range(4)}
+
+
+def test_calibration_moe_fx_trace_exposes_all_expert_targets():
+    config = tiny_config(dspark=False).text_config
+    config.n_routed_experts = 4
+    model = CalibrationDeepseekV41MoE(
+        DeepseekV41MoE(config), config, calibrate_all_experts=False
+    ).eval()
+
+    class ExpertLeafTracer(Tracer):
+        def is_leaf_module(self, module, qualname):
+            return isinstance(module, type(model.experts[0])) or super().is_leaf_module(
+                module, qualname
+            )
+
+    graph = ExpertLeafTracer().trace(model, concrete_args={"image_mask": None})
+    expert_targets = {
+        node.target
+        for node in graph.nodes
+        if node.op == "call_module" and str(node.target).startswith("experts.")
+    }
+
+    assert expert_targets == {f"experts.{index}" for index in range(4)}
 
 
 def test_official_fp32_parameter_exceptions_survive_bf16_default():

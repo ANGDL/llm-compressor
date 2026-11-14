@@ -395,6 +395,29 @@ DSV4.1 的安全做法是让 `H_total` 只包含当前 routed expert 或受控�
 
 而不是把 Hessian 整体搬到 CPU 后继续保持错误的 target 粒度。
 
+#### 6.3.1 动态 routed MoE 的 tracing 兼容
+
+自动 GPTQ policy 将同一 `Expert` owner 下的 `w1/w2/w3` 作为一个
+target，再由 pipeline 把连续 owner 合并成 bounded target group。这个边界
+只有在共享 FX graph 中能看到每个 owner 的 `call_module` 时才成立。部分特化
+MoE forward 会先从 tensor 计算 active expert id，再用 Python `for`/`zip`
+遍历它；对 FX 而言，这会尝试迭代 `Proxy`，在 tracing 阶段直接失败。
+
+实现采用两层兼容策略：
+
+1. 通用 streaming 代码只做 module-tree owner discovery、target grouping、
+   admission 和 modifier lifecycle，不读取模型名，也不改 GPTQ 数学；
+2. 特化模型在自身 forward 或 calibration wrapper 内提供 FX 可见的绕环。DeepSeek
+   V4.1 在 `is_fx_tracing()` 为真时改用固定 `range(num_experts)`，每个循环体
+   通过 `torch.where(indices == expert_id)` 得到动态 token rows，再调用对应的
+   `Expert` owner；正常执行继续使用 active-expert grouping。
+
+该 tracing 分支必须保持三个不变量：路由权重和 token/slot 顺序与正常路径一致；
+shared expert 仍在同一 forward 中执行；每个量化 expert owner 都出现在 target
+plan。对应测试需要同时覆盖小模型 FX trace、正常路径输出一致性和 observer/
+statistics 输入一致性。不能通过把整个 `experts` collection 设为 leaf 来绕过
+问题，因为这会重新把所有 expert Hessian 留到一个 sequential boundary。
+
 ### 6.4 量化后传播
 
 GPTQ 更新当前权重后，如果存在 successor target，pipeline 会：
@@ -1012,6 +1035,36 @@ peak device allocated
 - `git diff --check`；
 - 两层 Qwen3 的 GPTQ/iMatrix 与 sequential oneshot 对照；
 - DSV4.1 native path 不被通用 MTP wrapper 接管。
+
+### 16.1 DSV4.1 GPTQ 端到端资源验证
+
+2026-11-14 的 DSV4.1 多模态 GPTQ 重跑暴露并修复了两个与 Hessian
+生命周期正交、但会遮蔽 admission 的通用 working-set 问题：
+
+1. prefix graph 中的 nested `get_attr` 参数（例如
+   `model.image_start`）不能把参数 owner `model` 当作完整 module root。
+   `SubgraphWeightSession` 现在跳过 nested direct parameter 的 subtree working
+   set，并用 parameter-level load plan 恢复它。否则 initial boundary 会错误地
+   同时加载 43 个 decoder block。
+2. traced prefix 可能跨 boundary 传递 `torch.dtype` 元数据，例如视觉路径中的
+   `weight.dtype`。Boundary store 将该值作为不可变标量保存和恢复，不会把它
+   当作 activation tensor。
+
+修复后的 attempt `attempt-20261114T140935Z-6a5386e2` 在进入 GPTQ target 前的
+initial boundary 峰值为 `4.88/103.1 GB`，prefix 只 materialize 3 个视觉权重
+组，每组 259 个 tensor。第一个 bounded target 包含 8 个连续 expert owner，
+admission 记录为：
+
+```text
+materialized_bytes=1,240,230,656
+modifier_held_bytes=2,013,669,552
+modifier_scratch_bytes=7,124,025,344
+device_required_bytes=10,377,925,552
+```
+
+这证明 GPTQ Hessian 已按 owner group 限制在当前 execution unit 内，未恢复
+CPU Hessian offload，也没有把整个 DSV4.1 block 作为一个 target。完整量化仍需
+等待 1,980 个 bounded groups 和后续 validate/report 阶段完成。
 
 环境限制：
 

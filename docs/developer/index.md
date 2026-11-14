@@ -36,6 +36,9 @@ LLM Compressor is an open-source project that values community contributions. We
 
 ## Streaming PTQ implementation
 
+- [Streaming PTQ implementation design](streaming-ptq-implementation-design.md):
+  detailed contracts for GPTQ Hessian lifetime, target admission, bounded HIGGS,
+  MTP compatibility, QAD limits, upstream adaptation, recovery, and validation.
 - [Transactional Streaming PTQ implementation plan](transactional-streaming-ptq-plan.md):
   recovery correctness, bounded activation retention, resource budgets, and
   extensions for GPTQ, MoE expert parallelism (EP), multimodal models, and

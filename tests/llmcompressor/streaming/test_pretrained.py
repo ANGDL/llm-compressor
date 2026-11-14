@@ -15,7 +15,14 @@ from transformers import (
     Qwen3ForCausalLM,
 )
 
+from llmcompressor.modeling.deepseekv41 import (
+    DeepseekV41NativeForCausalLM,
+)
+from llmcompressor.modeling.deepseekv41 import (
+    ModelConfig as DeepseekV41ModelConfig,
+)
 from llmcompressor.modifiers.quantization import QuantizationModifier
+from llmcompressor.pipelines.sequential.helpers import trace_graph
 from llmcompressor.recipe import Recipe
 from llmcompressor.streaming import (
     DeepSeekV4WeightMaterializer,
@@ -103,6 +110,60 @@ class _ExpertOwnerModel(torch.nn.Module):
                 )
             ]
         )
+
+
+def _tiny_deepseek_v41_config():
+    return DeepseekV41ModelConfig(
+        text_config=dict(
+            vocab_size=32,
+            hidden_size=32,
+            moe_intermediate_size=32,
+            num_hidden_layers=2,
+            num_nextn_predict_layers=1,
+            num_attention_heads=2,
+            n_routed_experts=4,
+            num_experts_per_tok=2,
+            q_lora_rank=32,
+            head_dim=32,
+            qk_rope_head_dim=8,
+            o_groups=2,
+            o_lora_rank=16,
+            sliding_window=4,
+            max_position_embeddings=64,
+            max_seq_len=64,
+            index_n_heads=2,
+            index_head_dim=32,
+            index_topk=2,
+            hc_mult=2,
+            compress_ratios=[0, 2, 0],
+            kv_source_layer_ids=[1],
+            index_source_layer_ids=[1],
+            candidate_source_layer_id=1,
+            candidate_topk_blocks=2,
+            candidate_block_size=2,
+            engram_layer_ids=[],
+            engram_num_embeddings=[],
+            engram_vocab_size=5,
+            engram_n_heads=1,
+            engram_head_dim=32,
+            engram_max_ngram_size=2,
+            engram_compressed_vocab_size=32,
+            dspark_block_size=3,
+            dspark_noise_token_id=31,
+            dspark_target_layer_ids=[1],
+            dspark_markov_rank=8,
+            dspark_n_routed_experts=2,
+            dspark_num_experts_per_tok=1,
+        ),
+        vision_config=dict(
+            num_hidden_layers=0,
+            hidden_size=32,
+            num_attention_heads=2,
+            intermediate_size=32,
+            patch_size=2,
+            downsample_ratio=2,
+        ),
+    )
 
 
 def _write_raw_deepseek_v4_checkpoint(checkpoint, *, omit_names=()):
@@ -347,6 +408,76 @@ def test_gptq_targets_promote_attention_leaf():
     ) == (
         "layers.0.attention",
         "layers.0.mlp",
+    )
+
+
+def test_gptq_targets_promote_deepseek_v41_dspark_attention_leaf():
+    model = DeepseekV41NativeForCausalLM(_tiny_deepseek_v41_config())
+    layer = model.model.layers[0]
+    schemes = {
+        "model.layers.0.attn.wq_a": Mock(),
+        "model.layers.0.ffn.experts.0.w1": Mock(),
+        "model.layers.0.ffn.experts.0.w2": Mock(),
+        "model.layers.0.ffn.experts.0.w3": Mock(),
+        "model.layers.0.ffn.experts.1.w1": Mock(),
+        "model.layers.0.ffn.experts.1.w2": Mock(),
+        "model.layers.0.ffn.experts.1.w3": Mock(),
+        "model.mtp.0.attn.wq_a": Mock(),
+        "model.mtp.0.ffn.experts.0.w1": Mock(),
+        "model.mtp.0.ffn.experts.0.w2": Mock(),
+        "model.mtp.0.ffn.experts.0.w3": Mock(),
+        "model.mtp.0.ffn.experts.1.w1": Mock(),
+        "model.mtp.0.ffn.experts.1.w2": Mock(),
+        "model.mtp.0.ffn.experts.1.w3": Mock(),
+    }
+
+    targets = _quantized_sequential_targets(
+        model,
+        schemes,
+        sequential_targets="Linear",
+        group_moe_experts=True,
+    )
+
+    assert "model.layers.0.attn" in targets
+    assert "model.layers.0.ffn.experts.0" in targets
+    assert "model.mtp.0.attn" in targets
+    assert "model.mtp.0.ffn.experts.0" in targets
+    assert "model.layers.0" not in targets
+    assert layer.attn.__class__.__name__ == "Attention"
+    assert model.model.mtp[0].attn.__class__.__name__ == "DSparkAttention"
+
+
+def test_deepseek_v41_trace_keeps_all_attention_calls_visible():
+    model = DeepseekV41NativeForCausalLM(_tiny_deepseek_v41_config()).eval()
+    schemes = {
+        name: Mock()
+        for name, module in model.named_modules()
+        if isinstance(module, torch.nn.Linear)
+    }
+    targets = _quantized_sequential_targets(
+        model,
+        schemes,
+        sequential_targets="Linear",
+        group_moe_experts=True,
+    )
+    graph, _ = trace_graph(
+        model,
+        {
+            "input_ids": torch.ones(1, 4, dtype=torch.long),
+            "attention_mask": torch.ones(1, 4, dtype=torch.bool),
+        },
+        list(targets),
+        [],
+    )
+
+    attention_calls = {
+        str(node.target)
+        for node in graph.graph.nodes
+        if node.op == "call_module" and str(node.target).endswith(".attn")
+    }
+
+    assert {"model.layers.0.attn", "model.layers.1.attn", "model.mtp.0.attn"} <= (
+        attention_calls
     )
 
 

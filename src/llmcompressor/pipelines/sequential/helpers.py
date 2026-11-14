@@ -5,7 +5,7 @@ from collections import UserDict, deque
 from dataclasses import dataclass
 from functools import wraps
 from types import FunctionType, MethodType
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, Sequence
 
 import torch
 from compressed_tensors.compressors import compress_module, decompress_module
@@ -192,11 +192,43 @@ def find_modules_outside_graph(model: Module, graph: GraphModule) -> dict[str, M
     return find_modules_outside_subgraphs(model, [whole_graph])
 
 
+def _match_sequential_targets(
+    model: Module, sequential_targets: Sequence[str]
+) -> dict[Module, str]:
+    """Match exact module paths without scanning every path against every target."""
+    named_modules = dict(model.named_modules())
+    class_targets = {
+        cls.__name__
+        for module in named_modules.values()
+        for cls in module.__class__.__mro__
+        if issubclass(cls, torch.nn.Module)
+    }
+    exact_names = set()
+    pattern_targets = []
+    for target in sequential_targets:
+        if (
+            target
+            and not target.startswith("re:")
+            and target in named_modules
+            and target not in class_targets
+        ):
+            exact_names.add(target)
+            continue
+        pattern_targets.append(target)
+    matched = {
+        module: name for name, module in named_modules.items() if name in exact_names
+    }
+    matched.update(
+        {module: name for name, module in match_named_modules(model, pattern_targets)}
+    )
+    return matched
+
+
 def _resolve_sequential_targets(
     model: PreTrainedModel, sequential_targets: list[str]
 ) -> set[Module]:
     """Combine requested targets with attention boundaries and remove nested ones."""
-    orig_targets = {m for _, m in list(match_named_modules(model, sequential_targets))}
+    orig_targets = set(_match_sequential_targets(model, sequential_targets))
 
     # The root owns every module, including attention boundaries.
     if model in orig_targets:

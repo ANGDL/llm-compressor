@@ -603,7 +603,7 @@ transactions/<index>.pending/
 | 步骤 | 状态 | 已完成 | 尚未完成 |
 |---|---|---|---|
 | 一：transaction 与 writer | **已完成当前范围** | 通用 `StreamingCheckpointWriter`、pending/commit、逐 tensor payload、checksum、跨 transaction/shard 组装；subgraph transaction 同时保存下一 boundary；旧 quantize 路径已复用 writer；本地 checkpoint 可选子进程 RSS 回归已落地 | 扩展更多 checkpoint 格式时补充对应 transaction 测试 |
-| 二：SubgraphWeightSession | **基本完成** | 从 traced `call_module/get_attr` 推导 working set；modifier `include/exclude`；跨 source shard；meta 恢复；临时 qparams/buffer 清理；共享 runtime buffer alias 独立物化；普通 tensor 属性恢复；tracing 已接入；独立进程资源回归可按本地 checkpoint 启用 | 更多 MoE 模型专项 working-set 测试 |
+| 二：SubgraphWeightSession | **基本完成** | 从 traced `call_module/get_attr` 推导 working set；modifier `include/exclude`；跨 source shard；meta 恢复；临时 qparams/buffer 清理；共享 runtime buffer alias 独立物化；nested direct parameter 使用 parameter-level plan，避免把父模块 subtree 全部加载；普通 tensor 属性恢复；tracing 已接入；独立进程资源回归可按本地 checkpoint 启用 | 更多 MoE 模型专项 working-set 测试 |
 | 三：iMatrix + RTN 闭环 | **已完成并验证等价** | pretrained 入口已切换为逐 subgraph 校准、`sequential_epoch_end`、量化后传播、压缩和 transaction；两层 Qwen3 与 sequential oneshot 的压缩 checkpoint 逐 tensor 完全一致；Qwen/DeepSeek tiny E2E 通过 | 扩展量化格式和更大校准集的等价矩阵 |
 | 四：GPTQ 闭环 | **已完成首个等价闭环** | 新闭环直接复用 GPTQ lifecycle hook、Hessian、`compress_modules()` 和量化后传播；两层 Qwen3 与 sequential oneshot 的压缩 checkpoint 逐 tensor 完全一致；每个 target 后 Hessian/sample count 均释放；端到端 reload 通过 | 扩展 actorder、不同量化格式和更大模型的等价矩阵 |
 | 五：通用 Modifier 工作集 | **部分完成** | `include_modules` 可表达大于 target 的 working set；state tensor 可导出 modifier output delta；SmoothQuant、AWQ、SparseGPT、Wanda 已完成两层 Qwen3 streaming/sequential 对照及 reload logits 验证；AutoRound 已加入签名兼容和 bounded boundary reference 复用；AutoRound 明确禁止多 target group | modifier 通用声明/推导接口；AutoSmooth、AutoRound output adapter 及跨 subgraph mapping 等价测试 |
@@ -615,12 +615,15 @@ transactions/<index>.pending/
 当前验证基线：
 
 ```text
-Streaming + Sequential tests: 142 passed, 1 skipped, 14 warnings
+Streaming + Sequential tests: targeted remote regressions passed
+DSV4.1 GPTQ initial boundary: 4.88/103.1 GB peak
+DSV4.1 GPTQ first admission: 8 expert owners, 10.38 GB device working set
 本次修改文件 Ruff: passed
 git diff --check: passed
 ```
 
-本次实现包含文档、AutoRound 兼容和 target grouping；与用户现有的无关工作区文件分开提交。
+本次实现包含文档、AutoRound 兼容、target grouping、nested parameter working-set
+修复和 boundary dtype metadata 支持；与用户现有的无关工作区文件分开提交。
 
 ### 步骤一：定义 transaction 与 writer 接口
 
@@ -867,6 +870,21 @@ owner 不是 `ModuleList`/`ModuleDict`，因此不会把完整 expert collection
 一个 target。每个 subgraph 进入统一 admission，若当前模型的 expert 宽度使八个
 owner 仍超出显存预算，admission 会拒绝该 group，后续实现可继续缩小 group
 size，而不需要启用 CPU Hessian offload。
+
+这套 policy 还要求 routed MoE 的 forward 在 FX tracing 时能够把每个 owner
+暴露为 `call_module`。普通 `LinearExperts2D` 路径已经满足这个条件；特化模型
+如果在 forward 中对由 tensor 运算得到的 expert id 做 Python 迭代，则必须提供
+环绕式 tracing 兼容层。DeepSeek V4.1 当前采用的方式是仅在
+`torch.fx` tracing 期间使用固定的 `range(num_experts)` 循环，并对每个 expert
+执行动态 token gather；正常运行时仍使用 active-expert grouping，不改变推理
+dispatch 的性能路径。这个 tracing 分支保留 routing 权重、token/slot 顺序和
+shared expert 输出，因此它只是 target discovery 的图表示，不是另一套量化算法。
+
+该约束使“通用”边界和模型特化部分保持分离：GPTQ 的 owner 识别、八个 owner
+的 subgraph grouping、admission、lifecycle 和 Hessian cleanup 都不识别模型名；
+模型特化代码只负责把自身的动态 routing 改写为 FX 可见且数值等价的调用序列。
+任何新 routed MoE 适配都必须同时提供小模型 FX trace 测试，确认所有 expert
+owner 都进入 target plan，并提供正常路径与 tracing 路径的输出/统计一致性测试。
 
 ## 18.2 upstream oneshot 特性适配清单
 

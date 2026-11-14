@@ -8,6 +8,7 @@ from llmcompressor.modeling.moe_context import MoECalibrationModule
 class CalibrationDeepseekV41MoE(MoECalibrationModule):
     is_permanent = True
     forward = DeepseekV41MoE.forward
+    _forward_traceable = DeepseekV41MoE._forward_traceable
 
     def __init__(self, original, config, calibrate_all_experts=True):
         super().__init__()
