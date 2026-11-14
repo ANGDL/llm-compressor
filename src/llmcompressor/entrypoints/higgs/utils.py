@@ -159,7 +159,8 @@ def _collapse_expert_patterns(
     all_expert_groups: dict[str, dict[str, set[int]]] = defaultdict(
         lambda: defaultdict(set)
     )
-    non_expert = []
+    exact_targets = []
+    wildcard_targets = []
 
     if all_layers is None:
         all_layers = layer_list
@@ -184,9 +185,8 @@ def _collapse_expert_patterns(
             )
             expert_groups[prefix][suffix].add(index)
         else:
-            non_expert.append(f"re:^{re.escape(layer)}$")
+            exact_targets.append(f"re:^{re.escape(layer)}$")
 
-    targets = list(non_expert)
     for prefix in sorted(expert_groups):
         escaped = re.escape(prefix)
         wildcard_suffixes = []
@@ -197,16 +197,28 @@ def _collapse_expert_patterns(
                 wildcard_suffixes.append(suffix)
                 continue
             for index in sorted(indices):
-                targets.append(
+                exact_targets.append(
                     f"re:^{escaped}\\.{index}\\.{re.escape(suffix)}$"
                 )
 
         if len(wildcard_suffixes) == 1:
             suffix = wildcard_suffixes[0]
-            targets.append(f"re:^{escaped}\\.\\d+\\.{re.escape(suffix)}$")
+            wildcard_targets.append(
+                f"re:^{escaped}\\.\\d+\\.{re.escape(suffix)}$"
+            )
         elif wildcard_suffixes:
             alt = "|".join(re.escape(s) for s in wildcard_suffixes)
-            targets.append(f"re:^{escaped}\\.\\d+\\.({alt})$")
+            wildcard_targets.append(f"re:^{escaped}\\.\\d+\\.({alt})$")
+
+    if exact_targets:
+        exact_body = "|".join(
+            target.removeprefix("re:^").removesuffix("$")
+            for target in exact_targets
+        )
+        targets = [f"re:^(?:{exact_body})$"]
+    else:
+        targets = []
+    targets.extend(wildcard_targets)
 
     return targets
 
