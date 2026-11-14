@@ -157,18 +157,13 @@ def _is_expert_path(module_name: str) -> bool:
 def _expert_owner(
     model: nn.Module,
     module_name: str,
-    candidate_names: set[str],
+    expert_descendant_counts: dict[str, int],
 ) -> str | None:
     current = module_name
     while current:
         module = model.get_submodule(current)
-        descendants = [
-            name
-            for name in candidate_names
-            if name == current or name.startswith(f"{current}.")
-        ]
         if (
-            len(descendants) > 1
+            expert_descendant_counts.get(current, 0) > 1
             and _is_expert_path(current)
             and not isinstance(module, (nn.ModuleList, nn.ModuleDict))
         ):
@@ -181,16 +176,27 @@ def _group_expert_targets(
     model: nn.Module,
     candidate_names: set[str],
 ) -> tuple[set[str], int]:
+    expert_descendant_counts: dict[str, int] = {}
+    for name in candidate_names:
+        current = name
+        while current:
+            if _is_expert_path(current):
+                expert_descendant_counts[current] = (
+                    expert_descendant_counts.get(current, 0) + 1
+                )
+            current, _, _ = current.rpartition(".")
     owners = {
         owner
         for name in candidate_names
-        if (owner := _expert_owner(model, name, candidate_names)) is not None
+        if (
+            owner := _expert_owner(model, name, expert_descendant_counts)
+        ) is not None
     }
     if not owners:
         return candidate_names, 0
     grouped = set(candidate_names)
     for name in candidate_names:
-        owner = _expert_owner(model, name, candidate_names)
+        owner = _expert_owner(model, name, expert_descendant_counts)
         if owner is not None:
             grouped.discard(name)
     grouped.update(owners)
