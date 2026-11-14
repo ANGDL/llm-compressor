@@ -80,6 +80,31 @@ class _ExpertModel(torch.nn.Module):
         self.experts = torch.nn.ModuleList([_DecoderLayer(), _DecoderLayer()])
 
 
+class _ExpertBlock(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.w1 = torch.nn.Linear(2, 2)
+        self.w2 = torch.nn.Linear(2, 2)
+        self.w3 = torch.nn.Linear(2, 2)
+
+
+class _ExpertOwnerModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.layers = torch.nn.ModuleList(
+            [
+                torch.nn.ModuleDict(
+                    {
+                        "experts": torch.nn.ModuleList(
+                            [_ExpertBlock(), _ExpertBlock()]
+                        ),
+                        "shared_experts": _ExpertBlock(),
+                    }
+                )
+            ]
+        )
+
+
 def _write_raw_deepseek_v4_checkpoint(checkpoint, *, omit_names=()):
     """Convert one tiny native shard to raw keys with one FP8+E8M0 weight."""
     tensors = load_file(checkpoint / "model.safetensors")
@@ -281,6 +306,32 @@ def test_gptq_targets_split_quantized_modules_within_decoder():
     ) == (
         "layers.0.proj",
         "layers.1.proj",
+    )
+
+
+def test_gptq_targets_group_moe_modules_by_expert_owner():
+    model = _ExpertOwnerModel()
+    schemes = {
+        "layers.0.experts.0.w1": Mock(),
+        "layers.0.experts.0.w2": Mock(),
+        "layers.0.experts.0.w3": Mock(),
+        "layers.0.experts.1.w1": Mock(),
+        "layers.0.experts.1.w2": Mock(),
+        "layers.0.experts.1.w3": Mock(),
+        "layers.0.shared_experts.w1": Mock(),
+        "layers.0.shared_experts.w2": Mock(),
+        "layers.0.shared_experts.w3": Mock(),
+    }
+
+    assert _quantized_sequential_targets(
+        model,
+        schemes,
+        sequential_targets="Linear",
+        group_moe_experts=True,
+    ) == (
+        "layers.0.experts.0",
+        "layers.0.experts.1",
+        "layers.0.shared_experts",
     )
 
 
