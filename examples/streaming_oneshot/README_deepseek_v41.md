@@ -20,6 +20,27 @@ python examples/streaming_oneshot/deepseek_v41_wNa8.py \
   --batch-size 1
 ```
 
+GPTQ can be enabled for the same target selection with
+`--use-gptq-quantization`. To select a bounded mixed-precision allocation before
+the streaming quantization pass, add `--use-higgs-quantization`. HIGGS evaluates
+the candidate weights one logical group at a time, then applies the generated
+configuration with the normal RTN/iMatrix path:
+
+```bash
+python examples/streaming_oneshot/deepseek_v41_wNa8.py \
+  --model-id /path/to/DeepSeek-V4.1-Flash \
+  --dataset-id lmms-lab/flickr30k \
+  --output-dir /path/to/DeepSeek-V4.1-Flash-HIGGS-WNa8 \
+  --use-higgs-quantization \
+  --higgs-candidate-bits 4 8 \
+  --higgs-target-bitwidth 6.0
+```
+
+Use `--use-higgs-quantization --use-gptq-quantization` to apply the HIGGS
+allocation with GPTQ. HIGGS selects the ordinary two-dimensional weights as
+mixed precision groups; when `--quantize-engram-wkv` is also enabled, the
+Engram `wkv` projection remains in its dedicated W8A8 FP32-scale group.
+
 示例默认使用稀疏路由；需要让每个专家看到全部 token 时，再添加
 `--moe-calibrate-all-experts`。
 

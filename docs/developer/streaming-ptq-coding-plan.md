@@ -1,6 +1,8 @@
 # Streaming PTQ：逐 Subgraph 闭环执行设计
 
 > 文档定位：这是 Streaming PTQ 的目标架构和落地计划，不是提交历史。
+> 详细的当前实现契约、资源公式、状态表和兼容边界见
+> [Streaming PTQ 实现设计](streaming-ptq-implementation-design.md)。
 >
 > 本文明确区分“已经存在的可复用组件”和“尚待实现的新流水线”。用户用法、支持矩阵和资源实测应写入 `docs/guides/streaming_ptq.md`。
 
@@ -596,7 +598,7 @@ transactions/<index>.pending/
 
 每一步都应产生可单独审查的功能和测试，提交信息不得使用 `PR1`、`PR2` 等编号字样。
 
-### 15.1 当前进度（2026-11-13）
+### 15.1 当前进度（2026-11-14）
 
 | 步骤 | 状态 | 已完成 | 尚未完成 |
 |---|---|---|---|
@@ -859,7 +861,7 @@ logical target 的峰值由该 target 的权重、融合 partner 和 MSE 临时 
 
 ## 18.2 upstream oneshot 特性适配清单
 
-截至 2026-11-13，`main..upstream/main` 中与 streaming PTQ 直接相关的提交
+截至 2026-11-14，`main..upstream/main` 中与 streaming PTQ 直接相关的提交
 需要按下表处理：
 
 | upstream 提交/特性 | oneshot 行为 | streaming 处理 |
@@ -872,7 +874,7 @@ logical target 的峰值由该 target 的权重、融合 partner 和 MSE 临时 
 | `68a83df8e` GPTQ 显式 `actorder=None` | 保留配置中的显式语义 | streaming 的 GPTQ adapter 直接透传该配置，并在 target admission 中使用一致的 Hessian 估算 |
 | `118c11d01` GPTQ DDP global scale broadcast | 多卡量化时同步 global scale | 当前 streaming 单卡边界保持不变；未来多卡必须以 wrapper 方式接入，不能让 DSV4.1 特化路径直接承担 MTP/DDP 语义 |
 | `b3faa86f3` MSE/iMatrix 数值统一 | oneshot observer 与 iMatrix 使用一致误差数值 | streaming 只复用 observer/quantizer，不复制数值实现；在等价测试中锁定 dtype、detach 和 reduction 语义 |
-| `ebc4e7559` HIGGS | 独立生成混合精度 config | 暂不接入主闭环；作为后续配置选择层，优先级低于 GPTQ、grouping、AutoRound |
+| `ebc4e7559` HIGGS | 独立生成混合精度 config | 已实现 bounded provider；作为配置选择层输出普通 `QuantizationConfig`，组合接入 streaming GPTQ/RTN 仍需验证 |
 
 其中，`MTP` 兼容不能通过给所有模型增加全局 special case 实现。后续应增加
 一个 MTP wrapper/compatibility adapter：默认保持通用模型路径不变，只在检测到
@@ -899,21 +901,17 @@ MTP 的新增输入、输出和 checkpoint tensor 不能污染基础模型的 GP
 
 ## 19. 当前实施顺序
 
-GPTQ Hessian 生命周期、AutoRound 兼容和显式 target grouping 已经落地；
-本阶段按以下顺序继续实现：
+GPTQ Hessian 生命周期、AutoRound 兼容、显式 target grouping、bounded HIGGS
+provider、基础 MTP wrapper 和 QAD + GPTQ adapter 已经落地；本阶段按以下顺序
+继续实现：
 
-1. **HIGGS streaming provider**：先完成有界 MSE 摘要收集、fused/MoE
-   grouping、全局 ILP 求解、稳定 fingerprint 和 config 输出，避免重新引入
-   完整 shard 常驻或 CPU Hessian offload。
-2. **特化模型 MTP wrapper**：先检查并优先复用 upstream 的 GLM5
-   `MtpModel`/checkpoint conversion 适配；wrapper 只在检测到 MTP ownership
-   时扩展 target plan、working set 和 finalizer，普通模型与 DSV4.1 无 MTP
-   路径保持不变。
-3. **QAD streaming 泛化**：最低优先级，参考 upstream 的 block-wise shared
-   data、multiple sequential targets per subgraph 和 weight re-observation，
-   在前两个 wrapper/lifecycle 契约稳定后实现，不把 QAD 特化逻辑散落到主
-   pipeline。
-4. **组合验证**：覆盖 HIGGS 配置交给 streaming GPTQ/RTN 的路径、MTP 与
-   特化 materializer 的组合，以及 QAD 与 grouped target 的资源边界。
-5. **自动 target grouping**：`sequential_targets_per_subgraph="auto"` 作为
-   后续独立工作，复用已有显式 grouping execution unit 和 admission 预算。
+1. **HIGGS 组合接入**：验证 provider 生成的 config 交给 streaming GPTQ/RTN
+   的路径，并把 provider fingerprint 纳入恢复身份。
+2. **observer numerics parity**：适配 upstream `b3faa86f3` 的误差 dtype、
+   reduction、scale rounding 和 `patience=0`，保留 bounded search。
+3. **特化模型 MTP 完整矩阵**：覆盖 upstream MTP、多 MTP、native DSV4.1
+   extra state、MTP + GPTQ 的 ownership 和 reload。
+4. **QAD 完整验证**：补 numerical parity、grouped target、recovery 和资源曲线；
+   QAD 仍然是最低优先级。
+5. **自动 target grouping**：`sequential_targets_per_subgraph="auto"` 复用
+   显式 grouping execution unit 和 admission 预算。

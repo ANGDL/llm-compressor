@@ -625,10 +625,12 @@ class DeepseekV41Block(nn.Module):
             valid = mask & ~image_mask
             x = self.engram(x, hashes[:, :, self.engram.hash_index], valid)
         current = x.mean(2) if any(self._target_flags) else None
-        targets = tuple(
-            current if flag else previous
-            for flag, previous in zip(self._target_flags, targets)
-        )
+        updated_targets = []
+        for index, previous in enumerate(targets):
+            updated_targets.append(
+                current if self._target_flags[index] else previous
+            )
+        targets = tuple(updated_targets)
         attn_pre, attn_post, attn_comb = self.mixes(x, "attn")
         attn_input = self.attn_norm(self.pre(x, pre_mix))
         value, shared = (

@@ -57,9 +57,35 @@ from llmcompressor.modeling.deepseekv41 import (
 )
 from llmcompressor.modifiers.gptq import GPTQModifier
 from llmcompressor.modifiers.quantization import QuantizationModifier
-from llmcompressor.streaming import DeepSeekV41WeightMaterializer, streaming_oneshot
+from llmcompressor.streaming import (
+    DeepSeekV41WeightMaterializer,
+    get_higgs_config_streaming,
+    streaming_oneshot,
+)
 
 _WO_A_PATTERN = r"re:.*\.attn\.wo_a$"
+_ENGRAM_WKV_PATTERN = r"re:.*\.engram\.wkv$"
+
+
+def _quantization_scheme(bits, targets, *, scale_dtype=None):
+    return QuantizationScheme(
+        targets=targets,
+        weights=QuantizationArgs(
+            num_bits=bits,
+            type="int",
+            strategy="channel",
+            symmetric=True,
+            observer="imatrix_mse",
+            scale_dtype=scale_dtype,
+        ),
+        input_activations=QuantizationArgs(
+            num_bits=8,
+            type="int",
+            strategy="token",
+            symmetric=True,
+            dynamic=True,
+        ),
+    )
 
 
 def _schemes(
@@ -75,41 +101,25 @@ def _schemes(
     if quantize_wo_a:
         other.append(_WO_A_PATTERN)
 
-    def scheme(bits, targets, *, scale_dtype=None):
-        return QuantizationScheme(
-            targets=targets,
-            weights=QuantizationArgs(
-                num_bits=bits,
-                type="int",
-                strategy="channel",
-                symmetric=True,
-                observer="imatrix_mse",
-                scale_dtype=scale_dtype,
-            ),
-            input_activations=QuantizationArgs(
-                num_bits=8,
-                type="int",
-                strategy="token",
-                symmetric=True,
-                dynamic=True,
-            ),
-        )
-
     if mode == "wna8":
         groups = {
-            "routed_w4a8": scheme(4, [routed], scale_dtype=scale_dtype),
-            "other_w8a8": scheme(8, other, scale_dtype=scale_dtype),
+            "routed_w4a8": _quantization_scheme(
+                4, [routed], scale_dtype=scale_dtype
+            ),
+            "other_w8a8": _quantization_scheme(
+                8, other, scale_dtype=scale_dtype
+            ),
         }
     else:
         groups = {
-            "all": scheme(
+            "all": _quantization_scheme(
                 8 if mode == "w8a8" else 4, [routed, *other], scale_dtype=scale_dtype
             )
         }
     if quantize_engram_wkv:
-        groups["engram_w8a8"] = scheme(
+        groups["engram_w8a8"] = _quantization_scheme(
             8,
-            [r"re:model\.layers\.\d+\.engram\.wkv$"],
+            [_ENGRAM_WKV_PATTERN],
             scale_dtype=torch.float32,
         )
     ignores = [
@@ -129,6 +139,13 @@ def _schemes(
     if not quantize_wo_a:
         ignores.append(_WO_A_PATTERN)
     return groups, ignores
+
+
+def _higgs_candidate_schemes(candidate_bits, *, scale_dtype=None):
+    return [
+        _quantization_scheme(bits, ["Linear"], scale_dtype=scale_dtype)
+        for bits in candidate_bits
+    ]
 
 
 def _load_encoding(model_id: Path):
@@ -583,6 +600,41 @@ def main():
         default=False,
         help="Use GPTQ quantization instead of PTQ (default: disabled).",
     )
+    parser.add_argument(
+        "--use-higgs-quantization",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Use bounded streaming HIGGS to select the per-layer weight "
+            "bitwidth before PTQ or GPTQ."
+        ),
+    )
+    parser.add_argument(
+        "--higgs-candidate-bits",
+        type=int,
+        nargs="+",
+        choices=(4, 8),
+        default=[4, 8],
+        help="Candidate weight bitwidths for HIGGS (default: 4 8).",
+    )
+    parser.add_argument(
+        "--higgs-target-bitwidth",
+        type=float,
+        default=6.0,
+        help="HIGGS parameter-weighted average weight bitwidth limit.",
+    )
+    parser.add_argument(
+        "--higgs-target-act-bitwidth",
+        type=float,
+        default=None,
+        help="Optional HIGGS parameter-weighted average activation bitwidth limit.",
+    )
+    parser.add_argument(
+        "--higgs-allow-unquantized",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Allow HIGGS to leave selected matched weights unquantized.",
+    )
     args = parser.parse_args()
     if (
         min(args.num_calibration_samples, args.max_sequence_length, args.batch_size)
@@ -595,6 +647,17 @@ def main():
         parser.error("DeepSeek V4.1 multimodal calibration requires --batch-size 1")
     if not 1 <= args.reasoning_effort <= 100:
         parser.error("reasoning-effort must be within 1..100")
+    if args.higgs_target_bitwidth <= 0:
+        parser.error("--higgs-target-bitwidth must be positive")
+    if (
+        args.higgs_target_act_bitwidth is not None
+        and args.higgs_target_act_bitwidth <= 0
+    ):
+        parser.error("--higgs-target-act-bitwidth must be positive")
+    if args.use_higgs_quantization:
+        args.higgs_candidate_bits = sorted(set(args.higgs_candidate_bits))
+        if not args.higgs_candidate_bits:
+            parser.error("--higgs-candidate-bits must contain at least one bitwidth")
     tokenizer = AutoTokenizer.from_pretrained(args.model_id, local_files_only=True)
     config = ModelConfig.from_pretrained(args.model_id, local_files_only=True)
     text = config.text_config
@@ -618,6 +681,46 @@ def main():
         quantize_engram_wkv=args.quantize_engram_wkv,
         scale_dtype=torch.float32 if args.use_float32_scale_dtype else None,
     )
+    fixed_groups = dict(groups)
+    materializer = DeepSeekV41WeightMaterializer(
+        save_raw_checkpoint_format=args.save_raw_checkpoint_format,
+        source_has_mtp=has_mtp,
+    )
+    if args.use_higgs_quantization:
+        higgs_ignores = list(ignores)
+        if args.quantize_engram_wkv:
+            higgs_ignores.append(_ENGRAM_WKV_PATTERN)
+        higgs_config = get_higgs_config_streaming(
+            args.model_id,
+            candidate_schemes=_higgs_candidate_schemes(
+                args.higgs_candidate_bits,
+                scale_dtype=(
+                    torch.float32 if args.use_float32_scale_dtype else None
+                ),
+            ),
+            targets=["Linear"],
+            ignore=higgs_ignores,
+            target_avg_bitwidth=args.higgs_target_bitwidth,
+            target_avg_act_bitwidth=args.higgs_target_act_bitwidth,
+            device=args.device,
+            allow_unquantized=args.higgs_allow_unquantized,
+            materializer=materializer,
+            target_dtype=torch.bfloat16,
+        )
+        groups = dict(higgs_config.config_groups)
+        if args.quantize_engram_wkv:
+            groups["engram_w8a8"] = fixed_groups["engram_w8a8"]
+        ignores = [
+            value
+            for value in (higgs_config.ignore or higgs_ignores)
+            if value != _ENGRAM_WKV_PATTERN
+        ]
+        print(
+            "HIGGS selected "
+            f"{len(groups)} config group(s) from bits "
+            f"{args.higgs_candidate_bits} at average weight bitwidth "
+            f"{args.higgs_target_bitwidth:.3f}"
+        )
     factory = partial(
         DeepseekV41NativeForCausalLM,
         tokenizer=tokenizer,
@@ -645,10 +748,7 @@ def main():
         shuffle_calibration_samples=False,
         device=args.device,
         moe_calibrate_all_experts=args.moe_calibrate_all_experts,
-        materializer=DeepSeekV41WeightMaterializer(
-            save_raw_checkpoint_format=args.save_raw_checkpoint_format,
-            source_has_mtp=has_mtp,
-        ),
+        materializer=materializer,
         checkpoint_progress=args.checkpoint_progress,
         async_save=args.async_save,
         pack_to_int8=True,
