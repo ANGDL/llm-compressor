@@ -7,7 +7,7 @@ and config generation from ILP solutions.
 
 import re
 from collections import defaultdict
-from typing import Dict, List
+from typing import Collection, Dict, List
 
 import numpy as np
 import torch
@@ -144,29 +144,68 @@ def compute_heuristic_alphas(
 # Config generation from ILP solution
 # ---------------------------------------------------------------------------
 
-_EXPERT_RE = re.compile(r"^(.+\.experts)\.\d+\.(.+)$")
+_EXPERT_RE = re.compile(r"^(.+\.experts)\.(\d+)\.(.+)$")
 
 
-def _collapse_expert_patterns(layer_list: list[str]) -> list[str]:
-    """Collapse individual MoE expert layers into wildcard regex patterns."""
-    expert_groups: dict[str, set[str]] = defaultdict(set)
+def _collapse_expert_patterns(
+    layer_list: list[str],
+    *,
+    all_layers: Collection[str] | None = None,
+) -> list[str]:
+    """Collapse expert layers only when the wildcard remains disjoint."""
+    expert_groups: dict[str, dict[str, set[int]]] = defaultdict(
+        lambda: defaultdict(set)
+    )
+    all_expert_groups: dict[str, dict[str, set[int]]] = defaultdict(
+        lambda: defaultdict(set)
+    )
     non_expert = []
+
+    if all_layers is None:
+        all_layers = layer_list
+
+    for layer in all_layers:
+        match = _EXPERT_RE.match(layer)
+        if match:
+            prefix, index, suffix = (
+                match.group(1),
+                int(match.group(2)),
+                match.group(3),
+            )
+            all_expert_groups[prefix][suffix].add(index)
 
     for layer in layer_list:
         m = _EXPERT_RE.match(layer)
         if m:
-            expert_groups[m.group(1)].add(m.group(2))
+            prefix, index, suffix = (
+                m.group(1),
+                int(m.group(2)),
+                m.group(3),
+            )
+            expert_groups[prefix][suffix].add(index)
         else:
             non_expert.append(f"re:^{re.escape(layer)}$")
 
     targets = list(non_expert)
     for prefix in sorted(expert_groups):
-        suffixes = sorted(expert_groups[prefix])
         escaped = re.escape(prefix)
-        if len(suffixes) == 1:
-            targets.append(f"re:^{escaped}\\.\\d+\\.{re.escape(suffixes[0])}$")
-        else:
-            alt = "|".join(re.escape(s) for s in suffixes)
+        wildcard_suffixes = []
+        for suffix in sorted(expert_groups[prefix]):
+            indices = expert_groups[prefix][suffix]
+            complete = indices == all_expert_groups[prefix][suffix]
+            if complete:
+                wildcard_suffixes.append(suffix)
+                continue
+            for index in sorted(indices):
+                targets.append(
+                    f"re:^{escaped}\\.{index}\\.{re.escape(suffix)}$"
+                )
+
+        if len(wildcard_suffixes) == 1:
+            suffix = wildcard_suffixes[0]
+            targets.append(f"re:^{escaped}\\.\\d+\\.{re.escape(suffix)}$")
+        elif wildcard_suffixes:
+            alt = "|".join(re.escape(s) for s in wildcard_suffixes)
             targets.append(f"re:^{escaped}\\.\\d+\\.({alt})$")
 
     return targets
@@ -194,7 +233,10 @@ def generate_config_groups(
             continue
 
         scheme_dict = base_scheme.model_dump()
-        scheme_dict["targets"] = _collapse_expert_patterns(sorted(layer_list))
+        scheme_dict["targets"] = _collapse_expert_patterns(
+            sorted(layer_list),
+            all_layers=ilp_solution.keys(),
+        )
 
         if base_scheme.format is None:
             dummy = torch.nn.Linear(64, 64, bias=False)
