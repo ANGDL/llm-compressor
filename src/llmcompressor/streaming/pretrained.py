@@ -12,7 +12,13 @@ from typing import Any
 
 import torch
 from compressed_tensors.quantization import QuantizationScheme
-from compressed_tensors.quantization.lifecycle.initialize import _is_attention_module
+
+try:
+    from compressed_tensors.quantization.lifecycle.initialize import (
+        _is_attention_module as _compressed_tensors_is_attention_module,
+    )
+except ImportError:
+    _compressed_tensors_is_attention_module = None
 from compressed_tensors.utils import match_named_modules
 from loguru import logger
 from torch import nn
@@ -145,9 +151,30 @@ def _attention_ancestor(model: nn.Module, module_name: str) -> str | None:
     current = module_name
     while current:
         current, _, _ = current.rpartition(".")
-        if current and _is_attention_module(model.get_submodule(current)):
+        if current and _is_streaming_attention_module(model.get_submodule(current)):
             return current
     return None
+
+
+def _is_streaming_attention_module(module: nn.Module) -> bool:
+    """Return whether a module should be a tracing/quantization boundary.
+
+    The compressed-tensors helper is the primary source of truth for standard
+    Transformers attention implementations. Model adapters can opt in with the
+    stable ``_streaming_attention_boundary`` marker, which is needed by native
+    attention implementations that do not inherit a Transformers attention
+    class. The class-name fallback keeps custom ``*Attention`` implementations
+    compatible with older model adapters while the marker remains the preferred
+    extension point.
+    """
+    if getattr(module, "_streaming_attention_boundary", False):
+        return True
+    if (
+        _compressed_tensors_is_attention_module is not None
+        and _compressed_tensors_is_attention_module(module)
+    ):
+        return True
+    return module.__class__.__name__.endswith("Attention")
 
 
 def _is_expert_path(module_name: str) -> bool:

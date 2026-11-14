@@ -8,6 +8,7 @@ from functools import lru_cache
 
 import torch
 from torch import nn
+from torch.fx._symbolic_trace import is_fx_tracing
 from torch.nn import functional as F
 from transformers import PreTrainedModel
 from transformers.generation import GenerationMixin
@@ -21,6 +22,14 @@ from .config import DeepseekV41Config, ModelConfig
 from .engram import Engram, EngramEmbedding, EngramHash
 from .quantization import Linear
 from .vision import Aligner, Vision
+
+
+def _is_streaming_trace() -> bool:
+    """Detect both FX symbolic tracing and the Transformers HF tracer."""
+    compiler_is_compiling = getattr(torch.compiler, "is_compiling", None)
+    return is_fx_tracing() or (
+        callable(compiler_is_compiling) and compiler_is_compiling()
+    )
 
 
 @lru_cache(maxsize=8)
@@ -232,6 +241,8 @@ class Indexer(nn.Module):
 
 
 class Attention(nn.Module):
+    _streaming_attention_boundary = True
+
     # The shared full-position table stays on CPU during streaming. Forward
     # transfers only the positions needed by the current chunk/token.
     _streaming_cpu_buffers = ("freqs_cis",)
@@ -489,6 +500,8 @@ class DeepseekV41MoE(nn.Module):
         x = x.reshape(-1, self.dim)
         mask = None if image_mask is None else image_mask.flatten()
         weights, indices = self.gate(x, mask)
+        if _is_streaming_trace():
+            return self._forward_traceable(x, shape, weights, indices)
         output = torch.zeros_like(x, dtype=torch.float32)
         flat_indices = indices.flatten()
         # One stable grouping avoids a device/host synchronization from nonzero
@@ -534,6 +547,28 @@ class DeepseekV41MoE(nn.Module):
             else:
                 values = expert(x.index_select(0, expert_rows), expert_weights)
                 output.index_add_(0, expert_rows, values.float())
+        return (output + self.shared_experts(x)).to(x.dtype).reshape(shape)
+
+    def _forward_traceable(
+        self,
+        x: torch.Tensor,
+        shape: torch.Size,
+        weights: torch.Tensor,
+        indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Keep every routed expert visible to the sequential FX tracer.
+
+        The normal dispatch path groups active expert ids with ``tolist()``.
+        That is efficient at runtime, but FX cannot iterate over the resulting
+        Proxy object. A fixed Python loop preserves the routed token semantics
+        while exposing each ``Expert`` as an independent sequential target.
+        """
+        output = torch.zeros_like(x, dtype=torch.float32)
+        for expert_id, expert in enumerate(self.experts):
+            rows, slots = torch.where(indices == expert_id)
+            expert_weights = weights[rows, slots].unsqueeze(-1)
+            values = expert(x.index_select(0, rows), expert_weights)
+            output.index_add_(0, rows, values.float())
         return (output + self.shared_experts(x)).to(x.dtype).reshape(shape)
 
 
@@ -633,11 +668,14 @@ class DeepseekV41Block(nn.Module):
         targets = tuple(updated_targets)
         attn_pre, attn_post, attn_comb = self.mixes(x, "attn")
         attn_input = self.attn_norm(self.pre(x, pre_mix))
-        value, shared = (
-            self.attn(attn_input, mask, shared)
-            if cache is None
-            else self.attn(attn_input, mask, shared, cache=cache, start_pos=start_pos)
-        )
+        if _is_streaming_trace():
+            value, shared = self.attn(attn_input, mask, shared)
+        elif cache is None:
+            value, shared = self.attn(attn_input, mask, shared)
+        else:
+            value, shared = self.attn(
+                attn_input, mask, shared, cache=cache, start_pos=start_pos
+            )
         x = self.post(value, x, attn_post, attn_comb)
         ffn_pre, ffn_post, ffn_comb = self.mixes(x, "ffn")
         value = self.ffn(self.ffn_norm(self.pre(x, attn_pre)), image_mask)

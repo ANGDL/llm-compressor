@@ -5,13 +5,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Sequence
 
-from compressed_tensors.utils import match_named_modules
 from loguru import logger
 from torch import nn
 
 from llmcompressor.utils.pytorch.module import infer_sequential_targets
 
-from .helpers import Subgraph, trace_subgraphs
+from .helpers import Subgraph, _match_sequential_targets, trace_subgraphs
 
 __all__ = ["SequentialExecutionPlan", "trace_sequential_plan"]
 
@@ -51,9 +50,7 @@ def trace_sequential_plan(
         list(tracing_ignore),
         targets_per_subgraph,
     )
-    matched_names = {}
-    for name, module in match_named_modules(model, patterns):
-        matched_names.setdefault(module, name)
+    matched_names = _match_sequential_targets(model, patterns)
     matched = set(matched_names)
     target_names = []
     target_indices = []

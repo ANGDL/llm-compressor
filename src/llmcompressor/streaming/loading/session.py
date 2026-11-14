@@ -331,9 +331,9 @@ class SubgraphWeightSession:
                 if isinstance(value, torch.nn.Module) and not value._modules:
                     name = attribute_name
                 elif isinstance(value, torch.Tensor) and value.is_meta:
+                    if self._is_direct_parameter(attribute_name):
+                        continue
                     if not separator:
-                        if attribute_name in self.model._parameters:
-                            continue
                         raise ValueError(
                             "A root-level checkpoint tensor cannot be loaded as a "
                             f"module working set: {attribute_name!r}"
@@ -464,7 +464,8 @@ class SubgraphWeightSession:
         direct_parameters = tuple(
             str(node.target)
             for node in subgraph.graph.nodes
-            if node.op == "get_attr" and str(node.target) in self.model._parameters
+            if node.op == "get_attr"
+            and self._is_direct_parameter(str(node.target))
         )
         uncovered = tuple(
             name
@@ -614,6 +615,14 @@ class SubgraphWeightSession:
         """Return whether a module owns any tensor exposed by the weight source."""
 
         return module_name in self._checkpoint_modules
+
+    def _is_direct_parameter(self, qualified_name: str) -> bool:
+        owner_name, separator, local_name = qualified_name.rpartition(".")
+        if not separator:
+            owner_name = ""
+            local_name = qualified_name
+        owner = self.model.get_submodule(owner_name)
+        return local_name in owner._parameters
 
     def _has_loadable_state(self, module_name: str) -> bool:
         return (

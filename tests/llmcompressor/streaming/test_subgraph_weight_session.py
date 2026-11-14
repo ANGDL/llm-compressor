@@ -33,6 +33,13 @@ class SessionModel(nn.Module):
         self.final_norm = nn.LayerNorm(4)
 
 
+class NestedParameterModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.backbone = Block()
+        self.backbone.image_start = nn.Parameter(torch.randn(4))
+
+
 class RuntimeBufferOnlyBlock(nn.Module):
     def __init__(self):
         super().__init__()
@@ -127,6 +134,32 @@ def test_ignores_container_module_get_attr_working_set(tmp_path):
     subgraph = Subgraph(graph, {"value"}, set())
 
     assert session.working_set(subgraph) == ()
+
+
+def test_nested_get_attr_loads_only_direct_parameter_and_target(tmp_path):
+    reference = NestedParameterModel()
+    checkpoint = tmp_path / "model.safetensors"
+    save_file(reference.state_dict(), checkpoint)
+    model = build_meta_model(NestedParameterModel)
+    session = SubgraphWeightSession(model, SafetensorsWeightSource(checkpoint))
+
+    graph = Graph()
+    value = graph.placeholder("value")
+    image_start = graph.get_attr("backbone.image_start")
+    value = graph.call_module("backbone.proj", (value,))
+    value = graph.call_function(torch.add, (value, image_start))
+    graph.output({"value": value})
+    subgraph = Subgraph(graph, {"value"}, {"value"})
+
+    plan = session.plan(subgraph)
+    assert [target.name for target in plan.targets] == [
+        "backbone.proj",
+        "backbone",
+    ]
+    with session.loaded_plan(plan, device="cpu", dtype=torch.float32):
+        assert not model.backbone.proj.weight.is_meta
+        assert not model.backbone.image_start.is_meta
+        assert model.backbone.norm.weight.is_meta
 
 
 class SharedRuntimeBufferBlock(nn.Module):

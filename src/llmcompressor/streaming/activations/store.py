@@ -19,7 +19,7 @@ if TYPE_CHECKING:
         HostMemoryReservation,
     )
 
-_PRIMITIVE_TYPES = (type(None), bool, int, float, str, bytes)
+_PRIMITIVE_TYPES = (type(None), bool, int, float, str, bytes, torch.dtype)
 _KV_CACHE_NAMES = {
     "cache",
     "key_cache",

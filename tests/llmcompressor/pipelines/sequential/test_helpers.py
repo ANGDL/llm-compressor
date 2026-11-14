@@ -693,3 +693,11 @@ def test_whole_model_target_is_one_untraced_subgraph(targets_per_subgraph):
     assert torch.equal(
         subgraphs[0].forward(model, **sample_input), model(**sample_input)
     )
+
+
+def test_resolve_sequential_targets_uses_exact_module_paths():
+    model = DummyModelMultipleSequentialLayers()
+
+    targets = _resolve_sequential_targets(model, ["layer1", "layer2", "layer3"])
+
+    assert targets == {model.layer1, model.layer2, model.layer3}
