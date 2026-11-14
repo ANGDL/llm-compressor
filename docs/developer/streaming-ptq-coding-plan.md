@@ -859,6 +859,15 @@ provider 必须遵守以下边界：
 logical target 的峰值由该 target 的权重、融合 partner 和 MSE 临时 workspace
 决定，不得随总 checkpoint shard 大小增长。
 
+GPTQ 的自动 MoE target policy 采用两级边界：先按模块路径和实际量化后代识别
+最小 expert owner，将同一 owner 下的多个 Linear 作为一个逻辑 target；再在
+调用方未指定 group size 时，把最多八个连续 owner target 放进一个 subgraph。
+这个策略只依赖模块树和 quantization scheme，不识别 DSV4.1、GLM 或其他模型名。
+owner 不是 `ModuleList`/`ModuleDict`，因此不会把完整 expert collection 误当成
+一个 target。每个 subgraph 进入统一 admission，若当前模型的 expert 宽度使八个
+owner 仍超出显存预算，admission 会拒绝该 group，后续实现可继续缩小 group
+size，而不需要启用 CPU Hessian offload。
+
 ## 18.2 upstream oneshot 特性适配清单
 
 截至 2026-11-14，`main..upstream/main` 中与 streaming PTQ 直接相关的提交

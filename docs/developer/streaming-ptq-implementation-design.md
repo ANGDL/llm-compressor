@@ -300,7 +300,10 @@ dense 模型可以按 decoder layer 或 Linear 运行；包含大量 routed expe
 必须使用更细粒度的 target policy。
 
 当前入口在检测到 expert collection 且用户没有显式 `sequential_targets` 时，
-将 GPTQ target pattern 收紧为 `Linear`：
+从 GPTQ 的 `Linear` 语义开始解析 target。随后会把同一个 expert owner
+下面的多个量化 Linear 合并为一个 owner target；当调用方没有显式设置
+`sequential_targets_per_subgraph` 时，再把最多八个连续 owner target 放入
+一个 subgraph：
 
 ```python
 automatic_gptq_targets = (
@@ -315,12 +318,17 @@ automatic_gptq_targets = (
 1. 根据 recipe 找出真正匹配 quantization scheme 的模块；
 2. 从 shared `infer_sequential_targets()` 推导可执行 target；
 3. 对 attention leaf 保留必要的 attention ancestor；
-4. 删除被更小 ancestor 覆盖的重复 target；
-5. 检查每个量化模块都被某个 target 覆盖；
-6. 将结果交给 shared tracer 和 streaming pipeline。
+4. 对路径中带有 expert owner 的模块，向上找到包含多个量化后代的最小
+   非 `ModuleList`/`ModuleDict` owner；
+5. 删除被 owner 或更小 ancestor 覆盖的重复 target；
+6. 检查每个量化模块都被某个 target 覆盖；
+7. 将结果交给 shared tracer 和 streaming pipeline，并对自动 GPTQ 使用有界
+   target group。
 
-这样处理的意义是让 GPTQ 在一个专家 Linear 结束时就能进入
-`sequential_epoch_end`，而不是等待整个 MoE block 的所有专家。
+这样处理的意义是让 GPTQ 在一个 bounded expert-owner group 结束时就能进入
+`sequential_epoch_end`，而不是等待整个 MoE block 的所有专家，也不会为
+大规模 MoE 建立数万条独立 tracing boundary。实际 group 仍经过 admission
+检查，物化权重、Hessian 和 scratch 超过设备预算时会在执行前拒绝。
 
 ### 6.2 Hessian 生命周期
 

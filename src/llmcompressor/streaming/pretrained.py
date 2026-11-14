@@ -150,6 +150,53 @@ def _attention_ancestor(model: nn.Module, module_name: str) -> str | None:
     return None
 
 
+def _is_expert_path(module_name: str) -> bool:
+    return any("expert" in part.lower() for part in module_name.split("."))
+
+
+def _expert_owner(
+    model: nn.Module,
+    module_name: str,
+    candidate_names: set[str],
+) -> str | None:
+    current = module_name
+    while current:
+        module = model.get_submodule(current)
+        descendants = [
+            name
+            for name in candidate_names
+            if name == current or name.startswith(f"{current}.")
+        ]
+        if (
+            len(descendants) > 1
+            and _is_expert_path(current)
+            and not isinstance(module, (nn.ModuleList, nn.ModuleDict))
+        ):
+            return current
+        current, _, _ = current.rpartition(".")
+    return None
+
+
+def _group_expert_targets(
+    model: nn.Module,
+    candidate_names: set[str],
+) -> tuple[set[str], int]:
+    owners = {
+        owner
+        for name in candidate_names
+        if (owner := _expert_owner(model, name, candidate_names)) is not None
+    }
+    if not owners:
+        return candidate_names, 0
+    grouped = set(candidate_names)
+    for name in candidate_names:
+        owner = _expert_owner(model, name, candidate_names)
+        if owner is not None:
+            grouped.discard(name)
+    grouped.update(owners)
+    return grouped, len(owners)
+
+
 def _has_expert_collection(model: nn.Module) -> bool:
     """Return whether the model exposes multiple routed expert modules."""
     for name, module in model.named_modules():
@@ -167,6 +214,7 @@ def _quantized_sequential_targets(
     model: nn.Module,
     schemes: dict[str, QuantizationScheme],
     sequential_targets: Sequence[str] | str | None = None,
+    group_moe_experts: bool = False,
 ) -> tuple[str, ...]:
     """Select trace targets which cover every exact quantization target.
 
@@ -196,6 +244,14 @@ def _quantized_sequential_targets(
         if ancestor is not None:
             promoted.discard(name)
             promoted.add(ancestor)
+
+    if group_moe_experts:
+        promoted, expert_owner_count = _group_expert_targets(model, promoted)
+        if expert_owner_count:
+            logger.info(
+                "Grouped quantized MoE modules into "
+                f"{expert_owner_count} expert-owner target(s)"
+            )
 
     selected = []
     for name, _ in model.named_modules():
@@ -441,7 +497,14 @@ def streaming_oneshot_from_pretrained(
             meta_model,
             schemes,
             sequential_targets=target_patterns,
+            group_moe_experts=automatic_gptq_targets,
         )
+        if automatic_gptq_targets and sequential_targets_per_subgraph == 1:
+            sequential_targets_per_subgraph = 8
+            logger.info(
+                "Automatic GPTQ MoE target grouping: "
+                "using up to 8 consecutive expert-owner targets per subgraph"
+            )
         target_mode = (
             "automatic GPTQ Linear"
             if automatic_gptq_targets
