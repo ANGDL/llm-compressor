@@ -465,7 +465,7 @@ adapter 通过 `supports_target_groups` 声明是否允许 group：
   owner 内，不能跨 target boundary；
 - 未声明 working set 的 modifier 不得借助 group 偶然访问 meta parameter。
 
-### 7.3 自动 grouping 尚未实现
+### 7.3 自动 target grouping 尚未实现
 
 `sequential_targets_per_subgraph="auto"` 不能简单转换成一个较大的整数。自动
 模式需要：
@@ -478,8 +478,11 @@ adapter 通过 `supports_target_groups` 声明是否允许 group：
 6. 以失败即缩小 group、成功即尝试扩大的策略生成最终 plan；
 7. 把最终 group plan 写入 run fingerprint。
 
-在这项能力完成前，默认保持 `1`，避免“看似自动”但重新形成 DSV4.1 block
-级 Hessian 峰值。
+在这项能力完成前，target group 默认保持 `1`，避免“看似自动”但重新形成
+DSV4.1 block 级 Hessian 峰值。这里的 `sequential_targets_per_subgraph` 只
+控制 modifier lifecycle 和 Hessian/observer 的 target 边界，不控制 EP dispatch
+的 token 数。EP token capacity 由 §17.3 单独计算，即使 target group 仍为 `1`
+也可以合并多个 calibration boundary。
 
 ## 8. HIGGS bounded provider
 
@@ -1315,15 +1318,16 @@ ETA；它明确说明“首组快 3.21 倍”并不等于整个模型已达到�
    用 propagation 总时长推断。评估按 FX liveness 只搬运当前 group 输入，
    对仅透传至后续层/DSpark 的值保留 CPU 缓存。任何实现都要保留 alias、
    in-place routing、CSA2 shared state、MTP context 的语义和快照隔离。
-3. 再做预算驱动的自动 group sizing。先校准 GPTQ batch-compression scratch
+3. 再做预算驱动的自动 token sizing。先校准 GPTQ batch-compression scratch
    模型：第 2 组 admission 为 3,203,145,920 bytes，但实际 update 峰值达
    14,914,841,088 bytes（含 runtime、activation、prefetch 等）。不能据当前
-   较小的静态 estimate 直接将固定 8 放大为 64/128，更不能退回 CPU Hessian
-   offload。需要分别建模固定工作区、随 group 增长的 Hessian/权重、压缩 batch
-   的临时副本、activation 和 prefetch，并在 admission 中保留边界。
-4. 自动分组的实际 group 列表、预算策略与版本必须进入 manifest/fingerprint；
-   恢复使用已记录的 group 计划，不能因空闲显存变化而静默改变量化数学。
-   所有新策略继续与使用相同 group 计划的 sequential oneshot 对照。
+   较小的静态 estimate 直接将固定 batch 或固定 group 放大为 64/128，更不能
+   退回 CPU Hessian offload。需要分别建模固定工作区、随 group 增长的
+   Hessian/权重、压缩 batch 的临时副本、activation 和 prefetch，并按每个
+   EP rank 的实际 token capacity 保留 admission 边界。
+4. 自动 token capacity 的实际计划、预算策略与版本必须进入
+   manifest/fingerprint；恢复使用已记录的计划，不能因空闲显存变化而静默改变
+   量化数学。所有新策略继续与使用相同计划的 sequential oneshot 对照。
 
 #### 16.2.6 2026-11-15 EP 提速实施设计
 
@@ -1970,7 +1974,8 @@ git status --short
 3. **MTP 完整矩阵**：补 upstream MTP、多 MTP、native DSV4.1 extra state、
    MTP + GPTQ 的 ownership 和 reload 测试。
 4. **QAD 完整矩阵**：补 numerical parity、grouped target、recovery 和资源曲线。
-5. **自动 grouping**：实现基于 admission 的 `"auto"`，并将 group plan 指纹化。
+5. **自动 token budget**：实现基于通用 modifier admission 的 per-rank token
+   capacity，并将 capacity policy 和实际计划指纹化。
 6. **结构 modifier 协议**：在 writer/finalizer 支持 delete/rename/config patch
    后，重新评估 REAP 等结构修改型 modifier。
 
@@ -2131,12 +2136,282 @@ state_filter = make_expert_state_filter(
 global commit 仍是下一阶段，在真实 torchrun tiny/native 对照通过前不开放为默认
 生产入口。
 
+### 17.3 EP token budget 与通用 modifier 显存模型
+
+2026-11-16 确定：EP 调度不再同时保留 `forward_batch_size` 和
+`max_batch_input_bytes` 两个独立限制。两者都以 batch 数或输入字节数间接限制
+工作量，无法表达变长 calibration、top-k 路由和不同 EP owner 的显存差异。EP
+的唯一调度单位改为 token；pipeline 的数据 batch size 继续独立存在。
+
+#### 17.3.1 三种 batch/token 概念
+
+设计和实现必须区分以下三个概念，不能复用同一个参数名：
+
+| 概念 | 所在阶段 | 作用 | DSV4.1 当前取值 |
+| --- | --- | --- | --- |
+| pipeline `batch_size` | DataLoader / calibration 输入 | 决定每个原始 calibration 输入的样本数、padding 和模型原生 batch 维 | `1` |
+| EP dispatch token budget | `ExpertParallelExecutor` | 决定每个 owner rank 一次可以接收多少实际 expert token | 自动计算 |
+| modifier 内部 batch size | modifier update/优化算法 | 由 GPTQ、AutoRound 等算法自身定义压缩或优化 batch | 由 modifier 自己管理 |
+
+DSV4.1 图像 calibration 仍使用 `pipeline batch_size=1`。EP token budget 可以
+把多个已经落盘或缓存的 boundary 输入合并执行，但不能改变单个输入的图像、
+文本、mask、patch 或 position shape。增加 EP token budget 也不能改变
+calibration sample 数、sequence length 或模型原生 forward 的 batch 语义。
+
+`forward_batch_size` 和 `max_batch_input_bytes` 只能作为旧实现的历史配置或
+迁移字段记录，不能继续作为新的运行时限流条件。若必须提供人工干预入口，只
+保留一个全局的 `expert_parallel_token_budget="auto"|int` 上限；自动模式下
+内部仍然为每个 owner 计算不同的 capacity。
+
+#### 17.3.2 per-rank capacity 的计算模型
+
+对于每个 EP owner rank `r`，先建立固定工作集：
+
+```text
+M_fixed[r] =
+    resident expert weights
+  + replicated/runtime weights assigned to r
+  + modifier persistent statistics
+  + modifier update workspace
+  + fixed communication/runtime workspace
+  + already reserved prefetch or checkpoint workspace
+```
+
+其中 modifier persistent statistics 包括 GPTQ Hessian、observer state、
+AutoSmooth/QAD 的跨 batch activation cache，以及其他 modifier 在当前 target
+生命周期内必须保留的状态。它们的生命周期由 modifier contract 决定，不能仅
+因为当前 dispatch 变小就释放或缩小。
+
+然后估计每个 rank 随 dispatch token 数 `T` 增长的工作集：
+
+```text
+M_batch[r, T] =
+    boundary input residency
+  + expert input assembly and transfer
+  + expert intermediate/output activations
+  + modifier calibration scratch
+  + activation propagation scratch
+  + output split/return workspace
+```
+
+候选 capacity 必须满足：
+
+```text
+M_fixed[r] + M_batch[r, capacity[r]]
+    <= usable_device_memory[r]
+```
+
+`usable_device_memory[r]` 必须扣除 device safety reserve。对于存在多个执行
+阶段的 target，最终 capacity 取实际执行阶段的最小值：
+
+```text
+capacity[r] = min(
+    calibration_capacity[r],
+    propagation_capacity[r],
+    modifier_update_capacity[r],
+)
+```
+
+没有 propagation 的 statistics-only recipe 不应为不存在的阶段保留预算；复用
+calibration output 的 modifier 也不应重复计算 propagation workspace。阶段选择
+必须来自 modifier contract 和 pipeline execution mode，而不是根据 modifier
+类名猜测。
+
+#### 17.3.3 token cost 必须来自实际模型 shape
+
+`M_batch[r, T]` 不能使用固定的 `hidden_size * sequence_length` 常数。模型
+adapter 或通用 module inspection 必须从当前 target 的真实 module shape 推导：
+
+- expert 输入和输出 width；
+- `w1/w3`、`w2` 或 fused projection 的中间 width；
+- activation、weight 和 accumulation dtype；
+- route top-k 或 all-experts 模式；
+- 输入 boundary 中实际携带的 hidden、indices、weights、mask 和 metadata；
+- owner 侧拼接、拆分、传输和 output accumulation 的临时张量。
+
+对于 DSV4.1 routed expert，保守估算至少覆盖：
+
+```text
+hidden input
++ w1/w3 intermediate activations
++ w2 output
++ route/output accumulation
+```
+
+其中 w1/w3 的 FP32 accumulation 必须按 FP32 workspace 计费，即使 boundary
+和权重使用 BF16。对于非 DSV4.1 模型，不能读取 DSV4.1 配置字段；应通过
+线性层 shape、expert adapter 声明和实际输入 tensor 推导等价成本。
+
+如果不同 expert 的 shape 不同，capacity 计算使用 owner 上最坏的 per-token
+cost；placement 仍按 expert storage bytes 做稳定分配。后续可以将 token budget
+扩展为 weighted token units，但第一阶段的公开语义仍是实际 token 数。
+
+#### 17.3.4 runtime dispatch 规则
+
+`ExpertParallelExecutor.forward_many` 不再按照 boundary 数量或输入字节总量
+切分。它应在 FX 图中形成 expert call 后，读取每个 expert 输入的第一维：
+
+```python
+expert_tokens = expert_input.shape[0]
+```
+
+这个值代表该 expert 当前实际收到的 routed token 数。executor 对每个 owner
+独立维护累计 token：
+
+```text
+owner_tokens[r] += expert_tokens
+```
+
+当加入下一个 expert call 会超过 `capacity[r]` 时，结束当前 owner dispatch，
+提交下一个 dispatch。不同 owner 可以同时拥有不同数量的 token，不需要为了
+统一 batch size 而提前截断容量较大的 rank。
+
+当前实现必须保持以下顺序语义：
+
+1. 同一 expert 内部的输入顺序与原始 FX 图一致；
+2. 同一个 owner 的兼容 expert 输入可以拼接，但必须记录每个输入的原始长度；
+3. owner 返回后按原始 entry 顺序拆分输出；
+4. downstream dependency 只有在对应 node 完成后才能继续；
+5. route weight、in-place `index_add_`、shared expert、CSA2 和 MTP state 的
+   原有更新顺序不变；
+6. token budget 只改变 dispatch 分段，不改变 calibration boundary 和 target
+   sequential boundary。
+
+对于标准 top-k routing，owner token 数由实际路由决定。对于
+`moe_calibrate_all_experts`，每个 expert 可能看到完整输入，因此 capacity
+必须按 all-experts 最坏路径估算。空 expert 不产生实际 token，也不应因为
+模型声明的 expert 总数被重复收费。
+
+Pipeline 需要以主执行设备能够容纳的 boundary token 数形成一轮
+`forward_many` 输入；executor 再对非主 owner 按各自 capacity 独立切分。主设备
+的 boundary residency、非主设备的 expert dispatch workspace 和 output return
+workspace 必须分别计入 admission。不能只用非主 owner 的 capacity 放大输入
+收集而导致主设备 OOM。
+
+#### 17.3.5 modifier 无关的 memory contract
+
+EP core 不得导入或判断 `GPTQModifier`、`QuantizationModifier`、`QADModifier`
+或其他具体 modifier 类型。内存估算通过 modifier contract/adapter 提供以下
+语义：
+
+```text
+estimate_persistent_memory(
+    module,
+    total_calibration_tokens,
+) -> bytes
+
+estimate_batch_memory(
+    module,
+    dispatch_tokens,
+    phase,
+) -> bytes
+
+estimate_host_memory(
+    module,
+    total_calibration_tokens,
+) -> bytes
+
+estimate_update_memory(
+    module,
+    phase,
+) -> bytes
+```
+
+兼容已有 adapter 时，可以暂时继续使用：
+
+```text
+estimate_memory(module, num_tokens) -> (held_bytes, scratch_bytes)
+```
+
+但 pipeline 必须明确区分两个 token 计数：
+
+- `total_calibration_tokens`：用于跨 batch 持久化统计和 host cache；
+- `dispatch_tokens`：用于当前一次 calibration/propagation 的临时 workspace。
+
+不能把完整 calibration token 数错误地作为一次 EP dispatch 的 scratch，也不能
+把需要跨 batch 保留的 cache 按当前 dispatch token 数缩小。现有
+`estimate_modifier_memory` 应作为兼容聚合入口，逐步将 modifier-specific
+逻辑迁移到 adapter，而不是在 `ExpertParallelPlan` 内增加 modifier 类判断。
+
+至少需要覆盖以下 modifier 语义：
+
+| modifier/能力 | 固定或跨 batch 内存 | token 相关内存 | EP 要求 |
+| --- | --- | --- | --- |
+| GPTQ | Hessian、observer、quantization state | calibration/propagation activation、compression scratch | adapter 提供 update scratch；不得由 EP core 特判 |
+| Quantization/RTN | observer 和量化状态 | activation observer workspace | 使用通用 modifier estimate |
+| AutoSmooth | parent/activation cache、scale state | smooth/balance 临时 activation | 区分 host cache 与 device scratch |
+| QAD | distilled/cache state | local training 和 activation scratch | 同时计入 host/device；不因 CPU cache 而放宽 device admission |
+| AutoRound | optimizer/quantization state | decoding layer 和优化 workspace | 保留 AutoRound 自己的 batch/iters 语义 |
+| HIGGS provider | candidate/config search state | bounded group evaluation workspace | provider 必须声明有界 memory curve |
+| 未来 modifier | 由 adapter 声明 | 由 adapter 声明 | 无有界估算时 preflight 拒绝 |
+
+当前某个 modifier 尚未实现 EP lifecycle adapter 时，通用 memory contract
+不能伪造支持。应由 recipe validation 明确拒绝该组合，或在 adapter 提供完整
+的 parameter placement、statistics lifetime、communication 和 recovery
+声明后再启用。
+
+#### 17.3.6 admission、manifest 和恢复
+
+每个 target group 在加载权重前完成所有 owner 的 admission。日志至少记录：
+
+```text
+target
+modifier contracts
+phase
+total_calibration_tokens
+max boundary tokens
+owner device
+fixed memory
+batch bytes per token
+selected token capacity
+actual dispatch token count
+peak allocated/reserved bytes
+```
+
+运行 manifest/fingerprint 需要记录：
+
+- token budget policy 的版本；
+- 是否为 `auto`；
+- 每个 owner 的计算 capacity；
+- 实际 target group 与 owner placement；
+- modifier contract fingerprint；
+- runtime 采用的 phase set；
+- 用户提供的全局 token cap（如果有）。
+
+恢复任务必须复用已记录的 target group、owner placement 和 token policy。显存
+空闲量变化不能让恢复过程静默选择另一套 capacity 并改变 GPTQ、observer 或
+其他 modifier 的累积顺序。若硬件或显存状态不足以复现原计划，应在 admission
+阶段失败并要求显式重新开始。
+
+#### 17.3.7 验收矩阵
+
+文档设计完成后，代码实现至少需要以下验证：
+
+1. pipeline `batch_size=1`，EP token capacity 大于单个 boundary，确认多个
+   boundary 可以合并且输出逐 batch 与单 batch reference 一致；
+2. 两个 owner 使用不同 capacity，确认小容量 owner 先切 dispatch，大容量
+   owner 不被统一 batch size 提前截断；
+3. 变长 calibration boundary，确认按实际 token 而非样本数限流；
+4. top-k、空 expert、all-experts 和不同路由分布；
+5. GPTQ Hessian/sample count/qparams 对照；
+6. Quantization observer、AutoSmooth、QAD、AutoRound adapter 的固定内存和
+   token scratch 对照；
+7. 有 propagation、复用 propagation output 和无 successor target 的阶段组合；
+8. host/device admission、异常回滚、checkpoint recovery 和 manifest fingerprint；
+9. 不提供有界 memory estimate 的 modifier 在 preflight 阶段明确失败；
+10. 记录每个 rank 的 token、dispatch、时间和峰值显存，确认容量策略没有把
+    单卡热点隐藏在统一 batch size 统计中。
+
+这一设计的目标是让 EP 成为通用的 streaming execution capability：GPTQ、
+RTN、QAD、AutoSmooth、AutoRound、HIGGS 和未来 modifier 都通过同一套资源
+contract 接入；模型特化逻辑仍由 MoE/model adapter 负责，不能回流到 EP core。
+
 **本轮实现检查点。** 当前分支已保留三个可回退提交：
 
 - `668afa138`：owner CUDA stream、event dependency、卸载前统一同步；
 - `d18efc39d`：同一 owner 的兼容 expert 输入按批次拼接，一次传入 owner，
-  owner 内按原 expert 顺序调用，再按原输出边界拆回；单批输入上限默认
-  128 MiB，超限或结构不兼容时逐 expert 回退；
+  owner 内按原 expert 顺序调用，再按原输出边界拆回；该提交中的单批输入
+  字节上限属于历史实现，后续由 per-rank token capacity 取代；
 - `cbb376da8`：外部 `LocalExpertProxy`，标准 expert container 通过 context
   manager 临时替换，保留 `experts.<id>` 名称和 hooks，退出时恢复原模块。
 

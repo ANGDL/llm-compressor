@@ -252,6 +252,38 @@ def test_forward_many_batches_repeated_experts_with_variable_lengths():
     assert [expert.calls for expert in model.experts] == [1, 1]
 
 
+def test_forward_many_respects_per_owner_token_capacity():
+    torch.manual_seed(13)
+    model = _MoE(2).eval()
+    subgraph = _graph(model)
+    values = [
+        {
+            "hidden": torch.randn(3, 4),
+            "indices": torch.tensor([0, 1, 0]),
+        },
+        {
+            "hidden": torch.randn(5, 4),
+            "indices": torch.tensor([1, 0, 1, 0, 1]),
+        },
+    ]
+    plan = ExpertParallelPlan.from_model(
+        model, _targets(model), ("cpu:0", "cpu:1")
+    )
+    for expert in model.experts:
+        expert.calls = 0
+    with ExpertParallelExecutor(
+        model,
+        plan,
+        token_capacity={"cpu:0": 3, "cpu:1": 100},
+    ) as executor:
+        executor.forward_many([subgraph], values)
+
+    # Each owner receives more than three routed tokens across the two
+    # independent inputs, so the smaller owner capacity forces another call.
+    assert model.experts[0].calls == 2
+    assert model.experts[1].calls == 1
+
+
 def test_worker_failure_waits_for_other_workers_and_can_unwind():
     model = _MoE(2)
     barrier = threading.Barrier(2)

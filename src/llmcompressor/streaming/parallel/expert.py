@@ -17,7 +17,10 @@ from torch.utils._pytree import tree_flatten, tree_map, tree_unflatten
 
 from llmcompressor.pipelines.sequential.helpers import Subgraph
 
-from ..admission import ModifierMemoryEstimate, estimate_modifier_memory
+from ..admission import (
+    ModifierMemoryEstimate,
+    estimate_modifier_dispatch_memory,
+)
 from ..artifacts import fingerprint_json
 from ..loading.session import SubgraphLoadPlan
 from ..moe.proxy import install_local_expert_proxy
@@ -281,44 +284,46 @@ class ExpertParallelPlan:
     def estimate_memory(
         self, modifiers, modules, *, device, num_tokens, max_batch_tokens
     ) -> ModifierMemoryEstimate:
-        from llmcompressor.modifiers.gptq import GPTQModifier
-        from llmcompressor.modifiers.gptq.helpers import (
-            batch_key,
-            quantization_peak_bytes,
-        )
-
         owned = tuple(
             module for module in modules if self.module_devices[module] == device
         )
-        estimate = estimate_modifier_memory(
-            modifiers, owned, num_tokens=num_tokens, max_batch_tokens=max_batch_tokens
+        return estimate_modifier_dispatch_memory(
+            modifiers,
+            owned,
+            total_tokens=num_tokens,
+            dispatch_tokens=max_batch_tokens,
+            max_batch_tokens=max_batch_tokens,
         )
-        scratch = estimate.scratch_bytes
-        for modifier in modifiers:
-            if not isinstance(modifier, GPTQModifier):
+
+    def runtime_bytes_per_token(
+        self,
+        model: nn.Module,
+        device: torch.device,
+        *,
+        modules: Sequence[nn.Module] = (),
+        boundary_bytes_per_token: int = 0,
+    ) -> int:
+        """Estimate owner runtime storage from the current target's Linear shapes."""
+
+        resolved = torch.device(device)
+        total = boundary_bytes_per_token if resolved == self.devices[0] else 0
+        resident = set(modules) if modules else set(self.module_devices)
+        for module in resident:
+            if (
+                not isinstance(module, nn.Linear)
+                or self.module_devices.get(module) != resolved
+            ):
                 continue
-            batches = {}
-            for module in owned:
-                if not modifier._is_calibrated(module):
-                    continue
-                key = batch_key(module)
-                if key is None:
-                    key = id(module)
-                batches.setdefault(key, []).append(module)
-            for members in batches.values():
-                batch_size = (
-                    len(members)
-                    if modifier.batched_quantization == "auto"
-                    else min(len(members), modifier.batched_quantization or 1)
-                )
-                scratch = max(
-                    scratch,
-                    batch_size
-                    * quantization_peak_bytes(members[0], modifier.block_size),
-                )
-        return ModifierMemoryEstimate(
-            estimate.held_bytes, scratch, estimate.details, estimate.host_bytes
-        )
+            weight = getattr(module, "weight", None)
+            if weight is None or weight.ndim != 2:
+                continue
+            input_width = int(weight.shape[1])
+            output_width = int(weight.shape[0])
+            # Count input/output copies, intermediate activations, and
+            # accumulation/transfer buffers at FP32. This is intentionally a
+            # conservative model shared by all modifiers and model adapters.
+            total += 4 * (2 * input_width + 2 * output_width)
+        return max(1, total)
 
 
 def _join_subgraphs(subgraphs: Sequence[Subgraph]) -> tuple[Graph, set[str]]:
@@ -496,10 +501,6 @@ class _ExpertBatchResult:
     event: Any | None = None
 
 
-_DEFAULT_MAX_BATCH_INPUT_BYTES = 128 * 1024 * 1024
-_DEFAULT_FORWARD_BATCH_SIZE = 4
-
-
 class ExpertParallelExecutor:
     """Schedule independent expert calls concurrently and preserve FX dataflow."""
 
@@ -508,25 +509,13 @@ class ExpertParallelExecutor:
         model: nn.Module,
         plan: ExpertParallelPlan,
         *,
-        max_batch_input_bytes: int = _DEFAULT_MAX_BATCH_INPUT_BYTES,
-        forward_batch_size: int = _DEFAULT_FORWARD_BATCH_SIZE,
+        token_capacity: Mapping[torch.device | str, int] | None = None,
     ):
-        if (
-            isinstance(max_batch_input_bytes, bool)
-            or not isinstance(max_batch_input_bytes, int)
-            or max_batch_input_bytes <= 0
-        ):
-            raise ValueError("max_batch_input_bytes must be a positive integer")
-        if (
-            isinstance(forward_batch_size, bool)
-            or not isinstance(forward_batch_size, int)
-            or forward_batch_size <= 0
-        ):
-            raise ValueError("forward_batch_size must be a positive integer")
         self.model = model
         self.plan = plan
-        self.max_batch_input_bytes = max_batch_input_bytes
-        self.forward_batch_size = forward_batch_size
+        self.token_capacity: dict[torch.device, int] = {}
+        if token_capacity is not None:
+            self.set_token_capacity(token_capacity)
         self._workers = {
             device: ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"ep-{index}")
             for index, device in enumerate(plan.devices)
@@ -540,6 +529,40 @@ class ExpertParallelExecutor:
             for device in plan.devices
         }
         self._graphs: dict[tuple[int, ...], _ExecutionGraph] = {}
+
+    def set_token_capacity(
+        self, token_capacity: Mapping[torch.device | str, int] | None
+    ) -> None:
+        """Set the per-owner dispatch token capacity for the current target."""
+
+        normalized: dict[torch.device, int] = {}
+        for device in self.plan.devices:
+            value = None if token_capacity is None else token_capacity.get(device)
+            if value is None and token_capacity is not None:
+                value = token_capacity.get(str(device))
+            if value is None:
+                continue
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(
+                    f"token capacity for {device} must be a positive integer"
+                )
+            normalized[device] = value
+        if token_capacity is not None:
+            unknown = {
+                torch.device(device)
+                for device in token_capacity
+            }.difference(self.plan.devices)
+            if unknown:
+                raise ValueError(
+                    f"token capacity contains unknown EP devices: {sorted(map(str, unknown))}"
+                )
+        self.token_capacity = normalized
+
+    @property
+    def input_token_capacity(self) -> int | None:
+        """Return the primary-device capacity used to form pipeline microbatches."""
+
+        return self.token_capacity.get(self.plan.devices[0])
 
     def close(self) -> None:
         self.synchronize()
@@ -713,19 +736,25 @@ class ExpertParallelExecutor:
             tuple(output_indices),
         )
 
-    def _group_ready_experts(self, entries, primary):
+    @staticmethod
+    def _entry_token_count(entry) -> int:
+        _node, _name, args, kwargs = entry
+        for item in tree_flatten((args, kwargs))[0]:
+            if isinstance(item, torch.Tensor) and item.ndim >= 1:
+                return int(item.shape[0])
+        raise ValueError("Expert call has no tensor input with a token dimension")
+
+    def _group_ready_experts(self, entries, primary, owner):
         groups = []
         current = []
-        current_bytes = 0
+        current_tokens = 0
+        capacity = self.token_capacity.get(owner)
         for entry in entries:
-            input_bytes = sum(
-                item.numel() * item.element_size()
-                for item in self._call_leaves(entry[2], entry[3])[0]
-                if isinstance(item, torch.Tensor)
-            )
+            input_tokens = self._entry_token_count(entry)
             exceeds_budget = (
-                current
-                and current_bytes + input_bytes > self.max_batch_input_bytes
+                capacity is not None
+                and current
+                and current_tokens + input_tokens > capacity
             )
             incompatible = (
                 current
@@ -734,9 +763,9 @@ class ExpertParallelExecutor:
             if exceeds_budget or incompatible:
                 groups.append(current)
                 current = []
-                current_bytes = 0
+                current_tokens = 0
             current.append(entry)
-            current_bytes += input_bytes
+            current_tokens += input_tokens
         if current:
             groups.append(current)
         return groups
@@ -1028,7 +1057,9 @@ class ExpertParallelExecutor:
                 )
                 with primary_context, primary_stream_context:
                     for owner, entries in ready_experts.items():
-                        for group in self._group_ready_experts(entries, primary):
+                        for group in self._group_ready_experts(
+                            entries, primary, owner
+                        ):
                             prepared = (
                                 self._prepare_batch(group, primary)
                                 if len(group) > 1

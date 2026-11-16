@@ -11,6 +11,7 @@ from .admission import (
     DiskSpaceBudget,
     DiskSpaceError,
     ModifierMemoryEstimate,
+    estimate_modifier_dispatch_memory,
     estimate_modifier_memory,
 )
 from .artifacts import (
@@ -179,6 +180,7 @@ __all__ = [
     "InMemoryBoundaryActivationStore",
     "MaterializerInfo",
     "ModifierMemoryEstimate",
+    "estimate_modifier_dispatch_memory",
     "ModifierContract",
     "ModifierContractError",
     "ParallelContext",

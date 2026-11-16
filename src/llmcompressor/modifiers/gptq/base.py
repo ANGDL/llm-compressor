@@ -29,6 +29,7 @@ from llmcompressor.modifiers.gptq.helpers import (
     GPTQ_PRECISION,
     accumulate_hessian,
     assign_batches,
+    batch_key,
     make_empty_hessian,
     prepare_batch,
     quantization_peak_bytes,
@@ -281,6 +282,33 @@ class GPTQModifier(Modifier, QuantizationMixin):
         scratch = batch_size * quantization_peak_bytes(module, self.block_size)
 
         return held, scratch
+
+    def estimate_sequential_update_memory(
+        self, modules: list[torch.nn.Module] | tuple[torch.nn.Module, ...]
+    ) -> int:
+        """Estimate the largest compatible compression batch workspace."""
+
+        batches = {}
+        for module in modules:
+            if not self._is_calibrated(module):
+                continue
+            key = batch_key(module)
+            if key is None:
+                key = id(module)
+            batches.setdefault(key, []).append(module)
+        scratch = 0
+        for members in batches.values():
+            batch_size = (
+                len(members)
+                if self.batched_quantization == "auto"
+                else min(len(members), self.batched_quantization or 1)
+            )
+            scratch = max(
+                scratch,
+                batch_size
+                * quantization_peak_bytes(members[0], self.block_size),
+            )
+        return scratch
 
     def _is_calibrated(self, module: torch.nn.Module) -> bool:
         """Whether this modifier accumulates a Hessian for the module"""

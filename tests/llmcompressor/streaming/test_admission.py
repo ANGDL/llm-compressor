@@ -15,6 +15,7 @@ from llmcompressor.streaming.admission import (
     DeviceMemoryError,
     DiskSpaceBudget,
     DiskSpaceError,
+    estimate_modifier_dispatch_memory,
     estimate_modifier_memory,
 )
 from llmcompressor.streaming.modifier_contract import ModifierContractError
@@ -97,6 +98,26 @@ def test_dynamic_estimate_is_not_replaced_by_identity_probe():
 
     assert estimate.held_bytes == 12
     assert estimate.scratch_bytes == 42
+
+
+def test_modifier_dispatch_memory_separates_persistent_and_token_scratch():
+    class TokenModifier:
+        requires_calibration_data = True
+
+        def estimate_sequential_memory(self, _module, num_tokens):
+            return 100, 7 + 3 * num_tokens
+
+    estimate = estimate_modifier_dispatch_memory(
+        [TokenModifier()],
+        [nn.Identity()],
+        total_tokens=100,
+        dispatch_tokens=11,
+    )
+
+    assert estimate.held_bytes == 100
+    assert estimate.scratch_bytes == 7
+    assert estimate.batch_bytes == 33
+    assert estimate.peak_bytes == 140
 
 
 @pytest.mark.parametrize("quantizer_class", [QuantizationModifier, GPTQModifier])

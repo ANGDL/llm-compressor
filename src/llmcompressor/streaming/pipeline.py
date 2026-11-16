@@ -38,7 +38,7 @@ from .admission import (
     DeviceMemoryBudget,
     DeviceMemoryError,
     DiskSpaceBudget,
-    estimate_modifier_memory,
+    estimate_modifier_dispatch_memory,
 )
 from .artifacts import (
     ArtifactStore,
@@ -692,6 +692,47 @@ def _forward_target_group_many(
     )
 
 
+def _iter_execution_batches(
+    boundaries: BoundaryActivationStore,
+    boundary_index: int,
+    batch_indices: Sequence[int],
+    input_names: set[str],
+    *,
+    device: torch.device,
+    token_capacity: int | None,
+):
+    """Load boundary inputs up to a primary-device token capacity."""
+
+    current_indices = []
+    current_values = []
+    current_tokens = 0
+    for batch_index in batch_indices:
+        value = boundaries.get_for_execution(
+            boundary_index,
+            batch_index,
+            input_names,
+            device=device,
+        )
+        tokens = _boundary_token_count(
+            {name: value[name] for name in input_names}
+        )
+        exceeds_capacity = (
+            token_capacity is not None
+            and current_values
+            and current_tokens + tokens > token_capacity
+        )
+        if exceeds_capacity:
+            yield tuple(current_indices), tuple(current_values)
+            current_indices = []
+            current_values = []
+            current_tokens = 0
+        current_indices.append(batch_index)
+        current_values.append(value)
+        current_tokens += tokens
+    if current_values:
+        yield tuple(current_indices), tuple(current_values)
+
+
 def _reference_tensor(value: Any) -> torch.Tensor | None:
     """Find a floating decoder output in a boundary value."""
 
@@ -1339,7 +1380,7 @@ def run_subgraph_streaming_pipeline(
                     num_tokens = 0
                     max_batch_tokens = 0
                     boundary_bytes = 0
-                    max_batch_bytes = 0
+                    max_boundary_bytes_per_token = 0
                     for batch_index in batches:
                         value = boundaries.get(
                             group_start, batch_index, device="meta"
@@ -1353,7 +1394,15 @@ def run_subgraph_streaming_pipeline(
                         num_tokens += batch_tokens
                         max_batch_tokens = max(max_batch_tokens, batch_tokens)
                         boundary_bytes += _boundary_nbytes(value)
-                        max_batch_bytes = max(max_batch_bytes, _boundary_nbytes(value))
+                        current_boundary_bytes = _boundary_nbytes(value)
+                        if batch_tokens:
+                            max_boundary_bytes_per_token = max(
+                                max_boundary_bytes_per_token,
+                                (
+                                    current_boundary_bytes + batch_tokens - 1
+                                )
+                                // batch_tokens,
+                            )
                         del value
                     num_tokens = max(num_tokens, num_samples * (max_seq_length or 1), 1)
                     max_batch_tokens = max(max_batch_tokens, max_seq_length or 1)
@@ -1365,10 +1414,11 @@ def run_subgraph_streaming_pipeline(
                             if prefetched_prepared is not None
                             else adapter.plan_group(target_indices)
                         )
-                        modifier_memory = estimate_modifier_memory(
+                        modifier_memory = estimate_modifier_dispatch_memory(
                             modifiers,
                             resident_modules,
-                            num_tokens=num_tokens,
+                            total_tokens=num_tokens,
+                            dispatch_tokens=max_batch_tokens,
                             max_batch_tokens=max_batch_tokens,
                         )
                         materialized_bytes = (
@@ -1387,20 +1437,73 @@ def run_subgraph_streaming_pipeline(
                         disk_budget.check(target_label, disk_required)
                         if expert_parallel is not None:
                             owner_plans = expert_parallel.split_load_plan(plan)
+                            owner_capacities = {}
+                            boundary_bytes_per_token = max(
+                                1,
+                                max_boundary_bytes_per_token,
+                            )
                             for owner_device, owner_plan in owner_plans:
                                 owner_memory = expert_parallel.estimate_memory(
                                     modifiers, resident_modules,
                                     device=owner_device, num_tokens=num_tokens,
-                                    max_batch_tokens=max_batch_tokens,
+                                    max_batch_tokens=0,
+                                )
+                                dispatch_memory = expert_parallel.estimate_memory(
+                                    modifiers,
+                                    resident_modules,
+                                    device=owner_device,
+                                    num_tokens=num_tokens,
+                                    max_batch_tokens=1,
                                 )
                                 owner_weights = (
                                     adapter.weight_session.estimate_materialized_bytes(
                                         owner_plan, dtype=target_dtype
                                     )
                                 )
-                                owner_required = (
+                                runtime_bytes_per_token = (
+                                    expert_parallel.runtime_bytes_per_token(
+                                        adapter.model,
+                                        owner_device,
+                                        modules=resident_modules,
+                                        boundary_bytes_per_token=(
+                                            boundary_bytes_per_token
+                                            if owner_device == device
+                                            else 0
+                                        ),
+                                    )
+                                )
+                                modifier_bytes_per_token = (
+                                    dispatch_memory.batch_bytes
+                                )
+                                bytes_per_token = max(
+                                    1,
+                                    runtime_bytes_per_token
+                                    + modifier_bytes_per_token,
+                                )
+                                fixed_required = (
                                     owner_weights + owner_memory.peak_bytes
-                                    + 4 * max_batch_bytes
+                                )
+                                usable = device_budget.usable_bytes(owner_device)
+                                if usable is None:
+                                    capacity = max_batch_tokens
+                                else:
+                                    capacity = max(
+                                        1,
+                                        (usable - fixed_required)
+                                        // bytes_per_token,
+                                    )
+                                if capacity < max_batch_tokens:
+                                    raise DeviceMemoryError(
+                                        f"{target_label} expert owner "
+                                        f"{owner_device} cannot fit one "
+                                        f"calibration boundary: capacity="
+                                        f"{capacity} tokens, required at least "
+                                        f"{max_batch_tokens}"
+                                    )
+                                capacity = min(capacity, max(num_tokens, 1))
+                                owner_capacities[owner_device] = capacity
+                                owner_required = (
+                                    fixed_required + bytes_per_token * capacity
                                 )
                                 weight_stack.enter_context(
                                     device_budget.reserve(
@@ -1415,10 +1518,15 @@ def run_subgraph_streaming_pipeline(
                                     f"modifier_held_bytes={owner_memory.held_bytes} | "
                                     "modifier_scratch_bytes="
                                     f"{owner_memory.scratch_bytes} | "
-                                    "activation_transfer_bytes="
-                                    f"{4 * max_batch_bytes} | "
+                                    "modifier_batch_bytes_per_token="
+                                    f"{modifier_bytes_per_token} | "
+                                    "runtime_bytes_per_token="
+                                    f"{runtime_bytes_per_token} | "
+                                    "token_capacity="
+                                    f"{capacity} | "
                                     f"device_required_bytes={owner_required}"
                                 )
+                            ep_executor.set_token_capacity(owner_capacities)
                         elif prefetched_prepared is None:
                             weight_stack.enter_context(
                                 device_budget.reserve(
@@ -1537,10 +1645,11 @@ def run_subgraph_streaming_pipeline(
                                     ].submodules(adapter.model)
                                 )
                             )
-                            next_modifier_memory = estimate_modifier_memory(
+                            next_modifier_memory = estimate_modifier_dispatch_memory(
                                 modifiers,
                                 next_modules,
-                                num_tokens=num_tokens,
+                                total_tokens=num_tokens,
+                                dispatch_tokens=max_batch_tokens,
                                 max_batch_tokens=max_batch_tokens,
                             )
                             completion_bytes = _estimate_loaded_target_snapshot_bytes(
@@ -1655,26 +1764,21 @@ def run_subgraph_streaming_pipeline(
                         device,
                     ):
                         with DisableQuantization(adapter.model), torch.no_grad():
-                            batch_step = (
-                                ep_executor.forward_batch_size
+                            token_capacity = (
+                                ep_executor.input_token_capacity
                                 if ep_executor is not None
-                                else 1
+                                else None
                             )
-                            for batch_offset in range(0, len(batches), batch_step):
-                                batch_indices = batches[
-                                    batch_offset : batch_offset + batch_step
-                                ]
-                                values = []
+                            for batch_indices, values in _iter_execution_batches(
+                                boundaries,
+                                group_start,
+                                batches,
+                                group_inputs,
+                                device=device,
+                                token_capacity=token_capacity,
+                            ):
                                 for batch_index in batch_indices:
                                     session.state.current_batch_idx = batch_index
-                                    values.append(
-                                        boundaries.get_for_execution(
-                                            group_start,
-                                            batch_index,
-                                            group_inputs,
-                                            device=device,
-                                        )
-                                    )
                                 next_values = _forward_target_group_many(
                                     adapter,
                                     target_indices,
@@ -1778,26 +1882,21 @@ def run_subgraph_streaming_pipeline(
                                 ),
                                 torch.no_grad(),
                             ):
-                                batch_step = (
-                                    ep_executor.forward_batch_size
+                                token_capacity = (
+                                    ep_executor.input_token_capacity
                                     if ep_executor is not None
-                                    else 1
+                                    else None
                                 )
-                                for batch_offset in range(
-                                    0, len(batches), batch_step
+                                for batch_indices, values in (
+                                    _iter_execution_batches(
+                                        boundaries,
+                                        group_start,
+                                        batches,
+                                        group_inputs,
+                                        device=device,
+                                        token_capacity=token_capacity,
+                                    )
                                 ):
-                                    batch_indices = batches[
-                                        batch_offset : batch_offset + batch_step
-                                    ]
-                                    values = [
-                                        boundaries.get_for_execution(
-                                            group_start,
-                                            batch_index,
-                                            group_inputs,
-                                            device=device,
-                                        )
-                                        for batch_index in batch_indices
-                                    ]
                                     next_values = _forward_target_group_many(
                                         adapter,
                                         target_indices,
