@@ -23,6 +23,7 @@ __all__ = [
     "DiskSpaceError",
     "ModifierMemoryEstimate",
     "estimate_modifier_memory",
+    "estimate_modifier_dispatch_memory",
 ]
 
 
@@ -75,10 +76,36 @@ class ModifierMemoryEstimate:
     scratch_bytes: int
     details: tuple[dict[str, Any], ...] = ()
     host_bytes: int = 0
+    batch_bytes: int = 0
 
     @property
     def peak_bytes(self) -> int:
-        return self.held_bytes + self.scratch_bytes
+        return self.held_bytes + self.scratch_bytes + self.batch_bytes
+
+
+def _estimate_modifier_update_memory(
+    modifiers: Iterable[Any],
+    modules: Iterable[torch.nn.Module],
+) -> int:
+    modules = tuple(dict.fromkeys(modules))
+    total = 0
+    for modifier in tuple(modifiers):
+        adapter = get_modifier_adapter(modifier)
+        estimate_fn = (
+            adapter.estimate_update_memory
+            if adapter is not None
+            else getattr(modifier, "estimate_sequential_update_memory", None)
+        )
+        if not callable(estimate_fn):
+            continue
+        value = estimate_fn(modules)
+        if not isinstance(value, Integral) or value < 0:
+            raise ModifierContractError(
+                f"{type(modifier).__qualname__}.estimate_update_memory must "
+                "return a non-negative integer"
+            )
+        total += int(value)
+    return total
 
 
 def _estimate_observer_memory(
@@ -224,6 +251,68 @@ def estimate_modifier_memory(
     return ModifierMemoryEstimate(held, scratch, tuple(details), host)
 
 
+def estimate_modifier_dispatch_memory(
+    modifiers: Iterable[Any],
+    modules: Iterable[torch.nn.Module],
+    *,
+    total_tokens: int,
+    dispatch_tokens: int,
+    max_batch_tokens: int | None = None,
+) -> ModifierMemoryEstimate:
+    """Split modifier memory into persistent and dispatch-sized components.
+
+    Existing modifier estimators expose ``(held, scratch)`` for a token count.
+    Streaming uses the estimate at the full calibration size for persistent
+    state, the estimate at zero tokens for static scratch, and the difference
+    between the dispatch and zero-token estimates for temporary workspaces.
+    This keeps modifier-specific cache semantics out of EP scheduling while
+    allowing token-aware admission for adapters that already scale scratch with
+    their input size.
+    """
+
+    modifiers = tuple(modifiers)
+    modules = tuple(dict.fromkeys(modules))
+    if total_tokens < 0 or dispatch_tokens < 0:
+        raise ValueError("token counts must be non-negative")
+    if max_batch_tokens is not None and max_batch_tokens < 0:
+        raise ValueError("max_batch_tokens must be non-negative")
+    full = estimate_modifier_memory(
+        modifiers,
+        modules,
+        num_tokens=total_tokens,
+        max_batch_tokens=max_batch_tokens,
+    )
+    static = estimate_modifier_memory(
+        modifiers,
+        modules,
+        num_tokens=0,
+        max_batch_tokens=0,
+    )
+    dispatch = estimate_modifier_memory(
+        modifiers,
+        modules,
+        num_tokens=dispatch_tokens,
+        max_batch_tokens=dispatch_tokens,
+    )
+    update_bytes = _estimate_modifier_update_memory(modifiers, modules)
+    return ModifierMemoryEstimate(
+        held_bytes=full.held_bytes,
+        scratch_bytes=static.scratch_bytes + update_bytes,
+        details=full.details
+        + (
+            {
+                "modifier_type": "modifier_update",
+                "held_bytes": 0,
+                "scratch_bytes": update_bytes,
+            },
+        )
+        if update_bytes
+        else full.details,
+        host_bytes=full.host_bytes,
+        batch_bytes=max(0, dispatch.scratch_bytes - static.scratch_bytes),
+    )
+
+
 class DeviceMemoryReservation:
     def __init__(
         self,
@@ -344,3 +433,27 @@ class DeviceMemoryBudget:
             reservation = DeviceMemoryReservation(self, owner, required_bytes, resolved)
             self._reservations.add(reservation)
             return reservation
+
+    def usable_bytes(self, device: torch.device | str) -> int | None:
+        """Return capacity available for a new reservation on ``device``."""
+
+        resolved = torch.device(device)
+        if resolved.index is None and resolved.type == "cuda":
+            resolved = torch.device("cuda", torch.cuda.current_device())
+        with self._lock:
+            available = self._available_bytes(resolved)
+            if available is None:
+                return None
+            if available < 0:
+                raise ValueError("Available device memory must be non-negative")
+            promised = sum(
+                item._reserved_bytes
+                for item in self._reservations
+                if item.device == resolved
+            )
+            return max(
+                0,
+                available
+                - int(available * self.safety_reserve_fraction)
+                - promised,
+            )

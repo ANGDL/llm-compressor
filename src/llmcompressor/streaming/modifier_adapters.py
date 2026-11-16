@@ -96,6 +96,9 @@ class StreamingModifierAdapter:
     def estimate_host_memory(self, module: torch.nn.Module, num_tokens: int) -> int:
         return 0
 
+    def estimate_update_memory(self, modules: Sequence[torch.nn.Module]) -> int:
+        return 0
+
     def before_calibration(
         self, model: torch.nn.Module, targets: Sequence[str]
     ) -> None:
