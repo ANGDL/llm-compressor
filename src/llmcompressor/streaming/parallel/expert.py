@@ -596,6 +596,12 @@ class ExpertParallelExecutor:
     def _call_leaves(args, kwargs):
         return tree_flatten((args, kwargs))
 
+    @staticmethod
+    def _same_device(actual, expected):
+        if actual.type != expected.type:
+            return False
+        return actual.type != "cuda" or actual == expected
+
     @classmethod
     def _inputs_compatible(cls, entries, primary):
         if not entries:
@@ -606,7 +612,7 @@ class ExpertParallelExecutor:
         tensor_indices = []
         for leaf_index, leaf in enumerate(first_leaves):
             if isinstance(leaf, torch.Tensor):
-                if leaf.ndim < 1 or leaf.device != primary:
+                if leaf.ndim < 1 or not cls._same_device(leaf.device, primary):
                     return False
                 tensor_indices.append(leaf_index)
             else:
@@ -630,7 +636,7 @@ class ExpertParallelExecutor:
                     if (
                         not isinstance(current, torch.Tensor)
                         or current.ndim != first.ndim
-                        or current.device != primary
+                        or not cls._same_device(current.device, primary)
                         or current.dtype != first.dtype
                         or current.shape[1:] != first.shape[1:]
                         or id(current) in tensor_ids
