@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections import deque
 from collections.abc import Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from contextlib import nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -20,7 +20,9 @@ from llmcompressor.pipelines.sequential.helpers import Subgraph
 from ..admission import ModifierMemoryEstimate, estimate_modifier_memory
 from ..artifacts import fingerprint_json
 from ..loading.session import SubgraphLoadPlan
+from ..moe.proxy import install_local_expert_proxy
 from .placement import PlacementEntry, PlacementPlan
+from .topology import EPTopology
 
 
 def resolve_expert_parallel_devices(
@@ -59,6 +61,9 @@ class ExpertParallelPlan:
     devices: tuple[torch.device, ...]
     placement: PlacementPlan
     module_devices: dict[nn.Module, torch.device]
+    expert_collections: tuple[str, ...] = ()
+    expert_bytes: tuple[tuple[str, int], ...] = ()
+    adapters: tuple[Any, ...] = ()
     _owners: dict[str, int] = field(init=False, repr=False)
     backend = "single-process-expert-parallel-v1"
 
@@ -73,6 +78,8 @@ class ExpertParallelPlan:
         model: nn.Module,
         targets: Sequence[str],
         devices: Sequence[torch.device | str],
+        *,
+        adapters: Sequence[Any] = (),
     ) -> ExpertParallelPlan:
         resolved = tuple(torch.device(device) for device in devices)
         if len(resolved) < 2:
@@ -87,31 +94,20 @@ class ExpertParallelPlan:
                 target_ancestors.add(ancestor)
                 target_positions.setdefault(ancestor, target_index)
                 ancestor = ancestor.rpartition(".")[0]
+        collections = _discover_expert_collections(model, targets, adapters)
         entries = []
-        for collection_name, collection in model.named_modules():
-            if not (
-                getattr(collection, "_streaming_expert_collection", False)
-                or "expert" in collection_name.rsplit(".", 1)[-1].lower()
-            ):
-                continue
+        expert_sizes: dict[str, int] = {}
+        for collection_name, collection in collections:
             children = tuple(
                 (name, child)
                 for name, child in collection._modules.items()
                 if child is not None
             )
-            if not children or not (
-                isinstance(collection, (nn.ModuleList, nn.ModuleDict))
-                or isinstance(getattr(collection, "num_experts", None), int)
-            ):
-                continue
-            for expert_index, (child_name, _child) in enumerate(children):
+            for expert_index, (child_name, child) in enumerate(children):
                 name = f"{collection_name}.{child_name}"
                 if name in target_names or name in target_ancestors:
-                    entries.append(
-                        PlacementEntry(
-                            name, expert_index % len(resolved), expert_id=expert_index
-                        )
-                    )
+                    entries.append(PlacementEntry(name, 0, expert_id=expert_index))
+                    expert_sizes[name] = _module_storage_bytes(child)
                 elif any(ancestor in target_names for ancestor in _ancestors(name)):
                     raise ValueError(
                         "Expert parallelism requires independently traced expert "
@@ -120,14 +116,22 @@ class ExpertParallelPlan:
         if not entries:
             raise ValueError("No independently traced expert collection was found")
         entries.sort(key=lambda entry: target_positions[entry.logical_name])
+        owners = _balanced_expert_owners(
+            tuple(entry.logical_name for entry in entries),
+            expert_sizes,
+            len(resolved),
+        )
         entries = [
-            replace(entry, owner_rank=index % len(resolved))
-            for index, entry in enumerate(entries)
+            replace(entry, owner_rank=owners[entry.logical_name])
+            for entry in entries
         ]
         plan = cls(
             resolved,
             PlacementPlan(tuple(entries), ep_size=len(resolved)),
             {},
+            tuple(collection_name for collection_name, _collection in collections),
+            tuple(sorted(expert_sizes.items())),
+            tuple(adapters),
         )
         identities: dict[int, torch.device] = {}
         for name, module in model.named_modules(remove_duplicate=False):
@@ -145,6 +149,82 @@ class ExpertParallelPlan:
                         f"State in {name!r} is shared across expert owners"
                     )
         return plan
+
+    @classmethod
+    def from_model_with_topology(
+        cls,
+        model: nn.Module,
+        targets: Sequence[str],
+        topology: EPTopology,
+        devices: Sequence[torch.device | str],
+        *,
+        adapters: Sequence[Any] = (),
+    ) -> "ExpertParallelPlan":
+        """Build a local-device plan after validating an EP topology."""
+
+        if topology.config.ep_size != len(devices):
+            raise ValueError(
+                "topology ep_size must match the number of expert owner devices"
+            )
+        if topology.config.dp_size != 1:
+            raise NotImplementedError(
+                "single-process ExpertParallelExecutor does not support dp_size > 1"
+            )
+        return cls.from_model(model, targets, devices, adapters=adapters)
+
+    @property
+    def owner_by_name(self) -> dict[str, int]:
+        return dict(self._owners)
+
+    def local_expert_ids(
+        self, collection_name: str, owner_rank: int
+    ) -> tuple[int, ...]:
+        """Return stable local expert ids for an external adapter."""
+
+        if owner_rank < 0 or owner_rank >= len(self.devices):
+            raise ValueError("owner_rank is outside the EP device list")
+        return tuple(
+            entry.expert_id
+            for entry in self.placement.entries
+            if entry.logical_name.startswith(f"{collection_name}.")
+            and entry.owner_rank == owner_rank
+            and entry.expert_id is not None
+        )
+
+    @contextmanager
+    def install_standard_proxies(
+        self,
+        model: nn.Module,
+        *,
+        topology: EPTopology | None = None,
+    ):
+        """Install adapter-owned local proxies for standard MoE forwards.
+
+        Native traced paths that call individual expert leaves continue to use
+        :class:`ExpertParallelExecutor`. This context is for model adapters
+        whose parent MoE module calls an expert container directly.
+        """
+
+        if not self.adapters:
+            yield
+            return
+        process_group = None if topology is None else topology.ep_group
+        with ExitStack() as stack:
+            for adapter in self.adapters:
+                module_name = adapter.expert_module_name()
+                local_ids = self.local_expert_ids(
+                    module_name,
+                    0 if topology is None else topology.ep_rank,
+                )
+                stack.enter_context(
+                    install_local_expert_proxy(
+                        model,
+                        module_name,
+                        local_ids,
+                        process_group=process_group,
+                    )
+                )
+            yield
 
     def device_for(self, name: str) -> torch.device:
         current = name
@@ -190,6 +270,8 @@ class ExpertParallelPlan:
             "backend": self.backend,
             "devices": [str(device) for device in self.devices],
             "placement": self.placement.to_dict(),
+            "expert_collections": list(self.expert_collections),
+            "expert_bytes": [list(item) for item in self.expert_bytes],
         }
 
     @property
@@ -271,6 +353,74 @@ def _ancestors(name: str):
     while current:
         yield current
         current = current.rpartition(".")[0]
+
+
+def _module_storage_bytes(module: nn.Module) -> int:
+    return sum(
+        tensor.numel() * tensor.element_size()
+        for tensor in module.parameters(recurse=False)
+    ) + sum(
+        tensor.numel() * tensor.element_size()
+        for tensor in module.buffers(recurse=False)
+        if tensor is not None
+    )
+
+
+def _balanced_expert_owners(
+    names: Sequence[str],
+    sizes: Mapping[str, int],
+    owner_count: int,
+) -> dict[str, int]:
+    """Assign experts by descending bytes with stable tie breaking."""
+
+    totals = [0] * owner_count
+    owners = {}
+    ordered = sorted(
+        names,
+        key=lambda name: (-sizes.get(name, 0), names.index(name)),
+    )
+    for name in ordered:
+        owner = min(range(owner_count), key=lambda rank: (totals[rank], rank))
+        owners[name] = owner
+        totals[owner] += sizes.get(name, 0)
+    return owners
+
+
+def _discover_expert_collections(
+    model: nn.Module,
+    targets: Sequence[str],
+    adapters: Sequence[Any],
+) -> tuple[tuple[str, nn.Module], ...]:
+    names = []
+    seen = set()
+    for adapter in adapters:
+        validate = getattr(adapter, "validate", None)
+        if callable(validate):
+            validate(model)
+        module_name = adapter.expert_module_name()
+        collection = model.get_submodule(module_name)
+        if module_name not in seen:
+            names.append((module_name, collection))
+            seen.add(module_name)
+    for collection_name, collection in model.named_modules():
+        last_component = collection_name.rsplit(".", 1)[-1].lower()
+        if not (
+            getattr(collection, "_streaming_expert_collection", False)
+            or "expert" in last_component
+        ):
+            continue
+        children = tuple(
+            child for child in collection._modules.values() if child is not None
+        )
+        if not children or not (
+            isinstance(collection, (nn.ModuleList, nn.ModuleDict))
+            or isinstance(getattr(collection, "num_experts", None), int)
+        ):
+            continue
+        if collection_name not in seen:
+            names.append((collection_name, collection))
+            seen.add(collection_name)
+    return tuple(names)
 
 
 @dataclass(frozen=True)

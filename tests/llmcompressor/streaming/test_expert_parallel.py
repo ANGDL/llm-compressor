@@ -30,6 +30,13 @@ from llmcompressor.streaming.parallel.expert import (
     _ExecutionGraph,
     resolve_expert_parallel_devices,
 )
+from llmcompressor.streaming.parallel.topology import (
+    EPConfig,
+    EPMode,
+    EPTopology,
+    build_expert_placement,
+    make_expert_state_filter,
+)
 from llmcompressor.streaming.tracing import _split_target_subgraph
 from llmcompressor.utils.helpers import DisableQuantization
 
@@ -104,6 +111,67 @@ def test_placement_handles_uneven_experts_and_preserves_shared_owner(slots):
         model, _targets(model), tuple(reversed(plan.devices))
     )
     assert changed.fingerprint != plan.fingerprint
+
+
+def test_placement_balances_expert_bytes_with_stable_ties():
+    model = _MoE(4)
+    with torch.no_grad():
+        model.experts[0].w1.weight = nn.Parameter(torch.randn(16, 4))
+        model.experts[1].w1.weight = nn.Parameter(torch.randn(8, 4))
+        model.experts[2].w1.weight = nn.Parameter(torch.randn(4, 4))
+        model.experts[3].w1.weight = nn.Parameter(torch.randn(2, 4))
+    plan = ExpertParallelPlan.from_model(
+        model,
+        _targets(model),
+        ("cpu:0", "cpu:1"),
+    )
+    owners = [entry.owner_rank for entry in plan.placement.entries]
+    assert owners == [0, 1, 1, 0]
+    assert dict(plan.expert_bytes)["experts.0"] > dict(plan.expert_bytes)["experts.3"]
+
+
+def test_external_adapter_collection_can_drive_plan_and_proxy_ids():
+    model = _MoE(4)
+
+    class Adapter:
+        def validate(self, value):
+            assert value is model
+
+        def expert_module_name(self):
+            return "experts"
+
+    adapter = Adapter()
+    plan = ExpertParallelPlan.from_model(
+        model,
+        _targets(model),
+        ("cpu:0", "cpu:1"),
+        adapters=(adapter,),
+    )
+    assert plan.expert_collections == ("experts",)
+    assert plan.local_expert_ids("experts", 0) == (0, 2)
+
+
+def test_generic_ep_topology_and_state_filter():
+    config = EPConfig(ep_size=2, mode=EPMode.ALL_EXPERT)
+    topology = EPTopology.from_config(config)
+    assert topology.config.world_size == 2
+    placement = build_expert_placement(
+        num_experts=4,
+        ep_size=2,
+        expert_bytes=(10, 7, 6, 1),
+    )
+    state_filter = make_expert_state_filter(
+        placement,
+        1,
+        lambda name: (
+            int(name.split(".experts.", 1)[1].split(".", 1)[0])
+            if ".experts." in name
+            else None
+        ),
+    )
+    assert state_filter("layers.0.router.weight")
+    assert state_filter("layers.0.experts.1.w1.weight")
+    assert not state_filter("layers.0.experts.0.w1.weight")
 
 
 def test_placement_rejects_hidden_experts_and_cross_owner_aliases():
