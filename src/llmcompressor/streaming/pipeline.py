@@ -71,6 +71,7 @@ from .materialization import (
     WeightMaterializer,
     materialize_weights,
 )
+from .memory_adapters import modifier_calibration_context
 from .modifier_adapters import (
     StreamingModifierAdapter,
     get_modifier_adapter,
@@ -89,6 +90,11 @@ from .output import (
 )
 from .parallel import ParallelContext, PlacementPlan
 from .parallel.expert import ExpertParallelExecutor, ExpertParallelPlan
+from .parallel.token_budget import (
+    TOKEN_BUDGET_POLICY,
+    select_token_capacity,
+    validate_token_budget,
+)
 from .recovery import build_resume_plan
 from .tied_weights import infer_transformers_tied_weights
 from .tracing import TracedBoundaryAdapter
@@ -298,6 +304,7 @@ def _initialize_run(
     replace_existing: bool = False,
     execution: StreamingExecutionDescriptor | None = None,
     expert_parallel: ExpertParallelPlan | None = None,
+    expert_parallel_token_budget: str | int = "auto",
     target_groups: tuple[tuple[int, ...], ...] = (),
 ) -> str:
     normalized_recipe = _normalized_recipe_payload(recipe)
@@ -335,6 +342,8 @@ def _initialize_run(
                 "placement": placement.fingerprint,
                 **(
                     {"expert_parallel": expert_parallel.to_dict(),
+                     "token_budget_policy": TOKEN_BUDGET_POLICY,
+                     "token_budget": expert_parallel_token_budget,
                      "target_groups": target_groups}
                     if expert_parallel is not None else {}
                 ),
@@ -375,6 +384,8 @@ def _initialize_run(
                     for entry in expert_parallel.placement.entries
                 ) if expert_parallel else ()
             ),
+            token_budget_policy=TOKEN_BUDGET_POLICY if expert_parallel else "",
+            token_budget=expert_parallel_token_budget,
         ),
     )
     ArtifactStore(artifact_dir).initialize(
@@ -722,15 +733,16 @@ def _iter_execution_batches(
     current_values = []
     current_tokens = 0
     for batch_index in batch_indices:
-        value = boundaries.get_for_execution(
-            boundary_index,
-            batch_index,
-            input_names,
-            device=device,
-        )
+        value = boundaries.get(boundary_index, batch_index, device="meta")
         tokens = _boundary_token_count(
             {name: value[name] for name in input_names}
         )
+        del value
+        if tokens > token_capacity:
+            raise DeviceMemoryError(
+                f"Boundary {boundary_index} batch {batch_index} has {tokens} "
+                f"tokens, exceeding the input token capacity {token_capacity}"
+            )
         exceeds_capacity = (
             token_capacity is not None
             and current_values
@@ -741,6 +753,9 @@ def _iter_execution_batches(
             current_indices = []
             current_values = []
             current_tokens = 0
+        value = boundaries.get_for_execution(
+            boundary_index, batch_index, input_names, device=device
+        )
         current_indices.append(batch_index)
         current_values.append(value)
         current_tokens += tokens
@@ -1024,10 +1039,12 @@ def run_subgraph_streaming_pipeline(
     execution: StreamingExecutionDescriptor | None = None,
     targets_per_subgraph: int = 1,
     expert_parallel: ExpertParallelPlan | None = None,
+    expert_parallel_token_budget: str | int = "auto",
 ) -> tuple[Path, Path, str]:
     """Calibrate, modify, propagate, and persist one subgraph at a time."""
 
     device = torch.device(device)
+    validate_token_budget(expert_parallel_token_budget)
     # Quantization observes/modifies weights; no parameter needs autograd.
     adapter.model.requires_grad_(False)
     if (
@@ -1099,6 +1116,7 @@ def run_subgraph_streaming_pipeline(
         replace_existing=not checkpoint_progress,
         execution=execution or adapter.execution,
         expert_parallel=expert_parallel,
+        expert_parallel_token_budget=expert_parallel_token_budget,
         target_groups=target_groups,
     )
     transaction_writer = (
@@ -1194,7 +1212,7 @@ def run_subgraph_streaming_pipeline(
             committed_transaction_ids.insert(0, "prefix-00000")
 
     streaming_logger.info("setup | initializing modifier session")
-    with create_session() as session:
+    with create_session() as session, ExitStack() as calibration_stack:
         session.state.layerwise_calibration = True
         with _stage_logger(adapter.model, "[setup] initialize modifiers", device):
             session.initialize(
@@ -1207,6 +1225,10 @@ def run_subgraph_streaming_pipeline(
             )
             runtime_adapters = modifier_adapters(session.lifecycle.recipe.modifiers)
             try:
+                if expert_parallel is not None:
+                    calibration_stack.enter_context(
+                        modifier_calibration_context(session.lifecycle.recipe.modifiers)
+                    )
                 for modifier_adapter in runtime_adapters:
                     modifier_adapter.before_calibration(adapter.model, adapter.targets)
                     configure = getattr(modifier_adapter, "configure_algorithm", None)
@@ -1394,6 +1416,7 @@ def run_subgraph_streaming_pipeline(
                         modifier_adapter.before_target(resident_modules)
                     num_tokens = 0
                     max_batch_tokens = 0
+                    batch_token_counts = []
                     boundary_bytes = 0
                     max_boundary_bytes_per_token = 0
                     for batch_index in batches:
@@ -1403,10 +1426,11 @@ def run_subgraph_streaming_pipeline(
                         batch_tokens = _boundary_token_count(
                             {
                                 name: value[name]
-                                for name in subgraphs[0].input_names
+                                for name in group_inputs
                             }
                         )
                         num_tokens += batch_tokens
+                        batch_token_counts.append(batch_tokens)
                         max_batch_tokens = max(max_batch_tokens, batch_tokens)
                         boundary_bytes += _boundary_nbytes(value)
                         current_boundary_bytes = _boundary_nbytes(value)
@@ -1419,8 +1443,8 @@ def run_subgraph_streaming_pipeline(
                                 // batch_tokens,
                             )
                         del value
-                    num_tokens = max(num_tokens, num_samples * (max_seq_length or 1), 1)
-                    max_batch_tokens = max(max_batch_tokens, max_seq_length or 1)
+                    num_tokens = max(num_tokens, 1)
+                    max_batch_tokens = max(max_batch_tokens, 1)
                     with _stage_logger(
                         adapter.model, f"{target_label} | plan weights", device
                     ):
@@ -1452,23 +1476,31 @@ def run_subgraph_streaming_pipeline(
                         if expert_parallel is not None:
                             owner_plans = expert_parallel.split_load_plan(plan)
                             owner_capacities = {}
+                            phases = ["calibration", "update"]
+                            if not reuse_calibration_outputs and has_next:
+                                phases.append("propagation")
+                            token_store = ArtifactStore(artifact_dir)
+                            stored_plan = (
+                                token_store.load_ep_token_plan(group_index)
+                                if checkpoint_progress else None
+                            )
+                            token_identity = {
+                                "run": run_fingerprint,
+                                "policy": TOKEN_BUDGET_POLICY,
+                                "phases": phases,
+                                "input_tokens": batch_token_counts,
+                            }
+                            if stored_plan is not None and (
+                                stored_plan["identity"] != token_identity
+                            ):
+                                raise ValueError(
+                                    f"Incompatible EP token plan for {target_label}"
+                                )
                             boundary_bytes_per_token = max(
                                 1,
                                 max_boundary_bytes_per_token,
                             )
                             for owner_device, owner_plan in owner_plans:
-                                owner_memory = expert_parallel.estimate_memory(
-                                    modifiers, resident_modules,
-                                    device=owner_device, num_tokens=num_tokens,
-                                    max_batch_tokens=0,
-                                )
-                                dispatch_memory = expert_parallel.estimate_memory(
-                                    modifiers,
-                                    resident_modules,
-                                    device=owner_device,
-                                    num_tokens=num_tokens,
-                                    max_batch_tokens=1,
-                                )
                                 owner_weights = (
                                     adapter.weight_session.estimate_materialized_bytes(
                                         owner_plan, dtype=target_dtype
@@ -1486,39 +1518,63 @@ def run_subgraph_streaming_pipeline(
                                         ),
                                     )
                                 )
-                                modifier_bytes_per_token = (
-                                    dispatch_memory.batch_bytes
-                                )
-                                bytes_per_token = max(
-                                    1,
-                                    runtime_bytes_per_token
-                                    + modifier_bytes_per_token,
-                                )
-                                fixed_required = (
-                                    owner_weights + owner_memory.peak_bytes
-                                )
+                                if owner_device == expert_parallel.devices[0]:
+                                    runtime_bytes_per_token += (
+                                        expert_parallel.primary_transfer_bytes_per_token(
+                                            adapter.model, resident_modules
+                                        )
+                                    )
+
+                                def memory_at(tokens):
+                                    return max(
+                                        expert_parallel.estimate_memory(
+                                            modifiers, resident_modules,
+                                            device=owner_device,
+                                            num_tokens=num_tokens,
+                                            max_batch_tokens=tokens,
+                                            phase=phase,
+                                        ).peak_bytes
+                                        for phase in phases
+                                    )
+
+                                def required_at(tokens):
+                                    return (
+                                        owner_weights + memory_at(tokens)
+                                        + runtime_bytes_per_token * tokens
+                                    )
+
                                 usable = device_budget.usable_bytes(owner_device)
-                                if usable is None:
-                                    capacity = max_batch_tokens
+                                if stored_plan is not None:
+                                    capacity = stored_plan["capacities"][
+                                        str(owner_device)
+                                    ]
+                                    if (
+                                        usable is not None
+                                        and required_at(capacity) > usable
+                                    ):
+                                        raise DeviceMemoryError(
+                                            f"Recorded EP token capacity for "
+                                            f"{owner_device} no longer fits; "
+                                            "start a new run to replan"
+                                        )
                                 else:
-                                    capacity = max(
-                                        1,
-                                        (usable - fixed_required)
-                                        // bytes_per_token,
+                                    maximum = num_tokens
+                                    if expert_parallel_token_budget != "auto":
+                                        maximum = min(
+                                            maximum, expert_parallel_token_budget
+                                        )
+                                    capacity = select_token_capacity(
+                                        owner=(
+                                            f"{target_label} expert owner "
+                                            f"{owner_device}"
+                                        ),
+                                        usable_bytes=usable,
+                                        required_bytes=required_at,
+                                        maximum_tokens=maximum,
+                                        minimum_tokens=max_batch_tokens,
                                     )
-                                if capacity < max_batch_tokens:
-                                    raise DeviceMemoryError(
-                                        f"{target_label} expert owner "
-                                        f"{owner_device} cannot fit one "
-                                        f"calibration boundary: capacity="
-                                        f"{capacity} tokens, required at least "
-                                        f"{max_batch_tokens}"
-                                    )
-                                capacity = min(capacity, max(num_tokens, 1))
                                 owner_capacities[owner_device] = capacity
-                                owner_required = (
-                                    fixed_required + bytes_per_token * capacity
-                                )
+                                owner_required = required_at(capacity)
                                 weight_stack.enter_context(
                                     device_budget.reserve(
                                         f"{target_label} expert owner {owner_device}",
@@ -1529,17 +1585,23 @@ def run_subgraph_streaming_pipeline(
                                     f"{target_label} | EP admission | "
                                     f"device={owner_device} | "
                                     f"materialized_bytes={owner_weights} | "
-                                    f"modifier_held_bytes={owner_memory.held_bytes} | "
-                                    "modifier_scratch_bytes="
-                                    f"{owner_memory.scratch_bytes} | "
-                                    "modifier_batch_bytes_per_token="
-                                    f"{modifier_bytes_per_token} | "
+                                    f"modifier_peak_bytes={memory_at(capacity)} | "
                                     "runtime_bytes_per_token="
                                     f"{runtime_bytes_per_token} | "
                                     "token_capacity="
                                     f"{capacity} | "
                                     f"device_required_bytes={owner_required}"
                                 )
+                            token_store.commit_ep_token_plan(
+                                group_index,
+                                {
+                                    "identity": token_identity,
+                                    "capacities": {
+                                        str(owner): capacity
+                                        for owner, capacity in owner_capacities.items()
+                                    },
+                                },
+                            )
                             ep_executor.set_token_capacity(owner_capacities)
                         elif prefetched_prepared is None:
                             weight_stack.enter_context(
@@ -2032,7 +2094,8 @@ def run_subgraph_streaming_pipeline(
                         )
                         streaming_logger.info(
                             f"{target_label} | EP complete | device={owner_device} | "
-                            f"peak_allocated_bytes={owner_peak}"
+                            f"peak_allocated_bytes={owner_peak} | "
+                            f"dispatch={ep_executor.dispatch_statistics[owner_device]}"
                         )
             pipeline_failed = False
         finally:

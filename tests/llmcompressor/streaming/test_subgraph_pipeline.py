@@ -40,6 +40,7 @@ from llmcompressor.streaming.pipeline import (
     _debug_value_summary,
     _empty_device_cache,
     _initialize_run,
+    _iter_execution_batches,
     _stage_logger,
     _write_loaded_target_direct,
 )
@@ -55,6 +56,36 @@ def test_async_h2d_env_switch(monkeypatch, value, expected):
     else:
         monkeypatch.setenv("LLMCOMPRESSOR_STREAMING_ASYNC_H2D", value)
     assert _async_h2d_enabled() is expected
+
+
+@pytest.mark.parametrize("capacity, expected", [(None, [(0,), (1,), (2,)]),
+                                               (7, [(0, 1), (2,)])])
+def test_execution_batches_keep_pipeline_boundaries_and_limit_device_loading(
+    capacity, expected,
+):
+    class Boundaries:
+        def __init__(self):
+            self.loads = []
+
+        def get(self, _boundary, index, *, device):
+            return {"hidden": torch.empty(1, [3, 4, 5][index], 8, device=device)}
+
+        def get_for_execution(self, _boundary, index, _names, *, device):
+            self.loads.append(index)
+            return {"hidden": torch.empty(1, [3, 4, 5][index], 8)}
+
+    boundaries = Boundaries()
+    batches = _iter_execution_batches(
+        boundaries, 0, [0, 1, 2], {"hidden"},
+        device=torch.device("cpu"), token_capacity=capacity,
+    )
+    for indices in expected:
+        batch_indices, values = next(batches)
+        assert batch_indices == indices
+        assert len(values) == len(indices)
+        assert boundaries.loads[-1] == indices[-1]
+    with pytest.raises(StopIteration):
+        next(batches)
 
 
 def test_calibration_output_reuse_requires_each_modifier_to_opt_in():

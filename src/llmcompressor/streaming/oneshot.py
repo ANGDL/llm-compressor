@@ -249,6 +249,7 @@ def streaming_oneshot(
     sequential_targets: Sequence[str] | str | None = None,
     sequential_targets_per_subgraph: int = 1,
     expert_parallel_devices: Sequence[torch.device | str] | None = None,
+    expert_parallel_token_budget: str | int = "auto",
     statistics_cache: CandidateStatisticsCache | None = None,
     candidate_config: Any | None = None,
     prefix_fingerprint: str = "",
@@ -279,6 +280,10 @@ def streaming_oneshot(
     Routed expert weights and Hessians stay on their owner device; attention,
     routing and shared model state use the first device. The initial adapter
     supports one GPTQModifier or QuantizationModifier.
+
+    ``expert_parallel_token_budget`` sets an optional per-owner routed token
+    ceiling. ``"auto"`` derives independent capacities from device memory,
+    target shapes and modifier workspaces. It does not change ``batch_size``.
 
     Set ``finalize_only=True`` to validate and publish completed direct-writer
     shards after a previous normal-mode run failed during finalization.
@@ -340,6 +345,7 @@ def streaming_oneshot(
             sequential_targets=sequential_targets,
             sequential_targets_per_subgraph=sequential_targets_per_subgraph,
             expert_parallel_devices=expert_parallel_devices,
+            expert_parallel_token_budget=expert_parallel_token_budget,
             processor_identity=processor_identity,
         )
 
@@ -347,6 +353,8 @@ def streaming_oneshot(
         raise ValueError("async_save currently requires pretrained mode")
     if expert_parallel_devices is not None:
         raise ValueError("expert_parallel_devices currently requires pretrained mode")
+    if expert_parallel_token_budget != "auto":
+        raise ValueError("expert_parallel_token_budget requires expert parallel mode")
     if finalize_only:
         raise ValueError("finalize_only currently requires pretrained mode")
     if sequential_targets is not None:

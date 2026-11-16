@@ -7,6 +7,7 @@ from collections.abc import Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
+from math import prod
 from typing import Any
 
 import torch
@@ -22,6 +23,7 @@ from ..admission import (
     estimate_modifier_dispatch_memory,
 )
 from ..artifacts import fingerprint_json
+from ..calibration import calibration_batch_context
 from ..loading.session import SubgraphLoadPlan
 from ..moe.proxy import install_local_expert_proxy
 from .placement import PlacementEntry, PlacementPlan
@@ -68,6 +70,7 @@ class ExpertParallelPlan:
     expert_bytes: tuple[tuple[str, int], ...] = ()
     adapters: tuple[Any, ...] = ()
     _owners: dict[str, int] = field(init=False, repr=False)
+    _module_experts: dict[nn.Module, str] = field(default_factory=dict, repr=False)
     backend = "single-process-expert-parallel-v1"
 
     def __post_init__(self):
@@ -136,6 +139,9 @@ class ExpertParallelPlan:
             tuple(sorted(expert_sizes.items())),
             tuple(adapters),
         )
+        for entry in entries:
+            for module in model.get_submodule(entry.logical_name).modules():
+                plan._module_experts[module] = entry.logical_name
         identities: dict[int, torch.device] = {}
         for name, module in model.named_modules(remove_duplicate=False):
             owner = plan.device_for(name)
@@ -282,7 +288,8 @@ class ExpertParallelPlan:
         return fingerprint_json(self.to_dict())
 
     def estimate_memory(
-        self, modifiers, modules, *, device, num_tokens, max_batch_tokens
+        self, modifiers, modules, *, device, num_tokens, max_batch_tokens,
+        phase="calibration",
     ) -> ModifierMemoryEstimate:
         owned = tuple(
             module for module in modules if self.module_devices[module] == device
@@ -293,6 +300,7 @@ class ExpertParallelPlan:
             total_tokens=num_tokens,
             dispatch_tokens=max_batch_tokens,
             max_batch_tokens=max_batch_tokens,
+            phase=phase,
         )
 
     def runtime_bytes_per_token(
@@ -308,6 +316,7 @@ class ExpertParallelPlan:
         resolved = torch.device(device)
         total = boundary_bytes_per_token if resolved == self.devices[0] else 0
         resident = set(modules) if modules else set(self.module_devices)
+        expert_costs: dict[str, int] = {}
         for module in resident:
             if (
                 not isinstance(module, nn.Linear)
@@ -319,11 +328,63 @@ class ExpertParallelPlan:
                 continue
             input_width = int(weight.shape[1])
             output_width = int(weight.shape[0])
-            # Count input/output copies, intermediate activations, and
-            # accumulation/transfer buffers at FP32. This is intentionally a
-            # conservative model shared by all modifiers and model adapters.
-            total += 4 * (2 * input_width + 2 * output_width)
-        return max(1, total)
+            cost = 4 * (2 * input_width + 2 * output_width)
+            expert = self._module_experts.get(module)
+            if expert is None:
+                total += cost
+            else:
+                expert_costs[expert] = expert_costs.get(expert, 0) + cost
+        return max(1, total + max(expert_costs.values(), default=0))
+
+    def primary_transfer_bytes_per_token(
+        self, model: nn.Module, modules: Sequence[nn.Module]
+    ) -> int:
+        """Bound live routed inputs and outputs using a collection's routing fanout."""
+        from llmcompressor.modeling.moe.context import get_calibrate_all_experts_flag
+
+        resident = set(modules)
+        active_experts = {
+            self._module_experts[module]
+            for module in resident
+            if module in self._module_experts
+        }
+        total = 0
+        for collection in self.expert_collections:
+            parent = model.get_submodule(collection.rpartition(".")[0])
+            costs = []
+            for name in sorted(active_experts):
+                if not name.startswith(collection + "."):
+                    continue
+                expert = model.get_submodule(name)
+                linears = [
+                    module for module in expert.modules()
+                    if isinstance(module, nn.Linear) and module in resident
+                ]
+                if linears:
+                    width = max(
+                        max(module.in_features, module.out_features)
+                        for module in linears
+                    )
+                    costs.append(8 * width + 32)
+            if not costs:
+                continue
+            all_experts = get_calibrate_all_experts_flag() or getattr(
+                parent, "calibrate_all_experts", False
+            )
+            router = getattr(parent, "gate", getattr(parent, "router", parent))
+            fanout = len(costs)
+            if not all_experts:
+                for attribute in ("topk", "top_k", "num_experts_per_tok"):
+                    value = getattr(router, attribute, None)
+                    if (
+                        isinstance(value, int)
+                        and not isinstance(value, bool)
+                        and value > 0
+                    ):
+                        fanout = min(fanout, value)
+                        break
+            total += max(costs) * fanout
+        return total
 
 
 def _join_subgraphs(subgraphs: Sequence[Subgraph]) -> tuple[Graph, set[str]]:
@@ -529,6 +590,10 @@ class ExpertParallelExecutor:
             for device in plan.devices
         }
         self._graphs: dict[tuple[int, ...], _ExecutionGraph] = {}
+        self.dispatch_statistics = {
+            device: {"tokens": 0, "dispatches": 0, "expert_calls": 0, "max_tokens": 0}
+            for device in plan.devices
+        }
 
     def set_token_capacity(
         self, token_capacity: Mapping[torch.device | str, int] | None
@@ -554,9 +619,14 @@ class ExpertParallelExecutor:
             }.difference(self.plan.devices)
             if unknown:
                 raise ValueError(
-                    f"token capacity contains unknown EP devices: {sorted(map(str, unknown))}"
+                    "token capacity contains unknown EP devices: "
+                    f"{sorted(map(str, unknown))}"
                 )
         self.token_capacity = normalized
+        if hasattr(self, "dispatch_statistics"):
+            for statistics in self.dispatch_statistics.values():
+                for name in statistics:
+                    statistics[name] = 0
 
     @property
     def input_token_capacity(self) -> int | None:
@@ -741,7 +811,7 @@ class ExpertParallelExecutor:
         _node, _name, args, kwargs = entry
         for item in tree_flatten((args, kwargs))[0]:
             if isinstance(item, torch.Tensor) and item.ndim >= 1:
-                return int(item.shape[0])
+                return prod(item.shape[:-1]) if item.ndim > 1 else int(item.shape[0])
         raise ValueError("Expert call has no tensor input with a token dimension")
 
     def _group_ready_experts(self, entries, primary, owner):
@@ -751,6 +821,11 @@ class ExpertParallelExecutor:
         capacity = self.token_capacity.get(owner)
         for entry in entries:
             input_tokens = self._entry_token_count(entry)
+            if capacity is not None and input_tokens > capacity:
+                raise MemoryError(
+                    f"Expert {entry[1]} requires {input_tokens} tokens on {owner}, "
+                    f"exceeding its token capacity {capacity}"
+                )
             exceeds_budget = (
                 capacity is not None
                 and current
@@ -913,14 +988,15 @@ class ExpertParallelExecutor:
                     moved_kwargs,
                     prepared.output_lengths,
                 ):
-                    grouped_outputs.append(
-                        self._split_output(
-                            self.model.get_submodule(name)(
-                                *task_args, **task_kwargs
-                            ),
-                            output_lengths,
+                    with calibration_batch_context(output_lengths):
+                        grouped_outputs.append(
+                            self._split_output(
+                                self.model.get_submodule(name)(
+                                    *task_args, **task_kwargs
+                                ),
+                                output_lengths,
+                            )
                         )
-                    )
                 outputs = [None] * sum(
                     len(indices) for indices in prepared.output_indices
                 )
@@ -929,13 +1005,15 @@ class ExpertParallelExecutor:
                 ):
                     for output, index in zip(group_outputs, indices):
                         outputs[index] = output
+                entry_lengths = [0] * len(outputs)
+                for lengths, indices in zip(
+                    prepared.output_lengths, prepared.output_indices
+                ):
+                    for length, index in zip(lengths, indices):
+                        entry_lengths[index] = length
                 outputs = self._copy_batch_outputs(
                     outputs,
-                    tuple(
-                        length
-                        for output_lengths in prepared.output_lengths
-                        for length in output_lengths
-                    ),
+                    tuple(entry_lengths),
                     primary,
                     owner_stream,
                     primary_stream,
@@ -974,7 +1052,9 @@ class ExpertParallelExecutor:
             for node in schedule.ready
         )
         node_values = [dict(value) for value in values]
-        pending: dict[Future, tuple[tuple[int, Node], ...]] = {}
+        pending: dict[Future, tuple[torch.device, tuple[tuple[int, Node], ...]]] = {}
+        queued = {owner: deque() for owner in self.plan.devices}
+        active_owners = set()
         remaining_users = [
             schedule.remaining_users.copy() for _value in values
         ]
@@ -1003,7 +1083,7 @@ class ExpertParallelExecutor:
 
         unmet = [schedule.unmet.copy() for _value in values]
         try:
-            while ready or pending:
+            while ready or pending or any(queued.values()):
                 ready_experts = {}
                 while ready:
                     index, node = ready.popleft()
@@ -1044,6 +1124,10 @@ class ExpertParallelExecutor:
                         raise ValueError(
                             f"Unsupported expert parallel FX operation {node.op}"
                         )
+                for owner, entries in ready_experts.items():
+                    queued[owner].extend(
+                        self._group_ready_experts(entries, primary, owner)
+                    )
                 dispatches = []
                 primary_context = (
                     torch.cuda.device(primary)
@@ -1056,22 +1140,30 @@ class ExpertParallelExecutor:
                     else nullcontext()
                 )
                 with primary_context, primary_stream_context:
-                    for owner, entries in ready_experts.items():
-                        for group in self._group_ready_experts(
-                            entries, primary, owner
-                        ):
-                            prepared = (
-                                self._prepare_batch(group, primary)
-                                if len(group) > 1
-                                else None
-                            )
-                            dispatches.append((owner, group, prepared))
+                    for owner, groups in queued.items():
+                        if not groups or owner in active_owners:
+                            continue
+                        group = groups.popleft()
+                        prepared = (
+                            self._prepare_batch(group, primary)
+                            if len(group) > 1 else None
+                        )
+                        dispatches.append((owner, group, prepared))
                     input_event = (
                         primary_stream.record_event()
                         if primary_stream is not None and dispatches
                         else None
                     )
                 for owner, entries, prepared in dispatches:
+                    active_owners.add(owner)
+                    statistics = self.dispatch_statistics[owner]
+                    tokens = sum(self._entry_token_count(entry) for entry in entries)
+                    statistics["tokens"] += tokens
+                    statistics["dispatches"] += 1
+                    statistics["expert_calls"] += (
+                        len(prepared.names) if prepared is not None else len(entries)
+                    )
+                    statistics["max_tokens"] = max(statistics["max_tokens"], tokens)
                     if prepared is not None:
                         future = self._workers[owner].submit(
                             self._expert_forward_batch,
@@ -1079,7 +1171,7 @@ class ExpertParallelExecutor:
                             input_event,
                             primary_stream,
                         )
-                        pending[future] = tuple(entry[0] for entry in entries)
+                        pending[future] = (owner, tuple(entry[0] for entry in entries))
                         continue
                     for _node, name, args, kwargs in entries:
                         future = self._workers[owner].submit(
@@ -1090,11 +1182,12 @@ class ExpertParallelExecutor:
                             input_event,
                             primary_stream,
                         )
-                        pending[future] = (_node,)
+                        pending[future] = (owner, (_node,))
                 if pending:
                     completed, _remaining = wait(pending, return_when=FIRST_COMPLETED)
                     for future in completed:
-                        nodes = pending.pop(future)
+                        owner, nodes = pending.pop(future)
+                        active_owners.remove(owner)
                         result = future.result()
                         if isinstance(result, _ExpertBatchResult):
                             if result.event is not None:

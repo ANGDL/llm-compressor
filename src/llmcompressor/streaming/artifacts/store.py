@@ -13,7 +13,11 @@ import torch
 from safetensors import SafetensorError, safe_open
 from safetensors.torch import save_file
 
-from .manifest import StreamingRunManifest, TargetStatisticsMetadata
+from .manifest import (
+    StreamingRunManifest,
+    TargetStatisticsMetadata,
+    fingerprint_json,
+)
 from .validation import validate_manifest_compatibility
 
 MANIFEST_FILE = "manifest.json"
@@ -95,6 +99,9 @@ class ArtifactStore:
             return
 
         self.statistics_dir.mkdir(parents=True, exist_ok=True)
+        if replace_existing:
+            for path in (self.root / "ep-token-plans").glob("group-*.json"):
+                path.unlink()
         _atomic_write_json(self.root / RECIPE_FILE, normalized_recipe)
         _atomic_write_json(self.root / TARGETS_FILE, list(targets))
         # The manifest is the commit record for initialization and is written last.
@@ -102,6 +109,24 @@ class ArtifactStore:
 
     def load_manifest(self) -> StreamingRunManifest:
         return StreamingRunManifest.from_dict(_read_json(self.manifest_path))
+
+    def load_ep_token_plan(self, group_index: int) -> dict[str, Any] | None:
+        path = self.root / "ep-token-plans" / f"group-{group_index:05d}.json"
+        if not path.exists():
+            return None
+        record = _read_json(path)
+        plan = record["plan"]
+        if record["sha256"] != fingerprint_json(plan):
+            raise ValueError(f"Corrupt EP token plan for target group {group_index}")
+        return plan
+
+    def commit_ep_token_plan(self, group_index: int, plan: Mapping[str, Any]) -> None:
+        path = self.root / "ep-token-plans" / f"group-{group_index:05d}.json"
+        if path.exists():
+            if self.load_ep_token_plan(group_index) != plan:
+                raise ValueError("Refusing to replace an existing EP token plan")
+            return
+        _atomic_write_json(path, {"plan": plan, "sha256": fingerprint_json(plan)})
 
     def target_dir(self, target_index: int) -> Path:
         if target_index < 0:

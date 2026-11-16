@@ -6,6 +6,7 @@ import operator
 import os
 import threading
 import weakref
+from contextlib import ExitStack
 from copy import deepcopy
 from dataclasses import asdict
 
@@ -24,6 +25,7 @@ from llmcompressor.streaming.loading import (
     SubgraphWeightSession,
     build_meta_model,
 )
+from llmcompressor.streaming.memory_adapters import modifier_calibration_context
 from llmcompressor.streaming.parallel.expert import (
     ExpertParallelExecutor,
     ExpertParallelPlan,
@@ -278,10 +280,90 @@ def test_forward_many_respects_per_owner_token_capacity():
     ) as executor:
         executor.forward_many([subgraph], values)
 
-    # Each owner receives more than three routed tokens across the two
-    # independent inputs, so the smaller owner capacity forces another call.
     assert model.experts[0].calls == 2
     assert model.experts[1].calls == 1
+
+
+def test_forward_many_splits_interleaved_experts_in_original_order():
+    torch.manual_seed(17)
+    model = _MoE(4).eval()
+    subgraph = _graph(model)
+    values = [
+        {
+            "hidden": torch.randn(length, 4),
+            "indices": torch.arange(length) % 4,
+        }
+        for length in (7, 9, 5)
+    ]
+    expected = [subgraph.forward(model, **value)["result"] for value in values]
+    plan = ExpertParallelPlan.from_model(model, _targets(model), ("cpu:0", "cpu:1"))
+    with ExpertParallelExecutor(
+        model, plan, token_capacity={"cpu:0": 100, "cpu:1": 100}
+    ) as executor:
+        actual = executor.forward_many([subgraph], values)
+        statistics = executor.dispatch_statistics
+    for result, reference in zip(actual, expected):
+        torch.testing.assert_close(result["result"], reference)
+    assert statistics[torch.device("cpu:0")]["tokens"] == 12
+    assert statistics[torch.device("cpu:1")]["tokens"] == 9
+    assert statistics[torch.device("cpu:0")]["expert_calls"] == 2
+    assert statistics[torch.device("cpu:1")]["expert_calls"] == 2
+
+
+def test_forward_many_rejects_indivisible_call_larger_than_owner_capacity():
+    model = _MoE(2).eval()
+    plan = ExpertParallelPlan.from_model(model, _targets(model), ("cpu:0", "cpu:1"))
+    with ExpertParallelExecutor(
+        model, plan, token_capacity={"cpu:0": 2, "cpu:1": 10}
+    ) as executor:
+        with pytest.raises(MemoryError, match="requires 3 tokens"):
+            executor.forward(
+                [_graph(model)],
+                {"hidden": torch.randn(3, 4), "indices": torch.zeros(3)},
+            )
+
+
+def test_multidimensional_expert_tokens_count_sequence_and_batch_dimensions():
+    entry = (None, "experts.0", (torch.empty(2, 3, 4),), {})
+    assert ExpertParallelExecutor._entry_token_count(entry) == 6
+
+
+def test_owner_queue_prepares_only_one_dispatch_per_active_owner(monkeypatch):
+    model = _MoE(2).eval()
+    plan = ExpertParallelPlan.from_model(model, _targets(model), ("cpu:0", "cpu:1"))
+    original = ExpertParallelExecutor._prepare_batch.__func__
+    prepared_counts = {device: 0 for device in plan.devices}
+    completed_counts = {device: 0 for device in plan.devices}
+
+    def prepare(cls, entries, primary):
+        owner = plan.device_for(entries[0][1])
+        assert prepared_counts[owner] == completed_counts[owner]
+        prepared_counts[owner] += 1
+        return original(cls, entries, primary)
+
+    monkeypatch.setattr(ExpertParallelExecutor, "_prepare_batch", classmethod(prepare))
+    with ExpertParallelExecutor(
+        model, plan, token_capacity={"cpu:0": 4, "cpu:1": 4}
+    ) as executor:
+        original_forward = executor._expert_forward_batch
+
+        def forward(prepared, event, stream):
+            result = original_forward(prepared, event, stream)
+            completed_counts[plan.device_for(prepared.names[0])] += 1
+            return result
+
+        monkeypatch.setattr(executor, "_expert_forward_batch", forward)
+        values = [
+            {"hidden": torch.randn(2, 4), "indices": torch.tensor([0, 1])}
+            for _batch in range(12)
+        ]
+        actual = executor.forward_many([_graph(model)], values)
+        assert len(actual) == 12
+        for device, statistics in executor.dispatch_statistics.items():
+            assert statistics["tokens"] == 12
+            assert statistics["max_tokens"] <= 4
+            assert statistics["dispatches"] == 3
+            assert prepared_counts[device] == completed_counts[device] == 3
 
 
 def test_worker_failure_waits_for_other_workers_and_can_unwind():
@@ -337,7 +419,7 @@ def test_execution_schedule_is_cached_without_retaining_batch_tensors(monkeypatc
         assert len(builds) == 1
 
 
-def _run_gptq(model, values, devices=None):
+def _run_gptq(model, values, devices=None, *, coalesce=False):
     quantizer = GPTQModifier(
         config_groups={
             "weights": {
@@ -356,10 +438,11 @@ def _run_gptq(model, values, devices=None):
         batched_quantization=None,
     )
     subgraph = _graph(model)
-    with create_session() as session:
+    with create_session() as session, ExitStack() as calibration_stack:
         session.state.layerwise_calibration = True
         session.initialize(model=model, recipe=[quantizer], start=-1, copy_data=False)
         quantizer = session.lifecycle.recipe.modifiers[0]
+        calibration_stack.enter_context(modifier_calibration_context([quantizer]))
         LifecycleCallbacks.calibration_start()
         modules = tuple(
             module for expert in model.experts for module in expert.modules()
@@ -375,8 +458,11 @@ def _run_gptq(model, values, devices=None):
                         model, _targets(model), devices
                     )
                     with ExpertParallelExecutor(model, plan) as executor:
-                        for value in values:
-                            executor.forward([subgraph], value)
+                        if coalesce:
+                            executor.forward_many([subgraph], values)
+                        else:
+                            for value in values:
+                                executor.forward([subgraph], value)
             statistics = {
                 quantizer._module_names[module]: (
                     hessian.clone(),
@@ -400,7 +486,8 @@ def _run_gptq(model, values, devices=None):
     return statistics
 
 
-def test_parallel_gptq_matches_local_hessians_counts_weights_and_qparams():
+@pytest.mark.parametrize("coalesce", [False, True])
+def test_parallel_gptq_matches_local_hessians_counts_weights_and_qparams(coalesce):
     torch.manual_seed(3)
     reference = _MoE().eval()
     parallel = deepcopy(reference)
@@ -409,16 +496,21 @@ def test_parallel_gptq_matches_local_hessians_counts_weights_and_qparams():
         for _batch in range(2)
     ]
     expected = _run_gptq(reference, values)
-    actual = _run_gptq(parallel, values, ("cpu:0", "cpu:1", "cpu:2", "cpu:3"))
+    actual = _run_gptq(
+        parallel, values, ("cpu:0", "cpu:1", "cpu:2", "cpu:3"),
+        coalesce=coalesce,
+    )
     assert expected.keys() == actual.keys()
     for name, (hessian, count) in expected.items():
-        assert torch.equal(actual[name][0], hessian), name
+        torch.testing.assert_close(actual[name][0], hessian, msg=name)
         assert torch.equal(actual[name][1], count), name
     expected_tensors = reference.state_dict()
     actual_tensors = parallel.state_dict()
     assert actual_tensors.keys() == expected_tensors.keys()
     for name in expected_tensors:
-        assert torch.equal(actual_tensors[name], expected_tensors[name]), name
+        torch.testing.assert_close(
+            actual_tensors[name], expected_tensors[name], msg=name
+        )
 
 
 def test_parallel_manifest_roundtrip_records_topology_and_actual_groups():
@@ -489,7 +581,8 @@ def _cuda_devices(count):
 
 
 @pytest.mark.parametrize("count", [2, 4])
-def test_cuda_gptq_uses_local_statistics_and_matches_single_device(count):
+@pytest.mark.parametrize("coalesce", [False, True])
+def test_cuda_gptq_uses_local_statistics_and_matches_single_device(count, coalesce):
     devices = _cuda_devices(count)
     torch.manual_seed(3)
     reference = _MoE().eval().to(devices[0])
@@ -504,7 +597,7 @@ def test_cuda_gptq_uses_local_statistics_and_matches_single_device(count):
         for _batch in range(2)
     ]
     expected = _run_gptq(reference, values)
-    actual = _run_gptq(parallel, values, devices)
+    actual = _run_gptq(parallel, values, devices, coalesce=coalesce)
     for name, (hessian, samples) in expected.items():
         torch.testing.assert_close(actual[name][0].cpu(), hessian.cpu())
         assert torch.equal(actual[name][1].cpu(), samples.cpu())
