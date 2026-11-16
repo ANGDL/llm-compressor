@@ -2040,6 +2040,24 @@ P800 上的正式多 rank 端到端验收，但其中的执行拓扑比当前首
    `configure_streaming_ep`。只有 fused/native 容器才由 adapter 提供
    `expert_accessor`、state-name parser 或 route conversion；DSV4.1 adapter
    只是第一个验收实现，不能成为核心接口的隐含前提。
+
+标准容器的目标调用形态如下，proxy 生命周期由 streaming 管理，模型源码不变：
+
+```python
+with install_local_expert_proxy(
+    model,
+    "block.experts",
+    local_expert_ids,
+    process_group=ep_group,
+):
+    target_output = target_subgraph.forward(model, **batch)
+```
+
+proxy 保留 `block.experts.<id>` 的逻辑子模块名，因此现有 weight loader、GPTQ
+hooks、Hessian key 和 writer 不需要认识 proxy。退出 context 时原始 container
+和 child registration 恢复。标准 `ModuleList`/`ModuleDict` 使用通用 proxy；
+不能表达 canonical route 或 fused expert layout 的模型才由外部 adapter 提供
+route conversion/parent wrapper，不能要求模型类增加 EP 配置方法。
 4. 将旧分支的 `EPTopology`、stable placement、rank-local output 和 global
    commit 语义以兼容层接入，先支持 `dp_size=1` 的多进程 EP-only。
 5. 对每个 adapter 保持其完整 calibration 语义、独立 expert hook、原始 route

@@ -16,6 +16,7 @@ from llmcompressor.streaming import (
     ExpertGroupModifierAdapter,
     ExpertGroupPlan,
     InMemoryBoundaryActivationStore,
+    LocalExpertProxy,
     RoutedExpertBatch,
     SafetensorsWeightSource,
     StandardTransformersMoEAdapter,
@@ -23,6 +24,7 @@ from llmcompressor.streaming import (
     build_meta_model,
     discover_standard_moe_adapters,
     execute_expert_group,
+    install_local_expert_proxy,
 )
 
 
@@ -300,6 +302,31 @@ class StandardMoeModel(nn.Module):
         self.block = StandardMoeBlock()
 
 
+class ProxyMoeBlock(nn.Module):
+    def __init__(self, hidden_size=3, num_experts=4):
+        super().__init__()
+        self.experts = nn.ModuleList(
+            [
+                nn.Linear(hidden_size, hidden_size, bias=False)
+                for _ in range(num_experts)
+            ]
+        )
+
+    def forward(self, hidden_states, top_k_index, top_k_weights):
+        output = torch.zeros_like(hidden_states)
+        execute_expert_group(
+            self.experts,
+            hidden_states,
+            top_k_index,
+            top_k_weights,
+            ExpertGroupPlan.from_num_experts(
+                "experts", len(self.experts), len(self.experts)
+            ).groups[0],
+            output=output,
+        )
+        return output
+
+
 def test_standard_transformers_adapter_routes_and_restores_shape(tmp_path):
     torch.manual_seed(19)
     reference = StandardMoeModel()
@@ -334,6 +361,35 @@ def test_standard_transformers_adapter_discovery_is_model_agnostic():
     assert len(adapters) == 1
     assert adapters[0].moe_name == "block"
     assert adapters[0].adapter_id == "transformers-standard-v1"
+
+
+def test_local_expert_proxy_is_external_and_restores_standard_container():
+    torch.manual_seed(23)
+    reference = ProxyMoeBlock()
+    candidate = ProxyMoeBlock()
+    candidate.load_state_dict(reference.state_dict())
+    hidden_states = torch.randn(6, 3)
+    top_k_index = torch.tensor(
+        [[0, 1], [2, 0], [3, 1], [2, 3], [1, 0], [3, 2]]
+    )
+    top_k_weights = torch.rand(6, 2)
+    expected = reference(hidden_states, top_k_index, top_k_weights)
+    original_experts = candidate.experts
+
+    with install_local_expert_proxy(
+        candidate,
+        "experts",
+        range(4),
+        calibrate_all_experts=False,
+    ) as proxy:
+        assert isinstance(proxy, LocalExpertProxy)
+        actual = candidate(hidden_states, top_k_index, top_k_weights)
+        assert candidate.experts is proxy
+        assert tuple(candidate.experts._modules) == ("0", "1", "2", "3")
+
+    assert candidate.experts is original_experts
+    assert tuple(candidate.experts._modules) == ("0", "1", "2", "3")
+    torch.testing.assert_close(actual, expected)
 
 
 class GatedExpert(nn.Module):

@@ -13,15 +13,18 @@ from .expert_groups import (
     execute_expert_group,
 )
 from .modifier import ExpertGroupModifierAdapter
+from .proxy import LocalExpertProxy, install_local_expert_proxy
 
 __all__ = [
     "ExpertGroup",
     "ExpertGroupExecutor",
     "ExpertGroupPlan",
     "ExpertGroupModifierAdapter",
+    "LocalExpertProxy",
     "MoEModelAdapter",
     "RoutedExpertBatch",
     "StandardTransformersMoEAdapter",
     "discover_standard_moe_adapters",
     "execute_expert_group",
+    "install_local_expert_proxy",
 ]

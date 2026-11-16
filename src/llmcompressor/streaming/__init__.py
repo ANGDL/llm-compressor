@@ -97,10 +97,12 @@ from .moe import (
     ExpertGroupExecutor,
     ExpertGroupModifierAdapter,
     ExpertGroupPlan,
+    LocalExpertProxy,
     RoutedExpertBatch,
     StandardTransformersMoEAdapter,
     discover_standard_moe_adapters,
     execute_expert_group,
+    install_local_expert_proxy,
 )
 from .mtp import StreamingMTPWrapper
 from .oneshot import streaming_oneshot
@@ -153,6 +155,7 @@ __all__ = [
     "ExpertGroupExecutor",
     "ExpertGroupPlan",
     "ExpertGroupModifierAdapter",
+    "LocalExpertProxy",
     "StandardTransformersMoEAdapter",
     "discover_standard_moe_adapters",
     "GPTQStatisticsCollector",
@@ -172,6 +175,7 @@ __all__ = [
     "LoadedSubgraph",
     "RecipeInfo",
     "RoutedExpertBatch",
+    "install_local_expert_proxy",
     "SequentialInfo",
     "SoftwareInfo",
     "SourceCheckpointInfo",
