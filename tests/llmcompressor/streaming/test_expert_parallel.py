@@ -48,8 +48,10 @@ class _Expert(nn.Module):
         self.w2 = nn.Linear(8, 4, bias=False)
         self.barrier = None
         self.fail = False
+        self.calls = 0
 
     def forward(self, hidden):
+        self.calls += 1
         if self.barrier is not None:
             self.barrier.wait(timeout=10)
         if self.fail:
@@ -221,6 +223,33 @@ def test_concurrent_routing_preserves_mutation_and_cross_slice_liveness(split):
             assert torch.equal(actual["result"], expected)
             assert torch.equal(value["hidden"], hidden)
             assert executor._graphs
+
+
+def test_forward_many_batches_repeated_experts_with_variable_lengths():
+    torch.manual_seed(11)
+    model = _MoE(2).eval()
+    subgraph = _graph(model)
+    values = [
+        {
+            "hidden": torch.randn(3, 4),
+            "indices": torch.tensor([0, 1, 0]),
+        },
+        {
+            "hidden": torch.randn(5, 4),
+            "indices": torch.tensor([1, 0, 1, 0, 1]),
+        },
+    ]
+    expected = [subgraph.forward(model, **value)["result"] for value in values]
+    for expert in model.experts:
+        expert.calls = 0
+    plan = ExpertParallelPlan.from_model(model, _targets(model), ("cpu:0", "cpu:1"))
+    with ExpertParallelExecutor(model, plan) as executor:
+        actual = executor.forward_many([subgraph], values)
+
+    assert len(actual) == len(expected)
+    for result, reference in zip(actual, expected):
+        torch.testing.assert_close(result["result"], reference)
+    assert [expert.calls for expert in model.experts] == [1, 1]
 
 
 def test_worker_failure_waits_for_other_workers_and_can_unwind():

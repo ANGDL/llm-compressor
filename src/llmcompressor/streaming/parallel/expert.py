@@ -486,6 +486,8 @@ class _PreparedExpertBatch:
     args: Any
     kwargs: Any
     lengths: tuple[int, ...]
+    output_lengths: tuple[tuple[int, ...], ...]
+    output_indices: tuple[tuple[int, ...], ...]
 
 
 @dataclass(frozen=True)
@@ -495,6 +497,7 @@ class _ExpertBatchResult:
 
 
 _DEFAULT_MAX_BATCH_INPUT_BYTES = 128 * 1024 * 1024
+_DEFAULT_FORWARD_BATCH_SIZE = 4
 
 
 class ExpertParallelExecutor:
@@ -506,6 +509,7 @@ class ExpertParallelExecutor:
         plan: ExpertParallelPlan,
         *,
         max_batch_input_bytes: int = _DEFAULT_MAX_BATCH_INPUT_BYTES,
+        forward_batch_size: int = _DEFAULT_FORWARD_BATCH_SIZE,
     ):
         if (
             isinstance(max_batch_input_bytes, bool)
@@ -513,9 +517,16 @@ class ExpertParallelExecutor:
             or max_batch_input_bytes <= 0
         ):
             raise ValueError("max_batch_input_bytes must be a positive integer")
+        if (
+            isinstance(forward_batch_size, bool)
+            or not isinstance(forward_batch_size, int)
+            or forward_batch_size <= 0
+        ):
+            raise ValueError("forward_batch_size must be a positive integer")
         self.model = model
         self.plan = plan
         self.max_batch_input_bytes = max_batch_input_bytes
+        self.forward_batch_size = forward_batch_size
         self._workers = {
             device: ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"ep-{index}")
             for index, device in enumerate(plan.devices)
@@ -641,38 +652,53 @@ class ExpertParallelExecutor:
         if not cls._inputs_compatible(entries, primary):
             return None
         first_leaves, spec = cls._call_leaves(entries[0][2], entries[0][3])
-        all_leaves = [
-            cls._call_leaves(args, kwargs)[0]
-            for _node, _name, args, kwargs in entries
-        ]
-        lengths = tuple(
-            next(
-                leaves[leaf_index].shape[0]
-                for leaf_index in range(len(first_leaves))
-                if isinstance(leaves[leaf_index], torch.Tensor)
+        grouped_entries: dict[str, list[tuple[int, Any]]] = {}
+        for entry_index, (_node, name, args, kwargs) in enumerate(entries):
+            grouped_entries.setdefault(name, []).append(
+                (entry_index, (args, kwargs))
             )
-            for leaves in all_leaves
-        )
-        combined_leaves = []
-        for leaf_index, first in enumerate(first_leaves):
-            if isinstance(first, torch.Tensor):
-                combined_leaves.append(
-                    torch.cat(
+
+        names = []
+        lengths = []
+        output_lengths = []
+        output_indices = []
+        combined_leaves = [None] * len(first_leaves)
+        for name, group in grouped_entries.items():
+            names.append(name)
+            group_leaves = [
+                cls._call_leaves(args, kwargs)[0]
+                for _entry_index, (args, kwargs) in group
+            ]
+            group_lengths = tuple(
+                next(
+                    leaves[leaf_index].shape[0]
+                    for leaf_index in range(len(first_leaves))
+                    if isinstance(leaves[leaf_index], torch.Tensor)
+                )
+                for leaves in group_leaves
+            )
+            lengths.append(sum(group_lengths))
+            output_lengths.append(group_lengths)
+            output_indices.append(tuple(entry_index for entry_index, _ in group))
+            for leaf_index, first in enumerate(first_leaves):
+                if isinstance(first, torch.Tensor):
+                    combined_leaves[leaf_index] = torch.cat(
                         [
                             leaves[leaf_index]
-                            for leaves in all_leaves
+                            for leaves in group_leaves
                         ],
                         dim=0,
                     )
-                )
-            else:
-                combined_leaves.append(first)
+                elif combined_leaves[leaf_index] is None:
+                    combined_leaves[leaf_index] = first
         combined_args, combined_kwargs = tree_unflatten(combined_leaves, spec)
         return _PreparedExpertBatch(
-            tuple(name for _node, name, _args, _kwargs in entries),
+            tuple(names),
             combined_args,
             combined_kwargs,
-            lengths,
+            tuple(lengths),
+            tuple(output_lengths),
+            tuple(output_indices),
         )
 
     def _group_ready_experts(self, entries, primary):
@@ -774,6 +800,20 @@ class ExpertParallelExecutor:
             tree_unflatten(leaves, first_spec) for leaves in split_leaves
         )
 
+    @staticmethod
+    def _split_output(output, lengths):
+        leaves, spec = tree_flatten(output)
+        split_leaves = [[] for _length in lengths]
+        for leaf in leaves:
+            if isinstance(leaf, torch.Tensor):
+                pieces = leaf.split(lengths, dim=0)
+                for index, piece in enumerate(pieces):
+                    split_leaves[index].append(piece)
+            else:
+                for split in split_leaves:
+                    split.append(leaf)
+        return tuple(tree_unflatten(item, spec) for item in split_leaves)
+
     def _expert_forward(self, name, args, kwargs, input_event, primary_stream):
         device = self.plan.device_for(name)
         primary = self.plan.devices[0]
@@ -828,9 +868,13 @@ class ExpertParallelExecutor:
                 moved_leaves, spec = self._call_leaves(
                     moved_args, moved_kwargs
                 )
-                outputs = []
+                grouped_outputs = []
                 offset = 0
-                for name, length in zip(prepared.names, prepared.lengths):
+                for name, length, output_lengths in zip(
+                    prepared.names,
+                    prepared.lengths,
+                    prepared.output_lengths,
+                ):
                     task_leaves = [
                         leaf.narrow(0, offset, length)
                         if isinstance(leaf, torch.Tensor)
@@ -838,15 +882,30 @@ class ExpertParallelExecutor:
                         for leaf in moved_leaves
                     ]
                     task_args, task_kwargs = tree_unflatten(task_leaves, spec)
-                    outputs.append(
-                        self.model.get_submodule(name)(
-                            *task_args, **task_kwargs
+                    grouped_outputs.append(
+                        self._split_output(
+                            self.model.get_submodule(name)(
+                                *task_args, **task_kwargs
+                            ),
+                            output_lengths,
                         )
                     )
                     offset += length
+                outputs = [None] * sum(
+                    len(indices) for indices in prepared.output_indices
+                )
+                for group_outputs, indices in zip(
+                    grouped_outputs, prepared.output_indices
+                ):
+                    for output, index in zip(group_outputs, indices):
+                        outputs[index] = output
                 outputs = self._copy_batch_outputs(
                     outputs,
-                    prepared.lengths,
+                    tuple(
+                        length
+                        for output_lengths in prepared.output_lengths
+                        for length in output_lengths
+                    ),
                     primary,
                     owner_stream,
                     primary_stream,
@@ -862,17 +921,34 @@ class ExpertParallelExecutor:
     def forward(
         self, subgraphs: Sequence[Subgraph], value: Mapping[str, Any]
     ) -> dict[str, Any]:
+        return self.forward_many(subgraphs, (value,))[0]
+
+    @torch.no_grad()
+    def forward_many(
+        self,
+        subgraphs: Sequence[Subgraph],
+        values: Sequence[Mapping[str, Any]],
+    ) -> tuple[dict[str, Any], ...]:
+        """Execute independent inputs while batching repeated expert calls."""
+        if not values:
+            return ()
         key = tuple(id(subgraph) for subgraph in subgraphs)
         if key not in self._graphs:
             self._graphs.clear()
             self._graphs[key] = _ExecutionGraph.build(subgraphs)
         schedule = self._graphs[key]
         dependencies, users = schedule.dependencies, schedule.users
-        ready = deque(schedule.ready)
-        values: dict[Node, Any] = {}
-        pending: dict[Future, tuple[Node, ...]] = {}
-        remaining_users = schedule.remaining_users.copy()
-        output = None
+        ready = deque(
+            (index, node)
+            for index in range(len(values))
+            for node in schedule.ready
+        )
+        node_values = [dict(value) for value in values]
+        pending: dict[Future, tuple[tuple[int, Node], ...]] = {}
+        remaining_users = [
+            schedule.remaining_users.copy() for _value in values
+        ]
+        outputs = [None] * len(values)
         primary = self.plan.devices[0]
         primary_stream = (
             torch.cuda.current_stream(primary)
@@ -880,55 +956,60 @@ class ExpertParallelExecutor:
             else None
         )
 
-        def finish(node, result, event=None):
-            nonlocal output
+        def finish(index, node, result, event=None):
             if event is not None:
                 primary_stream.wait_event(event)
-            values[node] = result
+            node_values[index][node] = result
             if node.op == "output":
-                output = result
+                outputs[index] = result
             for source in dependencies[node]:
-                remaining_users[source] -= 1
-                if remaining_users[source] == 0:
-                    values.pop(source, None)
+                remaining_users[index][source] -= 1
+                if remaining_users[index][source] == 0:
+                    node_values[index].pop(source, None)
             for user in users[node]:
-                unmet[user] -= 1
-                if unmet[user] == 0:
-                    ready.append(user)
+                unmet[index][user] -= 1
+                if unmet[index][user] == 0:
+                    ready.append((index, user))
 
-        unmet = schedule.unmet.copy()
+        unmet = [schedule.unmet.copy() for _value in values]
         try:
             while ready or pending:
                 ready_experts = {}
                 while ready:
-                    node = ready.popleft()
-                    args, kwargs = map_arg((node.args, node.kwargs), values.__getitem__)
+                    index, node = ready.popleft()
+                    args, kwargs = map_arg(
+                        (node.args, node.kwargs),
+                        node_values[index].__getitem__,
+                    )
                     if node.op == "placeholder":
-                        finish(node, value[str(node.target)])
+                        finish(index, node, values[index][str(node.target)])
                     elif node.op == "get_attr":
                         attribute = self.model
                         for component in str(node.target).split("."):
                             attribute = getattr(attribute, component)
-                        finish(node, attribute)
+                        finish(index, node, attribute)
                     elif node.op == "call_module":
                         name = str(node.target)
                         if self.plan.is_expert(name):
                             ready_experts.setdefault(
                                 self.plan.device_for(name), []
-                            ).append((node, name, args, kwargs))
+                            ).append(((index, node), name, args, kwargs))
                         else:
                             finish(
-                                node, self.model.get_submodule(name)(*args, **kwargs)
+                                index,
+                                node,
+                                self.model.get_submodule(name)(*args, **kwargs),
                             )
                     elif node.op == "call_function":
-                        finish(node, node.target(*args, **kwargs))
+                        finish(index, node, node.target(*args, **kwargs))
                     elif node.op == "call_method":
                         finish(
+                            index,
                             node,
                             getattr(args[0], str(node.target))(*args[1:], **kwargs),
                         )
                     elif node.op == "output":
-                        finish(node, args[0])
+                        finish(index, node, args[0])
                     else:
                         raise ValueError(
                             f"Unsupported expert parallel FX operation {node.op}"
@@ -990,25 +1071,32 @@ class ExpertParallelExecutor:
                                 raise RuntimeError(
                                     "Expert batch returned an unexpected result count"
                                 )
-                            for node, result_value in zip(nodes, result.values):
-                                finish(node, result_value)
+                            for (index, node), result_value in zip(
+                                nodes, result.values
+                            ):
+                                finish(index, node, result_value)
                         else:
                             if len(nodes) != 1:
                                 raise RuntimeError(
                                     "Expert batch fallback returned multiple nodes"
                                 )
-                            finish(nodes[0], result)
+                            index, node = nodes[0]
+                            finish(index, node, result)
         except BaseException:
             for future in pending:
                 future.cancel()
             wait(pending)
             raise
-        if output is None:
+        if any(output is None for output in outputs):
             raise RuntimeError("Expert parallel graph did not produce an output")
-        return {
-            **{
-                name: item for name, item in value.items()
-                if name not in schedule.consumed
-            },
-            **output,
-        }
+        return tuple(
+            {
+                **{
+                    name: item
+                    for name, item in value.items()
+                    if name not in schedule.consumed
+                },
+                **output,
+            }
+            for value, output in zip(values, outputs)
+        )
