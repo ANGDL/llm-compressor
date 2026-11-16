@@ -671,6 +671,27 @@ def _forward_target_group(
     return current
 
 
+def _forward_target_group_many(
+    adapter: TracedBoundaryAdapter,
+    target_indices: Sequence[int],
+    values: Sequence[Mapping[str, Any]],
+    executor: ExpertParallelExecutor | None = None,
+) -> tuple[dict[str, Any], ...]:
+    """Forward a bounded set of batches, coalescing EP expert calls."""
+
+    if executor is not None:
+        return executor.forward_many(
+            tuple(
+                adapter.target_subgraphs[index] for index in target_indices
+            ),
+            values,
+        )
+    return tuple(
+        _forward_target_group(adapter, target_indices, value)
+        for value in values
+    )
+
+
 def _reference_tensor(value: Any) -> torch.Tensor | None:
     """Find a floating decoder output in a boundary value."""
 
@@ -1634,48 +1655,67 @@ def run_subgraph_streaming_pipeline(
                         device,
                     ):
                         with DisableQuantization(adapter.model), torch.no_grad():
-                            for batch_index in batches:
-                                session.state.current_batch_idx = batch_index
-                                value = boundaries.get_for_execution(
-                                    group_start,
-                                    batch_index,
-                                    group_inputs,
-                                    device=device,
-                                )
-                                if batch_index == batches[0]:
-                                    _debug_boundary(
-                                        "calibration input",
-                                        boundary=group_start,
-                                        batch=batch_index,
-                                        producer=(
-                                            adapter.targets[group_start - 1]
-                                            if group_start
-                                            else "<dataset>"
-                                        ),
-                                        consumer=target_name,
-                                        value={
-                                            name: value[name]
-                                            for name in subgraphs[0].input_names
-                                        },
+                            batch_step = (
+                                ep_executor.forward_batch_size
+                                if ep_executor is not None
+                                else 1
+                            )
+                            for batch_offset in range(0, len(batches), batch_step):
+                                batch_indices = batches[
+                                    batch_offset : batch_offset + batch_step
+                                ]
+                                values = []
+                                for batch_index in batch_indices:
+                                    session.state.current_batch_idx = batch_index
+                                    values.append(
+                                        boundaries.get_for_execution(
+                                            group_start,
+                                            batch_index,
+                                            group_inputs,
+                                            device=device,
+                                        )
                                     )
-                                next_value = _forward_target_group(
-                                    adapter, target_indices, value, ep_executor
+                                next_values = _forward_target_group_many(
+                                    adapter,
+                                    target_indices,
+                                    values,
+                                    ep_executor,
                                 )
-                                if (
-                                    reuse_calibration_outputs and has_next
+                                for batch_index, value, next_value in zip(
+                                    batch_indices, values, next_values
                                 ):
-                                    # These modifiers only collect statistics
-                                    # and compute qparams. Snapshot the output
-                                    # now, before the next batch can mutate it,
-                                    # and consume each input batch as usual.
-                                    boundaries.commit_propagated_batch(
-                                        group_start,
-                                        next_boundary,
-                                        batch_index,
-                                        next_value,
-                                        consumed_names=group_consumed,
-                                    )
-                                del next_value, value
+                                    if batch_index == batches[0]:
+                                        _debug_boundary(
+                                            "calibration input",
+                                            boundary=group_start,
+                                            batch=batch_index,
+                                            producer=(
+                                                adapter.targets[group_start - 1]
+                                                if group_start
+                                                else "<dataset>"
+                                            ),
+                                            consumer=target_name,
+                                            value={
+                                                name: value[name]
+                                                for name in subgraphs[0].input_names
+                                            },
+                                        )
+                                    if (
+                                        reuse_calibration_outputs and has_next
+                                    ):
+                                        # These modifiers only collect statistics
+                                        # and compute qparams. Snapshot the output
+                                        # now, before the next batch can mutate it,
+                                        # and consume each input batch as usual.
+                                        boundaries.commit_propagated_batch(
+                                            group_start,
+                                            next_boundary,
+                                            batch_index,
+                                            next_value,
+                                            consumed_names=group_consumed,
+                                        )
+                                    del next_value, value
+                                del next_values, values
                     with _stage_logger(
                         adapter.model,
                         f"{target_label} | modifier update",
@@ -1738,40 +1778,60 @@ def run_subgraph_streaming_pipeline(
                                 ),
                                 torch.no_grad(),
                             ):
-                                for batch_index in batches:
-                                    value = boundaries.get_for_execution(
-                                        group_start,
-                                        batch_index,
-                                        group_inputs,
-                                        device=device,
-                                    )
-                                    next_value = _forward_target_group(
-                                        adapter, target_indices, value, ep_executor
-                                    )
-                                    boundaries.commit_propagated_batch(
-                                        group_start,
-                                        next_boundary,
-                                        batch_index,
-                                        next_value,
-                                        consumed_names=group_consumed,
-                                    )
-                                    if batch_index == batches[0]:
-                                        _debug_boundary(
-                                            "propagated",
-                                            boundary=next_boundary,
-                                            batch=batch_index,
-                                            producer=target_name,
-                                            consumer=(
-                                                " + ".join(
-                                                    adapter.targets[index]
-                                                    for index in target_groups[
-                                                        group_index + 1
-                                                    ]
-                                                )
-                                            ),
-                                            value=next_value,
+                                batch_step = (
+                                    ep_executor.forward_batch_size
+                                    if ep_executor is not None
+                                    else 1
+                                )
+                                for batch_offset in range(
+                                    0, len(batches), batch_step
+                                ):
+                                    batch_indices = batches[
+                                        batch_offset : batch_offset + batch_step
+                                    ]
+                                    values = [
+                                        boundaries.get_for_execution(
+                                            group_start,
+                                            batch_index,
+                                            group_inputs,
+                                            device=device,
                                         )
-                                    del next_value, value
+                                        for batch_index in batch_indices
+                                    ]
+                                    next_values = _forward_target_group_many(
+                                        adapter,
+                                        target_indices,
+                                        values,
+                                        ep_executor,
+                                    )
+                                    for batch_index, value, next_value in zip(
+                                        batch_indices, values, next_values
+                                    ):
+                                        boundaries.commit_propagated_batch(
+                                            group_start,
+                                            next_boundary,
+                                            batch_index,
+                                            next_value,
+                                            consumed_names=group_consumed,
+                                        )
+                                        if batch_index == batches[0]:
+                                            _debug_boundary(
+                                                "propagated",
+                                                boundary=next_boundary,
+                                                batch=batch_index,
+                                                producer=target_name,
+                                                consumer=(
+                                                    " + ".join(
+                                                        adapter.targets[index]
+                                                        for index in target_groups[
+                                                            group_index + 1
+                                                        ]
+                                                    )
+                                                ),
+                                                value=next_value,
+                                            )
+                                        del next_value, value
+                                    del next_values, values
 
                     with _stage_logger(
                         adapter.model,
