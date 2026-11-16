@@ -2069,3 +2069,18 @@ route conversion/parent wrapper，不能要求模型类增加 EP 配置方法。
 **本地 expert 计算和粗粒度 combine 是主路径，逐 expert D2D executor 是兼容
 回退路径，expert bucket 是容量模式，fused MoE kernel 仍不默认启用。核心只
 依赖 `StreamingMoEAdapter`，不依赖任何具体模型类。**
+
+**本轮实现检查点。** 当前分支已保留三个可回退提交：
+
+- `668afa138`：owner CUDA stream、event dependency、卸载前统一同步；
+- `d18efc39d`：同一 owner 的兼容 expert 输入按批次拼接，一次传入 owner，
+  owner 内按原 expert 顺序调用，再按原输出边界拆回；单批输入上限默认
+  128 MiB，超限或结构不兼容时逐 expert 回退；
+- `cbb376da8`：外部 `LocalExpertProxy`，标准 expert container 通过 context
+  manager 临时替换，保留 `experts.<id>` 名称和 hooks，退出时恢复原模块。
+
+本地组合回归为 `70 passed, 5 skipped`，覆盖 EP executor、MoE adapter、
+外部 proxy、subgraph pipeline、GPTQ/oneshot 对照和异常清理。该结果证明
+当前改动没有改变已测 toy GPTQ 的 Hessian/sample count/qparams 语义；它不
+证明 P800 上的跨卡通信收益。多进程 EP 仍需接入 topology、rank-local
+materialization、global commit 和目标设备基准后，才能替换当前单进程路径。
