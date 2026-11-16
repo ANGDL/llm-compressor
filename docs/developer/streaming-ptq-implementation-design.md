@@ -2431,7 +2431,7 @@ expert_parallel_token_budget="auto"|int)`，pretrained pipeline 和
 时不允许设置手动上限。pipeline 的 `batch_size`、样本顺序、完整 sequence
 和 modifier 自己的优化 batch 参数不受此参数影响。
 
-资源实现分为三层：
+资源实现按以下职责分离：
 
 | 模块 | 实际职责 |
 | --- | --- |
@@ -2522,3 +2522,49 @@ tokens、dispatch 数、expert call 数、最大 dispatch tokens 和显存峰值
 kernel 分配的形式化上界；fused/native 算子需要相应模型/资源 adapter 提供
 足够的成本信息。当前没有进行生产模型端到端测试，因此不据此宣称 DSV4.1
 全模型峰值显存或实际加速比。
+
+#### 17.3.9 2026-11-16 单测与基线对照记录
+
+遵循当前验证范围，本轮只运行单元/回归测试，没有启动生产模型端到端量化
+任务。代码按 commit → push → node16 `git pull --ff-only` 同步。测试容器为
+`llm-quant-base`，测试仓库为 `/data/quant/llm-compressor`。
+
+所有本节测试均通过下列环境限制可见设备；测试中的逻辑 `cuda:0` 对应物理
+GPU 4，不对应物理 GPU 0：
+
+```bash
+CUDA_VISIBLE_DEVICES=4,5,6,7 \
+LLMCOMPRESSOR_TEST_EP_DEVICES=cuda:0,cuda:1,cuda:2,cuda:3 \
+python -m pytest -q ...
+```
+
+验证结果如下：
+
+| 测试范围 | 结果 | 关键证据 |
+| --- | --- | --- |
+| admission、expert executor、token planner、GPTQ adapter、artifact store/manifest、subgraph pipeline、pretrained、modifier adapter/contract、prefetch、MoE grouping | 209 passed，6 个既有 AutoRound 失败 | 2/4 owner CUDA GPTQ 的逐输入和合并输入对照均通过；包含 Hessian、sample count、weight、qparams |
+| DSV4.1 MoE 排序路由、普通/校准 FX expert 暴露、全部 owner admission 完成前不得加载 expert | 10 passed | 只选择相关单测，不运行本文件完整模型量化用例 |
+| 开发前 `58917dcd6` 的隔离源码副本，AutoRound adapter 专项基线 | 2 passed，6 failed | 六个失败的测试 ID 与当前回归完全一致，均为 reference output width 64/32 不匹配 |
+| 本轮改动 Python 文件的 Ruff、compileall、`git diff --check` | 通过 | 未修复与本轮无关的文件或测试问题 |
+
+AutoRound 基线通过 `git archive 58917dcd6` 解包至独立 `/tmp` 目录，并用该目录
+的 `src` 设置 `PYTHONPATH`，没有修改共享 checkout。失败测试覆盖：普通
+两层执行、after-update/after-commit 恢复、int8 checkpoint reload，以及
+FP32/BF16 accelerator 执行。这些错误本轮未修复。
+
+新增用例重点验证不同 owner 容量、变长和交错 expert 输出顺序、单次调用超限
+拒绝、二维/三维 token 计数、每 owner 至多一个已准备 dispatch、非线性内存
+曲线、完整 legacy/host cache 保守计费、update group workspace、关闭 hook
+时计数不变、异常后实例方法恢复、token plan 校验/不可覆盖/fresh-run 清理，
+以及不开 EP 时维持单 boundary 执行。
+
+node16 日志：
+
+- `/tmp/ep-token-regression-tests.log`
+- `/tmp/ep-token-native-unit-tests.log`
+- `/tmp/ep-token-autoround-baseline.log`
+
+本轮实现提交为 `d677ae75a`，测试生命周期修正与详细实现文档提交为
+`0f66ca529`。最终代码相对 `58917dcd6` 的 GPTQ 目录 diff 为空；算法适配集中于
+streaming 模块。没有生产端到端结果，因此全模型运行速度、所有层的显存峰值
+和资源曲线准确性仍需后续获准进行完整验证时实测。
