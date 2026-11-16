@@ -358,10 +358,10 @@ def _ancestors(name: str):
 def _module_storage_bytes(module: nn.Module) -> int:
     return sum(
         tensor.numel() * tensor.element_size()
-        for tensor in module.parameters(recurse=False)
+        for tensor in module.parameters()
     ) + sum(
         tensor.numel() * tensor.element_size()
-        for tensor in module.buffers(recurse=False)
+        for tensor in module.buffers()
         if tensor is not None
     )
 
@@ -590,7 +590,7 @@ class ExpertParallelExecutor:
         if not entries:
             return False
         first_leaves, first_spec = cls._call_leaves(
-            entries[0][1], entries[0][2]
+            entries[0][2], entries[0][3]
         )
         tensor_indices = []
         for leaf_index, leaf in enumerate(first_leaves):
@@ -606,7 +606,7 @@ class ExpertParallelExecutor:
         if not tensor_indices:
             return False
 
-        for _name, args, kwargs in entries:
+        for _node, _name, args, kwargs in entries:
             leaves, spec = cls._call_leaves(args, kwargs)
             if spec != first_spec or len(leaves) != len(first_leaves):
                 return False
@@ -640,10 +640,10 @@ class ExpertParallelExecutor:
     def _prepare_batch(cls, entries, primary):
         if not cls._inputs_compatible(entries, primary):
             return None
-        first_leaves, spec = cls._call_leaves(entries[0][1], entries[0][2])
+        first_leaves, spec = cls._call_leaves(entries[0][2], entries[0][3])
         all_leaves = [
             cls._call_leaves(args, kwargs)[0]
-            for _name, args, kwargs in entries
+            for _node, _name, args, kwargs in entries
         ]
         lengths = tuple(
             next(
@@ -669,7 +669,7 @@ class ExpertParallelExecutor:
                 combined_leaves.append(first)
         combined_args, combined_kwargs = tree_unflatten(combined_leaves, spec)
         return _PreparedExpertBatch(
-            tuple(name for name, _args, _kwargs in entries),
+            tuple(name for _node, name, _args, _kwargs in entries),
             combined_args,
             combined_kwargs,
             lengths,
@@ -682,7 +682,7 @@ class ExpertParallelExecutor:
         for entry in entries:
             input_bytes = sum(
                 item.numel() * item.element_size()
-                for item in self._call_leaves(entry[1], entry[2])[0]
+                for item in self._call_leaves(entry[2], entry[3])[0]
                 if isinstance(item, torch.Tensor)
             )
             exceeds_budget = (
