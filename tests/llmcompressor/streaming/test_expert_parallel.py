@@ -152,9 +152,10 @@ def test_external_adapter_collection_can_drive_plan_and_proxy_ids():
 
 
 def test_generic_ep_topology_and_state_filter():
-    config = EPConfig(ep_size=2, mode=EPMode.ALL_EXPERT)
-    topology = EPTopology.from_config(config)
-    assert topology.config.world_size == 2
+    topology = EPTopology.from_config(EPConfig())
+    assert topology.config.world_size == 1
+    with pytest.raises(ValueError, match="world_size"):
+        EPTopology.from_config(EPConfig(ep_size=2, mode=EPMode.ALL_EXPERT))
     placement = build_expert_placement(
         num_experts=4,
         ep_size=2,
