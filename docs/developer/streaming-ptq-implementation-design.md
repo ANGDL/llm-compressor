@@ -2070,6 +2070,67 @@ route conversion/parent wrapper，不能要求模型类增加 EP 配置方法。
 回退路径，expert bucket 是容量模式，fused MoE kernel 仍不默认启用。核心只
 依赖 `StreamingMoEAdapter`，不依赖任何具体模型类。**
 
+### 17.2 通用 topology、placement 与 adapter 接口
+
+2026-11-16 增加了第一版可复用的 EP topology contract，代码位于
+`streaming/parallel/topology.py`。它把进程坐标、专家 placement 和 checkpoint
+state ownership 分开，避免在每个模型类中增加 `configure_streaming_ep`：
+
+```python
+config = EPConfig(ep_size=8, dp_size=1, mode=EPMode.ALL_EXPERT)
+topology = EPTopology.from_config(config)
+spec = ExpertModuleSpec(
+    module_name="layers.0.mlp.experts",
+    num_experts=384,
+    expert_id_from_state_name=parse_expert_id,
+)
+placement = build_expert_placement(
+    num_experts=spec.num_experts,
+    ep_size=config.ep_size,
+    expert_bytes=expert_sizes,
+)
+state_filter = make_expert_state_filter(
+    placement, topology.ep_rank, spec.expert_id_from_state_name
+)
+```
+
+这组接口的约束如下：
+
+1. `EPConfig` 只描述 `ep_size`、`dp_size` 和校准模式，不包含模型名称、参数
+   正则表达式或模型方法。没有初始化 distributed group 时，EP size 大于一会
+   立即拒绝，避免悄悄退化为完整模型复制。
+2. `EPTopology` 使用 `rank = dp_rank * ep_size + ep_rank` 的固定布局，并在
+   所有 rank 以相同顺序创建 EP/DP process group。第一阶段仍只允许当前
+   single-process executor 使用 `dp_size=1`；`dp_size>1` 的统计归约和数据
+   切分不能被 dataclass 的存在误认为已经完成。
+3. `ExpertPlacementPlan` 使用 expert 实际参数和 buffer 字节数做稳定的
+   descending-size greedy placement；大小相同的 expert 仍按 logical expert id
+   稳定轮转。这样 DSV4.1 之外的非均匀 expert 也不会被固定 round-robin
+   造成单卡热点，placement fingerprint 同时记录 expert byte profile。
+4. `ExpertModuleSpec` 只负责外部模型 adapter 的容器名、expert 数量和 state
+   name parser。dense、router、shared expert 默认保持 replicated/canonical
+   policy；routed expert 才按 placement 过滤。未来 writer/loader 直接复用
+   `state_filter`，不把 DSV4.1 tensor namespace 放入 EP core。
+5. 标准 `ModuleList`/`ModuleDict` 可以通过现有
+   `StandardTransformersMoEAdapter` 与 `ExpertParallelPlan.from_model(...,
+   adapters=...)` 接入；`install_standard_proxies()` 临时安装
+   `LocalExpertProxy`，退出 context 时恢复原 container。proxy 只处理父 MoE
+   直接调用 expert container 的模型；DSV4.1 当前逐 expert FX leaf 仍使用
+   `ExpertParallelExecutor`，保证 GPTQ hook 输入、Hessian 和 `index_add_`
+   顺序不变。
+6. 单进程路径仍以显式 `expert_parallel_devices` 为入口。它执行的是
+   local-device owner dispatch，拥有独立 CUDA stream 和一次 owner 批量输入/
+   输出搬运；topology contract 为后续 torchrun EP-only backend 提供一致的
+   placement/state/filter 身份，不能把本地多卡 executor 的结果标记成已完成
+   多进程 global commit。
+
+因此当前阶段的泛化边界是清晰的：标准容器可通过外部 adapter 接入，fused/native
+容器需要提供 `ExpertModuleSpec` 和 route/partial-output adapter；任何一种都不
+要求修改模型类，也不会把 MTP、CSA2、Engram 或 DSV4.1 特殊逻辑放进 EP 核心。
+多进程 writer、owner-local GPTQ statistics reduction、rank-local staging 和
+global commit 仍是下一阶段，在真实 torchrun tiny/native 对照通过前不开放为默认
+生产入口。
+
 **本轮实现检查点。** 当前分支已保留三个可回退提交：
 
 - `668afa138`：owner CUDA stream、event dependency、卸载前统一同步；

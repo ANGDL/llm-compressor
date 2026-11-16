@@ -107,10 +107,18 @@ from .moe import (
 from .mtp import StreamingMTPWrapper
 from .oneshot import streaming_oneshot
 from .parallel import (
+    EPConfig,
+    EPMode,
+    EPTopology,
+    ExpertModuleSpec,
+    ExpertPlacementPlan,
     ParallelContext,
     PlacementEntry,
     PlacementPlan,
     StatisticsScope,
+    build_expert_placement,
+    ensure_streaming_ep_process_group,
+    make_expert_state_filter,
 )
 from .quantize import quantize_streaming
 from .recovery import (
@@ -151,7 +159,12 @@ __all__ = [
     "KimiK3WeightMaterializer",
     "KimiK3WeightSource",
     "ExecutionInfo",
+    "EPConfig",
+    "EPMode",
+    "EPTopology",
     "ExpertGroup",
+    "ExpertModuleSpec",
+    "ExpertPlacementPlan",
     "ExpertGroupExecutor",
     "ExpertGroupPlan",
     "ExpertGroupModifierAdapter",
@@ -207,6 +220,7 @@ __all__ = [
     "fingerprint_json",
     "execute_expert_group",
     "estimate_modifier_memory",
+    "build_expert_placement",
     "build_meta_model",
     "build_modifier_contracts",
     "calibration_outputs_reusable",
@@ -221,9 +235,11 @@ __all__ = [
     "fingerprint_streaming_value",
     "fingerprint_streaming_values",
     "load_streaming_model",
+    "make_expert_state_filter",
     "quantize_streaming",
     "trace_streaming_boundaries",
     "streaming_oneshot",
+    "ensure_streaming_ep_process_group",
     "RecoveryErrorKind",
     "RetiredBoundaryError",
     "ResumePlan",
