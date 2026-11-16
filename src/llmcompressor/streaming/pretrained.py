@@ -56,6 +56,7 @@ from .materialization import (
 from .modifier_adapters import get_modifier_adapter, validate_streaming_modifiers
 from .mtp import StreamingMTPWrapper
 from .output import build_quantization_config
+from .parallel.expert import ExpertParallelPlan, resolve_expert_parallel_devices
 from .pipeline import (
     _complete_direct_writer_staging,
     _initialize_run,
@@ -388,6 +389,7 @@ def streaming_oneshot_from_pretrained(
     dtype_policy: StreamingDTypePolicy | None = None,
     sequential_targets: Sequence[str] | str | None = None,
     sequential_targets_per_subgraph: int = 1,
+    expert_parallel_devices: Sequence[torch.device | str] | None = None,
     processor_identity: Any = None,
 ) -> Path:
     """Run traced streaming PTQ with an oneshot-like model/dataset interface."""
@@ -441,6 +443,17 @@ def streaming_oneshot_from_pretrained(
         raise ValueError("Pretrained streaming mode requires a local model directory")
     parsed_recipe = Recipe.create_instance(recipe)
     quantizer = _recipe_quantizer(parsed_recipe)
+    ep_devices = resolve_expert_parallel_devices(
+        expert_parallel_devices, torch.device(device)
+    )
+    if ep_devices and (
+        len(parsed_recipe.modifiers) != 1
+        or type(quantizer) not in (QuantizationModifier, GPTQModifier)
+    ):
+        raise ValueError(
+            "Expert parallel streaming currently supports one GPTQModifier or "
+            "QuantizationModifier; other modifier combinations require an EP adapter"
+        )
     config = model_config or AutoConfig.from_pretrained(
         checkpoint, local_files_only=True
     )
@@ -533,10 +546,11 @@ def streaming_oneshot_from_pretrained(
             group_moe_experts=automatic_gptq_targets,
         )
         if automatic_gptq_targets and sequential_targets_per_subgraph == 1:
-            sequential_targets_per_subgraph = 8
+            sequential_targets_per_subgraph = 8 * (len(ep_devices) or 1)
             logger.info(
                 "Automatic GPTQ MoE target grouping: "
-                "using up to 8 consecutive expert-owner targets per subgraph"
+                f"using up to {sequential_targets_per_subgraph} consecutive "
+                "expert-owner targets per subgraph"
             )
         target_mode = (
             "automatic GPTQ Linear"
@@ -561,6 +575,10 @@ def streaming_oneshot_from_pretrained(
             dtype=target_dtype,
             tracing_ignore=dataset_args.tracing_ignore,
             targets_per_subgraph=sequential_targets_per_subgraph,
+        )
+        expert_parallel = (
+            ExpertParallelPlan.from_model(meta_model, adapter.targets, ep_devices)
+            if ep_devices else None
         )
         adapter.execution = adapter.execution.with_inputs(
             dataloader.fingerprint,
@@ -630,6 +648,8 @@ def streaming_oneshot_from_pretrained(
                 pack_to_int8=pack_to_int8,
                 replace_existing=True,
                 execution=adapter.execution,
+                expert_parallel=expert_parallel,
+                target_groups=adapter.target_groups,
             )
             _complete_direct_writer_staging(
                 adapter=adapter,
@@ -663,6 +683,7 @@ def streaming_oneshot_from_pretrained(
                     pack_to_int8=pack_to_int8,
                     targets_per_subgraph=sequential_targets_per_subgraph,
                     execution=adapter.execution,
+                    expert_parallel=expert_parallel,
                 )
             )
         qconfig = build_quantization_config(quantizer.resolved_config)

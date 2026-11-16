@@ -59,6 +59,7 @@ nav:
       - model-free-ptq: guides/entrypoints/model-free-ptq.md
       - convert_checkpoint: guides/entrypoints/convert.md
     - Compression Schemes: guides/compression_schemes.md
+    - HIGGS 混合精度量化: guides/higgs_mixed_precision.md
     - Observers: guides/observers.md
     - Big Models and Distributed Support:
       - Model Loading: guides/big_models_and_distributed/model_loading.md

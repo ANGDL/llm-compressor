@@ -1066,6 +1066,873 @@ device_required_bytes=10,377,925,552
 CPU Hessian offload，也没有把整个 DSV4.1 block 作为一个 target。完整量化仍需
 等待 1,980 个 bounded groups 和后续 validate/report 阶段完成。
 
+### 16.2 2026-11-15：bounded group 执行时间回归
+
+GPTQ attempt `attempt-20261114T142101Z-65487e63` 于北京时间
+`2026-11-14 22:21:04` 启动；`2026-11-15 18:34:55` 检查时仍在运行，
+已完成 193/1,980 个 group。不能将该状态记为完整端到端成功。此前的普通
+expert group 约需 194–231 秒，包含 attention 的 group 更慢；完整量化按现状
+需要数天，不能作为可接受的性能基线。
+
+优先检查 tracing projection 的执行所有权。一个 shared sequential partition
+包含多个 target 时，逐 target 从相同 partition 递归收集依赖，可能把先前
+target 的 `call_module` 以及带副作用的 routing accumulation 复制到后续
+projection。若 group 有 G 个 target，执行各 projection 可能产生 O(G²) 次
+target 调用；重复的 attention 和 in-place accumulation 还可能影响结果及
+GPTQ observation 次数。增大 group 之前必须消除这种重复。
+
+修复和验收顺序：
+
+1. 用串行 Linear、并行 expert 汇合及 in-place accumulation 的人工 FX graph
+   复现；记录每个 target 的真实 forward 次数，不能只比较最终 tensor。
+2. 对每个原始 partition 一次性保留所有 target 和后续所需输出，再切分成
+   互不重叠的 target execution slices。每个原始 FX 运算只属于一个 slice，
+   跨 slice 的值通过 boundary 引用传递；继续复用 shared `partition_graph`
+   和 `trace_consumed_names`。
+   DSV4.1 tracing 分支的 routing accumulation 还必须显式使用
+   `output = output.index_add_(...)` 返回值，将累加顺序表达为 FX 数据依赖；
+   否则拓扑分区可以提前执行 shared-expert merge。该调整只作用于 tracing
+   兼容分支，并同时验证自然路由和全专家校准的输入与输出。
+3. 校准和量化后传播各执行每个 target 一次；Hessian 生命周期仍按 bounded
+   group 结束，不改变 GPTQ 数学，不引入 CPU Hessian offload。
+4. 用 observer/Hessian sample count、调用次数、输出和 checkpoint 对照验证；
+   覆盖 suffix/tuple、dead target、MTP 以及 DSV4.1 routing。
+5. 回归通过后替换远端运行，在相同数据和 recipe 下测量真实 group 耗时与
+   显存峰值，再决定是否需要按预算自动扩大 group。不能从减少 group 数量
+   直接推导加速比，也不能将 boundary 形状启发式估算的 `num_tokens` 当成
+   数据集实际 token 数。
+
+#### 16.2.1 grouped working set 必须保留 parameter-level 精度
+
+2026-11-15 复核 tiny native DSV4.1 + GPTQ 时发现，`plan_target()` 已正确将
+`get_attr` 和模型声明的直接参数依赖解析为精确参数计划，但 `plan_group()`
+把这些计划的 `module_names` 再传入 `plan_modules()`。直接参数计划记录的
+owner 名称只用于安装、恢复和导出，不能解释为需要加载 owner 的全部子树。
+例如 `layers.0.scale` 的 owner 为 `layers.0`，重新按模块计划会加载该层
+所有 expert 和 attention 权重；root parameter 甚至可能扩大为整个模型。
+
+实现方案是在 `SubgraphWeightSession` 中提供多个 subgraph 的统一规划入口：
+
+1. 分别读取各 subgraph 的 `call_module` 工作集并取最小模块根集合。
+2. 收集所有 `get_attr` 直接参数和各 target 声明的 runtime parameter；
+   仅删除已经被完整模块根覆盖的参数，然后通过既有 `plan_parameters()`
+   按 owner 合并、按 tensor identity 处理同 owner 别名。
+3. adapter 继续逐 target 验证 runtime dependency，禁止隐式跨 quantized
+   target 引用；将验证后的 module/parameter 依赖传给统一规划入口。
+4. 单 target 和 group 共用上述实现，保留既有 runtime buffer、缺失状态、
+   checkpoint source alias、host/device admission、安装和恢复协议。
+   不拼接重复的 `TargetLoadPlan`，也不从 owner 名推测完整模块加载范围。
+
+验收需同时覆盖 root/nested direct parameter、同 owner 多参数和别名、
+重复 module dependency、runtime buffer、无关大型 child 保持 meta、实际
+物化字节和退出后的 meta 恢复。native GPTQ + DSpark 测试记录每个 module
+真实 calibration hook 次数以及输入 batch 对 Hessian sample count 的贡献。
+MTP draft 可能增加 batch 维，不能把所有 `_num_samples` 硬编码为样本条数。
+
+已于北京时间 2026-11-15 18:56 通过 dashboard cancel 停止
+`attempt-20261115T104904Z-2637c021`，该轮尚在初始化；保留日志及工作目录，
+修复通过回归后再用相同原始参数重跑。原 run metadata 中的 git SHA 是创建
+run 时的版本，后续验证使用远端工作区增量补丁，必须单独记录代码版本。
+
+#### 16.2.2 本轮回归与端到端运行准备
+
+- 本地定向回归：267 passed、11 skipped；覆盖 tracing、weight session、
+  loader、pipeline、pretrained、execution、modifier adapters、HIGGS、
+  native DSV4.1。Ruff 与 `git diff --check` 通过。
+- 新工作集回归在修复前 root/nested 两种 owner 均错误估算 263,376 bytes
+  （当时 fixture 尚未加入 auxiliary module），而精确计划仅需 208 bytes。
+  最终 fixture 增加重复声明的 auxiliary module 后，正确值为 288 bytes；
+  安装时无关 256×256 child 保持 meta，参数别名、runtime buffer、导出与
+  卸载均验证通过。
+- native GPTQ 完整测试成功 finalize 5 层主干与 3 层 DSpark/MTP。
+  与原生 eager 执行逐模块比较观测 shape 序列，再独立核对 GPTQ sample
+  count。DSpark attention 的同一个 `wkv` 会分别处理 main/draft 输入，
+  每个样本两次 hook 是模型本身的行为，不能作为重复 projection 判据。
+- 远端同一测试集合：272 passed、6 failed。失败均为 AutoRound 的 reference
+  output 末维 32 与预测末维 64 不一致。已在独立进程内载入远端 HEAD 的
+  修改前 tracing，首个 AutoRound 失败同样复现，未修改磁盘代码。远端
+  auto-round 0.15.1 / transformers 5.17.0，本地 auto-round 0.14.2 /
+  transformers 5.19.0。该兼容问题单独保留，不能把当前远端集合记为全绿。
+  GPTQ、HIGGS、native DSpark 回归均通过。
+
+重跑前还发现存储约束：`/ssd2` 剩余约 262 GiB；源 checkpoint metadata 为
+510,286,023,000 bytes。最初按物理 shape 再计算 W4 的 346 GiB 估算错误：
+源 expert 已使用 packed FP4，例如 w1 为 `I8 [2304, 2560]`，对应逻辑
+shape `[2304, 5120]`，不能在物理 shape 上再次减半。按逻辑 shape、原
+WNa8 规则、FP32 channel scale 与保留 Engram 重新计算，产物约为
+493,490,084,696 bytes（459.60 GiB），其中：
+
+- routed W4 与 channel scale：279,198,302,208 bytes；
+- 其余 W8 与 channel scale：7,411,637,248 bytes；
+- 保留 Engram：202,758,032,400 bytes；
+- 其余静态状态估算：4,122,112,840 bytes。
+
+该值仍为布局估算，最终以 checkpoint index 为准。磁盘计划必须使用
+materializer 的逻辑 shape 和实际输出布局，不能只参考源文件物理 shape。
+
+本轮运行数据迁移至 `/ssd3/model-quality/runs/<run_id>`（迁移前可用约
+485 GiB），保留 `/ssd2/model-quality/runs/<run_id>` 为符号链接，使 dashboard、
+原参数和 attempt 关系继续可用。量化与原推理容器均已核实挂载 `/ssd2`、
+`/ssd3`。迁移在无活动 job 时执行：先完整复制、核对文件和大小，再将原目录
+改名保留于 `/ssd2/model-quality/retained`，最后切换符号链接；失败则恢复原路径。
+不删除旧 attempt，work/output 仍处于同一实际文件系统，保持 copy-free
+publication 约束。迁移后再归档取消轮次的 work，启动相同配置的新 attempt。
+
+迁移已完成，核对 1,001 个文件、29,183,491,238 bytes，原目录保留在
+`/ssd2/model-quality/retained/20261112T090344Z_a619a1629881-before-20261115-relocation`。
+迁移后 `/ssd3` 剩余约 458 GiB。新轮次：
+
+```text
+run_id: 20261112T090344Z_a619a1629881
+model_id: deepseek_v41_wNa8-c7c0b93d
+attempt_id: attempt-20261115T110755Z-9a853928
+quantize_job: job-20261115T110755Z-eb1ab395
+inference_job: job-20261115T110755Z-14a3d0d2
+report_job: job-20261115T110755Z-3fc3adb9
+process_started: 2026-11-15 19:07:59 +08:00
+parameters: 原配置，266 samples / max length 8192 / seed 42 / GPTQ WNa8
+local_base: c174ca911
+remote_base: 0ea24f39f50a692b0894d7e3c5914c517995c33b + 增量补丁
+incremental_patch_sha256:
+  79e10935f18654fcf714ff1688b6549d41e6c322246de4ff01be44ae105c6a85
+tracing.py_sha256:
+  3f95ca9753a4d2a825344f3306cbc12646cb84d0e1af6418dcf8ac5925b029a3
+loading/session.py_sha256:
+  0a589bc63fc57e0d50f1db12936d84384a9169523f64c15a9c1b8961f55051eb
+deepseekv41/model.py_sha256:
+  e3296b2a293923e7f68ccff2fd71004bc1d621b1496bccb1ef124b1318b2b32c
+```
+
+校正容量估算后，将当前 run 下约 27 GiB 的
+`work-attempt-20261114T142101Z-65487e63-superseded` 历史工作目录移回
+`/ssd2/model-quality/retained/<run_id>-historical-work/`，在 run 的原历史目录
+位置保留符号链接。操作仅针对取消轮次，不移动正在执行的 work，不删除旧
+日志或历史数据。迁移已完成，核对 656 个文件、28,680,188,144 bytes；
+迁移后可用 518,859,063,296 bytes（约 483 GiB），对预计产物留约 23 GiB 余量。
+
+后续 runtime-smoke 必须使用原 plan 的 `zhuang_xsgl_repro_20261102` 和
+`/workspace/ds_v41/w4a8/run_server.sh`。本地 manager 默认 inference container
+已被其他任务改为 `zhuang_glm53_p_deploytest`，且该容器缺少 repo；本轮通过
+环境覆盖 `MQ_INFERENCE_WORKER_CONTAINER` 指向原容器，不修改其他 plan 的默认
+容器配置。worker 使用该容器的 python310_torch29_cuda 环境，保持 `sglang`
+命令可用。此准备不等于 runtime-smoke 已通过；需要等量化与 validate 完成。
+
+#### 16.2.3 耗时对照与剩余验收
+
+旧轮次完整日志的统计（2026-11-15 19:15 检查）：
+
+| 类型 | 已完成 group | group 耗时中位数 | 范围 |
+|---|---:|---:|---:|
+| 仅 expert | 189 | 250.94 s | 194.07–431.00 s |
+| 含 attention | 4 | 2,820.57 s | 1,713.54–11,966.86 s |
+
+仅 expert 的 calibration 中位数为 50.42 s，modifier update 为 11.26 s，
+写 checkpoint 约 0.48 s。含 attention 的 calibration 中位数为 1,294.37 s。
+这些是旧实现的实际数据，不能沿用为新轮次 ETA。旧实现 8 个串行 target
+共执行 36 次，新实现只执行 8 次，但 group 总耗时还包含 GPTQ update、
+activation boundary I/O、量化后传播和权重加载，不能直接承诺 4.5 倍总加速。
+
+新轮次于 `2026-11-15 19:15:15 +08:00` 进入 initial boundary 收集，
+初始化包括数据处理、meta 模型、MoE owner discovery、FX tracing 和图分区。
+首组与后续普通 group 应分别记录，避免用 attention 重组或初始化时间推算
+所有 expert。剩余验收顺序：
+
+1. 首个 bounded group admission、calibration、update、propagation、
+   save/unload 全部成功，并记录峰值显存。
+2. 至少三个连续普通 expert group 的完成时间、各阶段耗时和资源曲线。
+3. 按剩余 attention/expert group 数与各自实测分布推算范围；单独预留 final
+   static tensor、validate、runtime-smoke 和 report 的时间。
+4. 全部 1,980 groups、最终 checkpoint validate、原推理容器 smoke 和 report
+   完成后，才将 GPTQ 大模型 E2E 标记为通过。
+
+当前只确认代码回归通过、存储迁移与新 attempt 启动，完整 GPTQ E2E 仍在运行。
+
+`2026-11-15 19:25 +08:00` 首组已完成校准和 modifier update：
+
+| 首组阶段 | 旧轮次 | 新轮次 |
+|---|---:|---:|
+| calibration | 987.10 s | 256.51 s |
+| modifier update | 15.09 s | 16.82 s |
+| activation propagation | 1,190.09 s | 390.29 s |
+| group total | 2,230.53 s | 694.98 s |
+
+该比较使用相同配置、相同首组 target 名单。校准阶段约快 3.85 倍，不能直接
+当作整组或整个模型的加速比。新轮次 initial boundary 为 221.01 s，
+峰值显存 4.88 GB；首组 calibration 峰值 11.71 GB，update 峰值 12.03 GB，
+admission 计划为 10,377,925,552 bytes。首组完整完成于 19:30:46，约快
+3.21 倍。当前未出现新的 OOM，完整端到端结果仍需继续观察。
+
+#### 16.2.4 只读取 metadata 的 admission 不应复制 activation payload
+
+首个普通 expert group（第 2 组）从旧轮次 431.00 s 降为 328.77 s，只有
+约 1.31 倍加速；不能将首组的 3.21 倍推广到整个模型。该组新 calibration
+为 70.10 s，update 为 11.68 s，propagation 为 201.51 s；从 start 到
+admission 另有约 37.47 s。manifest 中共 42 个含 attention group、1,938
+个普通 group，普通组才是总耗时的主要决定因素。
+
+代码复核确认，admission 遍历 266 个 batch 时调用
+`boundaries.get(group_start, batch_index)`，只为计算输入 shape 的 token
+启发式和 tensor 字节数，但默认 CPU 读取会在 `_move()` 中 clone 整份
+CPU activation。该复制没有数值用途，且在每个 group 重复发生。
+
+修复复用现有 `BoundaryActivationStore.get(..., device="meta")`：
+
+- in-memory store 将保存的 tensor 映射为仅含 shape/dtype 的 meta tensor，
+  不复制 payload，也不暴露可写的原始 activation；
+- disk store 保持现有恢复和错误检查协议；本轮不改变其序列化格式；
+- `_boundary_token_count()` 和 `_boundary_nbytes()` 的结果保持一致，实际
+  calibration/propagation 仍按原 device 读取真实数据；
+- 不修改 GPTQ 算法、target grouping、统计量、recipe 或 recovery identity。
+
+先增加 memory/disk meta 读取与无 clone 回归，在 grouped GPTQ / sequential
+逐 tensor 等价测试中验证 admission 确实走 metadata 路径；再同步远端。
+当前轮继续收集普通组基线，替换运行时保留该轮全部日志与分片。优化效果以
+新轮同组实测为准，不能将 37.47 s 全部直接记为已消除的成本。
+
+metadata 优化的本地回归为 227 passed、5 skipped，涵盖 boundary store、
+pipeline、tracing、weight session、pretrained 与 native DSV4.1。memory/disk
+meta 读取均验证 shape/dtype/alias 和无 `Tensor.clone()`；group 1/2 的 GPTQ
+checkpoint 与 sequential oneshot 逐 tensor 一致，admission 的 meta 读取次数
+也验证为每个 group 每个 batch 一次。
+
+远端同组回归为 231 passed、1 failed；唯一失败为
+`test_deepseek_v4_preserves_input_ids_and_collects_all_experts[False-False]`
+的 reload logits NaN。该参数组独立复跑 3 个 case 全部通过，本轮没有修改
+对应 DeepSeek-V4 模型/fixture；如再复现需单独定位，不能隐藏首次失败。
+metadata store、grouped GPTQ 与 native DSV4.1/DSpark 的回归均通过。
+
+优化前当前轮三个连续普通 group 实测为 328.77 / 320.02 / 295.11 s，
+中位数 320.02 s；该基线仍太慢。若机械地将此普通组中位数和单个 attention
+首组 694.98 s 外推到 1,938 + 42 个 group，总量约 180 小时（7.5 天）。
+样本有限，attention 差异大，这既不是完工承诺，也不是 metadata 优化后的
+ETA；它明确说明“首组快 3.21 倍”并不等于整个模型已达到可接受速度。
+
+下一轮性能工作应按证据排序：
+
+1. 验证 metadata 规划不再发生整份 CPU activation clone，记录同组 start
+   到 admission 的耗时。
+2. 分开测量 activation H2D、GPU 运算、D2H、CPU snapshot/dedup，而不是只
+   用 propagation 总时长推断。评估按 FX liveness 只搬运当前 group 输入，
+   对仅透传至后续层/DSpark 的值保留 CPU 缓存。任何实现都要保留 alias、
+   in-place routing、CSA2 shared state、MTP context 的语义和快照隔离。
+3. 再做预算驱动的自动 group sizing。先校准 GPTQ batch-compression scratch
+   模型：第 2 组 admission 为 3,203,145,920 bytes，但实际 update 峰值达
+   14,914,841,088 bytes（含 runtime、activation、prefetch 等）。不能据当前
+   较小的静态 estimate 直接将固定 8 放大为 64/128，更不能退回 CPU Hessian
+   offload。需要分别建模固定工作区、随 group 增长的 Hessian/权重、压缩 batch
+   的临时副本、activation 和 prefetch，并在 admission 中保留边界。
+4. 自动分组的实际 group 列表、预算策略与版本必须进入 manifest/fingerprint；
+   恢复使用已记录的 group 计划，不能因空闲显存变化而静默改变量化数学。
+   所有新策略继续与使用相同 group 计划的 sequential oneshot 对照。
+
+#### 16.2.6 2026-11-15 EP 提速实施设计
+
+20:45 +08:00 检查 `attempt-20261115T115518Z-8b92c0b3`：进程已经运行
+约 50 分钟，完成 5/1,980 组，第 6 组正在传播，尚无新 OOM。首组为
+632.94 s；随后四个普通专家组为 389.31 / 377.60 / 367.21 / 366.04 s，
+中位数 372.405 s。普通组校准约 115 s、GPTQ update 约 11 s、传播约
+232–256 s。start 到 admission 已降到约 1.1 s，但总速度仍不满足需求。
+仅按这些有限样本外推仍约 8–9 天，不能据首组改善承诺全模型加速。
+当时卡 0 使用约 23 GiB，其余七张 P800 空闲，主机可用内存约 1.6 TiB，
+SSD3 可用约 482 GiB。后续每次设备测试前都需重新检查资源。
+
+**交付范围与旧 EP-B 计划的关系。** 优先交付单进程、多设备、共享输入的
+参考专家并行，执行后端标识为 `single-process-expert-parallel-v1`。这是真正的
+专家所有权分片：每个专家的权重、observer 和 Hessian 只驻留在其 owner
+device，输入 token 只在该专家上观测一次；不复制完整模型，不以数据并行
+分片样本，也不使用 CPU Hessian offload。它不是
+`transactional-streaming-ptq-plan.md` §3.7/E9 的多进程 EP-B 完成证明；
+后者的进程组、故障广播、participant prepare/global commit、强杀与恢复
+矩阵继续保留。单进程执行保留当前一个 OS lock、一个 writer 和一个事务参与者，
+各设备工作完成并通过校验后才写出统一 checkpoint，不伪造多 rank 提交。
+
+**通用接口与模型边界。**
+
+1. `streaming_oneshot(..., expert_parallel_devices=[...])` 显式启用。
+   设备列表必须包含主执行设备、无重复、使用同一可用 CUDA 后端。
+   自动 GPTQ MoE target discovery 继续使用最小 expert owner，不识别模型名。
+   默认每设备最多八个 owner；全局 group 上限随设备数增长，但逐设备 admission
+   仍必须通过。显式 group size 保留调用方的选择。
+2. placement 从 FX 可见的独立 expert owner 和模块树推导。标准
+   `experts.<id>`、ModuleList/ModuleDict expert collection 都按稳定顺序分配；
+   attention、router、shared expert、直接参数和跨层 runtime state 留在主设备。
+   非整除专家数与空 owner slot 合法。不能解析为独立 expert 的 fused/共享状态
+   在 preflight 明确拒绝跨设备分片，不能静默复制或猜测。
+3. native DSV4.1 的 routing、pre-w2 route weight、all-experts、CSA2、
+   Engram 和 DSpark/MTP 使用已有 FX 图和模型侧兼容层。EP executor 不包含
+   DSV4.1 类型分支，不替换 MTP wrapper，也不改变模型输入输出协议。
+
+**执行路径。** 将一个 group 的互不重叠 target slices 合成同一 FX DAG，
+保留原始节点名、外部输入、consumed liveness 和输出边界。独立 expert
+`call_module` 交给每设备一个串行 worker；主线程执行其余已就绪节点。
+仅数据依赖满足的节点进入 ready queue，禁止把尚未就绪的专家结果堵在串行
+队列头。专家输入先从协调设备搬到 owner，输出回协调设备；使用明确的
+CUDA 同步边界保证异步执行及 tensor 生命周期正确。初版采用保守同步，
+后续实测再优化 peer transfer，不预先承诺线性加速。
+
+同一 expert 内部始终保持 eager 调用顺序和原生 GPTQ hook；不同 expert
+允许并发。涉及 in-place/impure 的 FX 节点保持原执行次序，原图未表达的
+跨 expert alias 依赖必须拒绝或先由模型 tracing adapter 显式表达。汇合输出
+沿原图的 index_add/add 顺序执行，不用一次 all_reduce 改变数学。每个 batch
+全部任务结束后，才切换校准/传播 hook 状态或复用输入。
+
+**权重与预算。** 对现有精确 `SubgraphLoadPlan` 按 expert owner 分片，
+保留 parameter-level planning，不能将直接参数 owner 重新扩成完整层。
+逐设备统计物化权重、Hessian、observer、GPTQ batched scratch、最大 batch
+activation 和双向传输工作区。所有设备 admission 在首次物化前完成；
+任一设备不满足时失败并释放已取得的 reservation。初版关闭跨 group
+prefetch，避免主设备 reservation 误覆盖其他设备。CPU boundary store
+仍只有一份，组内每个 batch 只取一次，不给每个 worker 克隆整份历史激活。
+加载、安装、observer 初始化、压缩、输出写入和卸载仍复用原有实现。
+
+GPTQ 的多设备 batch key 已包含 execution device，因而可复用原生
+`compress_module_list` 的数学和 Hessian pop/释放语义。首版 update 可以
+按 owner 顺序压缩，性能指标必须分别报告前向和 update；任何并行 update
+都需要独立验证 modifier 私有状态及 observer 生命周期，不能将不同专家的
+Hessian reduce 到一起，也不能向各设备广播完整专家权重。
+
+**身份、输出和失败。** manifest/fingerprint 必须包含后端版本、设备顺序、
+placement 和实际 group plan。拓扑变化拒绝原地 checkpoint-progress 恢复。
+专家参数仍用原逻辑名称写入一个标准 checkpoint，部署不依赖量化设备数。
+任一 worker 抛错时等待已提交任务退出，保留第一个异常，不继续发布当前组；
+所有设备的加载 context、线程池、reservation 和 hook 必须退出。恢复仍以
+现有已提交 group 为边界，不尝试从半个专家集合恢复。
+
+**验收顺序与完成标准。**
+
+- CPU reference：人工 FX 并行分支、真实路由、不同宽度和非整除专家、
+  空 token、in-place 汇合、跨 slice liveness、任务异常与卸载；
+  用同步 barrier 证明独立专家同时进入 forward，避免把串行多设备叫作并行。
+- GPTQ：相同 target group 和输入下对照单设备/oneshot，检查每模块输入、
+  Hessian、sample count、量化权重/qparams、清理和标准 checkpoint 重载。
+  未经过 scope 适配的默认 distributed process group 继续拒绝。
+- native tiny DSV4.1：主干、CSA2/Engram 和 DSpark/MTP 完整路径，
+  同时覆盖 routed 与 all-experts，不能只测标准 Transformers MoE。
+- 目标设备：先在空闲卡上运行 2/4 卡 tiny E2E 和资源失败用例，
+  再决定何时取消当前单卡基线。原 run 大模型用原数据和 recipe，
+  只增加 EP 参数；记录每设备峰值、同层普通组吞吐和包含 attention 的组。
+- GPTQ 全部量化、validate、原推理容器 smoke、report 完成前保持 E2E 未完成。
+  HIGGS 组合必须单独运行，不能用 GPTQ 或 tiny 的通过代替。
+
+**2026-11-15 21:14 实施与验收记录。** 参考 EP 已接入 pretrained API、
+DSV4.1 示例、精确加载、逐设备 admission、FX DAG 调度和原 writer。placement
+按 FX target 顺序在全部 routed expert owner 间稳定轮转，不能在每个小
+collection 重新从 owner 0 开始导致非整除模型的负载集中。GPTQ 压缩继续
+使用原实现，按设备兼容 batch 顺序执行；目前未宣称 update 自身并发。
+
+- 本地完整相关集合：193 passed、7 skipped；随后新增 native checkpoint
+  parity 与 admission 回归 2 passed。GPU 用例在本地跳过。
+- 目标 P800 的最终定向集合：22 passed。包括实际 2/4 卡 GPTQ Hessian、
+  sample count、权重/qparams 对照，逐设备安装与完整 meta 卸载，异常退出，
+  预算不足的 reservation 回收，native 5 层主干与 3 层 DSpark/MTP。
+- 同 group=32 的 native 单卡与 4 卡完整 checkpoint 逐 tensor 对照通过，
+  包含 Engram 与 MTP；FP32/FP16/BF16 使用 rtol=1e-6、atol=1e-7，
+  packed/整数/保留低精度状态逐字节一致，标准 streaming reload logits
+  有限且调用后权重全部恢复 meta。它不是原大模型 runtime-smoke 的替代。
+- 首次设备集合有一个测试错误：被 ignore 的 shared expert 后代未真正
+  用正则排除，未校准的空 qparam buffer 被错误拿来比较。已修正 ignore
+  为后代范围，Hessian、计数及参与量化的专家比较不放宽；最终集合全通过。
+
+原单卡轮次于 21:14:12 通过 API cancel，停止前完成 10/1,980 组，最后
+一组 358.87 s。确认所属 PID 1919006 退出后，将 work 原地保留为
+`work-attempt-20261115T115518Z-8b92c0b3-single-device-baseline`，没有删除
+日志或分片。21:15 检查八张卡均无活动进程。
+
+全量 8 卡计划的保守预估为 240 GPU-hours（这是资源预留估计，不是实测
+ETA）。启动时被 web ledger 的 80 GPU-hours 容量拒绝；来源是
+`ci/model_quality/web/plans.py` 的 `LaunchPolicy.gpu_hour_capacity` /
+`MODEL_QUALITY_GPU_HOUR_CAPACITY`，不能降低全量估算来规避。第一次预览
+在 ledger admission 前已经被 consume；重试返回 already launched，
+但该 run 下没有 quantize job，不能将其记为全量运行已启动。
+
+在该限制内先执行**有硬时限的性能验证**：使用原始 266 samples、8192
+长度和 WNa8 recipe，预留 4.2 GPU-hours，八卡 quantize 窗口最多 1,800 秒，
+仅量化/验证，不自动启动推理或上传。独立 watchdog 在窗口结束时，只终止
+argv 同时匹配该新 run 和示例脚本的量化进程；先 TERM、再 KILL，并保留
+日志与当前分片。该窗口不是完整大模型 E2E，超时退出应归类为主动预算停止，
+不能归类为算法失败。窗口预算和 guard 状态写入 run 目录。全量运行继续
+受 80 GPU-hours 约束，需要用该窗口实测重新估算，必要时由用户调整容量。
+
+性能窗口已通过正常 preview/start API 启动，21:24 检查为 RUNNING，
+实际 script PID 1957189，仍在 meta 模型、MoE owner discovery 与 tracing
+初始化；没有完成 group，因此尚无八卡吞吐或 ETA。部署快照和代码指纹随
+run 保留，manager/job 中的 `git_sha=a619...` 仍是 manager 的旧修订标识，
+不能用它替代实际执行文件的指纹。
+
+```text
+run_id: 20261115T130907Z_dsv41_gptq_ep8
+model_id: deepseek_v41_wNa8-15dc114c
+attempt_id: attempt-20261115T132043Z-589901c1
+quantize_job: job-20261115T132127Z-190dbad9
+report_job: job-20261115T132127Z-58416c11
+plan_hash: 870c0e28ea67b38e694a941a867a70cb36331c3790d7c911873adee4e40e6bf0
+script_started: 2026-11-15 21:21:30 +08:00
+guard_armed: 2026-11-15 21:20:45 +08:00
+guard_deadline: 2026-11-15 21:50:45 +08:00
+actual_root: /ssd3/model-quality/runs/20261115T130907Z_dsv41_gptq_ep8
+dashboard_root: /ssd2/model-quality/runs/20261115T130907Z_dsv41_gptq_ep8
+free_bytes_before_start: 515970236416
+parallel/expert.py_sha256:
+  7300c00d350c610867ea818dba2fa1313fd3c0869b6f0b16457dba9d723dd816
+pipeline.py_sha256:
+  8d60e3fa4e3e962e48e76ec29cb34faf77db59c6e1e5c674b6d0216135429472
+```
+
+**2026-11-15 用户授权提高预算后的执行约束与正确性结论。**
+
+用户明确允许提高上限。部署配置的 `MQ_GPU_HOUR_CAPACITY` 已设为 240，
+通过 `scripts/model-quality-web-remote restart` / `up` 使服务的
+`MODEL_QUALITY_GPU_HOUR_CAPACITY=240` 生效；不修改代码中的全局默认值。
+原 DSV4.1 推理容器 `zhuang_xsgl_repro_20261102` 加入 allowlist，同时保留
+既有 GLM 容器配置。启动管理命令时显式指定 DSV4.1 inference worker，
+已运行的量化进程不受 Web 服务重启影响。
+
+完整计划使用 240 GPU-hours 的资源预留和请求上限、8 个设备、原始
+266 samples / 8192 sequence length / seed 42 与 GPTQ WNa8 recipe，
+包含 quantize、validate、原推理容器 runtime-smoke 与 report。
+240 GPU-hours 是 admission 的预留估计，除以八卡为 30 小时，不能据此
+宣布量化会在 30 小时内完成。性能窗口的 4.2 GPU-hours reservation 必须
+先释放，随后才申请完整 240；不能伪造较低估计或将 30 分钟窗口静默变为
+无限运行。原性能窗口没有启用 checkpoint-progress，不能把未提交的部分
+分片拼入新完整运行；使用新 run，并保留窗口日志、工作目录与代码快照。
+
+当前正确性证据和边界如下：
+
+| 检查层次 | 已有证据 | 能支持的结论 |
+| --- | --- | --- |
+| GPTQ 算法 | 复用原生 `GPTQModifier`、`sequential_epoch_end`、`compress_module_list`，没有实现另一套 Hessian 归约/更新公式 | 资源管理与执行设备调整不主动替换 GPTQ 数学 |
+| streaming 与 oneshot | 本地回归包含 `test_streaming_gptq_matches_sequential_oneshot[1/2]` 及 grouped-target oneshot 对照 | 已测 toy 模型和相同 sequential 计划下结果对齐 |
+| EP 统计与压缩 | CPU 和真实 P800 2/4 卡逐模块 Hessian、sample count、权重/qparams 对照，以及更新后统计释放 | 已测独立 expert 的输入归属、统计设备和释放顺序正确 |
+| 特化 DSV4.1 | native tiny 主干、Engram、CSA2、3 层 DSpark/MTP，固定 group=32 的单卡/四卡 checkpoint 对照与重载 logits finite | 已测特化路径和完整 checkpoint 在该输入与分组下保持一致 |
+| 原大模型 | 八卡窗口已完成首组校准与 GPTQ update，尚未完成完整 checkpoint 和原推理容器验证 | 仍属于运行中，不能宣布全量正确或质量达标 |
+
+不得把“未发生 OOM”“测试通过”“可以重载且 logits 有限”表述为模型质量
+保证。最终还需要完整 tensor/index/config 校验、原推理容器 smoke，以及
+可复现的固定输入输出或质量评估结果；runtime-smoke 通过本身也不能证明
+质量无下降。当前完整计划未配置独立 evaluate 数据集，因此不得把其 report
+称为精度基准通过。将来补充质量评估时记录数据集、seed、推理参数和参考
+checkpoint，不能用先前 HIGGS 或 tiny 结果替代本次 GPTQ 产物的证据。
+
+EP 默认将 global group 从 8 扩为 64，会改变 sequential propagation 的
+更新边界；现有数值对照固定了相同 group 计划。不得承诺新的 group=64
+产物与旧 group=8 或任意 oneshot 默认分组逐位一致。模型中含不可见副作用、
+跨 owner alias 或未拆分 fused experts 时，也不能据现有测试泛化为已支持；
+必须保持显式 preflight 拒绝或补充 tracing/ownership 适配与对照。
+
+21:39 +08:00 性能窗口状态：首组 `[001/248]` 已完成 calibration 199.95 s、
+modifier update 80.44 s，正在量化后 activation propagation，没有新 OOM。
+这仍不足以估计普通组稳定吞吐。该组包含两个 Engram 投影、attention、
+shared expert 与 60 个 routed experts，不能作为纯 expert 组的稳定样本。
+
+**21:43 +08:00 完整八卡运行已启动。** 通过 API 主动取消性能窗口，释放
+`res-20261115T132127Z-4f422fc0` 的 4.2 GPU-hours。窗口量化进程已退出，
+watchdog 记录 `PROCESS_FINISHED`，没有等待 30 分钟上限，也没有发生新
+算法失败；API cancel reason 和 `full-e2e-transition.json` 记录本次切换原因。
+窗口没有完成首组 propagation，不能将 calibration/update 的分段计时相加
+冒充一个完整 group 的耗时。未删除窗口工作目录、日志或部署快照。
+
+确认服务 capacity=240、available=240 后，通过正常 preview/start API
+启动完整任务，240 GPU-hours 预留成功。21:44:36 +08:00 检查 quantize job
+为 RUNNING，实际脚本 PID 1986907；inference 和 report 等待量化完成。
+该轮仍在初始化，没有本轮完整 group 耗时或全量正确性结论。
+
+```text
+run_id: 20261115T134000Z_dsv41_gptq_ep8_full
+model_id: deepseek_v41_wNa8-15dc114c
+attempt_id: attempt-20261115T133930Z-3e35e33e
+launched_at: 2026-11-15T13:43:52.821108+00:00
+quantize_job: job-20261115T134352Z-eac088fd
+inference_job: job-20261115T134352Z-daae0cfd
+report_job: job-20261115T134352Z-231e1402
+reservation_id: res-20261115T134352Z-9fabedee
+reserved_gpu_hours: 240
+gpu_count: 8
+plan_hash: 27a3a495cd66f97064e54e8ac387a1e2aabdf044863f9b940333d917f594898d
+dashboard_root: /ssd2/model-quality/runs/20261115T134000Z_dsv41_gptq_ep8_full
+actual_root: /ssd3/model-quality/runs/20261115T134000Z_dsv41_gptq_ep8_full
+free_bytes_before_launch: 515472384000
+expected_output_bytes: 493490084696
+deployment_snapshot: codex-ep-deployment.tar
+deployment_snapshot_sha256:
+  c8e18a81f6a9ca4402dff996bb7a4d4477fb77400380edaaf8d95df934c14808
+```
+
+新运行的两个生产文件指纹与性能窗口相同。实际运行代码以快照和文件指纹
+为准，manager 保留的旧 `git_sha=a619...` 不是本次 EP 实现的完整代码身份。
+work/output 继续在同一实际文件系统，以免发布时再复制约 459.60 GiB；
+上述容量仅是启动时快照，后续继续检查实际剩余空间。
+
+**21:51 +08:00 Web 启动故障与修复设计。** 本地 health 请求 connection reset，
+容器内相同端口 connection refused，Web 进程已退出，启动日志最后一个
+异常为 `OSError: [Errno 98] Address already in use`。量化 PID 1986907
+持续运行。本次故障属于 Web 服务生命周期，不是 GPTQ 失败。21:52 通过
+正常 `up` 恢复，health 和 UI 均返回 HTTP 200。
+
+启动脚本有两个确定的竞争窗口：向旧进程发送 TERM 后立即启动新进程，
+没有等待旧进程释放监听端口；多个 up/restart 也没有共同的生命周期锁。
+修复保持在 `scripts/model-quality-web-remote`：start/stop 共同使用
+runtime 目录中的远端文件锁，锁内重新检查健康状态，停止仅匹配当前
+host/port 的 Web 命令行，等待旧进程退出后才启动；超时明确失败，不再
+叠加另一个监听者。新服务必须关闭继承的锁描述符，且锁内完成启动健康
+确认，避免下一个 up 将尚在启动的服务误判为旧进程后终止。PID 文件只作
+记录，不作为未经命令行核对的 kill 目标。验证覆盖延迟退出、并发启动和
+过期 PID 文件，再执行真实 Web restart/up、UI/health/capacity 检查；保持
+量化进程 PID、attempt 与 240 GPU-hours reservation 不变。
+
+修复已部署。隔离临时端口的三项回归全部通过（3 passed，2.97 s），包括
+旧监听者收到 TERM 后延迟 0.7 s 才退出、两个并发启动只创建一个监听者、
+过期 PID 文件指向无关存活进程时 start/stop 均不终止该进程；同时验证
+daemon 没有继续持有生命周期锁。`bash -n`、Ruff 和 diff whitespace
+检查通过。真实 restart 后，再并发执行两次正常 `up`，两次均成功。
+22:01:05 +08:00 检查本地 health/UI 均为 HTTP 200，仅有一个 Web
+监听进程 PID 1988275；原量化 PID 1986907 已运行 17:10，仍为相同
+attempt 的 RUNNING，capacity 和 reservation 均为 240 GPU-hours。
+
+**22:30 +08:00 八卡吞吐与 ETA 复核。** 完整运行已经持续 46.74 分钟，
+完成 3/248 组，第 4 组正在执行，没有新 OOM 或进程重启。第一组包含
+Engram/attention/shared expert 与 60 个 routed experts，851.04 s；
+随后两个纯 expert 组各有 64 个 owner，分别为 563.07 / 543.52 s，
+中位数 553.30 s，约 9 分 13 秒。按 expert 数量折算，与此前每八个
+owner 为一组、普通组中位 372.405 s 的单卡基线相比，吞吐约提高
+`8 * 372.405 / 553.30 = 5.38` 倍。不同分组下这只是吞吐比较，不是
+量化结果数值等价证明；两个普通组也不足以代表所有主干和 MTP 层。
+
+两个普通组的平均阶段时间为 calibration 152.25 s、GPTQ update
+91.21 s、activation propagation 280.08 s，其余约 29.77 s；分别约占
+27.5%、16.5%、50.6%、5.4%。资源规划和权重 I/O 已不是主要阶段。
+代码中仍有 expert 输入事件等待、逐 expert 的设备/主设备同步，以及
+顺序执行的 GPTQ device batch。后续优先分解传播与同步开销，并验证
+可并发的 GPTQ update，不能把移除同步当作无条件正确的优化。
+
+22:24:01–22:24:16 的八次只读设备采样处于第 3 组 propagation：
+各卡平均 utilization 为 0–0.625%，单次最大 1%；进程同期 CPU 使用约
+18.23 个核心。该短窗口提示运行效率仍有问题，不能将它表述为整个
+量化过程的平均利用率，也不能仅凭此确定每个等待点的根因。
+
+实际 manifest 共 42 个含 attention 的组。以普通组中位数作为底数，
+对余下 attention 组增加首组与普通组的差额，并扣除当前组已运行时间，
+22:30 的点估计为剩余 41.00 小时、2026-11-17 15:31 +08:00 完成量化。
+对外采用剩余 40–45 小时、11 月 17 日下午至晚间的粗估区间；不包含
+后续 validate/runtime-smoke/report，且后层/DSpark 开销仍有不确定性。
+该估计意味着完整任务很可能超过 240 GPU-hours 的原预留估计。
+
+同时核实出启动配置遗漏：实际 run 的 `resources` 只有
+`estimated_gpu_hours=240` 和 `gpu_count=8`，没有 `timeout_hours`。
+远端 `ci/model_quality/executor.py:495` 因而采用默认 24 小时，
+`_run_logged` 在 `process.wait(timeout=...)` 超时后终止整个量化进程组。
+本轮量化始于 2026-11-15 21:43:55.797657 +08:00，硬超时约为
+2026-11-16 21:43:56 +08:00，早于上述理论完成时间。此前只提高了准入
+预算，漏掉了 stage timeout 对齐；不能把当前配置描述为能直接长跑到完成。
+script-first 的 `_synthesize_model` 也没有透传请求中的 `timeout_hours`，
+后续需要同时修复计划生成、显式 timeout 配置与测试。已经启动的
+`process.wait` 持有既定 deadline，仅修改 YAML 不会热更新该 deadline，
+不得伪称现有运行超时已解除。本次速度检查继续保留原进程采集基线。
+
+原始证据保存在完整 run 根目录：
+`ep-speed-device-sample-20261115T1423Z.json`、
+`ep-speed-stage-summary-20261115T1423Z.json` 和
+`ep-speed-latest-20261115.json`。
+
+#### 16.2.7 激活传播优化：模型路由与通用执行路径
+
+用户要求检查 `deepseekv41/model.py`。当前静态检查发现：eager MoE 已采用
+稳定排序的分段路由，但 `_forward_traceable` 仍逐 expert 调用
+`torch.where(indices == expert_id)`；实际 streaming 执行使用后者产生的 FX
+图。因此 eager 的既有优化没有进入 streaming 路径。另一个确定的重复工作是
+EP executor 仅缓存拼接后的 FX graph，每个 batch 仍重新构造依赖、alias、
+副作用顺序和用户计数。边界 store 的 CPU snapshot、内容去重与 H2D/D2H
+也必须单独计时，不能预先把全部传播耗时归因于模型 GEMM 或某一同步。
+
+实施与验收顺序：
+
+1. 在目标 P800 上构造与普通组相同的 64 experts / 8 devices、5120 hidden /
+   2304 intermediate、8192 tokens、384-way / top-6 routing 的可复现实验。
+   仅物化当前 expert group，分别记录 boundary get、FX/EP forward 和
+   boundary commit；保留逐 expert where 的原始参考路由。微基准与当前
+   大任务共存时必须注明资源竞争，不能将其直接当成完整 E2E 提速倍数。
+2. 路由优化使用稳定排序后的 flat route rows、相应 pre-w2 weights 和
+   Python 整数分段 offset，一次生成共享路由元数据。每个 expert 仍是独立
+   FX `call_module`，slice 保留 row/slot 顺序，不把 expert 权重融合成大
+   target，不更改原顺序的 FP32 index_add。trace/meta 路径必须可执行；
+   grouped metadata 经 CPU boundary 存储后不能因 offset 被重新放到 GPU
+   而恢复逐 expert 的 `.item()` 同步。优先将可复用部分放到通用 MoE helper，
+   特化模型只负责调用适配，不给 streaming pipeline 添加 DSV4.1 分支。
+3. EP 静态依赖、alias 和副作用顺序可按 graph/group 缓存，batch runtime
+   只保留独立的 values、unmet 与 remaining-users。不得缓存 batch Tensor、
+   Future 或输入 CUDA event，不能让前一批激活逃逸到下一批。移除或替换
+   CUDA synchronize 需要单独的设备事件与 tensor 生命周期测试，不能与
+   路由优化混在一起靠“结果看起来正常”验收。
+4. 用 FP32/BF16、文本/图像 routing bias、空 expert、all-experts 和原生
+   DSpark/MTP 验证输出、逐 Linear 输入、GPTQ Hessian/sample count、
+   qparams、checkpoint 与 reload。覆盖普通 FX 和 HF meta tracer、
+   多 group 边界及实际 2/4 卡。只有数值和生命周期验证通过，才采集目标
+   设备新旧路径的同输入耗时，最后再安排完整长跑。
+
+正在运行的旧进程用于保留基线。新文件不会热更新旧进程已导入的函数；
+部署和完整重跑需要同时对齐 stage timeout，不能把改完源码描述为当前
+任务已经获得提速，也不能继续忽略 §16.2.6 发现的 24 小时硬超时。
+
+边界存储的进一步设计（依据首轮微基准，先记录再实施）：
+
+- 2026-11-15 P800 首轮 microbenchmark 的旧路径每 batch 平均 get
+  36–51 ms、forward 49–54 ms、commit 257–258 ms；commit 约占总时间
+  74%。复核发现首版工具未像真实 adapter 一样对全部 slices 执行
+  `trace_consumed_names`，保留了已经失活的内部输出；这一数字仅作为定位
+  线索，不能用作性能验收或外推 E2E。修正版先计算全图 liveness，再选择
+  中间的普通 64 expert group（默认 expert 64–127），使用前一组真实输出
+  作为输入，比较同输入的新旧路由和完整/按需 boundary 两种读取模式。
+  实验不含完整 attention/Engram，且与旧大任务共用设备，需注明竞争。
+- 当前 store.get 会把整个存活 boundary 搬上设备，而 FX group 只读取其中
+  一部分；executor 透传的未使用输入随后又被 snapshot 到 CPU。新的通用
+  `get_for_execution` 按当前 group 的外部 FX 输入集合读取。In-memory
+  store 对未参与执行的值保留私有 CPU snapshot，不向模型暴露这些对象。
+  Disk store 保留完整读取的保守兼容实现。
+- 如果未使用字段与活动字段共享同一 Tensor 对象（包括嵌套容器和内容
+  dedup 已形成的 alias），它也必须加入活动集合，共用本批 move memo。
+  这样对活动输入的原地修改仍能通过别名反映到下一 boundary。不同 view
+  的原有独立 snapshot 语义不变，不推断未经验证的 storage alias。
+- propagation commit 显式接收 consumed names；先 snapshot 执行结果，
+  再把源 boundary 中未消耗、未被结果覆盖的私有 CPU carry 直接交接给
+  目标 boundary。源/目标之间短暂共享只发生在 store 内部；读接口继续
+  clone/move，不允许模型修改私有 snapshot。新结果 snapshot 或预算
+  申请失败时，源 boundary 和既有目标仍完整存在。
+  启用内容 dedup 时，私有 carry 同时作为只读候选参与新结果去重，保留
+  新结果与旧 carry 内容相等时的既有共享语义，避免改变后续 alias 闭包。
+- host admission 保守地预留完整目标 boundary 的字节，包括交接 carry；
+  目标发布后再释放源 reservation。此阶段不扩大 host budget，不把
+  “减少物理复制”当成放宽 admission 的理由，也不添加 Hessian offload。
+  对无 host budget 的场景同样保持 source-before-destination 原子顺序。
+- 验收必须覆盖活动输入与闲置 carry 的嵌套 alias、in-place mutation、
+  多 batch、多 group、覆盖已有目标、失败 rollback、reservation 回收，
+  并用同一微基准比较只改 routing、只改 boundary、合并优化三个路径。
+
+本轮已实现的文件与职责：
+
+| 文件 | 实现 |
+| --- | --- |
+| `modeling/moe/routing.py` | 通用稳定分段路由、Python offsets、meta 支持 |
+| `modeling/deepseekv41/model.py` | trace 路径调用分段路由，每 expert 保持独立 FX leaf |
+| `streaming/activations/store.py` | 按输入集合读取、传递性 alias 闭包、私有 CPU carry 交接、原子 snapshot 与预算生命周期 |
+| `streaming/pipeline.py` | 根据各 slice 输出/输入计算 group 外部输入与 consumed 集合，校准和传播统一使用按需读取 |
+| `streaming/parallel/expert.py` | 每 group 缓存 FX 静态依赖、alias 写入顺序、ready/unmet/user 模板，每 batch 复制计数 |
+| `tools/benchmark_dsv41_streaming_propagation.py` | 保留旧 where 路由，计算全图 liveness，四路径同输入对照与分段 wall time |
+
+边界优化是通用 storage/execution 能力，没有按模型类名分支。Disk store
+通过默认完整读取与合并提交保持兼容；本轮性能收益主要针对 in-memory
+CPU boundary。没有修改单 expert 的数学运算、权重更新顺序、pre-w2
+route weights、FP32 汇合次序，也没有修改 EP CUDA synchronize 协议。
+eager 路径既有的活跃 expert 跳过策略保持原样。GPTQ 更新与传播仍是
+两个独立阶段，保持“更新后重新前向”的既有算法语义。
+
+2026-11-15 目标设备实测（修正版工具）：
+
+- 环境：8 × P800 OAM 96 GiB，同一量化容器，BF16；384 experts /
+  top-6、hidden 5120、intermediate 2304、8192 tokens；测 expert
+  64–127，前 64 expert 先生成输入 boundary；warmup 1、实测 5 batches。
+- 每次对照的四条路径共享相同参数与输入；检查 accumulator 和传递 carry
+  的 `rtol=0, atol=0` 一致性。计时包含 get、FX/EP forward、commit，
+  不包含模型构造、prefix 执行、输入 boundary 初始化及额外正确性读取。
+- 所有路径共用已缓存的 EP 静态 schedule，因此下面的旧路由/完整搬运
+  对照没有单独计入 schedule 缓存相对旧实现的收益。
+
+| 模拟闲置 carry | 路由 / boundary | get (ms) | forward (ms) | commit (ms) | 合计 (ms) |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 128 MiB | 旧 where / 完整搬运 | 73.35 | 34.99 | 274.93 | 383.27 |
+| 128 MiB | 旧 where / 按需读取 | 39.36 | 34.50 | 141.92 | 215.78 |
+| 128 MiB | 分段路由 / 完整搬运 | 74.01 | 28.64 | 281.42 | 384.08 |
+| 128 MiB | 分段路由 / 按需读取 | 44.73 | 28.60 | 142.07 | 215.40 |
+| 1 GiB | 旧 where / 完整搬运 | 271.54 | 49.37 | 860.87 | 1181.78 |
+| 1 GiB | 旧 where / 按需读取 | 41.07 | 58.67 | 151.53 | 251.27 |
+| 1 GiB | 分段路由 / 完整搬运 | 259.48 | 136.53 | 882.37 | 1278.38 |
+| 1 GiB | 分段路由 / 按需读取 | 43.00 | 38.45 | 147.37 | 228.81 |
+
+最终候选的 128 MiB 同输入传播合计约快 **1.78×**，1 GiB 约快 **5.16×**。
+前一轮候选曾测得 1.76× / 4.80×，其原始记录也保留。主要收益
+来自避免闲置 carry 的 H2D/D2H 和重复 snapshot；路由优化收益较小。
+1 GiB 测试的 forward 有明显抖动，分段路由/完整搬运出现离群耗时，
+仍需在设备独占或完整任务中重新采样，不能把单轮差异归因为路由退化。
+这些是 MoE 传播微基准结果，**不是整模型量化加速倍数**：旧大任务仍在
+同机运行，attention、Engram、图像前处理、GPTQ update、checkpoint IO
+均未包含在这张表中，不能据此承诺新的完成时间。
+
+可复现命令（远端 repo，已设置正确的 Python 环境和 `PYTHONPATH`）：
+
+```bash
+python tools/benchmark_dsv41_streaming_propagation.py \
+  --devices cuda:0 cuda:1 cuda:2 cuda:3 cuda:4 cuda:5 cuda:6 cuda:7 \
+  --iterations 5 --carry-mib 128 \
+  --output /tmp/dsv41-propagation-final-128m.json
+python tools/benchmark_dsv41_streaming_propagation.py \
+  --devices cuda:0 cuda:1 cuda:2 cuda:3 cuda:4 cuda:5 cuda:6 cuda:7 \
+  --iterations 5 --carry-mib 1024 \
+  --output /tmp/dsv41-propagation-final-1g.json
+```
+
+正确性验证记录：
+
+- 本地最终联合集合 **261 passed / 13 skipped**，覆盖通用 route、边界存储、
+  EP executor、subgraph pipeline、native DSV4.1 和 modifier 兼容。包含 FP32/BF16、
+  图像路由、空 expert、all-experts、普通 FX 与 HF meta trace、
+  统计量释放，以及 GPTQ/RTN/SmoothQuant/AWQ 与 oneshot 的既有对照。
+- P800 定向集合 **36 passed**：包括真实 CUDA facade 的 2/4 卡 GPTQ、
+  owner 装载卸载、CPU carry 生命周期及原生 DSpark/MTP。
+- 随后加强原生 checkpoint 对照：单卡参考使用旧逐 expert where 和完整
+  boundary 读取，四卡候选使用新路由和按需读取；比较每模块 Hessian
+  （`rtol=1e-6, atol=1e-7`）、sample count（精确相等）、checkpoint 中
+  浮点参数/qparams（同上容差）和整数权重（按字节精确相等）。
+  包含 Engram、3 层 DSpark/MTP，重载 logits 有限且参数恢复 meta。
+  加强后的单项对照在本地和 P800 均 **1 passed**；不能把它描述为真实
+  500 GB checkpoint 的完整验收。
+- 其中 tracing、HIGGS provider 与 modifier adapter 兼容集合为
+  **44 passed / 7 skipped**，覆盖 QAD/AutoSmooth/AutoRound 的既有回归；
+  GPU 依赖项目的跳过不代表完成相应大模型 HIGGS E2E。
+- 最终补齐 carry 与新结果之间的内容去重后，P800 聚焦回归
+  **10 passed**，再次覆盖原生新旧路径数值、alias、rollback 与预算交接。
+- 静态检查通过。本轮候选已经同步到远端供新进程使用，未重启、取消或
+  热修改旧量化进程。完整量化新速度和完成时间仍需新 attempt 测量，
+  启动时必须同时解决上文所述 stage timeout 配置。
+
+归档位置为当前 run 根目录的 `activation-propagation-20261115/`，
+实际绝对路径：
+
+```text
+/ssd3/model-quality/runs/20261115T134000Z_dsv41_gptq_ep8_full/activation-propagation-20261115/
+```
+
+保留首轮有 liveness 缺陷的工具结果、修正后的两轮 128 MiB / 1 GiB
+原始 JSON 和日志、P800 测试日志、旧实现 tar，以及最终源码/测试/文档
+快照 `candidate.tar`；首轮缺陷不能在后续分析中被遗忘。
+最终生产文件 SHA-256：
+
+| 文件 | SHA-256 |
+| --- | --- |
+| `modeling/moe/routing.py` | `21d2a9a1b32539ec797b30fc749b4f2e8049dca80732695ac2122f1f9266e409` |
+| `modeling/deepseekv41/model.py` | `05c46d7ad3174aa80489fced541a75f2f03cb2565bef1b6a3400a6226985fc94` |
+| `streaming/activations/store.py` | `597a49d8e20700ceb0b6af045fef66ab7ee68f89472731ad94c2278b5e8ee9be` |
+| `streaming/parallel/expert.py` | `56d3dbd6f95cd27a523f48a6ed9ee5fdc57658b58ec3b15da2386888da34d1b6` |
+| `streaming/pipeline.py` | `a525ca34ce6f65e13a32fc0ed5189a742aa0e658b004ab68421f5d286453ac31` |
+| `tools/benchmark_dsv41_streaming_propagation.py` | `f1e348c65bd15d79dafd7c49197294575d2e60a2416b376f7ae2d8d0efef82e6` |
+
+#### 16.2.8 DSV4.1 CED、CSA2 与 SWA Bounded Replay 核对
+
+2026-11-16 读取了本地技术报告
+`/Users/ang/models/DeepSeek-V4.1-Flash/DeepSeek_V41_Tech_Report.pdf`，
+并逐页对照模型目录中的官方参考实现
+`/Users/ang/models/DeepSeek-V4.1-Flash/inference/model.py`、当前 native
+`model.py` 和 checkpoint 配置。报告中的关键位置是：第 1、4–6、7–12、
+19–20、22 页；官方 Python 参考实现的对应入口是
+`Transformer.forward`、`Attention.forward` 和 `forward_spec`。
+
+报告给出的架构约束如下：
+
+| 架构能力 | 报告描述 | 对量化传播的含义 |
+| --- | --- | --- |
+| CED | 20 层 causal encoder 产生 `H20`；decoder 的 global KV 从 `H20` 按层投影，prompt 的大部分 decoder global 计算可以跳过 | decoder 不能继续把完整 prompt 当作普通 40 层 dense prefill |
+| CSA2 Full | 当前层生成 main KV、indexer K、Top-K 和 SWA KV | 需要保留一次 source state，并允许后续 target 直接消费 |
+| CSA2 Reindex | 复用最近 Full 的 main KV/indexer K，只重新算 indexer Q/Top-K | indexer Q 的输入仍然是当前层 hidden，不能复用整个 attention 输出 |
+| CSA2 Reuse | 复用 main KV、indexer K、最近 Top-K，只算当前层 Q、SWA KV 和 attention | 不能为每层复制 global KV 或重复 indexer |
+| SWA Bounded Replay | decoder prefill 只 replay prompt 最后 `nwin=128` 个 token；encoder/decoder SWA miss 也用有界 replay | decoder 后半段的 Linear/MoE 校准输入可以从完整序列降到 replay window，但这是有意的近似执行语义 |
+| CED + CSA2 | decoder Full Mode 的 global KV 从 `H20` 生成，后续 Reindex/Reuse 仍使用共享 state | 需要把“全序列 global state”和“最后 128 token 的局部 hidden”分开存活 |
+| FP4 main KV | global main KV 训练后用 FP4；SWA KV 对精度更敏感，保留更高精度 | weight-only GPTQ 当前不等于 serving path；必要时需要独立 KV 精度仿真校准 |
+| EPD/Engram | encoder、prefill、decode 可拆分；Engram lookup 可预取 | 属于运行时调度优化，不能把 Engram 表或 cache 当作普通 Linear boundary |
+
+当前实现中，以下内容已经与报告的 CSA2 配置一致：
+
+- `compress_ratios`、`kv_source_layer_ids=[2, 8, 14, 20]`、
+  `index_source_layer_ids=[2, 8, 14, 20, 24, 28, 32, 36]`；
+- `candidate_source_layer_id=20`、2048 个 block、每 block 8 个位置、
+  `index_topk=512`；
+- `Attention.forward` 中用 `shared` tuple 传递 compressed main KV、
+  indexer K、Top-K 和 candidate mask；
+- Full source、Reindex source 和 Reuse consumer 的计算职责；
+- 每层仍单独计算 Q 和 SWA KV，不能把 shared global state 误认为完整层输出。
+
+但当前量化路径有四个实质差异：
+
+1. **没有 CED prefill 分相。** `Transformer.forward` 从 embedding 开始，
+   对 40 个 backbone layers 都使用完整 calibration sequence；上半段
+   decoder 的 `Attention` 也对完整 token 数生成 Q、SWA KV、MoE 和 Linear
+   激活。`streaming/pipeline.py` 只按 target 顺序传播 boundary，没有
+   encoder/decode replay transition。
+2. **没有 SWA Bounded Replay。** 当前 `Attention.forward` 的非 cache 路径
+   是完整序列 prefill；`DeepseekV41Cache` 只服务 append-only cached
+   inference，不能表示“global KV 保留全序列、decoder hidden 只保留末尾
+   128 token”的双工作集。
+3. **官方参考 Python 也没有完整实现报告中的部署 replay。** 其
+   `Transformer.forward(input_ids, start_pos=0)` 仍循环全部层和输入 chunk；
+   `forward_spec` 在 `start_pos=0` 只为 DSpark seed SWA cache。报告中的
+   CED/Bounded Replay 是更深的 inference-system execution policy，不能
+   只因为当前 Python reference 能跑就认为量化已经复用了该优化。
+4. **当前 weight PTQ 不仿真 FP4 main KV。** 这不会导致 GPTQ Hessian
+   OOM，但会让 decoder attention 后续 Linear 的校准输入与部署精度路径
+   不完全相同。它应作为独立的 KV-cache calibration/quality 任务，不能
+   混入第一版 activation propagation 修复。
+
+因此，当前 `model.py` 的问题不是 CSA2 shared tuple 完全失效，而是把报告
+中的部署级 prefill policy 简化成了完整序列 forward。前一轮按需 boundary
+优化已经减少了 CPU/GPU carry 搬运；下一项更大的收益来自 decoder replay
+减少的 token 数，尤其是 20 层 decoder 的 routed expert、SWA projection、
+QKV/FFN Linear 和 GPTQ activation hooks。
+
+这次核对过的 capability 设计不进入当前实现。它可以作为未来推理 runtime
+的研究草案，但不应被接入 `streaming/pipeline.py` 或量化 checkpoint
+fingerprint：
+
+- 官方 serving runtime 已经负责 CSA2 Full/Reindex/Reuse 和 append/decode
+  KV cache；
+- GPTQ/HIGGS 校准必须保留完整 sequence 激活统计；
+- CED/SWA Bounded Replay 的近似 token slicing 会改变 decoder 后半段的
+  observer/Hessian 输入；
+- 因此当前 streaming PTQ 只优化 target 粒度、EP、权重生命周期和边界搬运，
+  不实现 decoder prompt replay。
+
+这里需要明确区分部署优化和量化校准：报告中的 CED/SWA Bounded Replay
+允许近似 SWA state，而 GPTQ/HIGGS 的激活统计直接决定量化参数。经过与官方
+reference 对照，决定**不把 bounded replay 接入当前 streaming PTQ 的实际
+forward**，也不为了追求传播速度牺牲校准精度。
+
+当前量化执行规则固定为：
+
+1. 保留完整 sequence prefill，作为 GPTQ、HIGGS 和普通 PTQ 的唯一校准语义；
+2. 继续复用官方已经实现的 CSA2 Full/Reindex/Reuse state，避免重复计算
+   compressed KV、indexer K、Top-K 和 candidate state；
+3. 不在 pipeline 中增加模型专用的 decoder replay、token slicing 或
+   absolute-position workaround；
+4. CED、SWA Bounded Replay 和 serving KV precision 只作为未来独立的推理
+   runtime 优化研究，不进入当前量化 checkpoint identity。
+
+因此不能用 CED 的部署收益估算当前 GPTQ 端到端时间；当前性能优化优先放在
+target 粒度、EP 并行、HIGGS streaming provider、权重生命周期和激活搬运，
+这些路径不改变完整 sequence 的激活统计。
+
+#### 16.2.5 metadata 优化版重跑记录
+
+完成基线采集后主动取消 `attempt-20261115T110755Z-9a853928`。该轮不是新
+OOM；其 work 已保留为
+`work-attempt-20261115T110755Z-9a853928-disjoint-baseline`。取消时 worker 已
+结束 stage，但量化子进程 PID 1900475 变为 PPID 1 并继续占用资源。核对完整
+argv 属于本 run 后，先 SIGTERM，等待 10 s 仍未退出再 SIGKILL；确认停止后
+才归档 work、创建新 attempt。此处暴露的 worker 跨进程组取消清理问题需要
+独立回归，本轮未修改队列实现。
+
+```text
+attempt_id: attempt-20261115T115518Z-8b92c0b3
+created_at: 2026-11-15 19:55:18 +08:00
+quantize_job: job-20261115T115518Z-8a9f118e
+inference_job: job-20261115T115518Z-780ad8b3
+report_job: job-20261115T115518Z-5ccae023
+metadata_patch_sha256:
+  8159ff0a0de6938d11d103e3fd7c2f38040c270a182ecc0ce7f498a74e2f144f
+pipeline.py_sha256:
+  b48e63ca40ff7f807e8a086c8daefb5f94add619fd5efb87c3e3c86e5dffe73f
+```
+
+其余三个生产文件的指纹与 §16.2.2 相同。新轮保留原数据、seed、recipe、
+266 samples、max length 8192、固定 8 target group 与 synchronous save；
+只替换 admission 的 metadata 读取路径。新轮首组与普通组资源/耗时、
+checkpoint validate、runtime-smoke 与 report 均待完成，不能将上一轮基线
+或单元测试结果代替本轮完整 E2E 结论。
+
 环境限制：
 
 - upstream MTP 全量测试需要本地缺失的 `mocker` fixture；

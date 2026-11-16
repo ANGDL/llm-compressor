@@ -618,12 +618,73 @@ transactions/<index>.pending/
 Streaming + Sequential tests: targeted remote regressions passed
 DSV4.1 GPTQ initial boundary: 4.88/103.1 GB peak
 DSV4.1 GPTQ first admission: 8 expert owners, 10.38 GB device working set
+DSV4.1 GPTQ full E2E: pending; 2026-11-15 performance regression under investigation
 本次修改文件 Ruff: passed
 git diff --check: passed
 ```
 
 本次实现包含文档、AutoRound 兼容、target grouping、nested parameter working-set
 修复和 boundary dtype metadata 支持；与用户现有的无关工作区文件分开提交。
+
+2026-11-15 性能修复计划（详见 implementation design §16.2）：
+
+- [x] 用 forward 调用次数复现 multi-target projection 重复执行。
+- [x] 每个原始 partition 只投影一次，再生成互不重叠的 target slices。
+- [x] 验证 calibration/propagation 调用次数、GPTQ sample count 和 checkpoint。
+- [x] group 从原 subgraph 和依赖统一规划，保留直接参数的精确工作集；
+  覆盖 root/nested owner、alias、runtime buffer、无关 child meta 与物化字节。
+- [x] native DSV4.1 + GPTQ 完整走完主干和三层 DSpark/MTP；
+  用真实 hook 次数和输入 batch 维验证 Hessian count。
+- [x] 本地 267 passed / 11 skipped；远端 272 passed，6 项 AutoRound
+  失败在修改前 tracing 复现，作为独立兼容问题保留。
+- [x] 无损迁移 run 至 `/ssd3`，保留原路径链接和 `/ssd2` 原目录备份；
+  启动 `attempt-20261115T110755Z-9a853928`，参数与原 run 相同。
+- [x] 首组完整完成，2,230.53 s → 694.98 s，峰值 12.03 GB；
+  三个普通组基线为 328.77 / 320.02 / 295.11 s，不能按首组推算整个模型。
+- [x] admission 改用已有 meta 读取接口；本地 227 passed / 5 skipped，
+  memory/disk 无 payload clone、grouped GPTQ checkpoint 等价均通过。
+- [x] 远端 metadata 回归 231 passed / 1 failed；唯一 tiny DeepSeek-V4
+  NaN 参数组独立复跑 3 passed，首次失败记录保留于详细设计文档。
+- [x] 保留基线 work/log，清理取消后的孤儿进程，启动同配置的
+  `attempt-20261115T115518Z-8b92c0b3`。
+- [x] 记录 metadata 优化版 start → admission 约 1.1 s；
+  普通组中位 372.405 s，单卡总速度仍不满足要求，详细记录见设计 §16.2.6。
+- [x] 优先实现单进程、多设备参考 EP：显式设备与稳定 expert placement、
+  逐设备精确加载和 admission、并发 FX 专家执行、原顺序汇合、统一 writer。
+- [x] EP 身份记录 backend/device order/placement/group plan，验证变拓扑恢复拒绝；
+  不将参考 EP 记为多进程 EP-B/global commit 已完成。
+- [x] EP CPU 并发和异常回归、同 group GPTQ 等价、native DSV4.1/DSpark；
+  目标 P800 2/4 卡定向验证最终 22 passed，包含 Engram、MTP、重载推理。
+- [x] 原参数 8 卡性能窗口已启动，4.2 GPU-hours / 最多 30 分钟；
+  watchdog 保留数据并在预算结束时停止。全量 240 GPU-hours 预留被现有
+  80 GPU-hours 容量拒绝，不把性能窗口记为全量 E2E。
+- [x] 用户授权提高上限后，将部署容量设为 240 GPU-hours，通过管理脚本
+  restart/up 生效，并保留既有推理容器配置、加入原 DSV4.1 容器；
+  明确区分算法对照通过、完整产物验收和模型质量评估，见设计 §16.2.6。
+- [x] 保留并主动停止性能窗口、确认旧量化进程退出、释放 4.2 预留后，
+  以 240 GPU-hours 启动 `20261115T134000Z_dsv41_gptq_ep8_full`；
+  21:44 +08:00 确认实际量化进程运行，原容器 inference 与 report 已排队。
+- [ ] 记录 8 卡普通组/attention 组耗时、每设备峰值和实测剩余时间；
+  使用已授权 240 GPU-hours 的完整计划执行 quantize/validate/runtime-smoke/report，
+  不将该预留估计当作 ETA，不拼接未启用 checkpoint-progress 的窗口产物。
+- [ ] 对齐 script-first 计划的 `resources.timeout_hours` 与长任务执行：
+  当前仍默认 24 小时，22:30 实测剩余约 41 小时，预计会先超时；
+  修复请求透传和验证，并明确已启动 wait 的 deadline 无法靠改 YAML 热更新。
+- [x] 分解 activation 的 get/forward/commit；修正微基准 liveness，
+  完成通用按需边界读取、嵌套 alias 闭包和私有 CPU carry 交接。
+- [x] native DSV4.1 trace 使用通用稳定分段路由，保留逐 expert FX leaf、
+  pre-w2 route weights 和原顺序 FP32 汇合；缓存 EP 静态 schedule。
+- [x] P800 8 卡 128 MiB / 1 GiB carry 的四路径同输入对照，传播微基准
+  最终分别约快 1.78× / 5.16×；记录范围与资源竞争，不外推整模型完成时间。
+- [x] 边界 alias/in-place/rollback/host budget、多 batch/group 回归；
+  新旧 native 路径逐模块 Hessian/count、checkpoint、Engram/MTP 和重载
+  对照，本地通过，P800 2/4 卡验证通过，详见设计 §16.2.7。
+- [ ] 新 attempt 测量真实 calibration/propagation 收益和余下量化时间；
+  不把源码同步误记为已运行进程提速。
+- [ ] 校准实际 GPTQ scratch 峰值后，实现带 manifest/fingerprint 的
+  预算驱动分组，禁止直接扩大固定 group。
+- [ ] 保留原 attempt 日志与输出，替换远端运行并记录同配置资源和耗时。
+- [ ] 实测之后评估自动 group sizing；暂不通过扩大固定 group 掩盖重复计算。
 
 ### 步骤一：定义 transaction 与 writer 接口
 
@@ -932,13 +993,22 @@ GPTQ Hessian 生命周期、AutoRound 兼容、显式 target grouping、bounded 
 provider、基础 MTP wrapper 和 QAD + GPTQ adapter 已经落地；本阶段按以下顺序
 继续实现：
 
-1. **HIGGS 组合接入**：验证 provider 生成的 config 交给 streaming GPTQ/RTN
+1. **EP 性能闭环（2026-11-15 提升为当前首要任务）**：先单进程、多设备
+   专家所有权分片与并发前向，复用 GPTQ 数学和单写者事务；完成目标设备
+   correctness/resource 验证后，用原始 DSV4.1 参数启动 8 卡 E2E，按普通组和
+   attention 组分别报告吞吐。多进程 EP-B 继续单独交付。
+2. **HIGGS 组合接入**：验证 provider 生成的 config 交给 streaming GPTQ/RTN
    的路径，并把 provider fingerprint 纳入恢复身份。
-2. **observer numerics parity**：适配 upstream `b3faa86f3` 的误差 dtype、
+3. **observer numerics parity**：适配 upstream `b3faa86f3` 的误差 dtype、
    reduction、scale rounding 和 `patience=0`，保留 bounded search。
-3. **特化模型 MTP 完整矩阵**：覆盖 upstream MTP、多 MTP、native DSV4.1
+4. **特化模型 MTP 完整矩阵**：覆盖 upstream MTP、多 MTP、native DSV4.1
    extra state、MTP + GPTQ 的 ownership 和 reload。
-4. **QAD 完整验证**：补 numerical parity、grouped target、recovery 和资源曲线；
-   QAD 仍然是最低优先级。
 5. **自动 target grouping**：`sequential_targets_per_subgraph="auto"` 复用
    显式 grouping execution unit 和 admission 预算。
+6. **QAD 完整验证**：补 numerical parity、grouped target、recovery 和资源曲线；
+   QAD 仍然是最低优先级。
+7. **DSV4.1 CED/Bounded Replay（暂不实现）**：官方 reference 已在 serving
+   runtime 中复用 CSA2/KV state，但 decoder prompt 仍按完整 sequence
+   prefill；当前 GPTQ/HIGGS 以激活统计精度为第一目标，保留完整 sequence
+   作为唯一量化语义。CED、SWA replay 和 serving KV precision 留到独立推理
+   runtime 任务，避免将近似 replay 混入量化 checkpoint。

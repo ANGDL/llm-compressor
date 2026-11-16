@@ -24,6 +24,7 @@ from llmcompressor.recipe import Recipe
 from llmcompressor.streaming import (
     ArtifactCompatibilityError,
     CastWeightMaterializer,
+    InMemoryBoundaryActivationStore,
     streaming_oneshot,
 )
 from llmcompressor.streaming._logging import streaming_logger
@@ -1002,7 +1003,10 @@ def test_checkpoint_progress_persists_boundaries_and_prefetches(tmp_path, monkey
     assert not work.exists()
 
 
-def test_streaming_gptq_matches_sequential_oneshot(tmp_path, monkeypatch):
+@pytest.mark.parametrize("targets_per_subgraph", [1, 2])
+def test_streaming_gptq_matches_sequential_oneshot(
+    tmp_path, monkeypatch, targets_per_subgraph
+):
     config = Qwen3Config(
         vocab_size=32,
         hidden_size=8,
@@ -1048,12 +1052,22 @@ def test_streaming_gptq_matches_sequential_oneshot(tmp_path, monkeypatch):
         precision="float32",
         pipeline="sequential",
         sequential_targets=["Qwen3DecoderLayer"],
+        sequential_targets_per_subgraph=targets_per_subgraph,
     )
 
     remaining_statistics = []
+    sample_counts = []
+    metadata_reads = []
     original = GPTQModifier.compress_module_list
+    original_get = InMemoryBoundaryActivationStore.get
+
+    def record_get(store, boundary, batch, *, device="cpu"):
+        if torch.device(device).type == "meta":
+            metadata_reads.append((boundary, batch))
+        return original_get(store, boundary, batch, device=device)
 
     def record_release(self, modules):
+        sample_counts.extend(count.item() for count in self._num_samples.values())
         result = original(self, modules)
         remaining_statistics.append(
             (len(self._hessians), len(self._num_samples))
@@ -1061,6 +1075,7 @@ def test_streaming_gptq_matches_sequential_oneshot(tmp_path, monkeypatch):
         return result
 
     monkeypatch.setattr(GPTQModifier, "compress_module_list", record_release)
+    monkeypatch.setattr(InMemoryBoundaryActivationStore, "get", record_get)
     streamed = streaming_oneshot(
         model=checkpoint,
         dataset=_calibration_data(),
@@ -1087,6 +1102,7 @@ def test_streaming_gptq_matches_sequential_oneshot(tmp_path, monkeypatch):
         num_calibration_samples=2,
         max_seq_length=4,
         target_dtype=torch.float32,
+        sequential_targets_per_subgraph=targets_per_subgraph,
     )
 
     expected = _checkpoint_tensors(baseline)
@@ -1096,6 +1112,13 @@ def test_streaming_gptq_matches_sequential_oneshot(tmp_path, monkeypatch):
         assert torch.equal(actual[name], expected[name]), name
     assert remaining_statistics
     assert all(counts == (0, 0) for counts in remaining_statistics)
+    assert sample_counts
+    assert set(sample_counts) == {2}
+    assert metadata_reads == [
+        (boundary, batch)
+        for boundary in range(0, 2, targets_per_subgraph)
+        for batch in range(2)
+    ]
 
 
 @pytest.mark.parametrize("use_imatrix", [False, True])

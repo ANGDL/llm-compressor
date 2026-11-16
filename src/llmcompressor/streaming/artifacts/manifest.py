@@ -177,6 +177,10 @@ class ParallelInfo:
 
     context: tuple[tuple[str, int], ...] = ()
     placement_fingerprint: str = ""
+    backend: str = "single-device"
+    devices: tuple[str, ...] = ()
+    target_groups: tuple[tuple[int, ...], ...] = ()
+    expert_owners: tuple[tuple[str, int], ...] = ()
 
     @classmethod
     def from_context(
@@ -184,12 +188,20 @@ class ParallelInfo:
         context: Mapping[str, int],
         *,
         placement_fingerprint: str = "",
+        backend: str = "single-device",
+        devices: tuple[str, ...] = (),
+        target_groups: tuple[tuple[int, ...], ...] = (),
+        expert_owners: tuple[tuple[str, int], ...] = (),
     ) -> ParallelInfo:
         return cls(
             context=tuple(
                 sorted((str(name), int(value)) for name, value in context.items())
             ),
             placement_fingerprint=placement_fingerprint,
+            backend=backend,
+            devices=devices,
+            target_groups=target_groups,
+            expert_owners=expert_owners,
         )
 
     @classmethod
@@ -197,6 +209,13 @@ class ParallelInfo:
         data = dict(value)
         data["context"] = tuple(
             (str(name), int(number)) for name, number in data.get("context", ())
+        )
+        data["devices"] = tuple(data.get("devices", ()))
+        data["target_groups"] = tuple(
+            tuple(group) for group in data.get("target_groups", ())
+        )
+        data["expert_owners"] = tuple(
+            (str(name), int(owner)) for name, owner in data.get("expert_owners", ())
         )
         return _from_mapping(cls, data)
 

@@ -22,6 +22,7 @@ from llmcompressor.modifiers.quantization.calibration import (
 from llmcompressor.modifiers.quantization.quantization.mixin import QuantizationMixin
 from llmcompressor.modifiers.utils.hooks import HooksMixin
 from llmcompressor.pipelines.cache import IntermediatesCache, IntermediateValue
+from llmcompressor.pipelines.sequential.helpers import Subgraph
 from llmcompressor.recipe import Recipe
 from llmcompressor.utils.helpers import DisableQuantization
 from llmcompressor.utils.int4_packing import DEFAULT_INT4_PACKING_WORKSPACE_BYTES
@@ -87,6 +88,7 @@ from .output import (
     quantized_tensor_bytes_for_save,
 )
 from .parallel import ParallelContext, PlacementPlan
+from .parallel.expert import ExpertParallelExecutor, ExpertParallelPlan
 from .recovery import build_resume_plan
 from .tied_weights import infer_transformers_tied_weights
 from .tracing import TracedBoundaryAdapter
@@ -295,6 +297,8 @@ def _initialize_run(
     placement: PlacementPlan | None = None,
     replace_existing: bool = False,
     execution: StreamingExecutionDescriptor | None = None,
+    expert_parallel: ExpertParallelPlan | None = None,
+    target_groups: tuple[tuple[int, ...], ...] = (),
 ) -> str:
     normalized_recipe = _normalized_recipe_payload(recipe)
     source_info = fingerprint_checkpoint(checkpoint)
@@ -304,6 +308,9 @@ def _initialize_run(
     )
     parallel_context = parallel_context or ParallelContext.single_device()
     placement = placement or PlacementPlan(ep_size=parallel_context.ep_size)
+    if expert_parallel is not None:
+        parallel_context = ParallelContext(ep_size=len(expert_parallel.devices))
+        placement = expert_parallel.placement
     run_fingerprint = fingerprint_json(
         {
             "source": source_info.content_fingerprint,
@@ -326,6 +333,11 @@ def _initialize_run(
             "parallel": {
                 "context": parallel_context.to_dict(),
                 "placement": placement.fingerprint,
+                **(
+                    {"expert_parallel": expert_parallel.to_dict(),
+                     "target_groups": target_groups}
+                    if expert_parallel is not None else {}
+                ),
             },
         }
     )
@@ -354,6 +366,15 @@ def _initialize_run(
         parallel=ParallelInfo.from_context(
             parallel_context.to_dict(),
             placement_fingerprint=placement.fingerprint,
+            backend=expert_parallel.backend if expert_parallel else "single-device",
+            devices=tuple(map(str, expert_parallel.devices)) if expert_parallel else (),
+            target_groups=target_groups if expert_parallel else (),
+            expert_owners=(
+                tuple(
+                    (entry.logical_name, entry.owner_rank)
+                    for entry in expert_parallel.placement.entries
+                ) if expert_parallel else ()
+            ),
         ),
     )
     ArtifactStore(artifact_dir).initialize(
@@ -614,13 +635,30 @@ def _modifier_update(
         quantizer.end_layerwise_calibration(list(modules))
 
 
+def _target_group_input_names(subgraphs: Sequence[Subgraph]) -> set[str]:
+    """Find external inputs without including values produced inside the group."""
+    available = set()
+    required = set()
+    for subgraph in subgraphs:
+        required.update(subgraph.input_names - available)
+        output = next(node for node in subgraph.graph.nodes if node.op == "output")
+        available.update(output.args[0])
+        available.difference_update(subgraph.consumed_names)
+    return required
+
+
 def _forward_target_group(
     adapter: TracedBoundaryAdapter,
     target_indices: Sequence[int],
     value: Mapping[str, Any],
+    executor: ExpertParallelExecutor | None = None,
 ) -> dict[str, Any]:
     """Execute consecutive target subgraphs without publishing internal boundaries."""
 
+    if executor is not None:
+        return executor.forward(
+            tuple(adapter.target_subgraphs[index] for index in target_indices), value
+        )
     current = dict(value)
     for target_index in target_indices:
         subgraph = adapter.target_subgraphs[target_index]
@@ -908,6 +946,7 @@ def run_subgraph_streaming_pipeline(
     dtype_policy: StreamingDTypePolicy | None = None,
     execution: StreamingExecutionDescriptor | None = None,
     targets_per_subgraph: int = 1,
+    expert_parallel: ExpertParallelPlan | None = None,
 ) -> tuple[Path, Path, str]:
     """Calibrate, modify, propagate, and persist one subgraph at a time."""
 
@@ -982,6 +1021,8 @@ def run_subgraph_streaming_pipeline(
         pack_to_int8=pack_to_int8,
         replace_existing=not checkpoint_progress,
         execution=execution or adapter.execution,
+        expert_parallel=expert_parallel,
+        target_groups=target_groups,
     )
     transaction_writer = (
         StreamingCheckpointWriter(
@@ -1127,7 +1168,8 @@ def run_subgraph_streaming_pipeline(
             )
             direct_writer = async_direct_writer
         prefetcher = (
-            SubgraphPrefetcher(adapter.weight_session) if adapter.targets else None
+            SubgraphPrefetcher(adapter.weight_session)
+            if adapter.targets and expert_parallel is None else None
         )
         streaming_logger.info(
             "setup | checkpoint write | "
@@ -1136,13 +1178,24 @@ def run_subgraph_streaming_pipeline(
         streaming_logger.info(
             "setup | weight prefetch | "
             + (
-                "prepare + pinned async H2D"
+                "disabled for expert parallel execution"
+                if expert_parallel is not None
+                else "prepare + pinned async H2D"
                 if _async_h2d_enabled() and device.type == "cuda"
                 else "prepare only"
             )
         )
         pipeline_failed = True
+        ep_executor = None
         try:
+            if expert_parallel is not None:
+                ep_executor = ExpertParallelExecutor(adapter.model, expert_parallel)
+                streaming_logger.info(
+                    f"setup | expert parallel | backend={expert_parallel.backend} | "
+                    f"devices={tuple(map(str, expert_parallel.devices))} | "
+                    f"experts={len(expert_parallel.placement.entries)} | "
+                    f"fingerprint={expert_parallel.fingerprint}"
+                )
             prefetch_pending = False
             target_count = len(target_groups)
             for group_index, target_indices in enumerate(target_groups):
@@ -1154,6 +1207,10 @@ def run_subgraph_streaming_pipeline(
                 target_name = " + ".join(target_names)
                 subgraphs = tuple(
                     adapter.target_subgraphs[index] for index in target_indices
+                )
+                group_inputs = _target_group_input_names(subgraphs)
+                group_consumed = set().union(
+                    *(subgraph.consumed_names for subgraph in subgraphs)
                 )
                 transaction_id = f"subgraph-{group_index:05d}"
                 if (
@@ -1219,7 +1276,10 @@ def run_subgraph_streaming_pipeline(
                         "Streaming QAD validation requires at least two batches"
                     )
                 target_label = _target_label(group_index, target_count, target_name)
-                _reset_peak_memory(device)
+                for owner_device in (
+                    expert_parallel.devices if expert_parallel else (device,)
+                ):
+                    _reset_peak_memory(owner_device)
                 streaming_logger.info(
                     f"{target_label} | start | batches={len(batches)} | device={device}"
                 )
@@ -1258,8 +1318,11 @@ def run_subgraph_streaming_pipeline(
                     num_tokens = 0
                     max_batch_tokens = 0
                     boundary_bytes = 0
+                    max_batch_bytes = 0
                     for batch_index in batches:
-                        value = boundaries.get(group_start, batch_index)
+                        value = boundaries.get(
+                            group_start, batch_index, device="meta"
+                        )
                         batch_tokens = _boundary_token_count(
                             {
                                 name: value[name]
@@ -1269,6 +1332,7 @@ def run_subgraph_streaming_pipeline(
                         num_tokens += batch_tokens
                         max_batch_tokens = max(max_batch_tokens, batch_tokens)
                         boundary_bytes += _boundary_nbytes(value)
+                        max_batch_bytes = max(max_batch_bytes, _boundary_nbytes(value))
                         del value
                     num_tokens = max(num_tokens, num_samples * (max_seq_length or 1), 1)
                     max_batch_tokens = max(max_batch_tokens, max_seq_length or 1)
@@ -1300,7 +1364,41 @@ def run_subgraph_streaming_pipeline(
                             + 1024 * 1024
                         )
                         disk_budget.check(target_label, disk_required)
-                        if prefetched_prepared is None:
+                        if expert_parallel is not None:
+                            owner_plans = expert_parallel.split_load_plan(plan)
+                            for owner_device, owner_plan in owner_plans:
+                                owner_memory = expert_parallel.estimate_memory(
+                                    modifiers, resident_modules,
+                                    device=owner_device, num_tokens=num_tokens,
+                                    max_batch_tokens=max_batch_tokens,
+                                )
+                                owner_weights = (
+                                    adapter.weight_session.estimate_materialized_bytes(
+                                        owner_plan, dtype=target_dtype
+                                    )
+                                )
+                                owner_required = (
+                                    owner_weights + owner_memory.peak_bytes
+                                    + 4 * max_batch_bytes
+                                )
+                                weight_stack.enter_context(
+                                    device_budget.reserve(
+                                        f"{target_label} expert owner {owner_device}",
+                                        owner_required, device=owner_device,
+                                    )
+                                )
+                                streaming_logger.info(
+                                    f"{target_label} | EP admission | "
+                                    f"device={owner_device} | "
+                                    f"materialized_bytes={owner_weights} | "
+                                    f"modifier_held_bytes={owner_memory.held_bytes} | "
+                                    "modifier_scratch_bytes="
+                                    f"{owner_memory.scratch_bytes} | "
+                                    "activation_transfer_bytes="
+                                    f"{4 * max_batch_bytes} | "
+                                    f"device_required_bytes={owner_required}"
+                                )
+                        elif prefetched_prepared is None:
                             weight_stack.enter_context(
                                 device_budget.reserve(
                                     f"{target_label} device working set",
@@ -1377,7 +1475,16 @@ def run_subgraph_streaming_pipeline(
                         f"{target_label} | load weights",
                         device,
                     ):
-                        prepared.move_to(device)
+                        if expert_parallel is None:
+                            prepared.move_to(device)
+                        else:
+                            prepared.move_to(
+                                device,
+                                target_devices={
+                                    target.name: expert_parallel.device_for(target.name)
+                                    for target in plan.targets
+                                },
+                            )
                         loaded = weight_stack.enter_context(
                             adapter.weight_session.installed(prepared)
                         )
@@ -1529,9 +1636,10 @@ def run_subgraph_streaming_pipeline(
                         with DisableQuantization(adapter.model), torch.no_grad():
                             for batch_index in batches:
                                 session.state.current_batch_idx = batch_index
-                                value = boundaries.get(
+                                value = boundaries.get_for_execution(
                                     group_start,
                                     batch_index,
+                                    group_inputs,
                                     device=device,
                                 )
                                 if batch_index == batches[0]:
@@ -1551,7 +1659,7 @@ def run_subgraph_streaming_pipeline(
                                         },
                                     )
                                 next_value = _forward_target_group(
-                                    adapter, target_indices, value
+                                    adapter, target_indices, value, ep_executor
                                 )
                                 if (
                                     reuse_calibration_outputs and has_next
@@ -1565,6 +1673,7 @@ def run_subgraph_streaming_pipeline(
                                         next_boundary,
                                         batch_index,
                                         next_value,
+                                        consumed_names=group_consumed,
                                     )
                                 del next_value, value
                     with _stage_logger(
@@ -1630,19 +1739,21 @@ def run_subgraph_streaming_pipeline(
                                 torch.no_grad(),
                             ):
                                 for batch_index in batches:
-                                    value = boundaries.get(
+                                    value = boundaries.get_for_execution(
                                         group_start,
                                         batch_index,
+                                        group_inputs,
                                         device=device,
                                     )
                                     next_value = _forward_target_group(
-                                        adapter, target_indices, value
+                                        adapter, target_indices, value, ep_executor
                                     )
                                     boundaries.commit_propagated_batch(
                                         group_start,
                                         next_boundary,
                                         batch_index,
                                         next_value,
+                                        consumed_names=group_consumed,
                                     )
                                     if batch_index == batches[0]:
                                         _debug_boundary(
@@ -1725,6 +1836,9 @@ def run_subgraph_streaming_pipeline(
                         weight_stack.close()
                         boundaries.delete(group_start)
                         _empty_device_cache(device)
+                        if expert_parallel is not None:
+                            for owner_device in expert_parallel.devices[1:]:
+                                _empty_device_cache(owner_device)
                 peak_allocated = (
                     torch.get_device_module(device).max_memory_allocated(device)
                     if device.type == "cuda"
@@ -1736,9 +1850,21 @@ def run_subgraph_streaming_pipeline(
                     f"baseline_allocated_bytes={baseline_allocated} | "
                     f"peak_allocated_bytes={peak_allocated}"
                 )
+                if expert_parallel is not None:
+                    for owner_device in expert_parallel.devices:
+                        owner_peak = (
+                            torch.cuda.max_memory_allocated(owner_device)
+                            if owner_device.type == "cuda" else None
+                        )
+                        streaming_logger.info(
+                            f"{target_label} | EP complete | device={owner_device} | "
+                            f"peak_allocated_bytes={owner_peak}"
+                        )
             pipeline_failed = False
         finally:
             try:
+                if ep_executor is not None:
+                    ep_executor.close()
                 if prefetcher is not None:
                     prefetcher.close(suppress_errors=pipeline_failed)
                 with _stage_logger(

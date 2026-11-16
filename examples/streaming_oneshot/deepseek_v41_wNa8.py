@@ -566,6 +566,11 @@ def main():
     parser.add_argument("--max-sequence-length", type=int, default=2048)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--device", help="Execution device, e.g. cpu or cuda:0")
+    parser.add_argument(
+        "--expert-parallel-devices",
+        nargs="+",
+        help="Expert owner devices, e.g. cuda:0 cuda:1; first must match --device.",
+    )
     parser.add_argument("--reasoning-effort", type=int, default=75)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
@@ -747,6 +752,7 @@ def main():
         batch_size=args.batch_size,
         shuffle_calibration_samples=False,
         device=args.device,
+        expert_parallel_devices=args.expert_parallel_devices,
         moe_calibrate_all_experts=args.moe_calibrate_all_experts,
         materializer=materializer,
         checkpoint_progress=args.checkpoint_progress,

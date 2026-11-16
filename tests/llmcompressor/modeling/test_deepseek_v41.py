@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import os
 from copy import deepcopy
 from functools import partial
 from pathlib import Path
@@ -8,7 +9,7 @@ import pytest
 import torch
 from safetensors import safe_open
 from safetensors.torch import load_file, save_file
-from torch.fx import Tracer
+from torch.fx import GraphModule, Tracer
 from torch.utils.data import DataLoader
 from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForImageTextToText
 
@@ -30,17 +31,28 @@ from llmcompressor.modeling.deepseekv41.model import (
     _draft_inputs,
 )
 from llmcompressor.modeling.moe_context import moe_calibration_context
+from llmcompressor.modifiers.gptq import GPTQModifier
 from llmcompressor.modifiers.quantization import QuantizationModifier
-from llmcompressor.pipelines.sequential.plan import trace_sequential_plan
+from llmcompressor.pipelines.sequential.helpers import (
+    partition_subgraphs,
+    trace_consumed_names,
+)
+from llmcompressor.pipelines.sequential.plan import (
+    SequentialExecutionPlan,
+    trace_sequential_plan,
+)
 from llmcompressor.streaming import (
     DeepSeekV41WeightMaterializer,
     DiskBoundaryActivationStore,
     HostMemoryBudget,
+    SafetensorsWeightSource,
     compare_cached_to_recompute,
     load_streaming_model,
     streaming_oneshot,
 )
 from llmcompressor.streaming.inference.quantization import resolve_schemes
+from llmcompressor.streaming.pipeline import _forward_target_group
+from llmcompressor.streaming.tracing import trace_streaming_boundaries
 from llmcompressor.utils import ImatrixFallbackStats
 from tools.create_tiny_dsv41 import encode_fp8
 
@@ -282,12 +294,75 @@ def test_moe_fx_trace_exposes_all_expert_targets():
     assert expert_targets == {f"experts.{index}" for index in range(4)}
 
 
-def test_calibration_moe_fx_trace_exposes_all_expert_targets():
+@pytest.mark.parametrize("calibrate_all_experts", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_calibration_moe_fx_trace_exposes_all_expert_targets(
+    calibrate_all_experts, dtype
+):
     config = tiny_config(dspark=False).text_config
     config.n_routed_experts = 4
     model = CalibrationDeepseekV41MoE(
-        DeepseekV41MoE(config), config, calibrate_all_experts=False
-    ).eval()
+        DeepseekV41MoE(config),
+        config,
+        calibrate_all_experts=calibrate_all_experts,
+    ).to(dtype).eval()
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.normal_(0, 0.05)
+
+    class ExpertLeafTracer(Tracer):
+        def is_leaf_module(self, module, qualname):
+            return isinstance(module, type(model.experts[0])) or super().is_leaf_module(
+                module, qualname
+            )
+
+    graph = ExpertLeafTracer().trace(model)
+    expert_targets = {
+        node.target
+        for node in graph.nodes
+        if node.op == "call_module" and str(node.target).startswith("experts.")
+    }
+
+    assert expert_targets == {f"experts.{index}" for index in range(4)}
+    captured = {}
+    handles = [
+        module.register_forward_pre_hook(
+            lambda _module, args, name=name: captured.setdefault(name, []).append(
+                args[0].detach().clone()
+            )
+        )
+        for name, module in model.named_modules()
+        if isinstance(module, torch.nn.Linear)
+    ]
+    try:
+        inputs = torch.randn(2, 5, config.dim, dtype=dtype)
+        image_mask = torch.tensor([[0, 1, 1, 0, 0], [1, 0, 0, 1, 0]]).bool()
+        with torch.no_grad():
+            expected = model(inputs, image_mask)
+            actual = GraphModule(model, graph)(inputs, image_mask)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        for values in captured.values():
+            if len(values) == 1:
+                assert values[0].numel() == 0
+            else:
+                assert len(values) == 2
+                torch.testing.assert_close(values[0], values[1], rtol=0, atol=0)
+    finally:
+        for handle in handles:
+            handle.remove()
+
+
+@pytest.mark.parametrize("group_size", [1, 4, 8])
+def test_grouped_moe_projection_preserves_routing_and_call_counts(
+    tmp_path, monkeypatch, group_size
+):
+    config = tiny_config(dspark=False).text_config
+    config.n_routed_experts = 8
+    torch.manual_seed(23)
+    model = DeepseekV41MoE(config).eval()
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.normal_(0, 0.05)
 
     class ExpertLeafTracer(Tracer):
         def is_leaf_module(self, module, qualname):
@@ -296,13 +371,78 @@ def test_calibration_moe_fx_trace_exposes_all_expert_targets():
             )
 
     graph = ExpertLeafTracer().trace(model, concrete_args={"image_mask": None})
-    expert_targets = {
-        node.target
+    traced = GraphModule(model, graph)
+    traced.add_module("tail", torch.nn.Identity())
+    output = next(node for node in graph.nodes if node.op == "output")
+    with graph.inserting_before(output):
+        tail = graph.call_module("tail", (output.args[0],))
+    output.args = (tail,)
+    traced.recompile()
+    names = tuple(
+        str(node.target)
         for node in graph.nodes
-        if node.op == "call_module" and str(node.target).startswith("experts.")
-    }
-
-    assert expert_targets == {f"experts.{index}" for index in range(4)}
+        if node.op == "call_module"
+        and str(node.target).startswith(("experts.", "shared_experts", "tail"))
+    )
+    subgraphs = partition_subgraphs(
+        traced, traced, {traced.get_submodule(name) for name in names}, group_size
+    )
+    placements = [
+        (index, name)
+        for index, subgraph in enumerate(subgraphs)
+        for name in subgraph.submodule_dict(traced, recurse=False)
+        if name in names
+    ]
+    names = tuple(name for _, name in placements)
+    plan = SequentialExecutionPlan(
+        subgraphs=tuple(subgraphs),
+        target_names=names,
+        target_subgraph_indices=tuple(index for index, _ in placements),
+    )
+    trace_consumed_names(subgraphs)
+    monkeypatch.setattr(
+        "llmcompressor.streaming.tracing.trace_sequential_plan",
+        lambda *args, **kwargs: plan,
+    )
+    checkpoint = tmp_path / "model.safetensors"
+    save_file(
+        {name: tensor.detach().clone() for name, tensor in traced.state_dict().items()},
+        checkpoint,
+    )
+    inputs = torch.randn(2, 5, config.dim)
+    with torch.no_grad():
+        expected = model(inputs)
+    traced.to("meta")
+    adapter = trace_streaming_boundaries(
+        model=traced,
+        source=SafetensorsWeightSource(checkpoint),
+        sample_batch={"x": inputs, "image_mask_1": None},
+        device="cpu",
+        dtype=torch.float32,
+        targets_per_subgraph=group_size,
+    )
+    calls = []
+    handles = [
+        traced.get_submodule(name).register_forward_hook(
+            lambda _module, _args, _output, name=name: calls.append(name)
+        )
+        for name in names
+    ]
+    try:
+        value = next(
+            adapter.calibration_boundaries([{"x": inputs, "image_mask_1": None}])
+        )
+        with torch.no_grad():
+            for group in adapter.target_groups:
+                with adapter.weight_session.loaded_plan(
+                    adapter.plan_group(group), device="cpu", dtype=torch.float32
+                ):
+                    value = _forward_target_group(adapter, group, value)
+        assert calls == list(names)
+        torch.testing.assert_close(value[tail.name], expected, rtol=0, atol=0)
+    finally:
+        for handle in handles:
+            handle.remove()
 
 
 def test_official_fp32_parameter_exceptions_survive_bf16_default():
@@ -1165,6 +1305,267 @@ def test_sequential_trace_matches_eager_backbone_and_draft_inputs():
     finally:
         for handle in handles:
             handle.remove()
+
+
+@pytest.mark.parametrize("ep_size", [1, 2, 4])
+def test_streaming_grouped_gptq_covers_native_dspark(tmp_path, monkeypatch, ep_size):
+    config = tiny_config()
+    checkpoint = tmp_path / "source"
+    write_checkpoint(checkpoint, config)
+    schemes, ignored = EXAMPLE._schemes("wna8")
+    expected_observations = {}
+    reference = DeepseekV41NativeForCausalLM(deepcopy(config)).eval()
+    with moe_calibration_context(reference, calibrate_all_experts=True):
+        handles = []
+        for name, module in reference.named_modules():
+            if isinstance(module, torch.nn.Linear):
+
+                def record_expected(_module, args, name=name):
+                    expected_observations.setdefault(name, []).append(
+                        tuple(args[0].shape)
+                    )
+
+                handles.append(module.register_forward_pre_hook(record_expected))
+        try:
+            with torch.no_grad():
+                reference(torch.arange(1, 9).unsqueeze(0))
+        finally:
+            for handle in handles:
+                handle.remove()
+    compressed = {}
+    observations = {}
+    original = GPTQModifier.compress_module_list
+    original_calibrate = GPTQModifier.calibrate_module
+
+    def record_observation(modifier, module, args, output):
+        name = modifier._module_names[module]
+        observations.setdefault(name, []).append(tuple(args[0].shape))
+        return original_calibrate(modifier, module, args, output)
+
+    def record_samples(modifier, modules):
+        for module in modules:
+            compressed[modifier._module_names[module]] = modifier._num_samples[
+                module
+            ].item()
+        return original(modifier, modules)
+
+    monkeypatch.setattr(GPTQModifier, "compress_module_list", record_samples)
+    monkeypatch.setattr(GPTQModifier, "calibrate_module", record_observation)
+    test_devices = os.environ.get("LLMCOMPRESSOR_TEST_EP_DEVICES")
+    if test_devices:
+        devices = test_devices.split(",")[:ep_size]
+        if len(devices) != ep_size:
+            pytest.skip("Insufficient explicitly assigned EP test devices")
+        device = devices[0]
+    else:
+        device = "cpu"
+        devices = tuple(f"cpu:{index}" for index in range(ep_size))
+        if ep_size > 1:
+            monkeypatch.setattr(
+                "llmcompressor.streaming.pretrained.resolve_expert_parallel_devices",
+                lambda _devices, _primary: tuple(map(torch.device, devices)),
+            )
+    output = streaming_oneshot(
+        model=checkpoint,
+        model_config=config,
+        model_factory=DeepseekV41NativeForCausalLM,
+        dataset=DataLoader(
+            [{"input_ids": torch.arange(1, 9)} for _ in range(2)], batch_size=1
+        ),
+        dataset_fingerprint="grouped-gptq-native-dspark",
+        recipe=[
+            GPTQModifier(
+                config_groups=schemes, ignore=ignored, actorder=None, block_size=8
+            )
+        ],
+        output_dir=tmp_path / "output",
+        work_dir=tmp_path / "work",
+        num_calibration_samples=2,
+        max_seq_length=8,
+        target_dtype=torch.float32,
+        device=device,
+        expert_parallel_devices=devices if ep_size > 1 else None,
+        moe_calibrate_all_experts=True,
+        materializer=DeepSeekV41WeightMaterializer(),
+    )
+    assert (output / "FINALIZED").is_file()
+    assert compressed.keys() == observations.keys()
+    for name, shapes in observations.items():
+        assert shapes == expected_observations[name] * 2, (name, shapes)
+        assert compressed[name] == sum(
+            1 if len(shape) == 2 else shape[0] for shape in shapes
+        ), (name, shapes, compressed[name])
+    for stage in range(3):
+        assert f"model.mtp.{stage}.ffn.experts.0.w2" in compressed
+    assert ModelConfig.from_pretrained(output).text_config.n_mtp_layers == 3
+
+
+def test_streaming_ep_admits_all_owners_before_preparing_experts(tmp_path, monkeypatch):
+    from llmcompressor.streaming.admission import DeviceMemoryBudget, DeviceMemoryError
+    from llmcompressor.streaming.loading import SubgraphWeightSession
+
+    config = tiny_config()
+    checkpoint = tmp_path / "source"
+    write_checkpoint(checkpoint, config)
+    groups, ignored = EXAMPLE._schemes("wna8")
+    monkeypatch.setattr(
+        "llmcompressor.streaming.pretrained.resolve_expert_parallel_devices",
+        lambda _devices, _primary: (torch.device("cpu:0"), torch.device("cpu:1")),
+    )
+    budget = DeviceMemoryBudget(
+        available_bytes=lambda device: 0 if device.index == 1 else 10**12
+    )
+    monkeypatch.setattr(
+        "llmcompressor.streaming.pipeline.DeviceMemoryBudget", lambda: budget
+    )
+    prepared_names = []
+    original = SubgraphWeightSession.prepare
+
+    def prepare(session, plan, **kwargs):
+        prepared_names.extend(plan.module_names)
+        return original(session, plan, **kwargs)
+
+    monkeypatch.setattr(SubgraphWeightSession, "prepare", prepare)
+    with pytest.raises(DeviceMemoryError, match="expert owner cpu:1"):
+        streaming_oneshot(
+            model=checkpoint, model_config=config,
+            model_factory=DeepseekV41NativeForCausalLM,
+            dataset=DataLoader([{"input_ids": torch.arange(1, 9)}], batch_size=1),
+            dataset_fingerprint="ep-owner-admission",
+            recipe=[GPTQModifier(config_groups=groups, ignore=ignored)],
+            output_dir=tmp_path / "output", work_dir=tmp_path / "work",
+            num_calibration_samples=1, max_seq_length=8,
+            target_dtype=torch.float32, device="cpu",
+            expert_parallel_devices=("cpu:0", "cpu:1"),
+            materializer=DeepSeekV41WeightMaterializer(),
+        )
+    assert not any(".experts." in name for name in prepared_names)
+    assert not budget._reservations
+
+
+def _reference_traceable_moe(self, hidden, shape, weights, indices):
+    output = torch.zeros_like(hidden, dtype=torch.float32)
+    for expert_id, expert in enumerate(self.experts):
+        rows, slots = torch.where(indices == expert_id)
+        route_weights = weights[rows, slots].unsqueeze(-1)
+        if self.calibrate_all_experts:
+            all_weights = hidden.new_ones(
+                (hidden.shape[0], 1), dtype=weights.dtype
+            ).index_copy(0, rows, route_weights)
+            values = expert(hidden, all_weights).index_select(0, rows)
+        else:
+            values = expert(hidden.index_select(0, rows), route_weights)
+        output = output.index_add_(0, rows, values.float())
+    return (output + self.shared_experts(hidden)).to(hidden.dtype).reshape(shape)
+
+
+def test_streaming_ep_native_checkpoint_matches_same_group_single_device(
+    tmp_path, monkeypatch
+):
+    from llmcompressor.streaming.activations import InMemoryBoundaryActivationStore
+
+    config = tiny_config(engram=True)
+    checkpoint = tmp_path / "source"
+    write_checkpoint(checkpoint, config)
+    groups, ignored = EXAMPLE._schemes("wna8")
+    assigned = os.environ.get("LLMCOMPRESSOR_TEST_EP_DEVICES")
+    if assigned:
+        devices = assigned.split(",")[:4]
+        if len(devices) != 4:
+            pytest.skip("Requires four explicitly assigned EP test devices")
+        device = devices[0]
+    else:
+        device = "cpu"
+        devices = ("cpu:0", "cpu:1", "cpu:2", "cpu:3")
+        monkeypatch.setattr(
+            "llmcompressor.streaming.pretrained.resolve_expert_parallel_devices",
+            lambda requested, _primary: (
+                tuple(map(torch.device, requested)) if requested else ()
+            ),
+        )
+    outputs = []
+    statistics = []
+    original_compress = GPTQModifier.compress_module_list
+
+    def record_statistics(modifier, modules):
+        for module in modules:
+            name = modifier._module_names[module]
+            statistics[-1][name] = (
+                modifier._hessians[module].detach().cpu().clone(),
+                modifier._num_samples[module].detach().cpu().clone(),
+            )
+        return original_compress(modifier, modules)
+
+    monkeypatch.setattr(GPTQModifier, "compress_module_list", record_statistics)
+    for parallel in (False, True):
+        name = "parallel" if parallel else "single"
+        statistics.append({})
+        with monkeypatch.context() as context:
+            if not parallel:
+                context.setattr(
+                    DeepseekV41MoE, "_forward_traceable", _reference_traceable_moe
+                )
+                context.setattr(
+                    InMemoryBoundaryActivationStore,
+                    "get_for_execution",
+                    lambda store, boundary, batch, _names, *, device="cpu": store.get(
+                        boundary, batch, device=device
+                    ),
+                )
+            outputs.append(streaming_oneshot(
+                model=checkpoint, model_config=deepcopy(config),
+                model_factory=partial(
+                    DeepseekV41NativeForCausalLM,
+                    engram_token_map=list(range(32)), engram_checkpoint=checkpoint,
+                ),
+                dataset=DataLoader(
+                    [{"input_ids": torch.arange(1, 9)} for _batch in range(2)],
+                    batch_size=1,
+                ),
+                dataset_fingerprint="ep-native-parity",
+                recipe=[GPTQModifier(
+                    config_groups=groups, ignore=ignored, actorder=None, block_size=8,
+                )],
+                output_dir=tmp_path / name, work_dir=tmp_path / f"{name}-work",
+                num_calibration_samples=2, max_seq_length=8,
+                target_dtype=torch.float32, device=device,
+                sequential_targets_per_subgraph=32,
+                expert_parallel_devices=devices if parallel else None,
+                materializer=DeepSeekV41WeightMaterializer(),
+            ))
+    assert statistics[0].keys() == statistics[1].keys()
+    for name, (hessian, count) in statistics[0].items():
+        torch.testing.assert_close(
+            statistics[1][name][0], hessian, rtol=1e-6, atol=1e-7, msg=name
+        )
+        assert torch.equal(statistics[1][name][1], count), name
+    expected, actual = (
+        {
+            name: value for shard in output.glob("*.safetensors")
+            for name, value in load_file(shard).items()
+        } for output in outputs
+    )
+    assert actual.keys() == expected.keys()
+    for name, value in expected.items():
+        if value.dtype in (torch.float32, torch.bfloat16, torch.float16):
+            torch.testing.assert_close(
+                actual[name], value, rtol=1e-6, atol=1e-7, msg=name
+            )
+        else:
+            assert torch.equal(actual[name].view(torch.uint8), value.view(torch.uint8))
+    with load_streaming_model(
+        outputs[1],
+        config=ModelConfig.from_pretrained(outputs[1], local_files_only=True),
+        model_factory=DeepseekV41NativeForCausalLM,
+        model_kwargs={
+            "engram_token_map": list(range(32)), "engram_checkpoint": outputs[1],
+        },
+        materializer=DeepSeekV41WeightMaterializer(),
+    ) as inference:
+        inference.model.config.calibrate_dspark = False
+        result = inference.forward(torch.tensor([[3, 4, 5, 6]]))
+        assert torch.isfinite(result.logits).all()
+        assert all(parameter.is_meta for parameter in inference.model.parameters())
 
 
 @pytest.mark.parametrize("mode", ["wna8", "w8a8", "w4a8"])

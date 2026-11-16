@@ -132,7 +132,7 @@ service_pid() {
 }
 
 service_pids() {
-    remote "docker exec '${MQ_CONTAINER}' bash -lc 'pid=\$(cat \"${MQ_RUNTIME_DIR}/server.pid\" 2>/dev/null || true); [[ -n \"\${pid}\" ]] && printf \"%s\\n\" \"\${pid}\"; pgrep -f \"[c]i.model_quality.web --host ${MQ_REMOTE_BIND} --port ${MQ_REMOTE_PORT}\" || true'" 2>/dev/null | awk 'NF && !seen[$0]++'
+    remote "docker exec '${MQ_CONTAINER}' bash -lc 'pgrep -f \"[c]i.model_quality.web --host ${MQ_REMOTE_BIND} --port ${MQ_REMOTE_PORT}([[:space:]]|$)\" || true'" 2>/dev/null
 }
 
 service_healthy() {
@@ -147,11 +147,38 @@ start_service() {
         return
     fi
     info "starting Web service in ${MQ_CONTAINER}"
-    remote "docker exec '${MQ_CONTAINER}' bash -lc 'mkdir -p \"${MQ_RUNTIME_DIR}\"; old=\$(cat \"${MQ_RUNTIME_DIR}/server.pid\" 2>/dev/null || true); if [[ -n \"\${old}\" ]] && kill -0 \"\${old}\" 2>/dev/null; then kill \"\${old}\"; fi; cd \"${MQ_REPO}\"; export MODEL_QUALITY_RUNS_ROOT=\"${MQ_RUNS_ROOT}\" MODEL_QUALITY_CONFIG=\"${MQ_CONFIG}\" MODEL_QUALITY_GIT_SHA=\"${MQ_GIT_SHA}\" MODEL_QUALITY_WEB_EXECUTOR=\"${MQ_EXECUTOR}\" MODEL_QUALITY_GPU_HOUR_CAPACITY=\"${MQ_GPU_HOUR_CAPACITY}\" MODEL_QUALITY_INFERENCE_CONTAINERS=\"${MQ_INFERENCE_CONTAINERS}\" MODEL_QUALITY_INFERENCE_SCRIPT_ROOTS=\"${MQ_INFERENCE_SCRIPT_ROOTS}\" MODEL_QUALITY_EVALUATION_COMMANDS=\"${MQ_EVALUATION_COMMANDS}\" MODEL_QUALITY_EVAL_LM_EVAL=\"${MQ_EVAL_LM_EVAL}\" MODEL_QUALITY_EVAL_EVALSCOPE=\"${MQ_EVAL_EVALSCOPE}\" MODEL_QUALITY_UPLOAD_PREFIXES=\"${MQ_UPLOAD_PREFIXES}\" PYTHONUNBUFFERED=1; nohup \"${MQ_PYTHON}\" -m ci.model_quality.web --host \"${MQ_REMOTE_BIND}\" --port \"${MQ_REMOTE_PORT}\" --runs-root \"${MQ_RUNS_ROOT}\" --config \"${MQ_CONFIG}\" --git-sha \"${MQ_GIT_SHA}\" >> \"${MQ_RUNTIME_DIR}/server.log\" 2>&1 < /dev/null & echo \$! > \"${MQ_RUNTIME_DIR}/server.pid\"'"
-    for _ in {1..20}; do
-        service_healthy && return
-        sleep 0.5
-    done
+    if remote "docker exec '${MQ_CONTAINER}' bash -lc '
+        set -e
+        exec 9>\"${MQ_RUNTIME_DIR}/server.lock\"
+        flock -w 30 9
+        if curl -fsS --max-time 3 http://${MQ_REMOTE_BIND}:${MQ_REMOTE_PORT}/api/health >/dev/null 2>&1; then exit 0; fi
+        pattern=\"[c]i.model_quality.web --host ${MQ_REMOTE_BIND} --port ${MQ_REMOTE_PORT}([[:space:]]|$)\"
+        pids=\$(pgrep -f \"\${pattern}\" || true)
+        if [[ -n \"\${pids}\" ]]; then
+            kill \${pids} 2>/dev/null || true
+            for _ in {1..100}; do
+                pgrep -f \"\${pattern}\" >/dev/null || break
+                sleep 0.1
+            done
+            if pgrep -f \"\${pattern}\" >/dev/null; then
+                echo \"Web service did not stop; refusing to start another listener\" >&2
+                exit 1
+            fi
+        fi
+        cd \"${MQ_REPO}\"
+        export MODEL_QUALITY_RUNS_ROOT=\"${MQ_RUNS_ROOT}\" MODEL_QUALITY_CONFIG=\"${MQ_CONFIG}\" MODEL_QUALITY_GIT_SHA=\"${MQ_GIT_SHA}\" MODEL_QUALITY_WEB_EXECUTOR=\"${MQ_EXECUTOR}\" MODEL_QUALITY_GPU_HOUR_CAPACITY=\"${MQ_GPU_HOUR_CAPACITY}\" MODEL_QUALITY_INFERENCE_CONTAINERS=\"${MQ_INFERENCE_CONTAINERS}\" MODEL_QUALITY_INFERENCE_SCRIPT_ROOTS=\"${MQ_INFERENCE_SCRIPT_ROOTS}\" MODEL_QUALITY_EVALUATION_COMMANDS=\"${MQ_EVALUATION_COMMANDS}\" MODEL_QUALITY_EVAL_LM_EVAL=\"${MQ_EVAL_LM_EVAL}\" MODEL_QUALITY_EVAL_EVALSCOPE=\"${MQ_EVAL_EVALSCOPE}\" MODEL_QUALITY_UPLOAD_PREFIXES=\"${MQ_UPLOAD_PREFIXES}\" PYTHONUNBUFFERED=1
+        nohup \"${MQ_PYTHON}\" -m ci.model_quality.web --host \"${MQ_REMOTE_BIND}\" --port \"${MQ_REMOTE_PORT}\" --runs-root \"${MQ_RUNS_ROOT}\" --config \"${MQ_CONFIG}\" --git-sha \"${MQ_GIT_SHA}\" 9>&- >> \"${MQ_RUNTIME_DIR}/server.log\" 2>&1 < /dev/null &
+        pid=\$!
+        echo \"\${pid}\" > \"${MQ_RUNTIME_DIR}/server.pid\"
+        for _ in {1..30}; do
+            if curl -fsS --max-time 1 http://${MQ_REMOTE_BIND}:${MQ_REMOTE_PORT}/api/health >/dev/null 2>&1; then exit 0; fi
+            kill -0 \"\${pid}\" 2>/dev/null || break
+            sleep 0.25
+        done
+        exit 1
+    '"; then
+        return
+    fi
     remote "docker exec '${MQ_CONTAINER}' bash -lc 'tail -40 \"${MQ_RUNTIME_DIR}/server.log\"'" >&2 || true
     die "remote Web service failed its health check"
 }
@@ -206,14 +233,25 @@ start_inference_worker() {
 
 stop_service() {
     container_ok || return
-    local pids
-    pids=$(service_pids || true)
-    if [[ -n ${pids} ]]; then
-        info "stopping Web service process(es): $(tr '\n' ' ' <<<"${pids}")"
-        remote "docker exec '${MQ_CONTAINER}' bash -lc 'for pid in ${pids//$'\n'/ }; do kill \"\${pid}\" 2>/dev/null || true; done; for _ in {1..20}; do alive=0; for pid in ${pids//$'\n'/ }; do kill -0 \"\${pid}\" 2>/dev/null && alive=1; done; [[ \"\${alive}\" == 0 ]] && break; sleep 0.1; done; rm -f \"${MQ_RUNTIME_DIR}/server.pid\"'"
-    else
-        remote "docker exec '${MQ_CONTAINER}' rm -f '${MQ_RUNTIME_DIR}/server.pid'"
-    fi
+    info "stopping Web service"
+    remote "docker exec '${MQ_CONTAINER}' bash -lc '
+        set -e
+        mkdir -p \"${MQ_RUNTIME_DIR}\"
+        exec 9>\"${MQ_RUNTIME_DIR}/server.lock\"
+        flock -w 30 9
+        pattern=\"[c]i.model_quality.web --host ${MQ_REMOTE_BIND} --port ${MQ_REMOTE_PORT}([[:space:]]|$)\"
+        pids=\$(pgrep -f \"\${pattern}\" || true)
+        if [[ -n \"\${pids}\" ]]; then kill \${pids} 2>/dev/null || true; fi
+        for _ in {1..100}; do
+            if ! pgrep -f \"\${pattern}\" >/dev/null; then
+                rm -f \"${MQ_RUNTIME_DIR}/server.pid\"
+                exit 0
+            fi
+            sleep 0.1
+        done
+        echo \"Web service did not stop; keeping its PID file\" >&2
+        exit 1
+    '"
 }
 
 local_health() { curl -fsS --max-time 3 "${MQ_URL}api/health" >/dev/null 2>&1; }

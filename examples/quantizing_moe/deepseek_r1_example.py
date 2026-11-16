@@ -27,7 +27,7 @@ tokenizer = AutoTokenizer.from_pretrained(model_id)
 # since the MoE gate layers are sensitive to quantization, we add them to the ignore
 # list so they remain at full precision
 recipe = GPTQModifier(
-    targets="Linear", scheme="W4A16", ignore=["lm_head", "re:.*mlp.gate$"]
+    targets="Linear", scheme="W8A8", ignore=["lm_head", "re:.*mlp.gate$"]
 )
 
 # Apply algorithms.

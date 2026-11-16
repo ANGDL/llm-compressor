@@ -248,6 +248,7 @@ def streaming_oneshot(
     finalize_only: bool = False,
     sequential_targets: Sequence[str] | str | None = None,
     sequential_targets_per_subgraph: int = 1,
+    expert_parallel_devices: Sequence[torch.device | str] | None = None,
     statistics_cache: CandidateStatisticsCache | None = None,
     candidate_config: Any | None = None,
     prefix_fingerprint: str = "",
@@ -270,7 +271,14 @@ def streaming_oneshot(
     ``sequential_targets`` is supplied. This lets GPTQ release each module's
     Hessian at its sequential boundary, which is required for large MoE layers.
     ``sequential_targets_per_subgraph`` controls how many consecutive traced
-    targets share one streaming lifecycle; GPTQ MoE runs default to one target.
+    targets share one streaming lifecycle; automatic GPTQ MoE runs use up to eight
+    expert owners per device.
+
+    ``expert_parallel_devices`` enables single-process expert parallelism on an
+    explicit ordered list of CUDA devices. The first device must match ``device``.
+    Routed expert weights and Hessians stay on their owner device; attention,
+    routing and shared model state use the first device. The initial adapter
+    supports one GPTQModifier or QuantizationModifier.
 
     Set ``finalize_only=True`` to validate and publish completed direct-writer
     shards after a previous normal-mode run failed during finalization.
@@ -331,11 +339,14 @@ def streaming_oneshot(
             finalize_only=finalize_only,
             sequential_targets=sequential_targets,
             sequential_targets_per_subgraph=sequential_targets_per_subgraph,
+            expert_parallel_devices=expert_parallel_devices,
             processor_identity=processor_identity,
         )
 
     if async_save:
         raise ValueError("async_save currently requires pretrained mode")
+    if expert_parallel_devices is not None:
+        raise ValueError("expert_parallel_devices currently requires pretrained mode")
     if finalize_only:
         raise ValueError("finalize_only currently requires pretrained mode")
     if sequential_targets is not None:
