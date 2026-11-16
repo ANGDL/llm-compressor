@@ -181,6 +181,8 @@ class ParallelInfo:
     devices: tuple[str, ...] = ()
     target_groups: tuple[tuple[int, ...], ...] = ()
     expert_owners: tuple[tuple[str, int], ...] = ()
+    token_budget_policy: str = ""
+    token_budget: str | int = "auto"
 
     @classmethod
     def from_context(
@@ -192,6 +194,8 @@ class ParallelInfo:
         devices: tuple[str, ...] = (),
         target_groups: tuple[tuple[int, ...], ...] = (),
         expert_owners: tuple[tuple[str, int], ...] = (),
+        token_budget_policy: str = "",
+        token_budget: str | int = "auto",
     ) -> ParallelInfo:
         return cls(
             context=tuple(
@@ -202,6 +206,8 @@ class ParallelInfo:
             devices=devices,
             target_groups=target_groups,
             expert_owners=expert_owners,
+            token_budget_policy=token_budget_policy,
+            token_budget=token_budget,
         )
 
     @classmethod

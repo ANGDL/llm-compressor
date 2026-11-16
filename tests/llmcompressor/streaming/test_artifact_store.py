@@ -166,3 +166,41 @@ def test_corrupt_statistics_are_not_resumable(initialized_store):
     (store.target_dir(0) / "stats.safetensors").write_bytes(b"corrupt")
 
     assert not store.is_target_complete(0)
+
+
+def test_ep_token_plan_roundtrip_is_immutable_and_survives_resume(initialized_store):
+    store, manifest, recipe = initialized_store
+    plan = {
+        "identity": {"run": "run-fingerprint", "policy": "ep-tokens-v2"},
+        "capacities": {"cuda:0": 4096, "cuda:1": 8192},
+    }
+    assert store.load_ep_token_plan(0) is None
+    store.commit_ep_token_plan(0, plan)
+    store.initialize(manifest, normalized_recipe=recipe, targets=["model.layers.0"])
+    assert store.load_ep_token_plan(0) == plan
+    store.commit_ep_token_plan(0, plan)
+    with pytest.raises(ValueError, match="Refusing to replace"):
+        store.commit_ep_token_plan(0, {**plan, "capacities": {"cuda:0": 2048}})
+
+
+def test_ep_token_plan_detects_corruption(initialized_store):
+    store, _, _ = initialized_store
+    store.commit_ep_token_plan(0, {"capacities": {"cuda:0": 4096}})
+    path = store.root / "ep-token-plans" / "group-00000.json"
+    record = json.loads(path.read_text())
+    record["plan"]["capacities"]["cuda:0"] = 8192
+    path.write_text(json.dumps(record))
+    with pytest.raises(ValueError, match="Corrupt EP token plan"):
+        store.load_ep_token_plan(0)
+
+
+def test_fresh_run_discards_old_token_plans(initialized_store):
+    store, manifest, recipe = initialized_store
+    store.commit_ep_token_plan(0, {"capacities": {"cuda:0": 4096}})
+    store.initialize(
+        manifest, normalized_recipe=recipe, targets=["model.layers.0"],
+        replace_existing=True,
+    )
+    assert store.load_ep_token_plan(0) is None
+    store.commit_ep_token_plan(0, {"capacities": {"cuda:0": 8192}})
+    assert store.load_ep_token_plan(0)["capacities"]["cuda:0"] == 8192

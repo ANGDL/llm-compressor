@@ -57,6 +57,7 @@ from .modifier_adapters import get_modifier_adapter, validate_streaming_modifier
 from .mtp import StreamingMTPWrapper
 from .output import build_quantization_config
 from .parallel.expert import ExpertParallelPlan, resolve_expert_parallel_devices
+from .parallel.token_budget import validate_token_budget
 from .pipeline import (
     _complete_direct_writer_staging,
     _initialize_run,
@@ -390,9 +391,15 @@ def streaming_oneshot_from_pretrained(
     sequential_targets: Sequence[str] | str | None = None,
     sequential_targets_per_subgraph: int = 1,
     expert_parallel_devices: Sequence[torch.device | str] | None = None,
+    expert_parallel_token_budget: str | int = "auto",
     processor_identity: Any = None,
 ) -> Path:
     """Run traced streaming PTQ with an oneshot-like model/dataset interface."""
+    validate_token_budget(expert_parallel_token_budget)
+    if expert_parallel_devices is None and expert_parallel_token_budget != "auto":
+        raise ValueError(
+            "expert_parallel_token_budget requires expert_parallel_devices"
+        )
     if (
         not isinstance(sequential_targets_per_subgraph, int)
         or isinstance(sequential_targets_per_subgraph, bool)
@@ -649,6 +656,7 @@ def streaming_oneshot_from_pretrained(
                 replace_existing=True,
                 execution=adapter.execution,
                 expert_parallel=expert_parallel,
+                expert_parallel_token_budget=expert_parallel_token_budget,
                 target_groups=adapter.target_groups,
             )
             _complete_direct_writer_staging(
@@ -684,6 +692,7 @@ def streaming_oneshot_from_pretrained(
                     targets_per_subgraph=sequential_targets_per_subgraph,
                     execution=adapter.execution,
                     expert_parallel=expert_parallel,
+                    expert_parallel_token_budget=expert_parallel_token_budget,
                 )
             )
         qconfig = build_quantization_config(quantizer.resolved_config)

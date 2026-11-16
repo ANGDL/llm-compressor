@@ -13,6 +13,7 @@ from typing import Any, Callable
 import torch
 from compressed_tensors.quantization import QuantizationStrategy
 
+from .memory_adapters import get_modifier_memory_adapter
 from .modifier_adapters import get_modifier_adapter
 from .modifier_contract import ModifierContractError, build_modifier_contracts
 
@@ -90,7 +91,7 @@ def _estimate_modifier_update_memory(
     modules = tuple(dict.fromkeys(modules))
     total = 0
     for modifier in tuple(modifiers):
-        adapter = get_modifier_adapter(modifier)
+        adapter = get_modifier_memory_adapter(modifier)
         estimate_fn = (
             adapter.estimate_update_memory
             if adapter is not None
@@ -258,17 +259,9 @@ def estimate_modifier_dispatch_memory(
     total_tokens: int,
     dispatch_tokens: int,
     max_batch_tokens: int | None = None,
+    phase: str = "calibration",
 ) -> ModifierMemoryEstimate:
-    """Split modifier memory into persistent and dispatch-sized components.
-
-    Existing modifier estimators expose ``(held, scratch)`` for a token count.
-    Streaming uses the estimate at the full calibration size for persistent
-    state, the estimate at zero tokens for static scratch, and the difference
-    between the dispatch and zero-token estimates for temporary workspaces.
-    This keeps modifier-specific cache semantics out of EP scheduling while
-    allowing token-aware admission for adapters that already scale scratch with
-    their input size.
-    """
+    """Combine conservative legacy estimates with explicit dispatch workspaces."""
 
     modifiers = tuple(modifiers)
     modules = tuple(dict.fromkeys(modules))
@@ -276,40 +269,41 @@ def estimate_modifier_dispatch_memory(
         raise ValueError("token counts must be non-negative")
     if max_batch_tokens is not None and max_batch_tokens < 0:
         raise ValueError("max_batch_tokens must be non-negative")
+    if phase not in {"calibration", "propagation", "update"}:
+        raise ValueError(f"Unknown modifier execution phase: {phase!r}")
     full = estimate_modifier_memory(
         modifiers,
         modules,
         num_tokens=total_tokens,
         max_batch_tokens=max_batch_tokens,
     )
-    static = estimate_modifier_memory(
-        modifiers,
-        modules,
-        num_tokens=0,
-        max_batch_tokens=0,
-    )
-    dispatch = estimate_modifier_memory(
-        modifiers,
-        modules,
-        num_tokens=dispatch_tokens,
-        max_batch_tokens=dispatch_tokens,
-    )
+    batch_bytes = 0
+    for modifier in modifiers:
+        adapter = get_modifier_memory_adapter(modifier)
+        estimate_fn = (
+            adapter.estimate_batch_memory
+            if adapter is not None
+            else getattr(modifier, "estimate_sequential_batch_memory", None)
+        )
+        if not callable(estimate_fn):
+            continue
+        modifier_batch = 0
+        for module in modules:
+            value = estimate_fn(module, dispatch_tokens, phase)
+            if isinstance(value, bool) or not isinstance(value, Integral) or value < 0:
+                raise ModifierContractError(
+                    f"{type(modifier).__qualname__}.estimate_batch_memory must "
+                    "return non-negative bytes"
+                )
+            modifier_batch = max(modifier_batch, int(value))
+        batch_bytes += modifier_batch
     update_bytes = _estimate_modifier_update_memory(modifiers, modules)
     return ModifierMemoryEstimate(
         held_bytes=full.held_bytes,
-        scratch_bytes=static.scratch_bytes + update_bytes,
-        details=full.details
-        + (
-            {
-                "modifier_type": "modifier_update",
-                "held_bytes": 0,
-                "scratch_bytes": update_bytes,
-            },
-        )
-        if update_bytes
-        else full.details,
+        scratch_bytes=max(full.scratch_bytes, update_bytes),
+        details=full.details,
         host_bytes=full.host_bytes,
-        batch_bytes=max(0, dispatch.scratch_bytes - static.scratch_bytes),
+        batch_bytes=batch_bytes,
     )
 
 

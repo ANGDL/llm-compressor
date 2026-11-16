@@ -571,6 +571,11 @@ def main():
         nargs="+",
         help="Expert owner devices, e.g. cuda:0 cuda:1; first must match --device.",
     )
+    parser.add_argument(
+        "--expert-parallel-token-budget",
+        default="auto",
+        help="Per-owner routed token ceiling, or auto for memory-based capacities.",
+    )
     parser.add_argument("--reasoning-effort", type=int, default=75)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
@@ -641,6 +646,13 @@ def main():
         help="Allow HIGGS to leave selected matched weights unquantized.",
     )
     args = parser.parse_args()
+    if args.expert_parallel_token_budget != "auto":
+        try:
+            args.expert_parallel_token_budget = int(args.expert_parallel_token_budget)
+        except ValueError:
+            parser.error("--expert-parallel-token-budget must be auto or an integer")
+        if args.expert_parallel_token_budget <= 0:
+            parser.error("--expert-parallel-token-budget must be positive")
     if (
         min(args.num_calibration_samples, args.max_sequence_length, args.batch_size)
         <= 0
@@ -753,6 +765,7 @@ def main():
         shuffle_calibration_samples=False,
         device=args.device,
         expert_parallel_devices=args.expert_parallel_devices,
+        expert_parallel_token_budget=args.expert_parallel_token_budget,
         moe_calibrate_all_experts=args.moe_calibrate_all_experts,
         materializer=materializer,
         checkpoint_progress=args.checkpoint_progress,

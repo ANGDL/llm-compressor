@@ -105,7 +105,13 @@ def test_modifier_dispatch_memory_separates_persistent_and_token_scratch():
         requires_calibration_data = True
 
         def estimate_sequential_memory(self, _module, num_tokens):
-            return 100, 7 + 3 * num_tokens
+            return 100 + num_tokens, 7
+
+        def estimate_sequential_host_memory(self, _module, num_tokens):
+            return 5 * num_tokens
+
+        def estimate_sequential_batch_memory(self, _module, dispatch_tokens, phase):
+            return 3 * dispatch_tokens if phase == "calibration" else 0
 
     estimate = estimate_modifier_dispatch_memory(
         [TokenModifier()],
@@ -114,10 +120,67 @@ def test_modifier_dispatch_memory_separates_persistent_and_token_scratch():
         dispatch_tokens=11,
     )
 
-    assert estimate.held_bytes == 100
+    assert estimate.held_bytes == 200
     assert estimate.scratch_bytes == 7
+    assert estimate.host_bytes == 500
     assert estimate.batch_bytes == 33
-    assert estimate.peak_bytes == 140
+    assert estimate.peak_bytes == 240
+
+
+def test_dispatch_memory_preserves_full_legacy_nonlinear_scratch():
+    class LegacyModifier:
+        requires_calibration_data = True
+
+        def estimate_sequential_memory(self, _module, num_tokens):
+            return num_tokens, num_tokens**2
+
+    estimate = estimate_modifier_dispatch_memory(
+        (modifier for modifier in [LegacyModifier()]),
+        (module for module in [nn.Identity()]),
+        total_tokens=100,
+        dispatch_tokens=2,
+    )
+    assert estimate.held_bytes == 100
+    assert estimate.scratch_bytes == 10_000
+    assert estimate.batch_bytes == 0
+
+
+def test_dispatch_memory_charges_group_update_and_nonlinear_batch_workspace():
+    class GroupModifier:
+        requires_calibration_data = True
+
+        def estimate_sequential_memory(self, _module, _num_tokens):
+            return 10, 5
+
+        def estimate_sequential_update_memory(self, modules):
+            return len(modules) * 100
+
+        def estimate_sequential_batch_memory(self, _module, dispatch_tokens, phase):
+            return dispatch_tokens**2 if phase == "calibration" else 0
+
+    modules = [nn.Identity(), nn.Identity()]
+    calibration = estimate_modifier_dispatch_memory(
+        [GroupModifier()], modules, total_tokens=100, dispatch_tokens=11
+    )
+    update = estimate_modifier_dispatch_memory(
+        [GroupModifier()], modules, total_tokens=100, dispatch_tokens=11,
+        phase="update",
+    )
+    assert calibration.peak_bytes == 20 + 200 + 121
+    assert update.peak_bytes == 20 + 200
+
+
+@pytest.mark.parametrize("invalid", [True, -1, 1.5, None])
+def test_dispatch_memory_rejects_invalid_workspace(invalid):
+    class InvalidModifier(EstimatedModifier):
+        def estimate_sequential_batch_memory(self, _module, _tokens, _phase):
+            return invalid
+
+    with pytest.raises(ModifierContractError, match="non-negative bytes"):
+        estimate_modifier_dispatch_memory(
+            [InvalidModifier()], [nn.Linear(4, 3, device="meta")],
+            total_tokens=10, dispatch_tokens=1,
+        )
 
 
 @pytest.mark.parametrize("quantizer_class", [QuantizationModifier, GPTQModifier])
