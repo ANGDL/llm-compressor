@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Generator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
-from itertools import chain
+from itertools import chain, groupby
 from typing import Any, Iterator
 
 import torch
@@ -15,6 +15,7 @@ from torch.fx import Graph
 from llmcompressor.pipelines.sequential.helpers import (
     SPECIALIZED_INPUT_META_KEY,
     Subgraph,
+    partition_graph,
     trace_consumed_names,
 )
 from llmcompressor.pipelines.sequential.plan import (
@@ -50,11 +51,14 @@ def _project_through_target(
     subgraph: Subgraph,
     target_name: str,
     required_output_names: set[str] | None = None,
+    *,
+    additional_targets: Sequence[str] = (),
 ) -> Subgraph:
     """Keep the target and dependencies needed by later streaming partitions."""
 
     nodes_by_name = {}
-    target_node = None
+    target_nodes = {}
+    target_names = {target_name, *additional_targets}
     for node in subgraph.graph.nodes:
         if node.op == "output":
             if required_output_names is None:
@@ -64,10 +68,13 @@ def _project_through_target(
                 )
             break
         nodes_by_name[node.name] = node
-        if node.op == "call_module" and str(node.target) == target_name:
-            target_node = node
-    if target_node is None:
-        raise ValueError(f"Target {target_name!r} is absent from traced partition")
+        if node.op == "call_module" and str(node.target) in target_names:
+            target_nodes[str(node.target)] = node
+    missing = target_names - target_nodes.keys()
+    if missing:
+        raise ValueError(
+            f"Targets {sorted(missing)!r} are absent from traced partition"
+        )
 
     output_nodes = {
         name: node
@@ -75,8 +82,19 @@ def _project_through_target(
         if name in (required_output_names or ())
     }
     if not output_nodes:
+        target_node = target_nodes[target_name]
         output_nodes[target_node.name] = target_node
-    required_nodes = {target_node, *output_nodes.values()}
+    required_nodes = {*target_nodes.values(), *output_nodes.values()}
+    required_nodes.update(
+        node
+        for node in nodes_by_name.values()
+        if (
+            node.op == "call_method"
+            and str(node.target).endswith("_")
+            and not str(node.target).startswith("__")
+        )
+        or (node.op == "call_function" and node.is_impure())
+    )
     pending = list(required_nodes)
     while pending:
         for dependency in pending.pop().all_input_nodes:
@@ -100,6 +118,24 @@ def _project_through_target(
         },
         consumed_names=set(),
     )
+
+
+def _split_target_subgraph(
+    model: nn.Module, subgraph: Subgraph, target_names: Sequence[str]
+) -> list[Subgraph]:
+    """Assign each operation to exactly one target slice in execution order."""
+    targets = set(target_names)
+    partitions = [[]]
+    seen_targets = []
+    for node in subgraph.graph.nodes:
+        if node.op == "call_module" and str(node.target) in targets:
+            if seen_targets:
+                partitions.append([])
+            seen_targets.append(str(node.target))
+        partitions[-1].append(node)
+    if tuple(seen_targets) != tuple(target_names):
+        raise ValueError("Projected target order differs from the sequential plan")
+    return partition_graph(model, partitions)
 
 
 def _move_tensors(value: Any, device: torch.device) -> Any:
@@ -297,7 +333,7 @@ class TracedBoundaryAdapter:
                     parameters.extend(parameter_names)
         return tuple(dict.fromkeys(modules)), tuple(dict.fromkeys(parameters))
 
-    def plan_target(self, index):
+    def _target_load_dependencies(self, index):
         name = self.targets[index]
         modules, _parameters = self._execution_dependencies(name)
         parameters = self._declared_runtime_parameters(name)
@@ -319,6 +355,10 @@ class TracedBoundaryAdapter:
                 raise ValueError(
                     "Runtime dependency modules must not contain other targets"
                 )
+        return modules, parameters
+
+    def plan_target(self, index):
+        modules, parameters = self._target_load_dependencies(index)
         return self.weight_session.plan(
             self.target_subgraphs[index],
             include_modules=modules,
@@ -332,14 +372,15 @@ class TracedBoundaryAdapter:
             raise ValueError("A streaming target group cannot be empty")
         if len(indices) == 1:
             return self.plan_target(indices[0])
-        plans = [self.plan_target(index) for index in indices]
-        module_names = tuple(
-            module_name
-            for plan in plans
-            for module_name in plan.module_names
-        )
-        return self.weight_session.plan_modules(
-            module_names, allow_missing_state=True
+        dependencies = [self._target_load_dependencies(index) for index in indices]
+        return self.weight_session.plan_subgraphs(
+            tuple(self.target_subgraphs[index] for index in indices),
+            include_modules=tuple(
+                name for modules, _parameters in dependencies for name in modules
+            ),
+            include_parameters=tuple(
+                name for _modules, parameters in dependencies for name in parameters
+            ),
         )
 
     def _prefix_dependency_candidates(self) -> tuple[str, ...]:
@@ -470,27 +511,43 @@ def trace_streaming_boundaries(
             "Explicit target names differ from the shared sequential trace: "
             f"expected {plan.target_names}, got {requested_target_names}"
         )
-    execution = replace(
-        describe_streaming_execution(model, plan.target_names, sample_batch),
-        graph_fingerprint=fingerprint_execution_graph(plan.subgraphs),
-    )
-
-    target_subgraphs = []
+    projected_groups = []
     required_names: set[str] = set()
-    for target_index in reversed(range(len(plan.target_names))):
-        subgraph_index = plan.target_subgraph_indices[target_index]
-        target_name = plan.target_names[target_index]
-        target_subgraph = _project_through_target(
-            plan.subgraphs[subgraph_index], target_name, required_names
+    groups = [
+        (subgraph_index, tuple(indices))
+        for subgraph_index, indices in groupby(
+            range(len(plan.target_names)),
+            key=lambda index: plan.target_subgraph_indices[index],
         )
-        target_subgraphs.append(target_subgraph)
+    ]
+    for subgraph_index, target_indices in reversed(groups):
+        target_names_in_group = tuple(
+            plan.target_names[index] for index in target_indices
+        )
+        target_subgraph = _project_through_target(
+            plan.subgraphs[subgraph_index],
+            target_names_in_group[-1],
+            required_names,
+            additional_targets=target_names_in_group[:-1],
+        )
+        projected_groups.append(
+            _split_target_subgraph(model, target_subgraph, target_names_in_group)
+        )
         output_node = next(
             node for node in target_subgraph.graph.nodes if node.op == "output"
         )
         required_names.difference_update(output_node.args[0])
         required_names.update(target_subgraph.input_names)
-    target_subgraphs.reverse()
+    target_subgraphs = [
+        subgraph for group in reversed(projected_groups) for subgraph in group
+    ]
     trace_consumed_names(target_subgraphs)
+    execution = replace(
+        describe_streaming_execution(model, plan.target_names, sample_batch),
+        graph_fingerprint=fingerprint_execution_graph(
+            (plan.subgraphs[0], *target_subgraphs)
+        ),
+    )
 
     loader = TargetWeightLoader(model, source, materializer, dtype_policy=dtype_policy)
     weight_session = SubgraphWeightSession(

@@ -16,12 +16,19 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from llmcompressor.modeling.deepseekv4.kernels import hc_split, sparse_attention
 from llmcompressor.modeling.deepseekv4.model import RMSNorm, precompute_freqs_cis
+from llmcompressor.modeling.moe.routing import (
+    group_expert_routes,
+    select_expert_routes,
+)
 
 from .cache import DeepseekV41Cache
 from .config import DeepseekV41Config, ModelConfig
 from .engram import Engram, EngramEmbedding, EngramHash
 from .quantization import Linear
 from .vision import Aligner, Vision
+
+torch.fx.wrap("group_expert_routes")
+torch.fx.wrap("select_expert_routes")
 
 
 def _is_streaming_trace() -> bool:
@@ -345,7 +352,13 @@ class Attention(nn.Module):
                 latent, compressed_mask = self.compressor(x, mask)
             if self.indexer is not None:
                 index_k, topk, candidates = self.indexer(
-                    x, qr, latent, index_k, candidates, freqs, compressed_mask
+                    x,
+                    qr,
+                    latent,
+                    index_k,
+                    candidates,
+                    freqs,
+                    compressed_mask,
                 )
             if latent is not None:
                 compressed = _rotate_tail(
@@ -558,17 +571,22 @@ class DeepseekV41MoE(nn.Module):
     ) -> torch.Tensor:
         """Keep every routed expert visible to the sequential FX tracer.
 
-        The normal dispatch path groups active expert ids with ``tolist()``.
-        That is efficient at runtime, but FX cannot iterate over the resulting
-        Proxy object. A fixed Python loop preserves the routed token semantics
-        while exposing each ``Expert`` as an independent sequential target.
+        Wrapped routing helpers keep stable segments and host offsets in the
+        FX graph. A fixed loop exposes each expert independently without
+        repeating a data-dependent nonzero operation for every expert.
         """
         output = torch.zeros_like(x, dtype=torch.float32)
+        grouped = group_expert_routes(weights, indices, self.n_routed_experts)
         for expert_id, expert in enumerate(self.experts):
-            rows, slots = torch.where(indices == expert_id)
-            expert_weights = weights[rows, slots].unsqueeze(-1)
-            values = expert(x.index_select(0, rows), expert_weights)
-            output.index_add_(0, rows, values.float())
+            rows, expert_weights = select_expert_routes(grouped, expert_id)
+            if self.calibrate_all_experts:
+                all_weights = x.new_ones(
+                    (x.shape[0], 1), dtype=weights.dtype
+                ).index_copy(0, rows, expert_weights)
+                values = expert(x, all_weights).index_select(0, rows)
+            else:
+                values = expert(x.index_select(0, rows), expert_weights)
+            output = output.index_add_(0, rows, values.float())
         return (output + self.shared_experts(x)).to(x.dtype).reshape(shape)
 
 

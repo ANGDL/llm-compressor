@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Generator, Iterable, Iterator, Sequence
+from collections.abc import Generator, Iterable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from time import perf_counter
@@ -123,6 +123,7 @@ class PreparedSubgraphWeights:
     _device: torch.device = torch.device("cpu")
     _transfer_event: Any | None = None
     _transfer_sources: list[torch.Tensor] | None = None
+    _target_devices: dict[str, torch.device] | None = None
 
     @property
     def device(self) -> torch.device:
@@ -131,6 +132,9 @@ class PreparedSubgraphWeights:
     @property
     def nbytes(self) -> int:
         return sum(target.nbytes for target in self.targets)
+
+    def target_device(self, name: str) -> torch.device:
+        return (self._target_devices or {}).get(name, self._device)
 
     def _close_device_reservation(self) -> None:
         if self.device_reservation is not None:
@@ -219,7 +223,12 @@ class PreparedSubgraphWeights:
             self.close()
             raise
 
-    def move_to(self, device: torch.device | str) -> PreparedSubgraphWeights:
+    def move_to(
+        self,
+        device: torch.device | str,
+        *,
+        target_devices: Mapping[str, torch.device] | None = None,
+    ) -> PreparedSubgraphWeights:
         """Move the complete aggregate, releasing CPU ownership incrementally."""
 
         resolved = torch.device(device)
@@ -233,16 +242,33 @@ class PreparedSubgraphWeights:
         if resolved.type == "cpu":
             return self
 
+        if target_devices is not None:
+            unknown = set(target_devices) - {
+                target.plan.name for target in self.targets
+            }
+            if unknown:
+                raise ValueError(f"Unknown prepared target devices: {sorted(unknown)}")
+            self._target_devices = {
+                name: torch.device(value) for name, value in target_devices.items()
+            }
+            if any(
+                value.type != resolved.type for value in self._target_devices.values()
+            ):
+                raise ValueError("Prepared target devices must use the same backend")
         try:
             for target in self.targets:
+                target_device = (
+                    self._target_devices.get(target.plan.name, resolved)
+                    if self._target_devices is not None else resolved
+                )
                 for values in (target.parameter_values, target.buffer_values):
                     for name, value in tuple(values.items()):
                         size = value.numel() * value.element_size()
-                        values[name] = value.to(device=resolved)
+                        values[name] = value.to(device=target_device)
                         del value
                         if self.reservation is not None:
                             self.reservation.release_committed(size)
-                target.device = resolved
+                target.device = target_device
             self._device = resolved
             if self.reservation is not None:
                 self.reservation.close()
@@ -452,10 +478,31 @@ class SubgraphWeightSession:
     ) -> SubgraphLoadPlan:
         """Resolve a subgraph working set without loading checkpoint tensors."""
 
-        module_names = self.working_set(
-            subgraph,
+        return self.plan_subgraphs(
+            (subgraph,),
             include_modules=include_modules,
             exclude_modules=exclude_modules,
+            include_parameters=include_parameters,
+        )
+
+    def plan_subgraphs(
+        self,
+        subgraphs: Sequence[Subgraph],
+        *,
+        include_modules: Sequence[str] = (),
+        exclude_modules: Sequence[str] = (),
+        include_parameters: Sequence[str] = (),
+    ) -> SubgraphLoadPlan:
+        """Resolve a union of graph dependencies, preserving direct parameters."""
+
+        module_names = _minimal_roots(
+            name
+            for subgraph in subgraphs
+            for name in self.working_set(
+                subgraph,
+                include_modules=include_modules,
+                exclude_modules=exclude_modules,
+            )
         )
         base = self.plan_modules(
             module_names,
@@ -463,6 +510,7 @@ class SubgraphWeightSession:
         )
         direct_parameters = tuple(
             str(node.target)
+            for subgraph in subgraphs
             for node in subgraph.graph.nodes
             if node.op == "get_attr"
             and self._is_direct_parameter(str(node.target))
@@ -554,9 +602,12 @@ class SubgraphWeightSession:
         """Install prepared weights and restore the model on context exit."""
 
         prepared.wait_for_transfer()
-        if any(target.device != prepared.device for target in prepared.targets):
+        if any(
+            target.device != prepared.target_device(target.plan.name)
+            for target in prepared.targets
+        ):
             prepared.close()
-            raise ValueError("Prepared subgraph tensors must share one device")
+            raise ValueError("Prepared subgraph tensors do not match their device plan")
         module_names = prepared.plan.module_names
         registered_state = self._registered_state(module_names)
         runtime_attributes = self._runtime_tensor_attributes(module_names)

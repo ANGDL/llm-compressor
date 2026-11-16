@@ -3,6 +3,8 @@
 HIGGS is an automated mixed-precision quantization system that uses Integer Linear Programming (ILP) to select optimal quantization schemes for each layer in a neural network. This technique is based on the paper: [Pushing the Limits of Large Language Model Quantization via the
 Linearity Theorem](https://arxiv.org/pdf/2411.17525)
 
+中文技术文档：[HIGGS 混合精度量化：原理、实现与使用边界](../../../../docs/guides/higgs_mixed_precision.md)。
+
 
 ## Quick start
 

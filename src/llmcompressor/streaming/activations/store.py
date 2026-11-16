@@ -7,6 +7,7 @@ import pickle
 import shutil
 import uuid
 from abc import ABC, abstractmethod
+from collections.abc import Collection, Mapping
 from dataclasses import fields, is_dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterator
@@ -188,6 +189,20 @@ def _tensor_bytes(value: Any, seen: set[int] | None = None) -> int:
     return 0
 
 
+def _tensors(value: Any) -> Iterator[torch.Tensor]:
+    if isinstance(value, torch.Tensor):
+        yield value
+    elif is_dataclass(value) and not isinstance(value, type):
+        for item in fields(value):
+            yield from _tensors(getattr(value, item.name))
+    elif isinstance(value, Mapping):
+        for item in value.values():
+            yield from _tensors(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _tensors(item)
+
+
 class BoundaryActivationStore(ABC):
     """Common batch-oriented interface for adjacent target activations."""
 
@@ -217,17 +232,43 @@ class BoundaryActivationStore(ABC):
     def _delete_batch(self, boundary: int, batch: int) -> None:
         """Delete one committed batch after its replacement is durable."""
 
+    def get_for_execution(
+        self,
+        boundary: int,
+        batch: int,
+        input_names: Collection[str],
+        *,
+        device: torch.device | str = "cpu",
+    ) -> Any:
+        """Read group inputs and aliases, retaining unused values privately.
+
+        Commit partial execution results with consumed_names to preserve carry.
+        Reads isolate tensors from the store, including inputs mutated in place.
+        """
+        return self.get(boundary, batch, device=device)
+
     def commit_propagated_batch(
         self,
         source_boundary: int,
         destination_boundary: int,
         batch: int,
         value: Any,
+        *,
+        consumed_names: Collection[str] | None = None,
     ) -> None:
         """Commit a CPU destination before consuming its matching source batch."""
 
         if source_boundary == destination_boundary:
             raise ValueError("Propagation boundaries must be distinct")
+        if consumed_names is not None:
+            source = self.get(source_boundary, batch)
+            value = {
+                **{
+                    name: item for name, item in source.items()
+                    if name not in consumed_names
+                },
+                **value,
+            }
         self.put(destination_boundary, batch, value)
         self._delete_batch(source_boundary, batch)
 
@@ -257,23 +298,43 @@ class InMemoryBoundaryActivationStore(BoundaryActivationStore):
         self._reservations: dict[int, dict[int, HostMemoryReservation]] = {}
 
     def put(self, boundary: int, batch: int, value: Any) -> None:
+        self._put(boundary, batch, value)
+
+    def _put(
+        self,
+        boundary: int,
+        batch: int,
+        value: Any,
+        carried: Mapping[str, Any] | None = None,
+    ) -> None:
         _check_index(boundary, "boundary")
         _check_index(batch, "batch")
+        complete_value = value if carried is None else {**carried, **value}
         reservation = (
             self.host_budget.reserve(
                 f"activation boundary {boundary} batch {batch}",
-                _tensor_bytes(value),
+                _tensor_bytes(complete_value),
             )
             if self.host_budget is not None
             else None
         )
         try:
+            candidates = {} if self.deduplicate_tensors else None
+            if candidates is not None and carried is not None:
+                seen = set()
+                for tensor in _tensors(carried):
+                    if id(tensor) not in seen:
+                        seen.add(id(tensor))
+                        signature = (tensor.dtype, tuple(tensor.shape))
+                        candidates.setdefault(signature, []).append(tensor)
             snapshot = _snapshot(
                 value,
                 self.storage_device,
                 memo={},
-                content_candidates={} if self.deduplicate_tensors else None,
+                content_candidates=candidates,
             )
+            if carried is not None:
+                snapshot = {**carried, **snapshot}
             if reservation is not None:
                 reservation.commit(_tensor_bytes(snapshot))
                 reservation.release_reserved(reservation.reserved_bytes)
@@ -300,6 +361,81 @@ class InMemoryBoundaryActivationStore(BoundaryActivationStore):
                 f"Boundary {boundary}, batch {batch} is not committed"
             ) from error
         return _move(value, torch.device(device), memo={})
+
+    def get_for_execution(
+        self,
+        boundary: int,
+        batch: int,
+        input_names: Collection[str],
+        *,
+        device: torch.device | str = "cpu",
+    ) -> Any:
+        _check_index(boundary, "boundary")
+        _check_index(batch, "batch")
+        try:
+            value = self._boundaries[boundary][batch]
+        except KeyError as error:
+            raise KeyError(
+                f"Boundary {boundary}, batch {batch} is not committed"
+            ) from error
+        if not isinstance(value, Mapping):
+            return self.get(boundary, batch, device=device)
+        selected = set(input_names)
+        missing = selected - value.keys()
+        if missing:
+            raise KeyError(f"Missing boundary inputs: {sorted(missing)}")
+        identities = {
+            name: {id(tensor) for tensor in _tensors(item)}
+            for name, item in value.items()
+        }
+        active = set().union(*(identities[name] for name in selected))
+        while True:
+            aliases = {
+                name for name, tensors in identities.items()
+                if name not in selected and tensors & active
+            }
+            if not aliases:
+                break
+            selected.update(aliases)
+            active.update(set().union(*(identities[name] for name in aliases)))
+        return _move(
+            {name: item for name, item in value.items() if name in selected},
+            torch.device(device),
+            memo={},
+        )
+
+    def commit_propagated_batch(
+        self,
+        source_boundary: int,
+        destination_boundary: int,
+        batch: int,
+        value: Any,
+        *,
+        consumed_names: Collection[str] | None = None,
+    ) -> None:
+        if consumed_names is None:
+            return super().commit_propagated_batch(
+                source_boundary,
+                destination_boundary,
+                batch,
+                value,
+            )
+        if source_boundary == destination_boundary:
+            raise ValueError("Propagation boundaries must be distinct")
+        _check_index(source_boundary, "source_boundary")
+        _check_index(batch, "batch")
+        try:
+            source = self._boundaries[source_boundary][batch]
+        except KeyError as error:
+            raise KeyError(
+                f"Boundary {source_boundary}, batch {batch} is not committed"
+            ) from error
+        carried = {
+            name: item for name, item in source.items()
+            if name not in consumed_names and name not in value
+        }
+        self._put(destination_boundary, batch, value, carried)
+        self._delete_batch(source_boundary, batch)
 
     def batch_indices(self, boundary: int) -> tuple[int, ...]:
         _check_index(boundary, "boundary")

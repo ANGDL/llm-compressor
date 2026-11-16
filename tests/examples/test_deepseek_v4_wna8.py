@@ -138,3 +138,38 @@ def test_checkpoint_names_can_be_read_from_index_without_shards(tmp_path):
         "embed.weight",
         "layers.0.attn.wq_a.weight",
     }
+
+
+def test_calibration_loader_uses_native_text_encoder(tmp_path, monkeypatch):
+    monkeypatch.setattr("datasets.config.HF_DATASETS_CACHE", tmp_path / "cache")
+    chat_path = tmp_path / "chat.jsonl"
+    text_path = tmp_path / "text.jsonl"
+    chat_path.write_text(
+        json.dumps({"messages": [{"role": "user", "content": "original chat"}]})
+    )
+    text_path.write_text(json.dumps({"text": "plain text", "meta": "ignored"}))
+
+    dataset = MODULE.load_calibration_dataset(
+        [chat_path, text_path], "train", 2, preprocess=MODULE._encode_example
+    )
+
+    assert dataset.column_names == ["text"]
+    assert "original chat" in dataset[0]["text"]
+    assert dataset[1]["text"] == "plain text"
+
+
+def test_calibration_loader_preserves_pretokenized_rows(tmp_path, monkeypatch):
+    monkeypatch.setattr("datasets.config.HF_DATASETS_CACHE", tmp_path / "cache")
+    path = tmp_path / "tokens.jsonl"
+    row = {
+        "input_ids": [1, 2, 3],
+        "attention_mask": [1, 1, 1],
+        "text": "metadata that must not replace input_ids",
+    }
+    path.write_text(json.dumps(row))
+
+    dataset = MODULE.load_calibration_dataset(
+        path, "test", 1, preprocess=MODULE._encode_example
+    )
+
+    assert dataset[0] == row

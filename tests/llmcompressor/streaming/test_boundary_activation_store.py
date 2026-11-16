@@ -90,6 +90,38 @@ def test_round_trip_torch_dtype_metadata(store):
     assert torch.equal(loaded["hidden_states"], value["hidden_states"])
 
 
+def test_meta_read_preserves_metadata_and_aliases_without_cloning(store, monkeypatch):
+    tensor = torch.randn(2, 3, 4, dtype=torch.bfloat16)
+    value = {
+        "hidden_states": tensor,
+        "alias": tensor,
+        "nested": BoundaryOutput(
+            hidden_states=tensor,
+            attention_mask=torch.ones(2, 3, dtype=torch.bool),
+            position_ids=torch.arange(3).expand(2, 3),
+            metadata={"dtype": torch.bfloat16},
+        ),
+    }
+    store.put(0, 0, value)
+
+    def unexpected_clone(*_args, **_kwargs):
+        raise AssertionError("metadata reads must not clone activation payloads")
+
+    with monkeypatch.context() as context:
+        context.setattr(torch.Tensor, "clone", unexpected_clone)
+        metadata = store.get(0, 0, device="meta")
+    assert metadata["hidden_states"].is_meta
+    assert metadata["hidden_states"] is metadata["alias"]
+    assert metadata["hidden_states"] is metadata["nested"].hidden_states
+    assert metadata["hidden_states"].shape == tensor.shape
+    assert metadata["hidden_states"].dtype == tensor.dtype
+    assert metadata["hidden_states"].nbytes == tensor.nbytes
+    assert metadata["nested"].attention_mask.is_meta
+    assert metadata["nested"].attention_mask.dtype == torch.bool
+    assert metadata["nested"].metadata["dtype"] is torch.bfloat16
+    assert_values_equal(store.get(0, 0), value)
+
+
 def test_put_detaches_and_snapshots_tensors(store):
     tensor = torch.arange(4.0, requires_grad=True)
     value = {"hidden_states": tensor}
@@ -295,3 +327,155 @@ def test_memory_budget_counts_distinct_overlapping_views():
     store.put(0, 0, {"left": source[:6], "right": source[2:]})
 
     assert store.tensor_bytes() == 2 * 6 * source.element_size()
+
+
+def test_selective_execution_carries_unread_snapshots_without_copy(monkeypatch):
+    store = InMemoryBoundaryActivationStore(deduplicate_tensors=True)
+    store.put(0, 0, {"active": torch.ones(3), "carry": torch.arange(128)})
+    stored_carry = store._boundaries[0][0]["carry"]
+    original_clone = torch.Tensor.clone
+
+    def check_clone(tensor, *args, **kwargs):
+        assert tensor is not stored_carry
+        return original_clone(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "clone", check_clone)
+    active = store.get_for_execution(0, 0, {"active"})
+    assert set(active) == {"active"}
+    active["active"].add_(2)
+    assert torch.equal(store._boundaries[0][0]["active"], torch.ones(3))
+    store.commit_propagated_batch(
+        0, 1, 0, {"result": active["active"]}, consumed_names={"active"}
+    )
+    assert not store.contains(0, 0)
+    assert store._boundaries[1][0]["carry"] is stored_carry
+    assert set(store._boundaries[1][0]) == {"carry", "result"}
+    assert torch.equal(store._boundaries[1][0]["result"], torch.full((3,), 3.0))
+
+
+def test_selective_execution_expands_transitive_nested_aliases():
+    store = InMemoryBoundaryActivationStore(deduplicate_tensors=True)
+    first, second = torch.ones(3), torch.arange(3)
+    store.put(0, 0, {
+        "active": first,
+        "nested": {"first": first, "second": second},
+        "transitive": [second],
+        "equal_content_alias": first.clone(),
+        "dataclass": BoundaryOutput(first, torch.ones(1), torch.arange(1), {}),
+        "carry": torch.zeros(100),
+    })
+    value = store.get_for_execution(0, 0, {"active"})
+    assert set(value) == {
+        "active", "nested", "transitive", "equal_content_alias", "dataclass"
+    }
+    assert value["active"] is value["nested"]["first"]
+    assert value["active"] is value["equal_content_alias"]
+    assert value["active"] is value["dataclass"].hidden_states
+    assert value["transitive"][0] is value["nested"]["second"]
+    value["active"].add_(5)
+    value["transitive"][0].add_(9)
+    del value["active"]
+    store.commit_propagated_batch(0, 1, 0, value, consumed_names={"active"})
+    restored = store.get(1, 0)
+    assert torch.equal(restored["nested"]["first"], torch.full((3,), 6.0))
+    assert torch.equal(restored["transitive"][0], torch.arange(3) + 9)
+    restored["carry"].add_(100)
+    assert torch.equal(store.get(1, 0)["carry"], torch.zeros(100))
+
+
+def test_selective_execution_preserves_existing_distinct_view_snapshots():
+    store = InMemoryBoundaryActivationStore()
+    source = torch.arange(5.0)
+    store.put(0, 0, {"active": source[:3], "other": source[2:]})
+    value = store.get_for_execution(0, 0, {"active"})
+    assert set(value) == {"active"}
+    value["active"].add_(10)
+    store.commit_propagated_batch(0, 1, 0, value, consumed_names=())
+    assert torch.equal(store.get(1, 0)["other"], torch.arange(2.0, 5.0))
+
+
+def test_partial_commit_preserves_content_deduplication_with_private_carry():
+    store = InMemoryBoundaryActivationStore(deduplicate_tensors=True)
+    store.put(0, 0, {"active": torch.ones(3), "carry": torch.full((3,), 2.0)})
+    value = store.get_for_execution(0, 0, {"active"})
+    store.commit_propagated_batch(
+        0, 1, 0, {"result": value["active"] + 1}, consumed_names={"active"}
+    )
+    assert store.tensor_bytes() == 3 * torch.tensor(0.0).element_size()
+    selected = store.get_for_execution(1, 0, {"result"})
+    assert set(selected) == {"carry", "result"}
+    assert selected["carry"] is selected["result"]
+    selected["result"].add_(5)
+    assert torch.equal(store.get(1, 0)["carry"], torch.full((3,), 2.0))
+
+
+def test_selective_execution_rejects_missing_inputs_and_handles_empty_group(store):
+    store.put(0, 0, {"active": torch.ones(3)})
+    if isinstance(store, InMemoryBoundaryActivationStore):
+        with pytest.raises(KeyError, match="Missing boundary inputs"):
+            store.get_for_execution(0, 0, {"missing"})
+        assert store.get_for_execution(0, 0, ()) == {}
+    else:
+        assert_values_equal(
+            store.get_for_execution(0, 0, ()), store.get(0, 0)
+        )
+    with pytest.raises(KeyError, match="not committed"):
+        store.get_for_execution(99, 0, ())
+
+
+def test_partial_propagation_retains_carry_and_consumes_only_current_batch(store):
+    for batch in range(2):
+        store.put(0, batch, {
+            "active": torch.tensor([batch]),
+            "carry": BoundaryOutput(
+                torch.ones(2), torch.ones(1), torch.arange(2), {"layer": 0}
+            ),
+        })
+    for boundary in range(3):
+        for batch in range(2):
+            original = store.get(boundary, batch)
+            value = store.get_for_execution(boundary, batch, {"active"})
+            result = {"active": value["active"] + 1}
+            store.commit_propagated_batch(
+                boundary, boundary + 1, batch, result, consumed_names={"active"}
+            )
+            assert not store.contains(boundary, batch)
+            assert_values_equal(
+                store.get(boundary + 1, batch)["carry"], original["carry"]
+            )
+        assert store.batch_indices(boundary) == ()
+    assert store.get(3, 0)["active"].item() == 3
+    assert store.get(3, 1)["active"].item() == 4
+
+
+def test_partial_commit_failure_keeps_source_destination_and_reservations():
+    budget = HostMemoryBudget(
+        safety_reserve_bytes=0, system_available=lambda: 1024,
+        cgroup_available=lambda: None,
+    )
+    store = InMemoryBoundaryActivationStore(host_budget=budget)
+    store.put(0, 0, {"carry": torch.arange(8)})
+    store.put(1, 0, {"previous": torch.ones(2)})
+    reservations = set(budget._reservations)
+    with pytest.raises(TypeError, match="Unsupported"):
+        store.commit_propagated_batch(
+            0, 1, 0, {"bad": object()}, consumed_names=()
+        )
+    assert store.contains(0, 0)
+    assert set(store.get(1, 0)) == {"previous"}
+    assert budget._reservations == reservations
+    with pytest.raises(MemoryError, match="Insufficient host memory"):
+        store.commit_propagated_batch(
+            0, 1, 0, {"large": torch.ones(300)}, consumed_names=()
+        )
+    assert budget._reservations == reservations
+    store.commit_propagated_batch(
+        0, 1, 0, {"result": torch.ones(3)}, consumed_names=()
+    )
+    assert not store.contains(0, 0)
+    assert len(budget._reservations) == 1
+    reservation = next(iter(budget._reservations))
+    assert reservation.reserved_bytes == 0
+    assert reservation.committed_bytes == store.tensor_bytes()
+    store.delete(1)
+    assert not budget._reservations
