@@ -483,8 +483,8 @@ class _ExecutionGraph:
 @dataclass(frozen=True)
 class _PreparedExpertBatch:
     names: tuple[str, ...]
-    args: Any
-    kwargs: Any
+    args: tuple[Any, ...]
+    kwargs: tuple[Any, ...]
     lengths: tuple[int, ...]
     output_lengths: tuple[tuple[int, ...], ...]
     output_indices: tuple[tuple[int, ...], ...]
@@ -662,7 +662,8 @@ class ExpertParallelExecutor:
         lengths = []
         output_lengths = []
         output_indices = []
-        combined_leaves = [None] * len(first_leaves)
+        grouped_args = []
+        grouped_kwargs = []
         for name, group in grouped_entries.items():
             names.append(name)
             group_leaves = [
@@ -680,6 +681,7 @@ class ExpertParallelExecutor:
             lengths.append(sum(group_lengths))
             output_lengths.append(group_lengths)
             output_indices.append(tuple(entry_index for entry_index, _ in group))
+            combined_leaves = [None] * len(first_leaves)
             for leaf_index, first in enumerate(first_leaves):
                 if isinstance(first, torch.Tensor):
                     combined_leaves[leaf_index] = torch.cat(
@@ -689,13 +691,17 @@ class ExpertParallelExecutor:
                         ],
                         dim=0,
                     )
-                elif combined_leaves[leaf_index] is None:
+                else:
                     combined_leaves[leaf_index] = first
-        combined_args, combined_kwargs = tree_unflatten(combined_leaves, spec)
+            combined_args, combined_kwargs = tree_unflatten(
+                combined_leaves, spec
+            )
+            grouped_args.append(combined_args)
+            grouped_kwargs.append(combined_kwargs)
         return _PreparedExpertBatch(
             tuple(names),
-            combined_args,
-            combined_kwargs,
+            tuple(grouped_args),
+            tuple(grouped_kwargs),
             tuple(lengths),
             tuple(output_lengths),
             tuple(output_indices),
@@ -865,23 +871,13 @@ class ExpertParallelExecutor:
                 moved_args, moved_kwargs = self._copy_inputs(
                     (prepared.args, prepared.kwargs), device, owner_stream
                 )
-                moved_leaves, spec = self._call_leaves(
-                    moved_args, moved_kwargs
-                )
                 grouped_outputs = []
-                offset = 0
-                for name, length, output_lengths in zip(
+                for name, task_args, task_kwargs, output_lengths in zip(
                     prepared.names,
-                    prepared.lengths,
+                    moved_args,
+                    moved_kwargs,
                     prepared.output_lengths,
                 ):
-                    task_leaves = [
-                        leaf.narrow(0, offset, length)
-                        if isinstance(leaf, torch.Tensor)
-                        else leaf
-                        for leaf in moved_leaves
-                    ]
-                    task_args, task_kwargs = tree_unflatten(task_leaves, spec)
                     grouped_outputs.append(
                         self._split_output(
                             self.model.get_submodule(name)(
@@ -890,7 +886,6 @@ class ExpertParallelExecutor:
                             output_lengths,
                         )
                     )
-                    offset += length
                 outputs = [None] * sum(
                     len(indices) for indices in prepared.output_indices
                 )
