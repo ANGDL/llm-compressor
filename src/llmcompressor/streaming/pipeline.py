@@ -149,15 +149,50 @@ def _target_label(index: int, total: int, target: str) -> str:
     return f"[{index + 1:0{width}d}/{total:0{width}d}] {target}"
 
 
-def _boundary_token_count(value: Any) -> int:
+_TOKEN_METADATA_NAMES = frozenset(
+    {
+        "attention_mask",
+        "image_mask",
+        "image_token_types",
+        "input_ids",
+        "position_ids",
+        "token_type_ids",
+    }
+)
+
+
+def _tensor_token_count(tensor: torch.Tensor, name: str | None = None) -> int:
+    """Estimate token count without charging routing or feature dimensions."""
+
+    if tensor.ndim == 0:
+        return 0
+    if tensor.ndim == 1:
+        return int(tensor.shape[0])
+    if name in _TOKEN_METADATA_NAMES or not tensor.is_floating_point():
+        return int(prod(tensor.shape[:2]))
+    if tensor.ndim == 2:
+        return int(tensor.shape[0])
+    return int(prod(tensor.shape[:2]))
+
+
+def _boundary_token_count(value: Any, name: str | None = None) -> int:
     if isinstance(value, torch.Tensor):
-        if value.ndim < 2:
-            return 0
-        return prod(value.shape[:-1]) if value.is_floating_point() else value.numel()
+        return _tensor_token_count(value, name)
     if isinstance(value, Mapping):
-        return max((_boundary_token_count(item) for item in value.values()), default=0)
+        named = []
+        unnamed = []
+        for item_name, item in value.items():
+            count = _boundary_token_count(item, str(item_name))
+            if str(item_name) in _TOKEN_METADATA_NAMES:
+                named.append(count)
+            else:
+                unnamed.append(count)
+        return max(named or unnamed, default=0)
     if isinstance(value, (list, tuple)):
-        return max((_boundary_token_count(item) for item in value), default=0)
+        return max(
+            (_boundary_token_count(item, name) for item in value),
+            default=0,
+        )
     return 0
 
 

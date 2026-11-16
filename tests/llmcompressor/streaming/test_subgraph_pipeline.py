@@ -35,6 +35,7 @@ from llmcompressor.streaming.loading import (
 from llmcompressor.streaming.output import prepare_quantized_tensor_for_save
 from llmcompressor.streaming.pipeline import (
     _async_h2d_enabled,
+    _boundary_token_count,
     _can_reuse_calibration_outputs,
     _debug_boundary,
     _debug_value_summary,
@@ -86,6 +87,33 @@ def test_execution_batches_keep_pipeline_boundaries_and_limit_device_loading(
         assert boundaries.loads[-1] == indices[-1]
     with pytest.raises(StopIteration):
         next(batches)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (
+            {
+                "hidden_states": torch.empty(1, 4747, 2, 8),
+                "topk": torch.empty(1, 4747, 512, dtype=torch.int32),
+                "attention_mask": torch.empty(1, 4747, dtype=torch.bool),
+            },
+            4747,
+        ),
+        (
+            {
+                "input_ids": torch.empty(1, 2602, dtype=torch.long),
+                "image_patches": torch.empty(1530, 3, 14, 14),
+            },
+            2602,
+        ),
+        ({"hidden_states": torch.empty(1024, 8)}, 1024),
+    ],
+)
+def test_boundary_token_count_ignores_routing_and_feature_dimensions(
+    value, expected
+):
+    assert _boundary_token_count(value) == expected
 
 
 def test_calibration_output_reuse_requires_each_modifier_to_opt_in():
