@@ -2420,3 +2420,105 @@ contract 接入；模型特化逻辑仍由 MoE/model adapter 负责，不能回�
 当前改动没有改变已测 toy GPTQ 的 Hessian/sample count/qparams 语义；它不
 证明 P800 上的跨卡通信收益。多进程 EP 仍需接入 topology、rank-local
 materialization、global commit 和目标设备基准后，才能替换当前单进程路径。
+
+#### 17.3.8 2026-11-16 实现：资源适配与调度边界
+
+本轮实现入口为 `streaming_oneshot(...,
+expert_parallel_token_budget="auto"|int)`，pretrained pipeline 和
+`examples/streaming_oneshot/deepseek_v41_wNa8.py` 同步透传。脚本对应参数为
+`--expert-parallel-token-budget auto|正整数`；手动数值是所有 owner 的统一
+上限，各 owner 在此上限以内仍按自身显存计算不同的 capacity。不开启 EP
+时不允许设置手动上限。pipeline 的 `batch_size`、样本顺序、完整 sequence
+和 modifier 自己的优化 batch 参数不受此参数影响。
+
+资源实现分为三层：
+
+| 模块 | 实际职责 |
+| --- | --- |
+| `streaming/admission.py` | 聚合持久化、legacy scratch、host cache 和显式 dispatch workspace；校验非负整数估算；预留设备资源 |
+| `streaming/memory_adapters.py` | 选择独立资源适配器，供已有算法声明 batch/update 成本和可选的校准兼容 context |
+| `streaming/parallel/token_budget.py` | 在单调的 `required_bytes(T)` 上二分搜索最大可准入 token 数，不假设内存曲线是线性的 |
+| `streaming/parallel/expert.py` | 根据真实 routed tensor 的 token 数切分 owner dispatch，执行和记录实际负载 |
+| `streaming/pipeline.py` | 汇总实际 boundary 元数据、选择执行阶段、在物化权重前完成所有 owner 的准入并保存计划 |
+
+资源估算接口与完整 lifecycle adapter 分离。新增 GPTQ 内存适配不应改变
+`get_modifier_adapter(GPTQModifier)` 的返回值，否则可能间接改变 propagation、
+target group 和失败恢复策略。`streaming/gptq_adapter.py` 单独处理 GPTQ 的
+update/batch 成本以及合并调用的样本计数兼容。相对本轮开发前的
+`58917dcd6`，`src/llmcompressor/modifiers/gptq/` 保持零差异；未来合并 upstream
+时主要审核独立 adapter 对原 hook、`batch_key`、`quantization_peak_bytes` 和
+sample normalization 的依赖。
+
+**Legacy estimate 的保守回退。** 当前继续以
+`estimate_sequential_memory(module, total_calibration_tokens)` 返回的 held 和
+scratch 为基线，host cache 同样使用完整 calibration token 数。不会用
+`estimate(0)` 和 `estimate(1)` 的差值猜测每 token 成本：这种做法无法处理
+二次 workspace、阈值分配和跨 batch cache。支持细分成本的 modifier/adapter
+可另外实现：
+
+```python
+estimate_sequential_batch_memory(module, dispatch_tokens, phase) -> int
+estimate_sequential_update_memory(modules) -> int
+```
+
+Streaming adapter 中对应方法名为 `estimate_batch_memory` 和
+`estimate_update_memory`。每个 modifier 的 batch scratch 取当前 owner 各模块
+估算的最大值，多个 modifier 的 workspace 保守相加；update workspace 至少
+覆盖 legacy scratch 和整组 update 估算的较大者。持久化状态始终按 owner
+实际持有的模块求和。未提供细分接口时保留完整 legacy scratch，可能使容量
+较小，但不会把未声明为临时的状态擅自按 dispatch token 数缩减。
+
+**GPTQ adapter。** Hessian 的持有量继续由原 modifier 估算；校准临时空间另计
+FP32 输入转换、缩放和 Hessian product，即
+`(2 * dispatch_tokens * input_width + input_width**2) * 4` 字节。压缩阶段按原
+`batch_key` 对兼容模块分组：显式 integer batch 取组内实际数量和上限的较小值，
+`None` 按单模块，`auto` 保守预留整组都参与压缩的 workspace。后者比运行时
+根据剩余显存选批更保守，可防止 dispatch 占满原本留给 update 的显存。
+
+合并多个二维 expert 输入时，原 GPTQ hook 仍执行一次，原 Hessian 累积公式
+和函数均不改动；独立 adapter 在该实例的 hook 注册前安装临时包装器，按
+`ContextVar` 保存的原始调用长度补回 sample counter。二维输入每个原始调用
+计一个样本；三维以上输入保留原 leading batch axis 计数。包装器由原
+`HooksMixin.register_hook` 注册，因此禁用 calibration hooks 时也会一起禁用。
+正常返回和异常退出均恢复原实例方法；不修改全局类，也不影响其他 GPTQ
+实例。与 baseline 的 Hessian、sample count、weight、qparams 对照需要同时
+覆盖逐输入执行与 `forward_many` 合并执行。
+
+**调度和内存生命周期。** 每个 owner 只允许一个已提交的任务；剩余任务只在
+host 队列中保留源 tensor 引用。只有 owner 空闲时才创建拼接输入并提交下一
+个任务，避免提前为所有 dispatch 分配 CUDA staging buffer。真实 token 数为
+`prod(input.shape[:-1])`，二维 expert 输入即 `input.shape[0]`。同一 expert 的
+原始第一维长度独立记录；返回输出按原 entry 顺序拆回，不能按 expert 分组
+后的顺序代替原 entry 顺序。空 expert 不增加 token 计费，但仍保留原 hook
+调用及其计数语义。
+
+单个原始 expert call 超出 owner capacity 时立即失败，不擅自切分该调用：
+任意切分可能改变 sample counter、激活观察器或模型 forward 语义。自动规划
+以最大原始 boundary token 数为最小可接纳窗口；若此窗口无法容纳，或者手动
+上限比它小，任务在加载当前 target 权重前失败。未启用 EP 时每轮仍执行一个
+原始 boundary，保留原 pipeline 校准、更新与传播生命周期。
+
+主设备输入收集首先读取 boundary 的 meta tensor，确认下一项能否加入窗口，
+然后再搬到执行设备；不会为了探测上限而先额外加载一个 CUDA boundary。
+主设备另计 boundary 常驻空间，以及依据当前 expert shape 和 routing fanout
+推导的 routed 输入/输出成本。已知 top-k 使用实际声明；all-experts 或无法
+确定的 fanout 使用当前 collection 的全部 active experts。owner runtime
+成本使用该 owner 最坏 expert 的 Linear 输入/输出 width，并对非 expert
+驻留层另外计费。
+
+**恢复和审计。** Manifest/fingerprint 记录 `ep-tokens-v2` policy、手动上限、
+placement 和 target group。每组精确容量与 phase/input token identity 写入
+`artifacts/ep-token-plans/group-XXXXX.json`，以 SHA-256 校验并原子提交。恢复
+复用原容量；当前显存不够时失败，不静默重算。fresh run 替换 manifest 时清理
+旧 token plan，避免旧组计划阻塞新执行。完成日志为每个 owner 记录 routed
+tokens、dispatch 数、expert call 数、最大 dispatch tokens 和显存峰值。当前
+这些统计用于观察负载，不代表已经自动迁移 expert 或实现动态 placement。
+
+**支持范围。** 可扩展 memory contract 不等于所有算法已经支持 EP lifecycle。
+现有 EP recipe 校验继续生效；AutoSmooth、QAD、AutoRound 的多设备参数、缓存、
+更新及恢复语义仍须单独适配。HIGGS 是 candidate provider，其 workspace 必须
+经 provider 路径声明和验证，不能把它当成普通 modifier 加入上述循环。
+本轮 runtime 成本来自 boundary/module shape 的保守估算，不是任意自定义
+kernel 分配的形式化上界；fused/native 算子需要相应模型/资源 adapter 提供
+足够的成本信息。当前没有进行生产模型端到端测试，因此不据此宣称 DSV4.1
+全模型峰值显存或实际加速比。

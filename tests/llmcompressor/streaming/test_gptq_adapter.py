@@ -57,7 +57,9 @@ def test_gptq_coalesced_counts_preserve_original_batch_semantics_and_hook_disabl
                     model(inputs)
                 assert modifier._num_samples[model[0]].item() == expected_count
                 torch.testing.assert_close(modifier._hessians[model[0]], snapshot)
-            modifier.remove_hooks()
+            LifecycleCallbacks.sequential_epoch_end(list(model.modules()))
+            modifier.end_layerwise_calibration(list(model.modules()))
+            LifecycleCallbacks.calibration_end()
         session.finalize()
 
 

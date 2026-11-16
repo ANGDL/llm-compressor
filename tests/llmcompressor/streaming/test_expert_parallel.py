@@ -520,6 +520,8 @@ def test_parallel_manifest_roundtrip_records_topology_and_actual_groups():
         devices=("cuda:1", "cuda:2"),
         expert_owners=(("experts.0", 0), ("experts.1", 1)),
         target_groups=((0, 1), (2,)),
+        token_budget_policy="ep-tokens-v2",
+        token_budget=8192,
     )
     assert ParallelInfo.from_dict(json.loads(json.dumps(asdict(manifest)))) == manifest
 
@@ -558,6 +560,8 @@ def test_recovery_rejects_device_order_and_group_changes(tmp_path):
     changed = dict(arguments, target_groups=((0, 1), (2, 3, 4)))
     with pytest.raises(ArtifactCompatibilityError, match="parallel"):
         _initialize_run(**changed)
+    with pytest.raises(ArtifactCompatibilityError, match="parallel"):
+        _initialize_run(**dict(arguments, expert_parallel_token_budget=8192))
     changed = dict(
         arguments,
         expert_parallel=ExpertParallelPlan.from_model(
