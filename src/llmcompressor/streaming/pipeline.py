@@ -38,7 +38,7 @@ from .admission import (
     DeviceMemoryBudget,
     DeviceMemoryError,
     DiskSpaceBudget,
-    estimate_modifier_dispatch_memory,
+    estimate_modifier_memory,
 )
 from .artifacts import (
     ArtifactStore,
@@ -702,6 +702,21 @@ def _iter_execution_batches(
     token_capacity: int | None,
 ):
     """Load boundary inputs up to a primary-device token capacity."""
+
+    if token_capacity is None:
+        for batch_index in batch_indices:
+            yield (
+                (batch_index,),
+                (
+                    boundaries.get_for_execution(
+                        boundary_index,
+                        batch_index,
+                        input_names,
+                        device=device,
+                    ),
+                ),
+            )
+        return
 
     current_indices = []
     current_values = []
@@ -1414,11 +1429,10 @@ def run_subgraph_streaming_pipeline(
                             if prefetched_prepared is not None
                             else adapter.plan_group(target_indices)
                         )
-                        modifier_memory = estimate_modifier_dispatch_memory(
+                        modifier_memory = estimate_modifier_memory(
                             modifiers,
                             resident_modules,
-                            total_tokens=num_tokens,
-                            dispatch_tokens=max_batch_tokens,
+                            num_tokens=num_tokens,
                             max_batch_tokens=max_batch_tokens,
                         )
                         materialized_bytes = (
@@ -1645,11 +1659,10 @@ def run_subgraph_streaming_pipeline(
                                     ].submodules(adapter.model)
                                 )
                             )
-                            next_modifier_memory = estimate_modifier_dispatch_memory(
+                            next_modifier_memory = estimate_modifier_memory(
                                 modifiers,
                                 next_modules,
-                                total_tokens=num_tokens,
-                                dispatch_tokens=max_batch_tokens,
+                                num_tokens=num_tokens,
                                 max_batch_tokens=max_batch_tokens,
                             )
                             completion_bytes = _estimate_loaded_target_snapshot_bytes(
