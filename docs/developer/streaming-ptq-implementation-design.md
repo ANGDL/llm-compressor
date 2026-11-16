@@ -1986,3 +1986,68 @@ git status --short
 ```
 
 任何实现如果破坏这些不变量，必须先更新资源模型和恢复协议，再进入代码。
+
+### 17.1 旧 `streaming-ptq-ep` 分支复核与架构调整
+
+2026-11-16 复核了本地历史分支 `streaming-ptq-ep`，其核心提交为
+`02b6ca111`（`Add streaming PTQ expert parallel pipeline`）。该分支同时包含
+`docs/developer/streaming-ptq-ep-design.md`、`streaming/ep.py`、本地 expert
+bucket executor、rank-local staging/merge 和 EP 专用测试。它没有完成目标
+P800 上的正式多 rank 端到端验收，但其中的执行拓扑比当前首版单进程
+`ExpertParallelExecutor` 更适合作为八卡生产路径。
+
+**结论。** 旧分支的总体方向更合理，后续 EP 优化以它的通信模型为准；当前
+单进程 executor 保留为正确性基线、单进程回退和没有 distributed launcher
+时的兼容路径。不能继续把“每个 expert 的输入复制到 owner、每个 expert 的
+输出复制回主卡”作为八卡主路径，只在通用 FX fallback 或不满足批量条件时使用。
+
+| 维度 | 当前单进程首版 | 旧 EP 分支 | 调整结论 |
+|---|---|---|---|
+| expert 执行 | 主卡切片后逐 expert D2D 到 owner，再逐 expert D2D 回主卡 | 每个 rank 只执行本地 experts，hidden/router 在 EP group 内复制 | 生产路径采用本地 expert 执行，消除 64 次级别的跨卡往返 |
+| combine | 主线程按 FX mutation 顺序执行多个 `index_add_` | local partial output 一次 combine；分布式路径用 EP group reduce | 保留原始 FP32 累加顺序；优先 owner 批量 combine，distributed 路径再用一次 collective |
+| 通信粒度 | expert 级输入/输出传输和 CUDA event | target/batch 级 output reduce；routed hidden 已复制时不需要 all-to-all | 禁止逐 expert host/device 同步，通信协议按 target/batch 定义 |
+| hook/Hessian | 每个独立 FX expert leaf 直接调用，GPTQ hook 语义清晰 | `LinearExperts2D` 本地循环也保留单 expert module hook | 两者都保留；模型 adapter 负责将 DSV4.1 native MoE 映射到 local owner |
+| 内存 | 当前 target 可按 expert owner 分片，主卡仍承担 dispatch scratch | replicated dense/shared + local routed weights；另有 expert bucket 降级 | 复用当前 admission，增加 replicated runtime、partial output 和 bucket 预算 |
+| checkpoint | 单进程单 writer | rank-local staging，global barrier 后 rank 0 bounded merge | 多进程 EP 必须采用旧分支的 global commit 语义，不能让 rank 并写一个 shard |
+| 模型边界 | 通用 FX executor，不识别模型名 | 外部 `StreamingMoEAdapter` 发现 expert container，并安装临时 proxy | 通用 EP 只依赖 adapter contract；模型本身不必增加 EP 方法 |
+
+旧分支中以下内容不能直接复制：
+
+1. 旧 `LinearExperts2D` 的 `one_hot` 路由会为 DSV4.1 的 384 experts 产生不必要
+   的大路由张量；当前 `group_expert_routes` 的稳定排序、Python offsets 和
+   `select_expert_routes` 应继续复用。
+2. 旧模型适配针对 DeepSeek V4/旧 fused experts，不能直接覆盖新的 native、
+   fused、MTP 或 multimodal MoE；这些差异必须通过各模型的 adapter contract
+   表达，不能把 DSV4.1、CSA2 或 DSpark/MTP 逻辑放进通用 EP。
+3. 旧分支虽然有分布式协议单元测试，但没有目标设备上的多 rank GPTQ/HIGGS
+   完整运行证明；`all_reduce`、rank-local writer、异常退出和恢复必须在
+   DSV4.1 tiny 与生产形状上重新验收。
+4. 旧分支的 `dp_size>1` 仍明确未实现，不能把 topology dataclass 当作 DP
+   statistics reduction 已完成；本轮先固定 EP-only，避免重复计入 GPTQ Hessian。
+
+**调整后的实现顺序。**
+
+1. 保留当前提交 `668afa138` 作为单进程异步 stream 回退点，并修复其测试中的
+   staticmethod 装饰器问题。
+2. 在通用 executor 中先实现 owner 内批量 dispatch：同一 owner 的兼容输入在
+   主卡一次拼接、一次传入、owner 上按 expert 顺序调用，再一次回传并按原
+   `index_add_` 依赖拆分；不兼容结构自动回退逐 expert。
+3. 在现有 `streaming/moe/adapters.py` 的 `MoEModelAdapter` contract 上增加
+   local-owner execution 能力，声明 expert container、replicated inputs、
+   local expert ids、route metadata、partial output 和 combine event；streaming
+   通过外部 adapter 为标准 `ModuleList`/`ModuleDict` 自动构造临时 proxy，并在
+   进入/退出 target 时原子替换和恢复。模型本身不需要增加
+   `configure_streaming_ep`。只有 fused/native 容器才由 adapter 提供
+   `expert_accessor`、state-name parser 或 route conversion；DSV4.1 adapter
+   只是第一个验收实现，不能成为核心接口的隐含前提。
+4. 将旧分支的 `EPTopology`、stable placement、rank-local output 和 global
+   commit 语义以兼容层接入，先支持 `dp_size=1` 的多进程 EP-only。
+5. 对每个 adapter 保持其完整 calibration 语义、独立 expert hook、原始 route
+   weight 和规定的汇合顺序；DSV4.1 额外覆盖 CSA2/Engram/MTP，但这些只是
+   adapter 验收项。只有在通用 tiny MoE、至少一个 fused/native MoE 和
+   DSV4.1 单进程/多进程逐 tensor 对照通过后，才在目标 P800 重新测量八卡速度。
+
+因此，旧分支不是直接替换当前代码的补丁，而是当前通用 EP 的正确性能方向：
+**本地 expert 计算和粗粒度 combine 是主路径，逐 expert D2D executor 是兼容
+回退路径，expert bucket 是容量模式，fused MoE kernel 仍不默认启用。核心只
+依赖 `StreamingMoEAdapter`，不依赖任何具体模型类。**

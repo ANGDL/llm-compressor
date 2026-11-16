@@ -13,7 +13,7 @@ import torch
 from torch import nn
 from torch.fx import Graph, Node
 from torch.fx.node import map_arg
-from torch.utils._pytree import tree_map
+from torch.utils._pytree import tree_flatten, tree_map, tree_unflatten
 
 from llmcompressor.pipelines.sequential.helpers import Subgraph
 
@@ -331,17 +331,41 @@ class _ExecutionGraph:
 
 
 @dataclass(frozen=True)
-class _ExpertResult:
-    value: Any
+class _PreparedExpertBatch:
+    names: tuple[str, ...]
+    args: Any
+    kwargs: Any
+    lengths: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class _ExpertBatchResult:
+    values: tuple[Any, ...]
     event: Any | None = None
+
+
+_DEFAULT_MAX_BATCH_INPUT_BYTES = 128 * 1024 * 1024
 
 
 class ExpertParallelExecutor:
     """Schedule independent expert calls concurrently and preserve FX dataflow."""
 
-    def __init__(self, model: nn.Module, plan: ExpertParallelPlan):
+    def __init__(
+        self,
+        model: nn.Module,
+        plan: ExpertParallelPlan,
+        *,
+        max_batch_input_bytes: int = _DEFAULT_MAX_BATCH_INPUT_BYTES,
+    ):
+        if (
+            isinstance(max_batch_input_bytes, bool)
+            or not isinstance(max_batch_input_bytes, int)
+            or max_batch_input_bytes <= 0
+        ):
+            raise ValueError("max_batch_input_bytes must be a positive integer")
         self.model = model
         self.plan = plan
+        self.max_batch_input_bytes = max_batch_input_bytes
         self._workers = {
             device: ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"ep-{index}")
             for index, device in enumerate(plan.devices)
@@ -374,7 +398,6 @@ class ExpertParallelExecutor:
     def __exit__(self, exc_type, exc_value, traceback):
         self.close()
 
-    @torch.no_grad()
     @staticmethod
     def _copy_inputs(value, device, stream):
         def copy(item):
@@ -399,6 +422,207 @@ class ExpertParallelExecutor:
             return output
 
         return tree_map(copy, value)
+
+    @staticmethod
+    def _same_static_value(first, current):
+        if type(first) is not type(current):
+            return False
+        if isinstance(first, (bool, int, float, str, bytes, type(None))):
+            return first == current
+        return first is current
+
+    @staticmethod
+    def _call_leaves(args, kwargs):
+        return tree_flatten((args, kwargs))
+
+    @classmethod
+    def _inputs_compatible(cls, entries, primary):
+        if not entries:
+            return False
+        first_leaves, first_spec = cls._call_leaves(
+            entries[0][1], entries[0][2]
+        )
+        tensor_indices = []
+        for leaf_index, leaf in enumerate(first_leaves):
+            if isinstance(leaf, torch.Tensor):
+                if leaf.ndim < 1 or leaf.device != primary:
+                    return False
+                tensor_indices.append(leaf_index)
+            else:
+                if leaf is not None and not isinstance(
+                    leaf, (bool, int, float, str, bytes)
+                ):
+                    return False
+        if not tensor_indices:
+            return False
+
+        for _name, args, kwargs in entries:
+            leaves, spec = cls._call_leaves(args, kwargs)
+            if spec != first_spec or len(leaves) != len(first_leaves):
+                return False
+            task_length = None
+            tensor_ids = set()
+            for leaf_index, (first, current) in enumerate(
+                zip(first_leaves, leaves)
+            ):
+                if isinstance(first, torch.Tensor):
+                    if (
+                        not isinstance(current, torch.Tensor)
+                        or current.ndim != first.ndim
+                        or current.device != primary
+                        or current.dtype != first.dtype
+                        or current.shape[1:] != first.shape[1:]
+                        or id(current) in tensor_ids
+                    ):
+                        return False
+                    tensor_ids.add(id(current))
+                    if task_length is None:
+                        task_length = current.shape[0]
+                    elif task_length != current.shape[0]:
+                        return False
+                elif not cls._same_static_value(first, current):
+                    return False
+            if task_length is None:
+                return False
+        return True
+
+    @classmethod
+    def _prepare_batch(cls, entries, primary):
+        if not cls._inputs_compatible(entries, primary):
+            return None
+        first_leaves, spec = cls._call_leaves(entries[0][1], entries[0][2])
+        all_leaves = [
+            cls._call_leaves(args, kwargs)[0]
+            for _name, args, kwargs in entries
+        ]
+        lengths = tuple(
+            next(
+                leaves[leaf_index].shape[0]
+                for leaf_index in range(len(first_leaves))
+                if isinstance(leaves[leaf_index], torch.Tensor)
+            )
+            for leaves in all_leaves
+        )
+        combined_leaves = []
+        for leaf_index, first in enumerate(first_leaves):
+            if isinstance(first, torch.Tensor):
+                combined_leaves.append(
+                    torch.cat(
+                        [
+                            leaves[leaf_index]
+                            for leaves in all_leaves
+                        ],
+                        dim=0,
+                    )
+                )
+            else:
+                combined_leaves.append(first)
+        combined_args, combined_kwargs = tree_unflatten(combined_leaves, spec)
+        return _PreparedExpertBatch(
+            tuple(name for name, _args, _kwargs in entries),
+            combined_args,
+            combined_kwargs,
+            lengths,
+        )
+
+    def _group_ready_experts(self, entries, primary):
+        groups = []
+        current = []
+        current_bytes = 0
+        for entry in entries:
+            input_bytes = sum(
+                item.numel() * item.element_size()
+                for item in self._call_leaves(entry[1], entry[2])[0]
+                if isinstance(item, torch.Tensor)
+            )
+            exceeds_budget = (
+                current
+                and current_bytes + input_bytes > self.max_batch_input_bytes
+            )
+            incompatible = (
+                current
+                and not self._inputs_compatible(current + [entry], primary)
+            )
+            if exceeds_budget or incompatible:
+                groups.append(current)
+                current = []
+                current_bytes = 0
+            current.append(entry)
+            current_bytes += input_bytes
+        if current:
+            groups.append(current)
+        return groups
+
+    @staticmethod
+    def _copy_batch_outputs(outputs, lengths, primary, stream, primary_stream):
+        flattened = [tree_flatten(output) for output in outputs]
+        first_leaves, first_spec = flattened[0]
+        for leaves, spec in flattened[1:]:
+            if spec != first_spec or len(leaves) != len(first_leaves):
+                return tuple(
+                    ExpertParallelExecutor._copy_outputs(
+                        output, primary, stream, primary_stream
+                    )
+                    for output in outputs
+                )
+        for leaf_index, first in enumerate(first_leaves):
+            if isinstance(first, torch.Tensor):
+                if (
+                    first.ndim < 1
+                    or first.shape[0] != lengths[0]
+                    or any(
+                        not isinstance(leaves[leaf_index], torch.Tensor)
+                        or leaves[leaf_index].ndim != first.ndim
+                        or leaves[leaf_index].shape[0] != lengths[index]
+                        or leaves[leaf_index].shape[1:] != first.shape[1:]
+                        or leaves[leaf_index].dtype != first.dtype
+                        for index, (leaves, _spec) in enumerate(flattened)
+                    )
+                ):
+                    return tuple(
+                        ExpertParallelExecutor._copy_outputs(
+                            output, primary, stream, primary_stream
+                        )
+                        for output in outputs
+                    )
+            elif any(
+                not ExpertParallelExecutor._same_static_value(
+                    first, leaves[leaf_index]
+                )
+                for leaves, _spec in flattened
+            ):
+                return tuple(
+                    ExpertParallelExecutor._copy_outputs(
+                        output, primary, stream, primary_stream
+                    )
+                    for output in outputs
+                )
+
+        split_leaves = [[] for _ in outputs]
+        for leaf_index, first in enumerate(first_leaves):
+            if isinstance(first, torch.Tensor):
+                combined = torch.cat(
+                    [leaves[leaf_index] for leaves, _spec in flattened],
+                    dim=0,
+                )
+                copied = combined.to(
+                    primary, non_blocking=stream is not None
+                )
+                if (
+                    stream is not None
+                    and primary_stream is not None
+                    and copied.device.type == "cuda"
+                ):
+                    copied.record_stream(primary_stream)
+                pieces = copied.split(lengths, dim=0)
+                for index, piece in enumerate(pieces):
+                    split_leaves[index].append(piece)
+            else:
+                for index in range(len(outputs)):
+                    split_leaves[index].append(first)
+        return tuple(
+            tree_unflatten(leaves, first_spec) for leaves in split_leaves
+        )
 
     def _expert_forward(self, name, args, kwargs, input_event, primary_stream):
         device = self.plan.device_for(name)
@@ -428,7 +652,61 @@ class ExpertParallelExecutor:
                 )
                 if output_event is not None:
                     output_event.record(owner_stream)
-                return _ExpertResult(output, output_event)
+                return _ExpertBatchResult((output,), output_event)
+
+    def _expert_forward_batch(
+        self, prepared, input_event, primary_stream
+    ):
+        device = self.plan.device_for(prepared.names[0])
+        if any(self.plan.device_for(name) != device for name in prepared.names):
+            raise ValueError("An expert batch must have one owner device")
+        primary = self.plan.devices[0]
+        context = torch.cuda.device(device) if device.type == "cuda" else nullcontext()
+        owner_stream = self._streams[device]
+        with context:
+            stream_context = (
+                torch.cuda.stream(owner_stream)
+                if owner_stream is not None
+                else nullcontext()
+            )
+            with stream_context:
+                if input_event is not None:
+                    owner_stream.wait_event(input_event)
+                moved_args, moved_kwargs = self._copy_inputs(
+                    (prepared.args, prepared.kwargs), device, owner_stream
+                )
+                moved_leaves, spec = self._call_leaves(
+                    moved_args, moved_kwargs
+                )
+                outputs = []
+                offset = 0
+                for name, length in zip(prepared.names, prepared.lengths):
+                    task_leaves = [
+                        leaf.narrow(0, offset, length)
+                        if isinstance(leaf, torch.Tensor)
+                        else leaf
+                        for leaf in moved_leaves
+                    ]
+                    task_args, task_kwargs = tree_unflatten(task_leaves, spec)
+                    outputs.append(
+                        self.model.get_submodule(name)(
+                            *task_args, **task_kwargs
+                        )
+                    )
+                    offset += length
+                outputs = self._copy_batch_outputs(
+                    outputs,
+                    prepared.lengths,
+                    primary,
+                    owner_stream,
+                    primary_stream,
+                )
+                output_event = (
+                    torch.cuda.Event() if owner_stream is not None else None
+                )
+                if output_event is not None:
+                    output_event.record(owner_stream)
+                return _ExpertBatchResult(outputs, output_event)
 
     @torch.no_grad()
     def forward(
@@ -442,7 +720,7 @@ class ExpertParallelExecutor:
         dependencies, users = schedule.dependencies, schedule.users
         ready = deque(schedule.ready)
         values: dict[Node, Any] = {}
-        pending: dict[Future, Node] = {}
+        pending: dict[Future, tuple[Node, ...]] = {}
         remaining_users = schedule.remaining_users.copy()
         output = None
         primary = self.plan.devices[0]
@@ -471,6 +749,7 @@ class ExpertParallelExecutor:
         unmet = schedule.unmet.copy()
         try:
             while ready or pending:
+                ready_experts = {}
                 while ready:
                     node = ready.popleft()
                     args, kwargs = map_arg((node.args, node.kwargs), values.__getitem__)
@@ -484,20 +763,9 @@ class ExpertParallelExecutor:
                     elif node.op == "call_module":
                         name = str(node.target)
                         if self.plan.is_expert(name):
-                            input_event = (
-                                primary_stream.record_event()
-                                if primary_stream is not None
-                                else None
-                            )
-                            future = self._workers[self.plan.device_for(name)].submit(
-                                self._expert_forward,
-                                name,
-                                args,
-                                kwargs,
-                                input_event,
-                                primary_stream,
-                            )
-                            pending[future] = node
+                            ready_experts.setdefault(
+                                self.plan.device_for(name), []
+                            ).append((node, name, args, kwargs))
                         else:
                             finish(
                                 node, self.model.get_submodule(name)(*args, **kwargs)
@@ -515,15 +783,71 @@ class ExpertParallelExecutor:
                         raise ValueError(
                             f"Unsupported expert parallel FX operation {node.op}"
                         )
+                dispatches = []
+                primary_context = (
+                    torch.cuda.device(primary)
+                    if primary.type == "cuda"
+                    else nullcontext()
+                )
+                primary_stream_context = (
+                    torch.cuda.stream(primary_stream)
+                    if primary_stream is not None
+                    else nullcontext()
+                )
+                with primary_context, primary_stream_context:
+                    for owner, entries in ready_experts.items():
+                        for group in self._group_ready_experts(entries, primary):
+                            prepared = (
+                                self._prepare_batch(group, primary)
+                                if len(group) > 1
+                                else None
+                            )
+                            dispatches.append((owner, group, prepared))
+                    input_event = (
+                        primary_stream.record_event()
+                        if primary_stream is not None and dispatches
+                        else None
+                    )
+                for owner, entries, prepared in dispatches:
+                    if prepared is not None:
+                        future = self._workers[owner].submit(
+                            self._expert_forward_batch,
+                            prepared,
+                            input_event,
+                            primary_stream,
+                        )
+                        pending[future] = tuple(entry[0] for entry in entries)
+                        continue
+                    for _node, name, args, kwargs in entries:
+                        future = self._workers[owner].submit(
+                            self._expert_forward,
+                            name,
+                            args,
+                            kwargs,
+                            input_event,
+                            primary_stream,
+                        )
+                        pending[future] = (_node,)
                 if pending:
                     completed, _remaining = wait(pending, return_when=FIRST_COMPLETED)
                     for future in completed:
-                        node = pending.pop(future)
+                        nodes = pending.pop(future)
                         result = future.result()
-                        if isinstance(result, _ExpertResult):
-                            finish(node, result.value, result.event)
+                        if isinstance(result, _ExpertBatchResult):
+                            if result.event is not None:
+                                primary_stream.wait_event(result.event)
+                            if len(nodes) != len(result.values):
+                                raise RuntimeError(
+                                    "Expert batch returned an unexpected result count"
+                                )
+                            for node, result_value in zip(nodes, result.values):
+                                finish(node, result_value)
                         else:
-                            finish(node, result)
+                            if len(nodes) != 1:
+                                raise RuntimeError(
+                                    "Expert batch fallback returned multiple nodes"
+                                )
+                            finish(nodes[0], result)
         except BaseException:
             for future in pending:
                 future.cancel()

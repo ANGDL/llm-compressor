@@ -996,7 +996,17 @@ provider、基础 MTP wrapper 和 QAD + GPTQ adapter 已经落地；本阶段按
 1. **EP 性能闭环（2026-11-15 提升为当前首要任务）**：先单进程、多设备
    专家所有权分片与并发前向，复用 GPTQ 数学和单写者事务；完成目标设备
    correctness/resource 验证后，用原始 DSV4.1 参数启动 8 卡 E2E，按普通组和
-   attention 组分别报告吞吐。多进程 EP-B 继续单独交付。
+   attention 组分别报告吞吐。2026-11-16 复核旧分支 `streaming-ptq-ep`
+   (`02b6ca111`) 后，性能主路径调整为通用 local-owner execution + target/batch
+   combine；逐 expert D2D 仅保留为通用 fallback。EP core 复用现有
+   `streaming/moe/adapters.py` 的 `MoEModelAdapter` contract，只依赖外部
+   expert container、route metadata、state ownership 和 partial output contract，
+   并通过临时 proxy 接入标准 `ModuleList`/`ModuleDict`；模型本身不必增加
+   `configure_streaming_ep`。DSV4.1 只是第一个 adapter
+   验收样例，不能在 pipeline、admission、writer 或 executor 中加入模型名分支。多进程 EP-B
+   沿用旧分支的 EP topology、rank-local staging 和 global commit 语义，仍需
+   tiny/native/fused MoE 以及 DSV4.1 的真实多 rank 验收，不能把旧分支单元
+   测试当作完成证明。
 2. **HIGGS 组合接入**：验证 provider 生成的 config 交给 streaming GPTQ/RTN
    的路径，并把 provider fingerprint 纳入恢复身份。
 3. **observer numerics parity**：适配 upstream `b3faa86f3` 的误差 dtype、
