@@ -330,6 +330,12 @@ class _ExecutionGraph:
         )
 
 
+@dataclass(frozen=True)
+class _ExpertResult:
+    value: Any
+    event: Any | None = None
+
+
 class ExpertParallelExecutor:
     """Schedule independent expert calls concurrently and preserve FX dataflow."""
 
@@ -340,11 +346,27 @@ class ExpertParallelExecutor:
             device: ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"ep-{index}")
             for index, device in enumerate(plan.devices)
         }
+        self._streams = {
+            device: (
+                torch.cuda.Stream(device=device)
+                if device.type == "cuda"
+                else None
+            )
+            for device in plan.devices
+        }
         self._graphs: dict[tuple[int, ...], _ExecutionGraph] = {}
 
     def close(self) -> None:
+        self.synchronize()
         for worker in self._workers.values():
             worker.shutdown(wait=True, cancel_futures=True)
+
+    def synchronize(self) -> None:
+        """Wait for queued owner streams before weights are unloaded or changed."""
+
+        for stream in self._streams.values():
+            if stream is not None:
+                stream.synchronize()
 
     def __enter__(self):
         return self
@@ -353,31 +375,60 @@ class ExpertParallelExecutor:
         self.close()
 
     @torch.no_grad()
-    def _expert_forward(self, name, args, kwargs, input_event):
+    @staticmethod
+    def _copy_inputs(value, device, stream):
+        def copy(item):
+            if not isinstance(item, torch.Tensor):
+                return item
+            return item.to(device, non_blocking=stream is not None)
+
+        return tree_map(copy, value)
+
+    @staticmethod
+    def _copy_outputs(value, primary, stream, primary_stream):
+        def copy(item):
+            if not isinstance(item, torch.Tensor):
+                return item
+            output = item.to(primary, non_blocking=stream is not None)
+            if (
+                stream is not None
+                and primary_stream is not None
+                and output.device.type == "cuda"
+            ):
+                output.record_stream(primary_stream)
+            return output
+
+        return tree_map(copy, value)
+
+    def _expert_forward(self, name, args, kwargs, input_event, primary_stream):
         device = self.plan.device_for(name)
         primary = self.plan.devices[0]
-        if input_event is not None:
-            input_event.synchronize()
         context = torch.cuda.device(device) if device.type == "cuda" else nullcontext()
+        owner_stream = self._streams[device]
         with context:
-            moved_args, moved_kwargs = tree_map(
-                lambda value: (
-                    value.to(device) if isinstance(value, torch.Tensor) else value
-                ),
-                (args, kwargs),
+            stream_context = (
+                torch.cuda.stream(owner_stream)
+                if owner_stream is not None
+                else nullcontext()
             )
-            output = self.model.get_submodule(name)(*moved_args, **moved_kwargs)
-            if device.type == "cuda":
-                torch.cuda.synchronize(device)
-            output = tree_map(
-                lambda value: (
-                    value.to(primary) if isinstance(value, torch.Tensor) else value
-                ),
-                output,
-            )
-            if primary.type == "cuda":
-                torch.cuda.synchronize(primary)
-            return output
+            with stream_context:
+                if input_event is not None:
+                    owner_stream.wait_event(input_event)
+                moved_args, moved_kwargs = self._copy_inputs(
+                    (args, kwargs), device, owner_stream
+                )
+                output = self.model.get_submodule(name)(
+                    *moved_args, **moved_kwargs
+                )
+                output = self._copy_outputs(
+                    output, primary, owner_stream, primary_stream
+                )
+                output_event = (
+                    torch.cuda.Event() if owner_stream is not None else None
+                )
+                if output_event is not None:
+                    output_event.record(owner_stream)
+                return _ExpertResult(output, output_event)
 
     @torch.no_grad()
     def forward(
@@ -394,9 +445,17 @@ class ExpertParallelExecutor:
         pending: dict[Future, Node] = {}
         remaining_users = schedule.remaining_users.copy()
         output = None
+        primary = self.plan.devices[0]
+        primary_stream = (
+            torch.cuda.current_stream(primary)
+            if primary.type == "cuda"
+            else None
+        )
 
-        def finish(node, result):
+        def finish(node, result, event=None):
             nonlocal output
+            if event is not None:
+                primary_stream.wait_event(event)
             values[node] = result
             if node.op == "output":
                 output = result
@@ -426,14 +485,17 @@ class ExpertParallelExecutor:
                         name = str(node.target)
                         if self.plan.is_expert(name):
                             input_event = (
-                                torch.cuda.current_stream(
-                                    self.plan.devices[0]
-                                ).record_event()
-                                if self.plan.devices[0].type == "cuda"
+                                primary_stream.record_event()
+                                if primary_stream is not None
                                 else None
                             )
                             future = self._workers[self.plan.device_for(name)].submit(
-                                self._expert_forward, name, args, kwargs, input_event
+                                self._expert_forward,
+                                name,
+                                args,
+                                kwargs,
+                                input_event,
+                                primary_stream,
                             )
                             pending[future] = node
                         else:
@@ -457,7 +519,11 @@ class ExpertParallelExecutor:
                     completed, _remaining = wait(pending, return_when=FIRST_COMPLETED)
                     for future in completed:
                         node = pending.pop(future)
-                        finish(node, future.result())
+                        result = future.result()
+                        if isinstance(result, _ExpertResult):
+                            finish(node, result.value, result.event)
+                        else:
+                            finish(node, result)
         except BaseException:
             for future in pending:
                 future.cancel()

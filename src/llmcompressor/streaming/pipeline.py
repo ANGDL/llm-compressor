@@ -1833,6 +1833,8 @@ def run_subgraph_streaming_pipeline(
                         f"{target_label} | unload weights",
                         device,
                     ):
+                        if ep_executor is not None:
+                            ep_executor.synchronize()
                         weight_stack.close()
                         boundaries.delete(group_start)
                         _empty_device_cache(device)
