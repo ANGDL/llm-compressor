@@ -1176,7 +1176,8 @@ def run_subgraph_streaming_pipeline(
     host_budget = HostMemoryBudget()
     disk_budget = DiskSpaceBudget(work)
     boundaries: BoundaryActivationStore
-    if checkpoint_progress:
+    memory_frontier = checkpoint_progress and expert_parallel is not None
+    if checkpoint_progress and not memory_frontier:
         boundaries = DiskBoundaryActivationStore(
             work / "boundaries", host_budget=host_budget
         )
@@ -1186,6 +1187,16 @@ def run_subgraph_streaming_pipeline(
             deduplicate_tensors=True,
             host_budget=host_budget,
         )
+    streaming_logger.info(
+        "setup | boundary storage | "
+        + (
+            "in-memory live frontier with durable checkpoint transactions"
+            if memory_frontier
+            else "disk-backed checkpoint frontier"
+            if checkpoint_progress
+            else "in-memory"
+        )
+    )
     source = adapter.weight_session.source
     written: set[str] = set()
     resume_plan = (
@@ -1502,9 +1513,16 @@ def run_subgraph_streaming_pipeline(
                         device_required = (
                             materialized_bytes + modifier_memory.peak_bytes
                         )
+                        boundary_disk_multiplier = (
+                            2
+                            if checkpoint_progress and memory_frontier
+                            else 4
+                            if checkpoint_progress
+                            else 0
+                        )
                         disk_required = (
                             (4 if async_save else 2) * materialized_bytes
-                            + (4 * boundary_bytes if checkpoint_progress else 0)
+                            + boundary_disk_multiplier * boundary_bytes
                             + 1024 * 1024
                         )
                         disk_budget.check(target_label, disk_required)

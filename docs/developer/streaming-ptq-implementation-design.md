@@ -2568,3 +2568,101 @@ node16 日志：
 `0f66ca529`。最终代码相对 `58917dcd6` 的 GPTQ 目录 diff 为空；算法适配集中于
 streaming 模块。没有生产端到端结果，因此全模型运行速度、所有层的显存峰值
 和资源曲线准确性仍需后续获准进行完整验证时实测。
+
+### 17.4 2026-11-16 物理 GPU 4–7、EP=4 全模型测试
+
+用户在单测完成后授权进行 EP=4 端到端测试，并允许清理 SSD2 上之前中断或用于
+适配的量化权重。本轮新建独立 run，保留原始失败 run 和上一轮 EP8 的记录，
+不将旧 checkpoint 当作 token policy 新实现的产物续跑。
+
+| 项目 | 本轮配置 |
+| --- | --- |
+| source run | `20261112T090344Z_a619a1629881` |
+| 新 run | `20261116T090217Z_dsv41_gptq_ep4_tokens` |
+| model ID | `deepseek_v41_wNa8-c5840582` |
+| attempt | `attempt-20261116T090217Z-dd1b9e86` |
+| quantize job | `job-20261116T090239Z-804444ab` |
+| report job | `job-20261116T090239Z-46892bae` |
+| 被测代码 | `73553b9a2f248aa09559c7acfaa9b43701fa36af` |
+| 容器/仓库 | node16 `llm-quant-base` / `/data/quant/llm-compressor` |
+| source model | `/ssd4/models/DeepSeek-V4.1-Flash-1017` |
+| 量化脚本 | `examples/streaming_oneshot/deepseek_v41_wNa8.py` |
+| 量化配置 | GPTQ WNa8，FP32 weight scales，量化 Engram wkv 和 attention wo_a |
+| 校准配置 | 266 samples，text samples 参数为 256，max sequence length 8192，seed 42 |
+| pipeline batch size | 1 |
+| EP devices | 逻辑 `cuda:0`–`cuda:3`，物理 GPU 4–7 |
+| 设备环境 | `CUDA_VISIBLE_DEVICES=4,5,6,7`，已从实际量化进程的 `/proc/<pid>/environ` 核对 |
+| token policy | `--expert-parallel-token-budget auto` |
+| HIGGS | 关闭，隔离 GPTQ/EP 路径的行为和速度 |
+| 保存 | `--no-async-save --save-raw-checkpoint-format`，新 work/model 目录 |
+| 流水线阶段 | preflight → 全模型 quantize → checkpoint validate → report |
+| 未调度阶段 | runtime-smoke、evaluate、publish；避免原八卡推理流程使用 GPU 0–3 |
+| GPU-hour 调度预算 | 本轮预留 96 GPU-hours；队列容量上限 240 GPU-hours，不作为速度预测 |
+
+物理 GPU 4–7 在启动前均无运行进程、各有约 96 GiB 可用显存。流水线 preflight
+在 worker 的宿主环境读取设备总数，因此其记录的 `visible_gpus=8` 不是量化
+进程的设备集；quantize 子进程由 `workflow.env` 在启动前设置上述四卡 mask，
+executor 中的逻辑 `cuda:0` 对应物理 GPU 4。
+
+**存储准备。** SSD2 原可用约 233 GiB，低于此前估算的约 459.6 GiB 完整
+WNa8 产物。通过现有 control plane 的 `cleanup_artifacts` 对旧 HIGGS
+适配 run `20261114T091000Z_dsv41higgs` 做预览后执行清理，删除 55 个权重、
+index/完成标记文件，共 `631,342,683,170 bytes`。该适配产物此前已经完成
+quantize/validate；本次依据用户对旧适配权重的清理授权明确退役，并非把它
+重新判定为失败。保留其配置、tokenizer、日志、stage 记录及报告，control
+plane 同时写入 cleanup 审计。清理后 SSD2 可用约 821 GiB，源模型、其他
+用户目录以及独立 smoke checkpoint 均保留。
+
+**启动记录。** 新计划经当前 checkout 的 `ControlPlane.preview_plan` 生成，
+检查确认为四卡 mask、EP=4、自动 token policy、无上传和无八卡推理任务，
+随后由正常队列 worker 执行。原 Web/worker 进程在本轮准备期间退出，已通过
+`scripts/model-quality-web-remote ... up` 恢复；Web 服务版本同步标为被测 SHA。
+临时启动配置关闭 inference worker，本轮仅使用主 quantize/report 队列。
+
+实际量化进程于 `2026-11-16 17:05:29 +08:00` 启动；preflight 无失败项，
+状态 WARN 仅因未启用可选 evaluation。此时完成数据预处理并开始构建模型和
+tracing。用户随后要求停止测试，为其他测试释放机器。通过
+`ControlPlane.cancel` 取消本轮 quantize 及后续 report 任务，并释放预留的
+96 GPU-hours。于 `2026-11-16 17:09:57 +08:00` 确认量化 PID `1931690`
+及 stage PID `1931689` 均已退出，物理 GPU 4–7 均为 `0 MiB`、`0%` 使用率。
+Web 和空闲队列 worker 保留运行，日志与运行记录保留。
+
+本轮在模型构建/tracing 阶段取消，尚无完整 target group 量化结果或端到端
+通过结论。取消时子进程退出产生的 `QUANTIZATION_FAILED` 阶段消息属于取消
+的结果，不代表新发现的实现故障；worker 日志确认任务状态为 `CANCELED`。
+
+远端记录位置：
+
+- 协议/完整参数：`/ssd2/model-quality/runs/20261116T090217Z_dsv41_gptq_ep4_tokens/ep4-token-test-protocol.json`
+- 计划与启动响应：`/ssd2/model-quality/launch-records/20261116T090217Z_dsv41_gptq_ep4_tokens.json`
+- 清理审计副本：`/ssd2/model-quality/launch-records/ep4-higgs-cleanup.json`
+- 阶段日志：run 下 `deepseek_v41_wNa8-c5840582/logs/attempt-20261116T090217Z-dd1b9e86/`
+
+后续仅在用户重新授权启动后继续验证，并记录首个完整 target group、普通 expert group 的稳定耗时、各 owner
+自动容量与实际 dispatch tokens、峰值显存、最终 FINALIZED/index 校验及 report
+状态，再判定通过或失败。初始化、attention group、普通 expert group 和最终
+静态张量写入分别计时，不能根据单一阶段耗时提前宣称整体加速比或完成时间。
+
+### 17.5 EP checkpoint frontier 的内存驻留
+
+EP 目标组的边界与普通 decoder boundary 不同。一个 GPTQ target group 可能只
+处理一个 MoE 层的部分 experts，但它的输出仍要携带已经计算出的 routed expert
+结果，直到父级 MoE 聚合完成。DSV4.1 首组实测输入 boundary 约 `98 GiB`，
+传播后 boundary 约 `260 GiB`，若每个 batch 都经过 SSD 临时文件，会同时产生
+GPU→CPU 拷贝、源 boundary 重读、`torch.save` 和 `fsync`。该阶段会让 XPU 长时
+空闲，CPU 和 SSD 成为瓶颈。
+
+当 `checkpoint_progress=True` 且启用了 EP 时，pipeline 现在使用
+`InMemoryBoundaryActivationStore` 保存当前 live frontier。传播过程中复用已经
+加载的 source boundary，避免 `DiskBoundaryActivationStore.commit_propagated_batch`
+重新读取同一 batch。每个 subgraph transaction 提交时，仍通过
+`StreamingCheckpointWriter.write_boundary` 将完整 frontier 持久化，因此恢复点、
+transaction metadata、boundary checksum 和失败重试语义保持不变。非 EP 的
+checkpoint pipeline 继续使用磁盘 frontier，以避免无界增加普通模型的主机内存
+占用。
+
+内存 frontier 的临时磁盘预算只计算 transaction 边界写入及其临时副本；磁盘
+frontier 仍使用原有的更保守预算。该策略适用于 GPTQ、HIGGS、RTN、AWQ 以及
+其他遵守 streaming modifier contract 的 modifier，不依赖具体量化算法。主机
+内存不足时，EP admission 或 boundary store 会在写入前通过
+`HostMemoryBudget` 拒绝运行，而不是隐式退回已淘汰的 CPU offload。
