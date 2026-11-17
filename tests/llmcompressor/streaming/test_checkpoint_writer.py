@@ -134,6 +134,27 @@ def test_committed_boundary_is_validated_and_reloaded(tmp_path):
     assert writer.committed_boundary("subgraph-00000") is None
 
 
+def test_boundary_metadata_supports_torch_scalar_metadata(tmp_path):
+    writer = StreamingCheckpointWriter(tmp_path, run_fingerprint="run-a")
+    value = {
+        "dtype": torch.bfloat16,
+        "device": torch.device("cpu"),
+        "layout": torch.strided,
+    }
+    with writer.transaction("subgraph-00000") as transaction:
+        transaction.write_boundary(0, value, boundary=1)
+        transaction.commit()
+
+    metadata = json.loads(
+        (tmp_path / "transactions/subgraph-00000/metadata.json").read_text()
+    )
+    structure = metadata["boundary"]["batches"][0]["summary"]["structure"]
+    described = {item["key"]: item["value"] for item in structure["items"]}
+    assert described["dtype"] == {"type": "torch.dtype", "value": "torch.bfloat16"}
+    assert described["device"] == {"type": "torch.device", "value": "cpu"}
+    assert described["layout"] == {"type": "torch.layout", "value": "torch.strided"}
+
+
 def test_transaction_metadata_contains_payload_checksum(tmp_path):
     writer = StreamingCheckpointWriter(tmp_path, run_fingerprint="run-a")
     with writer.transaction("subgraph-00000") as transaction:

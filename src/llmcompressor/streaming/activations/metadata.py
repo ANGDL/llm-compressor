@@ -45,6 +45,12 @@ def _describe(
         )
     if value is None or isinstance(value, (bool, int, float, str)):
         return {"type": type(value).__name__, "value": value}, 0
+    if isinstance(value, torch.dtype):
+        return {"type": "torch.dtype", "value": str(value)}, 0
+    if isinstance(value, torch.device):
+        return {"type": "torch.device", "value": str(value)}, 0
+    if isinstance(value, torch.layout):
+        return {"type": "torch.layout", "value": str(value)}, 0
     if isinstance(value, bytes):
         return {
             "type": "bytes",
