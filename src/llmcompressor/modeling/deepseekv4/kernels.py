@@ -9,6 +9,8 @@ from typing import Optional
 import torch
 from torch.nn import functional as F
 
+from llmcompressor.utils.hardware_ops import optional_hardware_backend
+
 REFERENCE_KERNEL_BACKEND_ENV = "DEEPSEEK_V4_KERNEL_BACKEND"
 REFERENCE_KERNEL_PATH_ENV = "DEEPSEEK_V4_REFERENCE_KERNEL_PATH"
 REFERENCE_MODEL_ENV = "DEEPSEEK_V4_REFERENCE_MODEL_PATH"
@@ -97,6 +99,7 @@ def _can_use_reference_kernels(tensor: torch.Tensor) -> bool:
     return tensor.is_cuda and _load_reference_kernel_module() is not None
 
 
+@optional_hardware_backend("bmm_fp32", contract_version=1)
 def _bmm_fp32(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
     """Use an FP32 accumulator on backends without ``bmm(out_dtype=...)``."""
 

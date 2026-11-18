@@ -139,6 +139,33 @@ def test_put_detaches_and_snapshots_tensors(store):
     assert torch.equal(reloaded["hidden_states"], torch.arange(4.0))
 
 
+def test_execution_metadata_charges_selected_aliases_once_and_excludes_carry():
+    store = InMemoryBoundaryActivationStore()
+    hidden = torch.ones(3, 4)
+    store.put(0, 0, {
+        "hidden": hidden,
+        "alias": hidden,
+        "carry": torch.ones(1000, 4),
+    })
+    metadata = store.execution_metadata(0, 0, {"hidden"})
+    assert set(metadata.values) == {"hidden", "alias"}
+    assert metadata.values["hidden"] is metadata.values["alias"]
+    assert metadata.tensor_bytes == hidden.nbytes
+    executed = store.get_for_execution(0, 0, {"hidden"})
+    assert set(executed) == set(metadata.values)
+
+
+def test_execution_alias_cache_is_invalidated_when_boundary_batch_changes():
+    store = InMemoryBoundaryActivationStore()
+    hidden = torch.ones(3, 4)
+    store.put(0, 0, {"hidden": hidden, "alias": hidden})
+    assert set(store.execution_metadata(0, 0, {"hidden"}).values) == {
+        "hidden", "alias"
+    }
+    store.put(0, 0, {"hidden": hidden, "alias": hidden.clone()})
+    assert set(store.execution_metadata(0, 0, {"hidden"}).values) == {"hidden"}
+
+
 def test_iterates_batches_in_stable_order(store):
     store.put(3, 2, {"hidden_states": torch.tensor([2])})
     store.put(3, 0, {"hidden_states": torch.tensor([0])})

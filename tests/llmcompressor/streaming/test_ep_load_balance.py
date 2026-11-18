@@ -123,6 +123,20 @@ def test_resident_windows_split_by_memory_and_report_activation_batches():
     assert max(window.activation_batches for window in windows) >= 2
 
 
+def test_resident_windows_keep_capacity_for_a_token_before_loading():
+    costs = {
+        "experts.0": ExpertCostProfile(storage_bytes=5, route_tokens=3),
+        "experts.1": ExpertCostProfile(storage_bytes=5, route_tokens=3),
+    }
+    placement = build_load_balanced_placement(costs, 1)
+    windows = plan_resident_windows(
+        placement, costs,
+        (OwnerMemoryProfile(usable_bytes=10, dispatch_bytes_per_token=1),),
+    )
+    assert len(windows) == 2
+    assert all(window.max_dispatch_tokens == 3 for window in windows)
+
+
 def test_async_window_scheduler_runs_owners_concurrently():
     costs = {
         "experts.0": ExpertCostProfile(storage_bytes=1, route_tokens=4),
@@ -169,6 +183,39 @@ def test_async_window_scheduler_runs_owners_concurrently():
     assert [window.owner_rank for window, _result in results] == [0, 1]
     assert [kind for kind, _owner, _value in events].count("compute") == 2
     assert [kind for kind, _owner, _value in events].count("release") == 2
+
+
+@pytest.mark.parametrize("next_prefetch_fails", [False, True])
+def test_async_windows_release_pending_state_and_preserve_compute_failure(
+    next_prefetch_fails,
+):
+    costs = {
+        f"experts.{index}": ExpertCostProfile(storage_bytes=8, route_tokens=1)
+        for index in range(3)
+    }
+    placement = build_load_balanced_placement(costs, 1)
+    windows = plan_resident_windows(
+        placement, costs, (OwnerMemoryProfile(usable_bytes=10),)
+    )
+    next_ready = threading.Event()
+    discarded = []
+
+    def prefetch(window):
+        if window.window_index == 1:
+            next_ready.set()
+            if next_prefetch_fails:
+                raise ValueError("prefetch failed")
+        return window.window_index
+
+    def compute(_window, _state):
+        assert next_ready.wait(timeout=5)
+        raise RuntimeError("compute failed")
+
+    with pytest.raises(RuntimeError, match="compute failed"):
+        AsyncResidentWindowScheduler().run(
+            windows, prefetch=prefetch, compute=compute, discard=discarded.append
+        )
+    assert sorted(discarded) == ([0] if next_prefetch_fails else [0, 1])
 
 
 def test_owner_update_scheduler_runs_disjoint_groups_concurrently():

@@ -8,7 +8,7 @@ import shutil
 import uuid
 from abc import ABC, abstractmethod
 from collections.abc import Collection, Mapping
-from dataclasses import fields, is_dataclass
+from dataclasses import dataclass, fields, is_dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterator
 
@@ -203,6 +203,14 @@ def _tensors(value: Any) -> Iterator[torch.Tensor]:
             yield from _tensors(item)
 
 
+@dataclass(frozen=True)
+class ExecutionBoundaryMetadata:
+    """Metadata for exactly the tensors transferred by an execution read."""
+
+    values: Any
+    tensor_bytes: int
+
+
 class BoundaryActivationStore(ABC):
     """Common batch-oriented interface for adjacent target activations."""
 
@@ -246,6 +254,20 @@ class BoundaryActivationStore(ABC):
         Reads isolate tensors from the store, including inputs mutated in place.
         """
         return self.get(boundary, batch, device=device)
+
+    def execution_metadata(
+        self, boundary: int, batch: int, input_names: Collection[str]
+    ) -> ExecutionBoundaryMetadata:
+        values = self.get_for_execution(
+            boundary, batch, input_names, device="meta"
+        )
+        return ExecutionBoundaryMetadata(values, _tensor_bytes(values))
+
+    def read_for_routing(
+        self, boundary: int, batch: int, input_names: Collection[str]
+    ) -> Any:
+        """Borrow CPU inputs for a verified nonmutating routing graph."""
+        return self.get_for_execution(boundary, batch, input_names, device="cpu")
 
     def commit_propagated_batch(
         self,
@@ -296,6 +318,9 @@ class InMemoryBoundaryActivationStore(BoundaryActivationStore):
         self.host_budget = host_budget
         self._boundaries: dict[int, dict[int, Any]] = {}
         self._reservations: dict[int, dict[int, HostMemoryReservation]] = {}
+        self._execution_names: dict[
+            tuple[int, int, frozenset[str]], frozenset[str]
+        ] = {}
 
     def put(self, boundary: int, batch: int, value: Any) -> None:
         self._put(boundary, batch, value)
@@ -344,6 +369,7 @@ class InMemoryBoundaryActivationStore(BoundaryActivationStore):
             raise
         previous = self._reservations.get(boundary, {}).pop(batch, None)
         self._boundaries.setdefault(boundary, {})[batch] = snapshot
+        self._invalidate_execution_names(boundary, batch)
         if reservation is not None:
             self._reservations.setdefault(boundary, {})[batch] = reservation
         if previous is not None:
@@ -380,6 +406,17 @@ class InMemoryBoundaryActivationStore(BoundaryActivationStore):
             ) from error
         if not isinstance(value, Mapping):
             return self.get(boundary, batch, device=device)
+        selected = self._select_execution_names(boundary, batch, value, input_names)
+        return _move(
+            {name: item for name, item in value.items() if name in selected},
+            torch.device(device),
+            memo={},
+        )
+
+    def _select_execution_names(self, boundary, batch, value, input_names):
+        key = (boundary, batch, frozenset(input_names))
+        if key in self._execution_names:
+            return self._execution_names[key]
         selected = set(input_names)
         missing = selected - value.keys()
         if missing:
@@ -398,11 +435,21 @@ class InMemoryBoundaryActivationStore(BoundaryActivationStore):
                 break
             selected.update(aliases)
             active.update(set().union(*(identities[name] for name in aliases)))
-        return _move(
-            {name: item for name, item in value.items() if name in selected},
-            torch.device(device),
-            memo={},
-        )
+        result = frozenset(selected)
+        self._execution_names[key] = result
+        return result
+
+    def read_for_routing(self, boundary, batch, input_names):
+        value = self._boundaries[boundary][batch]
+        if not isinstance(value, Mapping):
+            return super().read_for_routing(boundary, batch, input_names)
+        selected = self._select_execution_names(boundary, batch, value, input_names)
+        return {name: item for name, item in value.items() if name in selected}
+
+    def _invalidate_execution_names(self, boundary, batch=None):
+        for key in tuple(self._execution_names):
+            if key[0] == boundary and (batch is None or key[1] == batch):
+                del self._execution_names[key]
 
     def commit_propagated_batch(
         self,
@@ -444,6 +491,7 @@ class InMemoryBoundaryActivationStore(BoundaryActivationStore):
     def delete(self, boundary: int) -> None:
         _check_index(boundary, "boundary")
         self._boundaries.pop(boundary, None)
+        self._invalidate_execution_names(boundary)
         for reservation in self._reservations.pop(boundary, {}).values():
             reservation.close()
 
@@ -455,6 +503,7 @@ class InMemoryBoundaryActivationStore(BoundaryActivationStore):
     def _delete_batch(self, boundary: int, batch: int) -> None:
         _check_index(boundary, "boundary")
         _check_index(batch, "batch")
+        self._invalidate_execution_names(boundary, batch)
         batches = self._boundaries.get(boundary)
         if batches is None:
             return

@@ -4,6 +4,7 @@ from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import wraps
+from threading import RLock
 
 import torch
 from compressed_tensors.offload.dist_utils import is_source_process as is_src
@@ -15,6 +16,7 @@ from llmcompressor.modifiers.gptq.helpers import (
     quantization_peak_bytes,
 )
 from llmcompressor.modifiers.quantization.calibration import (
+    freeze_module_quantization,
     observe,
     update_qparams,
 )
@@ -22,6 +24,9 @@ from llmcompressor.observers import ACTIVATION_OBS
 
 from .calibration import calibration_sample_count
 from .modifier_contract import ModifierContractError
+from .numerics import native_gptq_factorization
+
+_WINDOW_INITIALIZATION_LOCK = RLock()
 
 
 @dataclass
@@ -31,6 +36,15 @@ class GPTQStreamingMemoryAdapter:
     owner_update_state = "independent"
     _owner_update_baseline: int | None = field(default=None, init=False, repr=False)
     _owner_update_count: int = field(default=0, init=False, repr=False)
+
+    @property
+    def supports_independent_expert_windows(self) -> bool:
+        """Coalesce only schemes whose activation semantics preserve token rows."""
+        return all(
+            args is None or (args.dynamic is True and args.strategy == "token")
+            for scheme in self.modifier.resolved_config.config_groups.values()
+            for args in (scheme.input_activations, scheme.output_activations)
+        )
 
     def validate_owner_groups(self, groups) -> None:
         """Reject observer or qparam state shared across owner groups."""
@@ -81,7 +95,9 @@ class GPTQStreamingMemoryAdapter:
             scratch = max(
                 scratch,
                 batch_size
-                * quantization_peak_bytes(members[0], self.modifier.block_size),
+                * quantization_peak_bytes(members[0], self.modifier.block_size)
+                + 2 * min(4, batch_size) * members[0].weight.shape[1] ** 2
+                * GPTQ_PRECISION.itemsize,
             )
         return scratch
 
@@ -137,6 +153,28 @@ class GPTQStreamingMemoryAdapter:
         self._owner_update_count = 0
 
     @contextmanager
+    def expert_window(self, model, modules):
+        """Initialize and release only this window's observer hooks."""
+        modifier = self.modifier
+        handles = set()
+        try:
+            with _WINDOW_INITIALIZATION_LOCK:
+                previous = set(modifier._calibration_hooks)
+                try:
+                    modifier.start_layerwise_calibration(model, list(modules))
+                finally:
+                    handles = modifier._calibration_hooks - previous
+            yield
+        finally:
+            with _WINDOW_INITIALIZATION_LOCK:
+                modifier.remove_hooks(handles)
+                modifier._calibration_hooks.difference_update(handles)
+            for module in modules:
+                freeze_module_quantization(module)
+                modifier._hessians.pop(module, None)
+                modifier._num_samples.pop(module, None)
+
+    @contextmanager
     def calibration_context(self):
         """Preserve original call counts while retaining GPTQ's original hook."""
         modifier = self.modifier
@@ -155,7 +193,8 @@ class GPTQStreamingMemoryAdapter:
 
         object.__setattr__(modifier, "calibrate_module", calibrate)
         try:
-            yield
+            with native_gptq_factorization():
+                yield
         finally:
             if had_override:
                 object.__setattr__(modifier, "calibrate_module", previous_override)

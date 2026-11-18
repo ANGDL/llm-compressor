@@ -99,6 +99,13 @@ from .parallel import (
     partition_modules_by_owner,
 )
 from .parallel.expert import ExpertParallelExecutor, ExpertParallelPlan
+from .parallel.region import (
+    ExpertRegionGraph,
+    UnsupportedExpertRegion,
+    coalesce_expert_regions,
+    execute_expert_region,
+    profile_expert_region,
+)
 from .parallel.telemetry import EPPhaseLogger
 from .parallel.token_budget import (
     TOKEN_BUDGET_POLICY,
@@ -835,7 +842,12 @@ def _iter_execution_batches(
             if telemetry is not None else nullcontext()
         )
         with context:
-            value = boundaries.get(boundary_index, batch_index, device="meta")
+            describe = getattr(boundaries, "execution_metadata", None)
+            value = (
+                describe(boundary_index, batch_index, input_names).values
+                if callable(describe)
+                else boundaries.get(boundary_index, batch_index, device="meta")
+            )
             tokens = _boundary_token_count(
                 {name: value[name] for name in input_names}
             )
@@ -1199,6 +1211,15 @@ def run_subgraph_streaming_pipeline(
         )
     for group in target_groups:
         adapter.plan_group(group)
+    window_adapter = (
+        get_modifier_memory_adapter(recipe.modifiers[0])
+        if expert_parallel is not None
+        and not checkpoint_progress
+        and len(recipe.modifiers) == 1
+        else None
+    )
+    if getattr(window_adapter, "supports_independent_expert_windows", False):
+        target_groups = coalesce_expert_regions(adapter, expert_parallel)
     run_fingerprint = _initialize_run(
         checkpoint=checkpoint,
         artifact_dir=artifact_dir,
@@ -1336,10 +1357,9 @@ def run_subgraph_streaming_pipeline(
             )
             runtime_adapters = modifier_adapters(session.lifecycle.recipe.modifiers)
             try:
-                if expert_parallel is not None:
-                    calibration_stack.enter_context(
-                        modifier_calibration_context(session.lifecycle.recipe.modifiers)
-                    )
+                calibration_stack.enter_context(
+                    modifier_calibration_context(session.lifecycle.recipe.modifiers)
+                )
                 for modifier_adapter in runtime_adapters:
                     modifier_adapter.before_calibration(adapter.model, adapter.targets)
                     configure = getattr(modifier_adapter, "configure_algorithm", None)
@@ -1360,6 +1380,8 @@ def run_subgraph_streaming_pipeline(
             if isinstance(modifier, QuantizationMixin)
         ]
         modifiers = tuple(session.lifecycle.recipe.modifiers)
+        if window_adapter is not None:
+            window_adapter = get_modifier_memory_adapter(modifiers[0])
         device_budget = DeviceMemoryBudget()
         reuse_calibration_outputs = _can_reuse_calibration_outputs(recipe)
         streaming_logger.info(
@@ -1498,6 +1520,56 @@ def run_subgraph_streaming_pipeline(
                     f"{target_label} | start | batches={len(batches)} | device={device}"
                 )
                 target_started_at = perf_counter()
+                region_graph = None
+                if getattr(
+                    window_adapter, "supports_independent_expert_windows", False
+                ):
+                    try:
+                        region_graph = ExpertRegionGraph.build(
+                            adapter.model, expert_parallel, subgraphs
+                        )
+                    except UnsupportedExpertRegion:
+                        pass
+                if region_graph is not None:
+                    with _stage_logger(
+                        adapter.model, f"{target_label} | profile routes", device
+                    ):
+                        route_profile = profile_expert_region(
+                            region_graph, boundaries, group_start, batches
+                        )
+
+                    def save_expert_window(window, loaded, modules):
+                        _compress_modules(modules)
+                        written.update(_write_loaded_target_direct(
+                            direct_writer, loaded, window.expert_names,
+                            f"{transaction_id}-r{window.owner_rank}-w{window.window_index}",
+                            materializer, pack_to_int8=pack_to_int8,
+                            host_budget=host_budget,
+                        ))
+
+                    window_plan = execute_expert_region(
+                        graph=region_graph, profile=route_profile,
+                        adapter=adapter, parallel=expert_parallel,
+                        modifier_adapter=window_adapter, modifiers=modifiers,
+                        boundaries=boundaries, boundary_index=group_start,
+                        destination_boundary=next_boundary, batches=batches,
+                        device_budget=device_budget, host_budget=host_budget,
+                        target_dtype=target_dtype,
+                        token_budget=expert_parallel_token_budget,
+                        label=target_label, save_window=save_expert_window,
+                        propagate=has_next,
+                    )
+                    ArtifactStore(artifact_dir).commit_ep_token_plan(
+                        group_index,
+                        {"policy": "routed-resident-windows-v1", **window_plan},
+                    )
+                    boundaries.delete(group_start)
+                    streaming_logger.info(
+                        f"{target_label} | complete | "
+                        f"time={perf_counter() - target_started_at:.2f}s | "
+                        "execution=routed-resident-windows"
+                    )
+                    continue
                 baseline_allocated = (
                     torch.get_device_module(device).memory_allocated(device)
                     if device.type == "cuda"
@@ -1538,17 +1610,18 @@ def run_subgraph_streaming_pipeline(
                         value = boundaries.get(
                             group_start, batch_index, device="meta"
                         )
-                        batch_tokens = _boundary_token_count(
-                            {
-                                name: value[name]
-                                for name in group_inputs
-                            }
+                        execution_metadata = boundaries.execution_metadata(
+                            group_start, batch_index, group_inputs
                         )
+                        batch_tokens = _boundary_token_count({
+                            name: execution_metadata.values[name]
+                            for name in group_inputs
+                        })
                         num_tokens += batch_tokens
                         batch_token_counts.append(batch_tokens)
                         max_batch_tokens = max(max_batch_tokens, batch_tokens)
                         boundary_bytes += _boundary_nbytes(value)
-                        current_boundary_bytes = _boundary_nbytes(value)
+                        current_boundary_bytes = execution_metadata.tensor_bytes
                         if batch_tokens:
                             max_boundary_bytes_per_token = max(
                                 max_boundary_bytes_per_token,
@@ -1557,7 +1630,7 @@ def run_subgraph_streaming_pipeline(
                                 )
                                 // batch_tokens,
                             )
-                        del value
+                        del value, execution_metadata
                     num_tokens = max(num_tokens, 1)
                     max_batch_tokens = max(max_batch_tokens, 1)
                     with _stage_logger(

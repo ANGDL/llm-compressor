@@ -597,7 +597,7 @@ class SubgraphWeightSession:
 
     @contextmanager
     def installed(
-        self, prepared: PreparedSubgraphWeights
+        self, prepared: PreparedSubgraphWeights, *, reinitialize: bool = True
     ) -> Generator[LoadedSubgraph, None, None]:
         """Install prepared weights and restore the model on context exit."""
 
@@ -622,11 +622,11 @@ class SubgraphWeightSession:
             # therefore bind plain tensor attributes to buffers that a later
             # context subsequently replaces. Refresh once more only after the
             # complete working set is resident.
-            reinitialize = getattr(
+            reinitialize_buffers = getattr(
                 self.model, "_reinitialize_non_persistent_buffers", None
             )
-            if callable(reinitialize):
-                reinitialize()
+            if reinitialize and callable(reinitialize_buffers):
+                reinitialize_buffers()
             yield LoadedSubgraph(self.model, module_names)
 
     def _runtime_tensor_attributes(
