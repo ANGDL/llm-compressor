@@ -26,6 +26,11 @@ from ..artifacts import fingerprint_json
 from ..calibration import calibration_batch_context
 from ..loading.session import SubgraphLoadPlan
 from ..moe.proxy import install_local_expert_proxy
+from .load_balance import (
+    ExpertCostProfile,
+    OwnerMemoryProfile,
+    build_load_balanced_placement,
+)
 from .placement import PlacementEntry, PlacementPlan
 from .topology import EPTopology
 
@@ -69,6 +74,8 @@ class ExpertParallelPlan:
     expert_collections: tuple[str, ...] = ()
     expert_bytes: tuple[tuple[str, int], ...] = ()
     adapters: tuple[Any, ...] = ()
+    placement_policy: str = "storage-v1"
+    route_profile_fingerprint: str = ""
     _owners: dict[str, int] = field(init=False, repr=False)
     _module_experts: dict[nn.Module, str] = field(default_factory=dict, repr=False)
     backend = "single-process-expert-parallel-v1"
@@ -86,6 +93,10 @@ class ExpertParallelPlan:
         devices: Sequence[torch.device | str],
         *,
         adapters: Sequence[Any] = (),
+        route_tokens: Mapping[str, int] | None = None,
+        token_work_units: Mapping[str, float] | None = None,
+        owner_compute_rates: Sequence[float] | None = None,
+        owner_memory: Sequence[OwnerMemoryProfile] | None = None,
     ) -> ExpertParallelPlan:
         resolved = tuple(torch.device(device) for device in devices)
         if len(resolved) < 2:
@@ -122,11 +133,69 @@ class ExpertParallelPlan:
         if not entries:
             raise ValueError("No independently traced expert collection was found")
         entries.sort(key=lambda entry: target_positions[entry.logical_name])
-        owners = _balanced_expert_owners(
-            tuple(entry.logical_name for entry in entries),
-            expert_sizes,
-            len(resolved),
-        )
+        logical_names = tuple(entry.logical_name for entry in entries)
+        if route_tokens is None:
+            if token_work_units is not None or owner_compute_rates is not None:
+                raise ValueError(
+                    "token_work_units and owner_compute_rates require route_tokens"
+                )
+            owners = _balanced_expert_owners(
+                logical_names,
+                expert_sizes,
+                len(resolved),
+            )
+            placement_policy = "storage-v1"
+            route_profile_fingerprint = ""
+        else:
+            unknown = set(route_tokens).difference(logical_names)
+            if unknown:
+                raise ValueError(
+                    "route_tokens contains unknown experts: "
+                    f"{sorted(unknown)}"
+                )
+            if token_work_units is not None:
+                unknown = set(token_work_units).difference(logical_names)
+                if unknown:
+                    raise ValueError(
+                        "token_work_units contains unknown experts: "
+                        f"{sorted(unknown)}"
+                    )
+            costs = {
+                name: ExpertCostProfile(
+                    storage_bytes=expert_sizes[name],
+                    route_tokens=route_tokens.get(name, 0),
+                    token_work_units=(
+                        1.0
+                        if token_work_units is None
+                        else token_work_units.get(name, 1.0)
+                    ),
+                )
+                for name in logical_names
+            }
+            load_plan = build_load_balanced_placement(
+                costs,
+                len(resolved),
+                compute_rates=owner_compute_rates,
+                owner_memory=owner_memory,
+            )
+            owners = load_plan.owner_by_name
+            placement_policy = load_plan.policy
+            route_profile_fingerprint = fingerprint_json(
+                {
+                    "route_tokens": {
+                        name: route_tokens.get(name, 0)
+                        for name in logical_names
+                    },
+                    "token_work_units": {
+                        name: (
+                            1.0
+                            if token_work_units is None
+                            else token_work_units.get(name, 1.0)
+                        )
+                        for name in logical_names
+                    },
+                }
+            )
         entries = [
             replace(entry, owner_rank=owners[entry.logical_name])
             for entry in entries
@@ -138,6 +207,8 @@ class ExpertParallelPlan:
             tuple(collection_name for collection_name, _collection in collections),
             tuple(sorted(expert_sizes.items())),
             tuple(adapters),
+            placement_policy,
+            route_profile_fingerprint,
         )
         for entry in entries:
             for module in model.get_submodule(entry.logical_name).modules():
@@ -168,6 +239,10 @@ class ExpertParallelPlan:
         devices: Sequence[torch.device | str],
         *,
         adapters: Sequence[Any] = (),
+        route_tokens: Mapping[str, int] | None = None,
+        token_work_units: Mapping[str, float] | None = None,
+        owner_compute_rates: Sequence[float] | None = None,
+        owner_memory: Sequence[OwnerMemoryProfile] | None = None,
     ) -> "ExpertParallelPlan":
         """Build a local-device plan after validating an EP topology."""
 
@@ -179,7 +254,16 @@ class ExpertParallelPlan:
             raise NotImplementedError(
                 "single-process ExpertParallelExecutor does not support dp_size > 1"
             )
-        return cls.from_model(model, targets, devices, adapters=adapters)
+        return cls.from_model(
+            model,
+            targets,
+            devices,
+            adapters=adapters,
+            route_tokens=route_tokens,
+            token_work_units=token_work_units,
+            owner_compute_rates=owner_compute_rates,
+            owner_memory=owner_memory,
+        )
 
     @property
     def owner_by_name(self) -> dict[str, int]:
@@ -281,6 +365,8 @@ class ExpertParallelPlan:
             "placement": self.placement.to_dict(),
             "expert_collections": list(self.expert_collections),
             "expert_bytes": [list(item) for item in self.expert_bytes],
+            "placement_policy": self.placement_policy,
+            "route_profile_fingerprint": self.route_profile_fingerprint,
         }
 
     @property
