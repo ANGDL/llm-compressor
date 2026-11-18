@@ -71,7 +71,10 @@ from .materialization import (
     WeightMaterializer,
     materialize_weights,
 )
-from .memory_adapters import modifier_calibration_context
+from .memory_adapters import (
+    get_modifier_memory_adapter,
+    modifier_calibration_context,
+)
 from .modifier_adapters import (
     StreamingModifierAdapter,
     get_modifier_adapter,
@@ -88,7 +91,13 @@ from .output import (
     quantized_module_formats,
     quantized_tensor_bytes_for_save,
 )
-from .parallel import ParallelContext, PlacementPlan
+from .parallel import (
+    OwnerModuleGroup,
+    OwnerUpdateScheduler,
+    ParallelContext,
+    PlacementPlan,
+    partition_modules_by_owner,
+)
 from .parallel.expert import ExpertParallelExecutor, ExpertParallelPlan
 from .parallel.token_budget import (
     TOKEN_BUDGET_POLICY,
@@ -670,15 +679,49 @@ def _modifier_update(
     modules: Sequence[torch.nn.Module],
     quantizers: Sequence[QuantizationMixin],
     adapters: Sequence[StreamingModifierAdapter] = (),
-) -> None:
+    owner_groups: Sequence[OwnerModuleGroup] | None = None,
+) -> str:
     with ExitStack() as stack:
         for adapter in adapters:
             stack.enter_context(adapter.update_context(active_session().state.model))
-        LifecycleCallbacks.sequential_epoch_end(list(modules))
+        owner_update_adapter = _owner_update_adapter(quantizers, adapters)
+        if owner_groups is not None and owner_update_adapter is not None:
+            validate = getattr(owner_update_adapter, "validate_owner_groups", None)
+            if callable(validate):
+                validate(owner_groups)
+            begin = getattr(owner_update_adapter, "begin_owner_update", None)
+            if callable(begin):
+                begin(modules)
+            OwnerUpdateScheduler().run(
+                owner_groups,
+                update=owner_update_adapter.update_owner,
+            )
+            finalize = getattr(owner_update_adapter, "finalize_owner_update", None)
+            if callable(finalize):
+                finalize()
+            update_parallelism = "owner-local"
+        else:
+            LifecycleCallbacks.sequential_epoch_end(list(modules))
+            update_parallelism = "serial-contract"
     for adapter in adapters:
         adapter.after_update(modules)
     for quantizer in quantizers:
         quantizer.end_layerwise_calibration(list(modules))
+    return update_parallelism
+
+
+def _owner_update_adapter(
+    quantizers: Sequence[QuantizationMixin],
+    adapters: Sequence[StreamingModifierAdapter],
+):
+    if len(quantizers) != 1 or adapters:
+        return None
+    candidate = get_modifier_memory_adapter(quantizers[0])
+    return (
+        candidate
+        if callable(getattr(candidate, "update_owner", None))
+        else None
+    )
 
 
 def _target_group_input_names(subgraphs: Sequence[Subgraph]) -> set[str]:
@@ -1948,6 +1991,14 @@ def run_subgraph_streaming_pipeline(
                                         )
                                     del next_value, value
                                 del next_values, values
+                    owner_update_groups = None
+                    if expert_parallel is not None:
+                        ep_executor.synchronize()
+                        owner_update_groups = partition_modules_by_owner(
+                            resident_modules,
+                            expert_parallel.devices,
+                            expert_parallel.module_devices,
+                        )
                     with _stage_logger(
                         adapter.model,
                         f"{target_label} | modifier update",
@@ -1970,8 +2021,15 @@ def run_subgraph_streaming_pipeline(
                                 )
                                 session.state.sequential_propagate_error = False
                         try:
-                            _modifier_update(
-                                resident_modules, quantizers, runtime_adapters
+                            update_parallelism = _modifier_update(
+                                resident_modules,
+                                quantizers,
+                                runtime_adapters,
+                                owner_groups=owner_update_groups,
+                            )
+                            streaming_logger.info(
+                                f"{target_label} | modifier update | "
+                                f"parallelism={update_parallelism}"
                             )
                         finally:
                             session.state.sequential_activations = (

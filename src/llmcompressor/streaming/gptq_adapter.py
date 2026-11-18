@@ -2,10 +2,11 @@
 
 from collections.abc import Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import wraps
 
 import torch
+from compressed_tensors.offload.dist_utils import is_source_process as is_src
 
 from llmcompressor.modifiers.gptq import GPTQModifier
 from llmcompressor.modifiers.gptq.helpers import (
@@ -13,13 +14,52 @@ from llmcompressor.modifiers.gptq.helpers import (
     batch_key,
     quantization_peak_bytes,
 )
+from llmcompressor.modifiers.quantization.calibration import (
+    observe,
+    update_qparams,
+)
+from llmcompressor.observers import ACTIVATION_OBS
 
 from .calibration import calibration_sample_count
+from .modifier_contract import ModifierContractError
 
 
 @dataclass
 class GPTQStreamingMemoryAdapter:
     modifier: GPTQModifier
+    owner_update_scope = "owner_local"
+    owner_update_state = "independent"
+    _owner_update_baseline: int | None = field(default=None, init=False, repr=False)
+    _owner_update_count: int = field(default=0, init=False, repr=False)
+
+    def validate_owner_groups(self, groups) -> None:
+        """Reject observer or qparam state shared across owner groups."""
+
+        state_owners: dict[int, torch.device] = {}
+        state_names = (
+            "weight_observer",
+            "input_observer",
+            "output_observer",
+            "q_observer",
+            "k_observer",
+            "v_observer",
+            "weight_scale",
+            "weight_zero_point",
+            "weight_global_scale",
+        )
+        for group in groups:
+            for module in group.modules:
+                for name in state_names:
+                    value = getattr(module, name, None)
+                    if value is None:
+                        continue
+                    identity = id(value)
+                    previous = state_owners.setdefault(identity, group.owner)
+                    if previous != group.owner:
+                        raise ModifierContractError(
+                            f"GPTQ state {name!r} is shared between owner "
+                            f"{previous} and {group.owner}"
+                        )
 
     def estimate_update_memory(self, modules: Sequence[torch.nn.Module]) -> int:
         """Bound the largest compatible compression batch before admission."""
@@ -55,6 +95,46 @@ class GPTQStreamingMemoryAdapter:
         return (2 * dispatch_tokens * columns + columns * columns) * (
             GPTQ_PRECISION.itemsize
         )
+
+    def update_owner(
+        self,
+        _owner: torch.device,
+        modules: Sequence[torch.nn.Module],
+    ) -> None:
+        """Observe and compress only the Hessians owned by one EP device."""
+
+        modules = [
+            module for module in modules if self.modifier._is_calibrated(module)
+        ]
+        if not modules:
+            return
+        observe(modules, base_name="weight")
+        self.modifier.sync_obs_act_stats(modules)
+        update_qparams(
+            modules,
+            ACTIVATION_OBS,
+            only_update_onload=not is_src(),
+        )
+        self.modifier.compress_module_list(modules)
+
+    def begin_owner_update(self, modules: Sequence[torch.nn.Module]) -> None:
+        """Snapshot shared bookkeeping before concurrent compression starts."""
+
+        self._owner_update_baseline = self.modifier._num_compressed_modules
+        self._owner_update_count = sum(
+            self.modifier._is_calibrated(module) for module in modules
+        )
+
+    def finalize_owner_update(self) -> None:
+        """Restore deterministic shared compression bookkeeping after the join."""
+
+        if self._owner_update_baseline is None:
+            return
+        self.modifier._num_compressed_modules = (
+            self._owner_update_baseline + self._owner_update_count
+        )
+        self._owner_update_baseline = None
+        self._owner_update_count = 0
 
     @contextmanager
     def calibration_context(self):

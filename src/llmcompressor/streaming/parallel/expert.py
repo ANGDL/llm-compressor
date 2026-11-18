@@ -728,9 +728,13 @@ class ExpertParallelExecutor:
     def synchronize(self) -> None:
         """Wait for queued owner streams before weights are unloaded or changed."""
 
-        for stream in self._streams.values():
-            if stream is not None:
-                stream.synchronize()
+        pending = [
+            self._workers[device].submit(stream.synchronize)
+            for device, stream in self._streams.items()
+            if stream is not None
+        ]
+        for future in pending:
+            future.result()
 
     def __enter__(self):
         return self

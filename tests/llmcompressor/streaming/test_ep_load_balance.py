@@ -15,6 +15,11 @@ from llmcompressor.streaming import (
     plan_resident_windows,
 )
 from llmcompressor.streaming.parallel.expert import ExpertParallelPlan
+from llmcompressor.streaming.parallel.modifier_update import (
+    OwnerModuleGroup,
+    OwnerUpdateScheduler,
+    partition_modules_by_owner,
+)
 
 
 def test_route_plan_preserves_token_rows_slots_and_weights():
@@ -164,6 +169,51 @@ def test_async_window_scheduler_runs_owners_concurrently():
     assert [window.owner_rank for window, _result in results] == [0, 1]
     assert [kind for kind, _owner, _value in events].count("compute") == 2
     assert [kind for kind, _owner, _value in events].count("release") == 2
+
+
+def test_owner_update_scheduler_runs_disjoint_groups_concurrently():
+    modules = (torch.nn.Linear(2, 2), torch.nn.Linear(2, 2))
+    groups = (
+        OwnerModuleGroup(torch.device("cpu:0"), (modules[0],)),
+        OwnerModuleGroup(torch.device("cpu:1"), (modules[1],)),
+    )
+    barrier = threading.Barrier(2)
+    entered = []
+    lock = threading.Lock()
+
+    def update(owner, group):
+        with lock:
+            entered.append((owner, group))
+        barrier.wait(timeout=5)
+        return len(group)
+
+    result = OwnerUpdateScheduler().run(groups, update=update)
+
+    assert [owner for owner, _value in result] == [
+        torch.device("cpu:0"),
+        torch.device("cpu:1"),
+    ]
+    assert sorted(len(group) for _owner, group in entered) == [1, 1]
+
+
+def test_partition_modules_by_owner_preserves_declared_order():
+    modules = (torch.nn.Linear(2, 2), torch.nn.ReLU(), torch.nn.Linear(2, 2))
+    groups = partition_modules_by_owner(
+        modules,
+        ("cpu:0", "cpu:1"),
+        {
+            modules[0]: "cpu:1",
+            modules[1]: "cpu:0",
+            modules[2]: "cpu:1",
+        },
+    )
+
+    assert [group.owner for group in groups] == [
+        torch.device("cpu:0"),
+        torch.device("cpu:1"),
+    ]
+    assert groups[0].modules == (modules[1],)
+    assert groups[1].modules == (modules[0], modules[2])
 
 
 class _TinyExpert(torch.nn.Module):
