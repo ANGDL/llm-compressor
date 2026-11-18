@@ -1,0 +1,198 @@
+from __future__ import annotations
+
+import threading
+
+import pytest
+import torch
+
+from llmcompressor.streaming import (
+    AsyncResidentWindowScheduler,
+    ExpertCostProfile,
+    OwnerMemoryProfile,
+    RoutePlan,
+    RoutePlanCollection,
+    build_load_balanced_placement,
+    plan_resident_windows,
+)
+from llmcompressor.streaming.parallel.expert import ExpertParallelPlan
+
+
+def test_route_plan_preserves_token_rows_slots_and_weights():
+    plan = RoutePlan.from_tensors(
+        torch.tensor([[0, 2], [1, 0], [2, 1]]),
+        torch.tensor([[0.7, 0.3], [0.2, 0.8], [0.4, 0.6]]),
+        num_experts=3,
+        original_shape=(3, 4),
+        batch_index=4,
+    )
+
+    assert plan.batch_index == 4
+    assert plan.token_counts == (2, 2, 2)
+    assert plan.total_assignments == 6
+    assert plan.route(0).token_indices.tolist() == [0, 1]
+    assert plan.route(0).slot_indices.tolist() == [0, 1]
+    torch.testing.assert_close(
+        plan.route(0).weights,
+        torch.tensor([0.7, 0.8]),
+    )
+    assert plan.to_metadata()["original_shape"] == (3, 4)
+
+
+def test_route_plan_collection_aggregates_work():
+    first = RoutePlan.from_tensors(
+        torch.tensor([[0], [1], [0]]),
+        torch.ones(3, 1),
+        num_experts=2,
+        batch_index=0,
+    )
+    second = RoutePlan.from_tensors(
+        torch.tensor([[1], [1]]),
+        torch.ones(2, 1),
+        num_experts=2,
+        batch_index=1,
+    )
+    collection = RoutePlanCollection((first, second))
+
+    assert collection.token_counts == (2, 3)
+    assert collection.total_tokens == 5
+    assert collection.work_units({0: 2.0, 1: 3.0}) == (4.0, 9.0)
+
+
+def test_load_balanced_placement_prefers_weighted_route_work():
+    costs = {
+        "experts.0": ExpertCostProfile(storage_bytes=10, route_tokens=100),
+        "experts.1": ExpertCostProfile(storage_bytes=10, route_tokens=90),
+        "experts.2": ExpertCostProfile(storage_bytes=10, route_tokens=10),
+        "experts.3": ExpertCostProfile(storage_bytes=10, route_tokens=10),
+    }
+
+    placement = build_load_balanced_placement(costs, 2)
+
+    assert placement.owner_by_name["experts.0"] != placement.owner_by_name["experts.1"]
+    assert max(placement.owner_route_tokens) - min(
+        placement.owner_route_tokens
+    ) <= 10
+    assert placement.placement.ep_size == 2
+
+
+def test_load_balanced_placement_rejects_expert_without_memory_fit():
+    costs = {
+        "experts.0": ExpertCostProfile(
+            storage_bytes=8,
+            persistent_state_bytes=5,
+        )
+    }
+    memory = (
+        OwnerMemoryProfile(usable_bytes=12),
+        OwnerMemoryProfile(usable_bytes=12),
+    )
+
+    with pytest.raises(MemoryError, match="experts.0"):
+        build_load_balanced_placement(costs, 2, owner_memory=memory)
+
+
+def test_resident_windows_split_by_memory_and_report_activation_batches():
+    costs = {
+        "experts.0": ExpertCostProfile(storage_bytes=6, route_tokens=20),
+        "experts.1": ExpertCostProfile(storage_bytes=6, route_tokens=5),
+        "experts.2": ExpertCostProfile(storage_bytes=6, route_tokens=4),
+        "experts.3": ExpertCostProfile(storage_bytes=6, route_tokens=2),
+    }
+    memory = (
+        OwnerMemoryProfile(
+            usable_bytes=20,
+            dispatch_bytes_per_token=1,
+        ),
+        OwnerMemoryProfile(
+            usable_bytes=20,
+            dispatch_bytes_per_token=1,
+        ),
+    )
+    placement = build_load_balanced_placement(costs, 2, owner_memory=memory)
+    windows = plan_resident_windows(placement, costs, memory)
+
+    assert {name for window in windows for name in window.expert_names} == set(
+        costs
+    )
+    assert all(window.resident_bytes <= 20 for window in windows)
+    assert max(window.activation_batches for window in windows) >= 2
+
+
+def test_async_window_scheduler_runs_owners_concurrently():
+    costs = {
+        "experts.0": ExpertCostProfile(storage_bytes=1, route_tokens=4),
+        "experts.1": ExpertCostProfile(storage_bytes=1, route_tokens=4),
+    }
+    placement = build_load_balanced_placement(costs, 2)
+    memory = (
+        OwnerMemoryProfile(usable_bytes=10),
+        OwnerMemoryProfile(usable_bytes=10),
+    )
+    windows = plan_resident_windows(placement, costs, memory)
+    barrier = threading.Barrier(2)
+    events: list[tuple[str, int, int]] = []
+    lock = threading.Lock()
+
+    def prefetch(window):
+        with lock:
+            events.append(("prefetch", window.owner_rank, window.window_index))
+        return window.expert_names
+
+    def compute(window, state):
+        assert state == window.expert_names
+        barrier.wait(timeout=5)
+        with lock:
+            events.append(("compute", window.owner_rank, window.window_index))
+        return len(state)
+
+    def update(window, _state, result):
+        with lock:
+            events.append(("update", window.owner_rank, result))
+
+    def release(window, _state, result):
+        with lock:
+            events.append(("release", window.owner_rank, result))
+
+    results = AsyncResidentWindowScheduler().run(
+        windows,
+        prefetch=prefetch,
+        compute=compute,
+        update=update,
+        release=release,
+    )
+
+    assert [window.owner_rank for window, _result in results] == [0, 1]
+    assert [kind for kind, _owner, _value in events].count("compute") == 2
+    assert [kind for kind, _owner, _value in events].count("release") == 2
+
+
+class _TinyExpert(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.ones(2, 2))
+
+
+class _TinyMoE(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.experts = torch.nn.ModuleList([_TinyExpert() for _ in range(4)])
+
+
+def test_expert_parallel_plan_accepts_route_profile():
+    model = _TinyMoE()
+    targets = tuple(f"experts.{index}" for index in range(4))
+    plan = ExpertParallelPlan.from_model(
+        model,
+        targets,
+        ("cpu:0", "cpu:1"),
+        route_tokens={
+            "experts.0": 100,
+            "experts.1": 90,
+            "experts.2": 10,
+            "experts.3": 10,
+        },
+    )
+
+    assert plan.placement_policy == "activation-aware-v1"
+    assert plan.route_profile_fingerprint
+    assert plan.owner_by_name["experts.0"] != plan.owner_by_name["experts.1"]

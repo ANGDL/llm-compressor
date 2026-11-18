@@ -22,7 +22,7 @@ from llmcompressor.utils.helpers import DisableQuantization
 from ..activations import BoundaryActivationStore
 from ..artifacts import fingerprint_json
 from ..loading import LoadedSubgraph, SubgraphWeightSession
-from ..parallel import PlacementEntry, PlacementPlan
+from ..parallel import PlacementEntry, PlacementPlan, RoutePlan
 
 __all__ = [
     "ExpertGroup",
@@ -173,6 +173,17 @@ class RoutedExpertBatch:
     top_k_weights: torch.Tensor
     original_shape: tuple[int, ...] | None = None
 
+    def route_plan(self, *, num_experts: int) -> RoutePlan:
+        """Return a reusable route plan without copying hidden states."""
+
+        return RoutePlan.from_tensors(
+            self.top_k_index,
+            self.top_k_weights,
+            num_experts=num_experts,
+            original_shape=self.original_shape,
+            batch_index=self.batch_index,
+        )
+
 
 class ExpertGroupModifier(Protocol):
     """Algorithm-owned calibration lifecycle for one resident model view."""
@@ -249,6 +260,7 @@ def execute_expert_group(
     *,
     output: torch.Tensor | None = None,
     calibrate_all_experts: bool = False,
+    route_plan: RoutePlan | None = None,
 ) -> torch.Tensor:
     """Execute one group and add its routed results into ``output``.
 
@@ -275,16 +287,29 @@ def execute_expert_group(
         or result.dtype != hidden_states.dtype
     ):
         raise ValueError("output must match hidden_states shape, dtype and device")
+    if route_plan is not None:
+        if (
+            route_plan.num_tokens != hidden_states.shape[0]
+            or route_plan.num_experts != num_experts
+            or route_plan.top_k != top_k_index.shape[1]
+            or route_plan.device != hidden_states.device
+        ):
+            raise ValueError("route_plan does not match the routed inputs")
 
     for expert_index in group.indices:
-        expert_mask = top_k_index == expert_index
-        top_k_pos, token_indices = torch.where(expert_mask.transpose(0, 1))
+        if route_plan is None:
+            expert_mask = top_k_index == expert_index
+            top_k_pos, token_indices = torch.where(expert_mask.transpose(0, 1))
+            expert_weights = top_k_weights[token_indices, top_k_pos, None]
+        else:
+            route = route_plan.route(expert_index)
+            token_indices = route.token_indices
+            expert_weights = route.weights[:, None]
         expert = experts[expert_index]
         if calibrate_all_experts:
             expert_output = expert(hidden_states)[token_indices]
         else:
             expert_output = expert(hidden_states[token_indices])
-        expert_weights = top_k_weights[token_indices, top_k_pos, None]
         weighted_output = expert_output * expert_weights
         result.index_add_(
             0,
@@ -351,6 +376,7 @@ class ExpertGroupExecutor:
         device: torch.device | str,
         dtype: torch.dtype,
         calibrate_all_experts: bool = False,
+        route_plan: RoutePlan | None = None,
         on_group: ExpertGroupCallback | None = None,
         after_group: ExpertGroupAfterCallback | None = None,
     ) -> torch.Tensor:
@@ -372,6 +398,12 @@ class ExpertGroupExecutor:
             )
         result = torch.zeros_like(hidden_states)
         experts = self.model.get_submodule(self.plan.experts_name)
+        if route_plan is None:
+            route_plan = RoutePlan.from_tensors(
+                top_k_index,
+                top_k_weights,
+                num_experts=self.plan.num_experts,
+            )
         for group in self.plan.groups:
             with self.loaded_group(
                 group, device=resolved_device, dtype=dtype
@@ -393,6 +425,7 @@ class ExpertGroupExecutor:
                     group,
                     output=result,
                     calibrate_all_experts=calibrate_all_experts,
+                    route_plan=route_plan,
                 )
                 if after_group is not None:
                     after_group(
@@ -459,6 +492,9 @@ class ExpertGroupExecutor:
                 device=resolved_device,
                 dtype=dtype,
                 calibrate_all_experts=calibrate_all_experts,
+                route_plan=routed.route_plan(
+                    num_experts=self.plan.num_experts
+                ),
             )
         return adapter.restore_output(routed, output)
 
