@@ -821,3 +821,8 @@ env_log.json
 # uv artifacts
 uv.lock
 .venv/
+
+.local-experiments/
+docs/developer/*-e2e-[0-9]*.md
+docs/reports/
+**/ep8-test-evidence/

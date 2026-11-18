@@ -99,6 +99,7 @@ from .parallel import (
     partition_modules_by_owner,
 )
 from .parallel.expert import ExpertParallelExecutor, ExpertParallelPlan
+from .parallel.telemetry import EPPhaseLogger
 from .parallel.token_budget import (
     TOKEN_BUDGET_POLICY,
     select_token_capacity,
@@ -155,7 +156,17 @@ def _stage_logger(
 
 def _target_label(index: int, total: int, target: str) -> str:
     width = max(2, len(str(total)))
+    targets = target.split(" + ")
+    if len(targets) > 2:
+        target = f"{targets[0]} ... {targets[-1]} ({len(targets)} targets)"
     return f"[{index + 1:0{width}d}/{total:0{width}d}] {target}"
+
+
+def _ep_phase_logger(executor, label, phase, **kwargs):
+    return (
+        executor.log_phase(label, phase, **kwargs)
+        if executor is not None else nullcontext()
+    )
 
 
 _TOKEN_METADATA_NAMES = frozenset(
@@ -680,6 +691,7 @@ def _modifier_update(
     quantizers: Sequence[QuantizationMixin],
     adapters: Sequence[StreamingModifierAdapter] = (),
     owner_groups: Sequence[OwnerModuleGroup] | None = None,
+    telemetry: EPPhaseLogger | None = None,
 ) -> str:
     with ExitStack() as stack:
         for adapter in adapters:
@@ -695,13 +707,19 @@ def _modifier_update(
             OwnerUpdateScheduler().run(
                 owner_groups,
                 update=owner_update_adapter.update_owner,
+                telemetry=telemetry,
             )
             finalize = getattr(owner_update_adapter, "finalize_owner_update", None)
             if callable(finalize):
                 finalize()
             update_parallelism = "owner-local"
         else:
-            LifecycleCallbacks.sequential_epoch_end(list(modules))
+            context = (
+                telemetry.owner_work(telemetry.devices[0], modules=len(modules))
+                if telemetry is not None else nullcontext()
+            )
+            with context:
+                LifecycleCallbacks.sequential_epoch_end(list(modules))
             update_parallelism = "serial-contract"
     for adapter in adapters:
         adapter.after_update(modules)
@@ -789,33 +807,39 @@ def _iter_execution_batches(
     *,
     device: torch.device,
     token_capacity: int | None,
+    telemetry: EPPhaseLogger | None = None,
 ):
     """Load boundary inputs up to a primary-device token capacity."""
 
+    def load(batch_index):
+        context = (
+            telemetry.primary_work("load", "loading boundary inputs")
+            if telemetry is not None else nullcontext()
+        )
+        with context:
+            return boundaries.get_for_execution(
+                boundary_index, batch_index, input_names, device=device
+            )
+
     if token_capacity is None:
         for batch_index in batch_indices:
-            yield (
-                (batch_index,),
-                (
-                    boundaries.get_for_execution(
-                        boundary_index,
-                        batch_index,
-                        input_names,
-                        device=device,
-                    ),
-                ),
-            )
+            yield (batch_index,), (load(batch_index),)
         return
 
     current_indices = []
     current_values = []
     current_tokens = 0
     for batch_index in batch_indices:
-        value = boundaries.get(boundary_index, batch_index, device="meta")
-        tokens = _boundary_token_count(
-            {name: value[name] for name in input_names}
+        context = (
+            telemetry.primary_work("load", "reading boundary metadata")
+            if telemetry is not None else nullcontext()
         )
-        del value
+        with context:
+            value = boundaries.get(boundary_index, batch_index, device="meta")
+            tokens = _boundary_token_count(
+                {name: value[name] for name in input_names}
+            )
+            del value
         if tokens > token_capacity:
             raise DeviceMemoryError(
                 f"Boundary {boundary_index} batch {batch_index} has {tokens} "
@@ -831,9 +855,7 @@ def _iter_execution_batches(
             current_indices = []
             current_values = []
             current_tokens = 0
-        value = boundaries.get_for_execution(
-            boundary_index, batch_index, input_names, device=device
-        )
+        value = load(batch_index)
         current_indices.append(batch_index)
         current_values.append(value)
         current_tokens += tokens
@@ -1386,6 +1408,10 @@ def run_subgraph_streaming_pipeline(
                 )
             prefetch_pending = False
             target_count = len(target_groups)
+            streaming_logger.info(
+                f"setup | progress counts target groups | groups={target_count} | "
+                "calibration batches and routed tokens are reported separately"
+            )
             for group_index, target_indices in enumerate(target_groups):
                 group_start = target_indices[0]
                 group_end = target_indices[-1]
@@ -1677,16 +1703,23 @@ def run_subgraph_streaming_pipeline(
                                         owner_required, device=owner_device,
                                     )
                                 )
+                                usable_text = (
+                                    f"{usable / 2**30:.2f}"
+                                    if usable is not None else "unknown"
+                                )
                                 streaming_logger.info(
                                     f"{target_label} | EP admission | "
+                                    "rank="
+                                    f"{expert_parallel.devices.index(owner_device)} | "
                                     f"device={owner_device} | "
-                                    f"materialized_bytes={owner_weights} | "
-                                    f"modifier_peak_bytes={memory_at(capacity)} | "
-                                    "runtime_bytes_per_token="
-                                    f"{runtime_bytes_per_token} | "
-                                    "token_capacity="
-                                    f"{capacity} | "
-                                    f"device_required_bytes={owner_required}"
+                                    f"weights_gib={owner_weights / 2**30:.2f} | "
+                                    "modifier_peak_gib="
+                                    f"{memory_at(capacity) / 2**30:.2f} | "
+                                    "runtime_bytes/token="
+                                    f"{runtime_bytes_per_token:,} | "
+                                    f"token_capacity={capacity:,} | "
+                                    f"required_gib={owner_required / 2**30:.2f} | "
+                                    f"usable_gib={usable_text}"
                                 )
                             token_store.commit_ep_token_plan(
                                 group_index,
@@ -1933,7 +1966,10 @@ def run_subgraph_streaming_pipeline(
                         adapter.model,
                         f"{target_label} | calibration",
                         device,
-                    ):
+                    ), _ep_phase_logger(
+                        ep_executor, target_label, "calibration",
+                        total_batches=len(batches),
+                    ) as ep_metrics:
                         with DisableQuantization(adapter.model), torch.no_grad():
                             token_capacity = (
                                 ep_executor.input_token_capacity
@@ -1947,6 +1983,7 @@ def run_subgraph_streaming_pipeline(
                                 group_inputs,
                                 device=device,
                                 token_capacity=token_capacity,
+                                telemetry=ep_metrics,
                             ):
                                 for batch_index in batch_indices:
                                     session.state.current_batch_idx = batch_index
@@ -1956,6 +1993,11 @@ def run_subgraph_streaming_pipeline(
                                     values,
                                     ep_executor,
                                 )
+                                publish_started_at = perf_counter()
+                                if ep_metrics is not None:
+                                    ep_metrics.activity(
+                                        "publishing calibration outputs"
+                                    )
                                 for batch_index, value, next_value in zip(
                                     batch_indices, values, next_values
                                 ):
@@ -1991,6 +2033,11 @@ def run_subgraph_streaming_pipeline(
                                         )
                                     del next_value, value
                                 del next_values, values
+                                if ep_metrics is not None:
+                                    ep_metrics.host_time(
+                                        "boundary", perf_counter() - publish_started_at
+                                    )
+                                    ep_metrics.advance(len(batch_indices))
                     owner_update_groups = None
                     if expert_parallel is not None:
                         ep_executor.synchronize()
@@ -1999,11 +2046,32 @@ def run_subgraph_streaming_pipeline(
                             expert_parallel.devices,
                             expert_parallel.module_devices,
                         )
+                    owner_local_update = (
+                        owner_update_groups is not None
+                        and _owner_update_adapter(quantizers, runtime_adapters)
+                        is not None
+                    )
+                    update_modules = (
+                        {
+                            group.owner: len(group.modules)
+                            for group in owner_update_groups
+                        }
+                        if owner_local_update
+                        else {device: len(resident_modules)}
+                    )
                     with _stage_logger(
                         adapter.model,
                         f"{target_label} | modifier update",
                         device,
-                    ):
+                    ), _ep_phase_logger(
+                        ep_executor, target_label, "modifier update",
+                        update_modules=update_modules,
+                    ) as ep_metrics:
+                        if ep_metrics is not None:
+                            ep_metrics.activity(
+                                "owner-local"
+                                if owner_local_update else "serial-contract"
+                            )
                         reference_cache = None
                         previous_activations = session.state.sequential_activations
                         previous_propagate_error = (
@@ -2026,6 +2094,7 @@ def run_subgraph_streaming_pipeline(
                                 quantizers,
                                 runtime_adapters,
                                 owner_groups=owner_update_groups,
+                                telemetry=ep_metrics,
                             )
                             streaming_logger.info(
                                 f"{target_label} | modifier update | "
@@ -2050,7 +2119,10 @@ def run_subgraph_streaming_pipeline(
                             adapter.model,
                             f"{target_label} | activation propagation",
                             device,
-                        ):
+                        ), _ep_phase_logger(
+                            ep_executor, target_label, "activation propagation",
+                            total_batches=len(batches),
+                        ) as ep_metrics:
                             # Match SequentialPipeline: propagation captures the
                             # modified full-precision output (or an algorithm's
                             # in-place weight update), without adding fake-quant
@@ -2081,6 +2153,7 @@ def run_subgraph_streaming_pipeline(
                                         group_inputs,
                                         device=device,
                                         token_capacity=token_capacity,
+                                        telemetry=ep_metrics,
                                     )
                                 ):
                                     next_values = _forward_target_group_many(
@@ -2089,6 +2162,9 @@ def run_subgraph_streaming_pipeline(
                                         values,
                                         ep_executor,
                                     )
+                                    publish_started_at = perf_counter()
+                                    if ep_metrics is not None:
+                                        ep_metrics.activity("publishing next boundary")
                                     for batch_index, value, next_value in zip(
                                         batch_indices, values, next_values
                                     ):
@@ -2117,6 +2193,12 @@ def run_subgraph_streaming_pipeline(
                                             )
                                         del next_value, value
                                     del next_values, values
+                                    if ep_metrics is not None:
+                                        ep_metrics.host_time(
+                                            "boundary",
+                                            perf_counter() - publish_started_at,
+                                        )
+                                        ep_metrics.advance(len(batch_indices))
 
                     with _stage_logger(
                         adapter.model,
@@ -2198,15 +2280,19 @@ def run_subgraph_streaming_pipeline(
                     f"peak_allocated_bytes={peak_allocated}"
                 )
                 if expert_parallel is not None:
-                    for owner_device in expert_parallel.devices:
+                    for owner_rank, owner_device in enumerate(expert_parallel.devices):
                         owner_peak = (
                             torch.cuda.max_memory_allocated(owner_device)
                             if owner_device.type == "cuda" else None
                         )
+                        peak_text = (
+                            f"{owner_peak / 2**30:.2f}"
+                            if owner_peak is not None else "unavailable"
+                        )
                         streaming_logger.info(
-                            f"{target_label} | EP complete | device={owner_device} | "
-                            f"peak_allocated_bytes={owner_peak} | "
-                            f"dispatch={ep_executor.dispatch_statistics[owner_device]}"
+                            f"{target_label} | EP memory | rank={owner_rank} | "
+                            f"device={owner_device} | "
+                            f"peak_allocated_gib={peak_text}"
                         )
             pipeline_failed = False
         finally:

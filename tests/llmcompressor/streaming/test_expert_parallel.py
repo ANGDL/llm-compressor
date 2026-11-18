@@ -315,6 +315,34 @@ def test_forward_many_splits_interleaved_experts_in_original_order():
     assert statistics[torch.device("cpu:1")]["expert_calls"] == 2
 
 
+def test_phase_workload_counters_separate_calibration_and_propagation():
+    model = _MoE(4).eval()
+    subgraph = _graph(model)
+    plan = ExpertParallelPlan.from_model(
+        model, _targets(model), ("cpu:0", "cpu:1")
+    )
+    values = [{
+        "hidden": torch.randn(6, 4),
+        "indices": torch.tensor([0, 1, 2, 3, 0, 1]),
+    }]
+    with ExpertParallelExecutor(model, plan) as executor:
+        for phase in ("calibration", "activation propagation"):
+            with executor.log_phase("group", phase, total_batches=1) as metrics:
+                actual = executor.forward_many([subgraph], values)
+                metrics.advance(1)
+                text = metrics.format("complete")
+                assert "routed_tokens=6" in text
+                assert "batches=1/1" in text
+                assert "token_max/mean=1.00" in text
+                rows = [line.split() for line in text.splitlines() if "cpu:" in line]
+                assert all(row[5] == "2/2" for row in rows)
+                assert all(row[6] == "1" for row in rows)
+                assert all(row[-1] == "waiting" for row in rows)
+        assert executor.telemetry is None
+    expected = subgraph.forward(model, **values[0])
+    torch.testing.assert_close(actual[0]["result"], expected["result"])
+
+
 def test_forward_many_rejects_indivisible_call_larger_than_owner_capacity():
     model = _MoE(2).eval()
     plan = ExpertParallelPlan.from_model(model, _targets(model), ("cpu:0", "cpu:1"))
@@ -331,6 +359,58 @@ def test_forward_many_rejects_indivisible_call_larger_than_owner_capacity():
 def test_multidimensional_expert_tokens_count_sequence_and_batch_dimensions():
     entry = (None, "experts.0", (torch.empty(2, 3, 4),), {})
     assert ExpertParallelExecutor._entry_token_count(entry) == 6
+
+
+def test_ready_grouping_checks_a_bounded_number_of_inputs_per_entry(monkeypatch):
+    model = _MoE(2).eval()
+    plan = ExpertParallelPlan.from_model(model, _targets(model), ("cpu:0", "cpu:1"))
+    original = ExpertParallelExecutor._inputs_compatible
+    checked = []
+
+    def compatible(cls, entries, primary):
+        checked.append(len(entries))
+        return original(entries, primary)
+
+    monkeypatch.setattr(
+        ExpertParallelExecutor, "_inputs_compatible", classmethod(compatible)
+    )
+    entries = [
+        (None, "experts.0", (torch.randn(2, 4),), {}) for _index in range(256)
+    ]
+    with ExpertParallelExecutor(model, plan) as executor:
+        groups = executor._group_ready_experts(
+            entries, torch.device("cpu:0"), torch.device("cpu:0")
+        )
+    assert len(groups) == 1
+    assert len(groups[0]) == len(entries)
+    assert max(checked) == 2
+    assert sum(checked) <= 2 * len(entries)
+
+
+def test_ready_grouping_preserves_incompatible_inputs_and_capacity_boundaries():
+    model = _MoE(2).eval()
+    plan = ExpertParallelPlan.from_model(model, _targets(model), ("cpu:0", "cpu:1"))
+    entries = [
+        (None, "experts.0", (torch.randn(length, width, dtype=dtype),), {})
+        for length, width, dtype in (
+            (2, 4, torch.float32),
+            (3, 4, torch.float32),
+            (1, 4, torch.float32),
+            (1, 4, torch.float64),
+            (1, 8, torch.float64),
+            (2, 8, torch.float64),
+        )
+    ]
+    with ExpertParallelExecutor(
+        model, plan, token_capacity={"cpu:0": 5}
+    ) as executor:
+        groups = executor._group_ready_experts(
+            entries, torch.device("cpu:0"), torch.device("cpu:0")
+        )
+    assert [[id(entry) for entry in group] for group in groups] == [
+        [id(entries[index]) for index in indices]
+        for indices in ((0, 1), (2,), (3,), (4, 5))
+    ]
 
 
 def test_owner_queue_prepares_only_one_dispatch_per_active_owner(monkeypatch):

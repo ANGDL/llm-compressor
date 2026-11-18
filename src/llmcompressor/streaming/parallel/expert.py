@@ -8,6 +8,7 @@ from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from math import prod
+from time import perf_counter
 from typing import Any
 
 import torch
@@ -32,6 +33,7 @@ from .load_balance import (
     build_load_balanced_placement,
 )
 from .placement import PlacementEntry, PlacementPlan
+from .telemetry import EPPhaseLogger
 from .topology import EPTopology
 
 
@@ -680,6 +682,34 @@ class ExpertParallelExecutor:
             device: {"tokens": 0, "dispatches": 0, "expert_calls": 0, "max_tokens": 0}
             for device in plan.devices
         }
+        self.telemetry: EPPhaseLogger | None = None
+
+    @contextmanager
+    def log_phase(self, label: str, phase: str, **kwargs):
+        """Observe one phase without waiting for any device or owner stream."""
+
+        if self.telemetry is not None:
+            raise RuntimeError("EP telemetry phases must not overlap")
+        with EPPhaseLogger(
+            self.plan.devices,
+            label=label,
+            phase=phase,
+            token_capacity=self.token_capacity,
+            **kwargs,
+        ) as telemetry:
+            self.telemetry = telemetry
+            try:
+                yield telemetry
+            finally:
+                self.telemetry = None
+
+    def _run_dispatch(self, owner, function, *args):
+        context = (
+            self.telemetry.owner_work(owner)
+            if self.telemetry is not None else nullcontext()
+        )
+        with context:
+            return function(*args)
 
     def set_token_capacity(
         self, token_capacity: Mapping[torch.device | str, int] | None
@@ -923,7 +953,8 @@ class ExpertParallelExecutor:
             )
             incompatible = (
                 current
-                and not self._inputs_compatible(current + [entry], primary)
+                and not exceeds_budget
+                and not self._inputs_compatible((current[0], entry), primary)
             )
             if exceeds_budget or incompatible:
                 groups.append(current)
@@ -1172,9 +1203,11 @@ class ExpertParallelExecutor:
                     ready.append((index, user))
 
         unmet = [schedule.unmet.copy() for _value in values]
+        telemetry = self.telemetry
         try:
             while ready or pending or any(queued.values()):
                 ready_experts = {}
+                ready_started_at = perf_counter() if telemetry is not None else 0
                 while ready:
                     index, node = ready.popleft()
                     args, kwargs = map_arg(
@@ -1195,14 +1228,23 @@ class ExpertParallelExecutor:
                                 self.plan.device_for(name), []
                             ).append(((index, node), name, args, kwargs))
                         else:
+                            if telemetry is not None:
+                                telemetry.activity(f"call_module:{name}")
                             finish(
                                 index,
                                 node,
                                 self.model.get_submodule(name)(*args, **kwargs),
                             )
                     elif node.op == "call_function":
+                        if telemetry is not None:
+                            telemetry.activity(
+                                "call_function:"
+                                + getattr(node.target, "__name__", node.name)
+                            )
                         finish(index, node, node.target(*args, **kwargs))
                     elif node.op == "call_method":
+                        if telemetry is not None:
+                            telemetry.activity(f"call_method:{node.target}")
                         finish(
                             index,
                             node,
@@ -1214,6 +1256,10 @@ class ExpertParallelExecutor:
                         raise ValueError(
                             f"Unsupported expert parallel FX operation {node.op}"
                         )
+                if telemetry is not None:
+                    telemetry.host_time("fx", perf_counter() - ready_started_at)
+                    telemetry.activity("packing expert inputs")
+                pack_started_at = perf_counter() if telemetry is not None else 0
                 for owner, entries in ready_experts.items():
                     queued[owner].extend(
                         self._group_ready_experts(entries, primary, owner)
@@ -1244,6 +1290,10 @@ class ExpertParallelExecutor:
                         if primary_stream is not None and dispatches
                         else None
                     )
+                if telemetry is not None:
+                    telemetry.host_time("pack", perf_counter() - pack_started_at)
+                    for owner, groups in queued.items():
+                        telemetry.queue(owner, len(groups))
                 for owner, entries, prepared in dispatches:
                     active_owners.add(owner)
                     statistics = self.dispatch_statistics[owner]
@@ -1254,8 +1304,19 @@ class ExpertParallelExecutor:
                         len(prepared.names) if prepared is not None else len(entries)
                     )
                     statistics["max_tokens"] = max(statistics["max_tokens"], tokens)
+                    if telemetry is not None:
+                        telemetry.dispatch(
+                            owner,
+                            tokens,
+                            (
+                                prepared.names if prepared is not None
+                                else tuple(entry[1] for entry in entries)
+                            ),
+                        )
                     if prepared is not None:
                         future = self._workers[owner].submit(
+                            self._run_dispatch,
+                            owner,
                             self._expert_forward_batch,
                             prepared,
                             input_event,
@@ -1265,6 +1326,8 @@ class ExpertParallelExecutor:
                         continue
                     for _node, name, args, kwargs in entries:
                         future = self._workers[owner].submit(
+                            self._run_dispatch,
+                            owner,
                             self._expert_forward,
                             name,
                             args,
@@ -1274,11 +1337,18 @@ class ExpertParallelExecutor:
                         )
                         pending[future] = (owner, (_node,))
                 if pending:
+                    if telemetry is not None:
+                        telemetry.activity("waiting for owner submissions")
+                    wait_started_at = perf_counter() if telemetry is not None else 0
                     completed, _remaining = wait(pending, return_when=FIRST_COMPLETED)
+                    if telemetry is not None:
+                        telemetry.host_time("wait", perf_counter() - wait_started_at)
                     for future in completed:
                         owner, nodes = pending.pop(future)
                         active_owners.remove(owner)
                         result = future.result()
+                        if telemetry is not None:
+                            telemetry.joined(owner)
                         if isinstance(result, _ExpertBatchResult):
                             if result.event is not None:
                                 primary_stream.wait_event(result.event)
@@ -1304,6 +1374,8 @@ class ExpertParallelExecutor:
             raise
         if any(output is None for output in outputs):
             raise RuntimeError("Expert parallel graph did not produce an output")
+        if telemetry is not None:
+            telemetry.activity("host forward returned")
         return tuple(
             {
                 **{
