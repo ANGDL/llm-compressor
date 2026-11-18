@@ -4,11 +4,14 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
 
 import torch
 from torch import nn
+
+from .telemetry import EPPhaseLogger
 
 __all__ = [
     "OwnerModuleGroup",
@@ -84,17 +87,25 @@ class OwnerUpdateScheduler:
     def _run_owner(
         group: OwnerModuleGroup,
         update: Callable[[torch.device, tuple[nn.Module, ...]], Any],
+        telemetry: EPPhaseLogger | None = None,
     ) -> Any:
-        if group.owner.type == "cuda":
-            with torch.cuda.device(group.owner):
-                return update(group.owner, group.modules)
-        return update(group.owner, group.modules)
+        context = (
+            telemetry.owner_work(group.owner, modules=len(group.modules))
+            if telemetry is not None else nullcontext()
+        )
+        device_context = (
+            torch.cuda.device(group.owner)
+            if group.owner.type == "cuda" else nullcontext()
+        )
+        with context, device_context:
+            return update(group.owner, group.modules)
 
     def run(
         self,
         groups: Sequence[OwnerModuleGroup],
         *,
         update: Callable[[torch.device, tuple[nn.Module, ...]], Any],
+        telemetry: EPPhaseLogger | None = None,
     ) -> tuple[tuple[torch.device, Any], ...]:
         """Run all owner-local updates and wait only for this update boundary."""
 
@@ -105,7 +116,7 @@ class OwnerUpdateScheduler:
             raise ValueError("owner update groups must have unique owners")
         if len(ordered) == 1:
             group = ordered[0]
-            return ((group.owner, self._run_owner(group, update)),)
+            return ((group.owner, self._run_owner(group, update, telemetry)),)
 
         results: dict[torch.device, Any] = {}
         workers = self.max_workers or len(ordered)
@@ -115,7 +126,7 @@ class OwnerUpdateScheduler:
             thread_name_prefix="ep-owner-update",
         ) as executor:
             for group in ordered:
-                future = executor.submit(self._run_owner, group, update)
+                future = executor.submit(self._run_owner, group, update, telemetry)
                 futures[future] = group
             try:
                 for future in as_completed(futures):
