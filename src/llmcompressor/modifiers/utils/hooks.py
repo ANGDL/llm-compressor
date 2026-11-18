@@ -1,5 +1,6 @@
 import contextlib
 from collections.abc import Callable
+from contextvars import ContextVar
 from functools import partial, wraps
 from typing import Any, ClassVar
 
@@ -14,6 +15,8 @@ from pydantic import BaseModel
 from torch.utils.hooks import RemovableHandle
 
 __all__ = ["HooksMixin"]
+
+_LOCAL_HOOKS_DISABLED = ContextVar("modifier_hooks_disabled", default=False)
 
 
 class HooksMixin(BaseModel):
@@ -48,6 +51,16 @@ class HooksMixin(BaseModel):
 
     # attached to local subclasses
     _hooks: set[RemovableHandle] = set()
+
+    @classmethod
+    @contextlib.contextmanager
+    def disable_hooks_local(cls):
+        """Disable hooks only in the current independent execution context."""
+        token = _LOCAL_HOOKS_DISABLED.set(True)
+        try:
+            yield
+        finally:
+            _LOCAL_HOOKS_DISABLED.reset(token)
 
     @classmethod
     @contextlib.contextmanager
@@ -94,7 +107,7 @@ class HooksMixin(BaseModel):
         def wrapped_hook(*args, **kwargs):
             nonlocal handle
 
-            if (
+            if _LOCAL_HOOKS_DISABLED.get() or (
                 HooksMixin._HOOKS_DISABLED
                 and handle not in HooksMixin._HOOKS_KEEP_ENABLED
             ):

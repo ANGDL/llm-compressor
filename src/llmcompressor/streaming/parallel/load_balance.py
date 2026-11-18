@@ -7,6 +7,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from math import ceil, isfinite
+from threading import Event
 from typing import Any, TypeVar
 
 from ..artifacts import fingerprint_json
@@ -342,12 +343,10 @@ def plan_resident_windows(
                     "capacity for its routed tokens"
                 )
             max_tokens = min(capacity, current_tokens) if current_tokens else 0
-            batches = (
-                ceil(max(token for token in (
-                    expert_costs[name].route_tokens for name in current
-                )) / max_tokens)
-                if max_tokens
-                else 0
+            batches = sum(
+                max(1, ceil(expert_costs[name].route_tokens / max_tokens))
+                if max_tokens else 1
+                for name in current
             )
             windows.append(
                 ResidentWindow(
@@ -368,13 +367,23 @@ def plan_resident_windows(
 
         for name in names:
             cost = expert_costs[name]
-            if cost.total_resident_bytes > owner_memory[owner].resident_budget_bytes:
+            minimum_dispatch = (
+                owner_memory[owner].dispatch_bytes_per_token if cost.route_tokens else 0
+            )
+            if (
+                cost.total_resident_bytes + minimum_dispatch
+                > owner_memory[owner].resident_budget_bytes
+            ):
                 raise MemoryError(
                     f"expert {name!r} cannot fit in an owner resident window"
                 )
+            minimum_dispatch = (
+                owner_memory[owner].dispatch_bytes_per_token
+                if current_tokens + cost.route_tokens else 0
+            )
             would_exceed = (
                 current
-                and current_bytes + cost.total_resident_bytes
+                and current_bytes + cost.total_resident_bytes + minimum_dispatch
                 > owner_memory[owner].resident_budget_bytes
             )
             if would_exceed:
@@ -404,6 +413,7 @@ class AsyncResidentWindowScheduler:
         compute: Callable[[ResidentWindow, T], U],
         update: Callable[[ResidentWindow, T, U], Any] | None = None,
         release: Callable[[ResidentWindow, T, U], Any] | None = None,
+        discard: Callable[[T], Any] | None = None,
     ) -> tuple[tuple[ResidentWindow, U], ...]:
         """Run one bounded pipeline per owner and return results in plan order."""
 
@@ -417,6 +427,7 @@ class AsyncResidentWindowScheduler:
             owner_windows.sort(key=lambda window: window.window_index)
 
         results: list[tuple[ResidentWindow, U]] = []
+        canceled = Event()
 
         def run_owner(owner_windows: list[ResidentWindow]):
             owner_results = []
@@ -425,22 +436,43 @@ class AsyncResidentWindowScheduler:
                 thread_name_prefix=f"ep-prefetch-{owner_windows[0].owner_rank}",
             ) as owner_prefetch:
                 prefetched: Future[T] | None = None
-                for index, window in enumerate(owner_windows):
-                    if prefetched is None:
-                        prefetched = owner_prefetch.submit(prefetch, window)
-                    state = prefetched.result()
-                    next_prefetched = None
-                    if self.max_prefetch and index + 1 < len(owner_windows):
-                        next_prefetched = owner_prefetch.submit(
-                            prefetch, owner_windows[index + 1]
-                        )
-                    result = compute(window, state)
-                    if update is not None:
-                        update(window, state, result)
-                    if release is not None:
-                        release(window, state, result)
-                    owner_results.append((window, result))
-                    prefetched = next_prefetched
+                try:
+                    for index, window in enumerate(owner_windows):
+                        if canceled.is_set():
+                            break
+                        if prefetched is None:
+                            prefetched = owner_prefetch.submit(prefetch, window)
+                        current = prefetched
+                        prefetched = None
+                        state = current.result()
+                        if self.max_prefetch and index + 1 < len(owner_windows):
+                            prefetched = owner_prefetch.submit(
+                                prefetch, owner_windows[index + 1]
+                            )
+                        try:
+                            result = compute(window, state)
+                            if update is not None:
+                                update(window, state, result)
+                            if release is not None:
+                                release(window, state, result)
+                            owner_results.append((window, result))
+                        finally:
+                            if discard is not None:
+                                discard(state)
+                except BaseException:
+                    canceled.set()
+                    raise
+                finally:
+                    if prefetched is not None:
+                        if not prefetched.cancel():
+                            try:
+                                state = prefetched.result()
+                            except BaseException:
+                                if not canceled.is_set():
+                                    raise
+                            else:
+                                if discard is not None:
+                                    discard(state)
             return owner_results
 
         with ThreadPoolExecutor(
