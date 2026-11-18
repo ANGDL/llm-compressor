@@ -118,6 +118,8 @@ from .parallel import (
     ExpertRoute,
     LoadBalancedPlacement,
     OwnerMemoryProfile,
+    OwnerModuleGroup,
+    OwnerUpdateScheduler,
     ParallelContext,
     PlacementEntry,
     PlacementPlan,
@@ -130,6 +132,7 @@ from .parallel import (
     ensure_streaming_ep_process_group,
     make_expert_state_filter,
     plan_resident_windows,
+    partition_modules_by_owner,
 )
 from .quantize import quantize_streaming
 from .recovery import (
@@ -199,6 +202,8 @@ __all__ = [
     "ModifierContractError",
     "ParallelContext",
     "OwnerMemoryProfile",
+    "OwnerModuleGroup",
+    "OwnerUpdateScheduler",
     "ParallelInfo",
     "PlacementEntry",
     "PlacementPlan",
@@ -258,6 +263,7 @@ __all__ = [
     "load_streaming_model",
     "make_expert_state_filter",
     "plan_resident_windows",
+    "partition_modules_by_owner",
     "quantize_streaming",
     "trace_streaming_boundaries",
     "streaming_oneshot",

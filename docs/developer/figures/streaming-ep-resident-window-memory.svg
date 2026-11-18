@@ -1,0 +1,176 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="920" viewBox="0 0 1600 920" role="img" aria-labelledby="title desc">
+  <title id="title">Streaming EP resident window memory and asynchronous pipeline</title>
+  <desc id="desc">A memory and scheduling diagram for streaming expert parallel post-training quantization. Each owner has a usable memory budget divided among resident expert weights, Hessian and observer state, activation scratch, update workspace, and safety reserve. Resident windows exchange experts only after Hessian completion. Route metadata and activation chunks are double buffered when admission allows.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,5 L0,10 z" fill="#2563eb"/>
+    </marker>
+    <marker id="arrow-green" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,5 L0,10 z" fill="#059669"/>
+    </marker>
+    <marker id="arrow-orange" markerWidth="10" markerHeight="5" refX="9" refY="2.5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,2.5 L0,5 z" fill="#ea580c"/>
+    </marker>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%">
+      <feDropShadow dx="0" dy="3" stdDeviation="4" flood-color="#0f172a" flood-opacity="0.12"/>
+    </filter>
+    <style>
+      .title { font: 700 28px Inter, ui-sans-serif, system-ui, -apple-system, sans-serif; fill: #0f172a; }
+      .subtitle { font: 400 15px Inter, ui-sans-serif, system-ui, -apple-system, sans-serif; fill: #475569; }
+      .section { font: 700 16px Inter, ui-sans-serif, system-ui, -apple-system, sans-serif; fill: #0f172a; }
+      .label { font: 600 14px Inter, ui-sans-serif, system-ui, -apple-system, sans-serif; fill: #0f172a; }
+      .body { font: 400 13px Inter, ui-sans-serif, system-ui, -apple-system, sans-serif; fill: #334155; }
+      .small { font: 400 11px Inter, ui-sans-serif, system-ui, -apple-system, sans-serif; fill: #475569; }
+      .tiny { font: 400 10px Inter, ui-sans-serif, system-ui, -apple-system, sans-serif; fill: #64748b; }
+      .formula { font: 600 14px ui-monospace, SFMono-Regular, Menlo, monospace; fill: #1e293b; }
+      .data { stroke: #2563eb; stroke-width: 2.5; fill: none; marker-end: url(#arrow); }
+      .async { stroke: #059669; stroke-width: 2.3; fill: none; marker-end: url(#arrow-green); }
+      .swap { stroke: #ea580c; stroke-width: 2.2; stroke-dasharray: 8 6; fill: none; marker-end: url(#arrow-orange); }
+    </style>
+  </defs>
+
+  <rect width="1600" height="920" fill="#f8fafc"/>
+  <rect x="36" y="28" width="1528" height="92" rx="16" fill="#ffffff" stroke="#cbd5e1"/>
+  <text x="68" y="66" class="title">Resident window memory model</text>
+  <text x="68" y="94" class="subtitle">The planner admits a window only when fixed state plus transient dispatch memory fits the owner budget.</text>
+  <text x="1180" y="67" class="small">solid: tensor flow</text>
+  <line x1="1128" y1="62" x2="1165" y2="62" stroke="#2563eb" stroke-width="2.5" marker-end="url(#arrow)"/>
+  <text x="1180" y="94" class="small">dashed orange: expert swap</text>
+  <line x1="1128" y1="89" x2="1165" y2="89" stroke="#ea580c" stroke-width="2.2" stroke-dasharray="8 6" marker-end="url(#arrow-orange)"/>
+
+  <rect x="36" y="144" width="438" height="724" rx="16" fill="#eff6ff" stroke="#93c5fd"/>
+  <text x="64" y="180" class="section">Owner memory admission</text>
+  <text x="64" y="204" class="small">A separate budget is evaluated for every EP rank.</text>
+
+  <rect x="80" y="232" width="180" height="500" rx="12" fill="#ffffff" stroke="#bfdbfe" filter="url(#shadow)"/>
+  <text x="170" y="260" text-anchor="middle" class="label">usable_memory[r]</text>
+  <rect x="116" y="286" width="108" height="116" fill="#bfdbfe"/>
+  <text x="170" y="332" text-anchor="middle" class="small">resident</text>
+  <text x="170" y="350" text-anchor="middle" class="small">expert weights</text>
+  <text x="170" y="369" text-anchor="middle" class="tiny">Wᵢ only</text>
+  <rect x="116" y="402" width="108" height="92" fill="#fde68a"/>
+  <text x="170" y="439" text-anchor="middle" class="small">Hessian /</text>
+  <text x="170" y="457" text-anchor="middle" class="small">observer state</text>
+  <rect x="116" y="494" width="108" height="82" fill="#fed7aa"/>
+  <text x="170" y="528" text-anchor="middle" class="small">activation</text>
+  <text x="170" y="546" text-anchor="middle" class="small">scratch</text>
+  <rect x="116" y="576" width="108" height="70" fill="#ddd6fe"/>
+  <text x="170" y="607" text-anchor="middle" class="small">update</text>
+  <text x="170" y="623" text-anchor="middle" class="small">workspace</text>
+  <rect x="116" y="646" width="108" height="54" fill="#bbf7d0"/>
+  <text x="170" y="679" text-anchor="middle" class="small">safety reserve</text>
+  <line x1="116" y1="286" x2="224" y2="286" stroke="#1e3a8a"/>
+  <line x1="116" y1="700" x2="224" y2="700" stroke="#166534"/>
+
+  <rect x="286" y="286" width="158" height="330" rx="12" fill="#ffffff" stroke="#93c5fd"/>
+  <text x="306" y="316" class="label">Admission rule</text>
+  <text x="306" y="350" class="formula">M_fixed</text>
+  <text x="367" y="350" class="body">= weights</text>
+  <text x="306" y="374" class="formula">+ state</text>
+  <text x="306" y="398" class="formula">+ output</text>
+  <text x="306" y="422" class="formula">+ comms</text>
+  <line x1="306" y1="440" x2="420" y2="440" stroke="#cbd5e1"/>
+  <text x="306" y="470" class="formula">M_dispatch</text>
+  <text x="306" y="494" class="body">= gather</text>
+  <text x="306" y="518" class="body">+ activation</text>
+  <text x="306" y="542" class="body">+ modifier scratch</text>
+  <line x1="306" y1="560" x2="420" y2="560" stroke="#cbd5e1"/>
+  <text x="306" y="589" class="formula">M_fixed</text>
+  <text x="306" y="610" class="formula">+ M_dispatch</text>
+  <text x="306" y="635" class="formula">≤ usable_memory</text>
+
+  <rect x="64" y="766" width="380" height="70" rx="10" fill="#ffffff" stroke="#60a5fa"/>
+  <text x="254" y="795" text-anchor="middle" class="body">If a single expert cannot fit:</text>
+  <text x="254" y="816" text-anchor="middle" class="small">fail admission or change the resource contract.</text>
+
+  <rect x="506" y="144" width="548" height="724" rx="16" fill="#f5f3ff" stroke="#c4b5fd"/>
+  <text x="534" y="180" class="section">Resident windows and Hessian lifetime</text>
+  <text x="534" y="204" class="small">Experts are replaced only after their complete target scope.</text>
+
+  <rect x="536" y="236" width="488" height="230" rx="14" fill="#ffffff" stroke="#a78bfa" filter="url(#shadow)"/>
+  <rect x="560" y="264" width="200" height="168" rx="12" fill="#ede9fe" stroke="#8b5cf6" stroke-width="2"/>
+  <text x="660" y="296" text-anchor="middle" class="label">Window W₀</text>
+  <text x="660" y="328" text-anchor="middle" class="body">E₀ · E₄ · E₇ · E₁₂</text>
+  <text x="660" y="352" text-anchor="middle" class="body">weights resident</text>
+  <text x="660" y="376" text-anchor="middle" class="body">Hessian accumulates</text>
+  <text x="660" y="410" text-anchor="middle" class="small">chunks 0 … k</text>
+  <rect x="800" y="264" width="200" height="168" rx="12" fill="#f1f5f9" stroke="#94a3b8"/>
+  <text x="900" y="296" text-anchor="middle" class="label">Window W₁</text>
+  <text x="900" y="328" text-anchor="middle" class="body">E₁ · E₃ · E₉ · E₁₁</text>
+  <text x="900" y="352" text-anchor="middle" class="body">prefetch after release</text>
+  <text x="900" y="376" text-anchor="middle" class="body">new Hessian state</text>
+  <text x="900" y="410" text-anchor="middle" class="small">chunks 0 … k</text>
+  <path d="M760 348 L800 348" class="swap"/>
+  <text x="780" y="333" text-anchor="middle" class="tiny">swap</text>
+  <text x="552" y="452" class="tiny">W₀ state is released only after quantize + write.</text>
+
+  <rect x="536" y="500" width="488" height="330" rx="14" fill="#ffffff" stroke="#c4b5fd"/>
+  <text x="560" y="532" class="label">Per-expert lifecycle</text>
+  <rect x="560" y="562" width="106" height="60" rx="9" fill="#dbeafe" stroke="#60a5fa"/>
+  <text x="613" y="588" text-anchor="middle" class="small">route</text>
+  <text x="613" y="605" text-anchor="middle" class="small">chunk</text>
+  <rect x="690" y="562" width="106" height="60" rx="9" fill="#fef3c7" stroke="#fbbf24"/>
+  <text x="743" y="588" text-anchor="middle" class="small">forward</text>
+  <text x="743" y="605" text-anchor="middle" class="small">+ Hessian</text>
+  <rect x="820" y="562" width="106" height="60" rx="9" fill="#ede9fe" stroke="#a78bfa"/>
+  <text x="873" y="588" text-anchor="middle" class="small">quantize</text>
+  <text x="873" y="605" text-anchor="middle" class="small">+ update</text>
+  <rect x="950" y="562" width="50" height="60" rx="9" fill="#dcfce7" stroke="#4ade80"/>
+  <text x="975" y="597" text-anchor="middle" class="tiny">free</text>
+  <path d="M666 592 L690 592" class="data"/>
+  <path d="M796 592 L820 592" class="data"/>
+  <path d="M926 592 L950 592" class="async"/>
+  <rect x="560" y="660" width="440" height="112" rx="10" fill="#fff7ed" stroke="#fdba74"/>
+  <text x="580" y="690" class="label">GPTQ synchronization point</text>
+  <text x="580" y="718" class="body">last route chunk(e)</text>
+  <text x="712" y="718" class="body">→ sync Hessian</text>
+  <text x="820" y="718" class="body">→ compress</text>
+  <text x="580" y="744" class="body">→ publish quantized state</text>
+  <text x="780" y="744" class="body">→ release weight/state</text>
+
+  <rect x="1086" y="144" width="478" height="724" rx="16" fill="#ecfdf5" stroke="#86efac"/>
+  <text x="1114" y="180" class="section">Bounded asynchronous pipeline</text>
+  <text x="1114" y="204" class="small">Double buffering is enabled only when admission leaves headroom.</text>
+
+  <rect x="1114" y="236" width="422" height="168" rx="14" fill="#ffffff" stroke="#86efac" filter="url(#shadow)"/>
+  <text x="1138" y="268" class="label">Route metadata and activation chunks</text>
+  <rect x="1138" y="292" width="112" height="72" rx="10" fill="#dbeafe" stroke="#60a5fa"/>
+  <text x="1194" y="321" text-anchor="middle" class="small">buffer A</text>
+  <text x="1194" y="341" text-anchor="middle" class="tiny">current chunk</text>
+  <rect x="1272" y="292" width="112" height="72" rx="10" fill="#fef3c7" stroke="#fbbf24"/>
+  <text x="1328" y="321" text-anchor="middle" class="small">compute B</text>
+  <text x="1328" y="341" text-anchor="middle" class="tiny">Hessian active</text>
+  <rect x="1406" y="292" width="106" height="72" rx="10" fill="#dcfce7" stroke="#4ade80"/>
+  <text x="1459" y="321" text-anchor="middle" class="small">prefetch</text>
+  <text x="1459" y="341" text-anchor="middle" class="tiny">next window</text>
+  <path d="M1250 328 L1272 328" class="data"/>
+  <path d="M1384 328 L1406 328" class="async"/>
+  <text x="1138" y="388" class="tiny">CPU packing and disk I/O may overlap device work.</text>
+
+  <rect x="1114" y="438" width="422" height="220" rx="14" fill="#ffffff" stroke="#86efac"/>
+  <text x="1138" y="470" class="label">Owner timeline</text>
+  <text x="1138" y="502" class="small">rank r</text>
+  <line x1="1194" y1="498" x2="1498" y2="498" stroke="#cbd5e1"/>
+  <rect x="1200" y="520" width="78" height="48" rx="8" fill="#dbeafe" stroke="#60a5fa"/>
+  <text x="1239" y="549" text-anchor="middle" class="tiny">pack W₀</text>
+  <rect x="1286" y="520" width="100" height="48" rx="8" fill="#fef3c7" stroke="#fbbf24"/>
+  <text x="1336" y="549" text-anchor="middle" class="tiny">forward W₀</text>
+  <rect x="1394" y="520" width="92" height="48" rx="8" fill="#ede9fe" stroke="#a78bfa"/>
+  <text x="1440" y="549" text-anchor="middle" class="tiny">update W₀</text>
+  <rect x="1494" y="520" width="38" height="48" rx="8" fill="#dcfce7" stroke="#4ade80"/>
+  <text x="1513" y="549" text-anchor="middle" class="tiny">W₁</text>
+  <text x="1138" y="616" class="small">other owner</text>
+  <line x1="1194" y1="612" x2="1498" y2="612" stroke="#cbd5e1"/>
+  <rect x="1200" y="634" width="100" height="48" rx="8" fill="#dbeafe" stroke="#60a5fa"/>
+  <text x="1250" y="663" text-anchor="middle" class="tiny">pack W₀</text>
+  <rect x="1308" y="634" width="92" height="48" rx="8" fill="#fef3c7" stroke="#fbbf24"/>
+  <text x="1354" y="663" text-anchor="middle" class="tiny">forward</text>
+  <rect x="1408" y="634" width="82" height="48" rx="8" fill="#dcfce7" stroke="#4ade80"/>
+  <text x="1449" y="663" text-anchor="middle" class="tiny">W₁ prep</text>
+
+  <rect x="1114" y="692" width="422" height="138" rx="14" fill="#fff7ed" stroke="#fdba74"/>
+  <text x="1138" y="724" class="label">Scheduling rule</text>
+  <text x="1138" y="752" class="body">maximize useful work per owner</text>
+  <text x="1138" y="776" class="body">while preserving fixed combine order</text>
+  <text x="1138" y="800" class="small">If double buffering does not fit, use single-buffer device flow.</text>
+</svg>

@@ -518,6 +518,13 @@ RoutePlan 的生命周期限定在一个 target scope。gate 本身可以只执�
 RoutePlan 可以按 boundary 分段写入 `BoundaryActivationStore` 或独立的紧凑
 metadata 文件，不需要把所有层、所有样本的 route metadata 同时放在显存。
 
+![Route-aware streaming EP architecture](figures/streaming-ep-route-window-architecture.svg)
+
+图中左侧的 RoutePlan 保留 token 行号和 route weight，中间的 planner 只在
+通过显存准入后生成稳定的 resident placement epoch，右侧各 owner 独立推进
+pack、forward/Hessian、quantize/write/release。底部的 GPTQ correctness
+boundary 表示专家必须完成全部校准 token 后才能释放 Hessian 和权重。
+
 resident window 的规则如下：
 
 | 情况 | 执行方式 |
@@ -628,6 +635,13 @@ Gate route plan
 不同 owner 不需要因为某个 owner 的 window 较慢而停止所有计算。最终
 target output、modifier reduction、propagation 和 checkpoint commit 才是
 必须等待所有 owner 完成的边界。
+
+![Resident window memory and asynchronous pipeline](figures/streaming-ep-resident-window-memory.svg)
+
+第二张图把两个容易混淆的约束拆开：左侧是每个 owner 的显存 admission，
+中间是 resident expert 与 Hessian 的生命周期，右侧是有界的 route
+metadata/activation 双缓冲。双缓冲只有在 `M_fixed + M_dispatch` 仍满足
+owner 显存预算时才启用，否则退化为单缓冲设备流水。
 
 ### 7.2 可以安全重叠的工作
 
@@ -838,7 +852,45 @@ continue propagation/write
 串行 fallback，并在日志中写明 `update_parallelism=serial-contract`，避免
 把低利用率误判为硬件故障。
 
-### 9.3 HIGGS 和未来 modifier
+当前实现已经在 `src/llmcompressor/streaming/parallel/modifier_update.py`
+提供通用 `OwnerUpdateScheduler`。主 pipeline 在 GPTQ 具备单一 quantizer、
+没有额外 runtime adapter、且每个 owner 的 observer/qparam state 不共享时，
+先并行 handoff 各 owner 的 forward stream，再由
+`GPTQStreamingMemoryAdapter.update_owner()` 只处理本 owner 的模块。
+所有 owner update 完成后，pipeline 才统一结束 layerwise calibration、
+执行 propagation 和提交 checkpoint。其他 modifier 仍明确记录为
+`serial-contract`，不会因为启用了 EP 就被强行拆分。
+
+### 9.3 当前实现的同步审计
+
+2026-11-18 对当前 `ExpertParallelExecutor` 和主 streaming pipeline 的
+同步点审计结果如下：
+
+| 位置 | 当前行为 | 是否阻塞无关 owner | 结论 |
+| --- | --- | --- | --- |
+| `forward_many()` 提交 dispatch | 每个 owner 一个 worker 和 device stream，同时提交 ready work | 否 | rank-local forward 可以并行 |
+| `forward_many()` 完成等待 | `wait(..., FIRST_COMPLETED)`，先消费最先完成的 owner | 否 | 不等待全部 owner 再发下一份 work |
+| 同一 owner 的 active queue | 一个 owner 同时只保留一个 transient batch | 只限制本 owner | 防止重复 staging/Hessian workspace |
+| `ExpertParallelExecutor.synchronize()` | modifier update handoff、target 卸载前等待各 owner stream | 是 update/target commit 边界 | 为了安全读取 Hessian、卸载或换权重，属于必要同步 |
+| `_modifier_update()` | GPTQ owner-local contract 通过 owner scheduler 并发；其他 modifier 由 `LifecycleCallbacks.sequential_epoch_end(modules)` 串行 | 只在 owner update 完成边界 | GPTQ 可并行，未声明能力的 modifier 保持 serial-contract |
+| checkpoint commit / propagation | 等待当前 target 的所有结果 | 是数据依赖边界 | 必须等待，不能提前发布不完整输出 |
+| `LocalExpertProxy` 的 `all_reduce` | 分布式 proxy 每次 forward 汇合各 rank partial output | 是 collective | 这是模型语义所需；当前 single-process executor 不走该路径 |
+
+因此当前实现的准确结论是：**expert forward/dispatch 和满足 contract 的
+GPTQ update 已按 owner 并行**。`synchronize()` 在 update 前用于完成
+forward stream 到 modifier update 的必要 handoff，在 target 的权重卸载、
+换入或最终关闭前再次作为生命周期边界使用；它不调用跨设备的
+`torch.cuda.synchronize()`。异常退出路径中的全量等待只用于确保 worker
+已停止后再释放模型状态。
+
+回归测试
+`tests/llmcompressor/streaming/test_expert_parallel.py::test_owner_progress_does_not_wait_for_slow_owner`
+会让一个 owner 阻塞，并验证另一个 owner 仍能推进第二个 dispatch。只有在
+modifier resource contract 确认 `owner_local/independent` 后，才可以把
+其他 modifier 的 `_modifier_update()` 改成 owner worker 并行；在此之前强行
+拆分会破坏共享 lifecycle、qparams 和 writer 提交顺序。
+
+### 9.4 HIGGS 和未来 modifier
 
 HIGGS 是 provider/candidate 搜索路径，不应被当作 GPTQ 的特例复制。provider
 必须提供 bounded candidate workspace、candidate evaluation scope 和是否需要
@@ -1038,15 +1090,16 @@ progress: 115/248 groups
 | `build_load_balanced_placement` | 按 normalized routed work + owner memory hard limit 做稳定 greedy placement |
 | `plan_resident_windows` | 按 owner memory 将专家拆成 bounded resident windows，并计算 activation chunk 数 |
 | `AsyncResidentWindowScheduler` | 每个 owner 一个有界流水，跨 owner 并行，并支持 next-window prefetch |
+| `OwnerUpdateScheduler` | 对声明 owner-local/independent 的 modifier 并发执行 owner update，并在 update boundary 汇合 |
 | `ExpertParallelPlan` | 增加可选 `route_tokens`、`token_work_units`、`owner_compute_rates` 和 `owner_memory`，默认仍使用 storage placement |
 | `ExpertGroupExecutor` | 同一 gate route plan 在多个 expert group 间复用，避免重复构造路由索引 |
 
-当前阶段已经把 route/placement/window/scheduler 的通用契约和可测试实现放入
-代码，但主 `run_subgraph_streaming_pipeline()` 仍使用原有 FX executor。下一阶段
-需要由模型 adapter 将 gate route plan 接到目标 target boundary，再将 resident
-window 的 weight session、GPTQ lifecycle 和 output accumulation 接到主 pipeline。
-在这一步完成前，不能把现有 DSV4.1 streaming 任务标记为已经启用
-activation-aware placement 或 expert paging。
+当前阶段已经把 route/placement/window/owner-update scheduler 的通用契约和
+可测试实现放入代码。主 `run_subgraph_streaming_pipeline()` 仍使用原有 FX
+executor，RoutePlan/resident window 尚未完全接入 DSV4.1 生产 streaming
+pipeline；但 GPTQ 的 owner-local update 已接入现有 EP target lifecycle。
+在 RoutePlan 和 resident window 真正接入前，不能把现有 DSV4.1 streaming
+任务标记为已经启用 activation-aware placement 或 expert paging。
 
 本阶段验证：
 

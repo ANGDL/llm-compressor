@@ -20,6 +20,7 @@ from llmcompressor.modifiers.gptq import GPTQModifier
 from llmcompressor.pipelines.sequential.helpers import Subgraph
 from llmcompressor.streaming.artifacts import ParallelInfo
 from llmcompressor.streaming.checkpoint import SafetensorsWeightSource
+from llmcompressor.streaming.gptq_adapter import GPTQStreamingMemoryAdapter
 from llmcompressor.streaming.loading import (
     HostMemoryBudget,
     SubgraphWeightSession,
@@ -31,6 +32,10 @@ from llmcompressor.streaming.parallel.expert import (
     ExpertParallelPlan,
     _ExecutionGraph,
     resolve_expert_parallel_devices,
+)
+from llmcompressor.streaming.parallel.modifier_update import (
+    OwnerUpdateScheduler,
+    partition_modules_by_owner,
 )
 from llmcompressor.streaming.parallel.topology import (
     EPConfig,
@@ -366,6 +371,70 @@ def test_owner_queue_prepares_only_one_dispatch_per_active_owner(monkeypatch):
             assert prepared_counts[device] == completed_counts[device] == 3
 
 
+def test_owner_progress_does_not_wait_for_slow_owner():
+    model = _MoE(2).eval()
+    subgraph = _graph(model)
+    slow_started = threading.Event()
+    release_slow = threading.Event()
+    fast_second_started = threading.Event()
+    fast_calls = 0
+
+    slow_forward = model.experts[0].forward
+    fast_forward = model.experts[1].forward
+
+    def slow(hidden):
+        slow_started.set()
+        assert release_slow.wait(timeout=5)
+        return slow_forward(hidden)
+
+    def fast(hidden):
+        nonlocal fast_calls
+        fast_calls += 1
+        if fast_calls >= 2:
+            fast_second_started.set()
+        return fast_forward(hidden)
+
+    model.experts[0].forward = slow
+    model.experts[1].forward = fast
+    plan = ExpertParallelPlan.from_model(
+        model, _targets(model), ("cpu:0", "cpu:1")
+    )
+    values = [
+        {
+            "hidden": torch.randn(2, 4),
+            "indices": torch.full((2,), expert_index),
+        }
+        for expert_index in (0, 1, 1)
+    ]
+    executor = ExpertParallelExecutor(
+        model,
+        plan,
+        token_capacity={"cpu:0": 2, "cpu:1": 2},
+    )
+    result = {}
+    error = {}
+
+    def run():
+        try:
+            result["value"] = executor.forward_many([subgraph], values)
+        except BaseException as exception:
+            error["value"] = exception
+
+    worker = threading.Thread(target=run)
+    worker.start()
+    try:
+        assert slow_started.wait(timeout=5)
+        assert fast_second_started.wait(timeout=5)
+    finally:
+        release_slow.set()
+        worker.join(timeout=5)
+        executor.close()
+
+    assert not worker.is_alive()
+    assert not error
+    assert len(result["value"]) == len(values)
+
+
 def test_worker_failure_waits_for_other_workers_and_can_unwind():
     model = _MoE(2)
     barrier = threading.Barrier(2)
@@ -419,7 +488,14 @@ def test_execution_schedule_is_cached_without_retaining_batch_tensors(monkeypatc
         assert len(builds) == 1
 
 
-def _run_gptq(model, values, devices=None, *, coalesce=False):
+def _run_gptq(
+    model,
+    values,
+    devices=None,
+    *,
+    coalesce=False,
+    owner_update=False,
+):
     quantizer = GPTQModifier(
         config_groups={
             "weights": {
@@ -475,7 +551,21 @@ def _run_gptq(model, values, devices=None, *, coalesce=False):
                 and quantizer._num_samples[module].device == module.weight.device
                 for module, hessian in quantizer._hessians.items()
             )
-            LifecycleCallbacks.sequential_epoch_end(list(modules))
+            if owner_update:
+                groups = partition_modules_by_owner(
+                    modules,
+                    plan.devices,
+                    plan.module_devices,
+                )
+                update_adapter = GPTQStreamingMemoryAdapter(quantizer)
+                update_adapter.begin_owner_update(modules)
+                OwnerUpdateScheduler().run(
+                    groups,
+                    update=update_adapter.update_owner,
+                )
+                update_adapter.finalize_owner_update()
+            else:
+                LifecycleCallbacks.sequential_epoch_end(list(modules))
             quantizer.end_layerwise_calibration(list(modules))
             assert not quantizer._hessians
             assert not quantizer._num_samples
@@ -484,6 +574,38 @@ def _run_gptq(model, values, devices=None, *, coalesce=False):
         finally:
             quantizer.remove_hooks()
     return statistics
+
+
+def test_parallel_gptq_owner_updates_match_single_device():
+    torch.manual_seed(5)
+    reference = _MoE().eval()
+    parallel = deepcopy(reference)
+    values = [
+        {
+            "hidden": torch.randn(6, 4),
+            "indices": torch.tensor([0, 2, 1, 2, 3, 0]),
+        }
+        for _batch in range(2)
+    ]
+    expected = _run_gptq(reference, values)
+    actual = _run_gptq(
+        parallel,
+        values,
+        ("cpu:0", "cpu:1", "cpu:2", "cpu:3"),
+        coalesce=True,
+        owner_update=True,
+    )
+
+    assert expected.keys() == actual.keys()
+    for name, (hessian, count) in expected.items():
+        torch.testing.assert_close(actual[name][0], hessian, msg=name)
+        assert torch.equal(actual[name][1], count), name
+    for name, expected_tensor in reference.state_dict().items():
+        torch.testing.assert_close(
+            parallel.state_dict()[name],
+            expected_tensor,
+            msg=name,
+        )
 
 
 @pytest.mark.parametrize("coalesce", [False, True])

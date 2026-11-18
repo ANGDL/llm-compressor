@@ -10,6 +10,11 @@ from .load_balance import (
     build_load_balanced_placement,
     plan_resident_windows,
 )
+from .modifier_update import (
+    OwnerModuleGroup,
+    OwnerUpdateScheduler,
+    partition_modules_by_owner,
+)
 from .placement import PlacementEntry, PlacementPlan
 from .route_plan import ExpertRoute, RoutePlan, RoutePlanCollection
 from .topology import (
@@ -34,6 +39,8 @@ __all__ = [
     "ExpertRoute",
     "LoadBalancedPlacement",
     "OwnerMemoryProfile",
+    "OwnerModuleGroup",
+    "OwnerUpdateScheduler",
     "ParallelContext",
     "PlacementEntry",
     "PlacementPlan",
@@ -46,4 +53,5 @@ __all__ = [
     "ensure_streaming_ep_process_group",
     "make_expert_state_filter",
     "plan_resident_windows",
+    "partition_modules_by_owner",
 ]
