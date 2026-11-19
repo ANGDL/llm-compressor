@@ -2,6 +2,7 @@ import operator
 import os
 from contextlib import ExitStack
 from copy import deepcopy
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -17,7 +18,7 @@ from llmcompressor.pipelines.sequential.helpers import Subgraph
 from llmcompressor.pipelines.sequential.plan import SequentialExecutionPlan
 from llmcompressor.recipe import Recipe
 from llmcompressor.streaming.activations import InMemoryBoundaryActivationStore
-from llmcompressor.streaming.admission import DeviceMemoryBudget
+from llmcompressor.streaming.admission import DeviceMemoryBudget, DeviceMemoryError
 from llmcompressor.streaming.artifacts import ArtifactStore
 from llmcompressor.streaming.checkpoint import SafetensorsWeightSource
 from llmcompressor.streaming.gptq_adapter import GPTQStreamingMemoryAdapter
@@ -30,9 +31,11 @@ from llmcompressor.streaming.loading import (
 from llmcompressor.streaming.materialization import CastWeightMaterializer
 from llmcompressor.streaming.memory_adapters import modifier_calibration_context
 from llmcompressor.streaming.parallel.expert import ExpertParallelPlan
+from llmcompressor.streaming.parallel.load_balance import ResidentWindow
 from llmcompressor.streaming.parallel.region import (
     ExpertRegionGraph,
     UnsupportedExpertRegion,
+    _admit_runtime_window,
     coalesce_expert_regions,
     execute_expert_region,
     profile_expert_region,
@@ -118,6 +121,111 @@ def make_plan(model):
     )
 
 
+@pytest.fixture
+def runtime_window():
+    return ResidentWindow(
+        owner_rank=0,
+        window_index=1,
+        expert_names=("experts.0",),
+        resident_bytes=100,
+        route_tokens=20,
+        work_units=20.0,
+        max_dispatch_tokens=10,
+        activation_batches=2,
+    )
+
+
+@pytest.mark.parametrize(
+    "required_bytes,available",
+    [
+        (lambda tokens: 100 + 10 * tokens, 180),
+        (lambda tokens: 100 + tokens**2, 164),
+    ],
+    ids=["linear", "nonlinear"],
+)
+def test_runtime_window_admission_reduces_capacity_for_live_headroom(
+    runtime_window, required_bytes, available
+):
+    budget = DeviceMemoryBudget(available_bytes=available, safety_reserve_fraction=0)
+
+    effective, reservation = _admit_runtime_window(
+        runtime_window,
+        required_bytes=required_bytes,
+        device_budget=budget,
+        device="cpu",
+        label="test",
+        route_tokens={"experts.0": 20},
+    )
+
+    try:
+        assert effective.max_dispatch_tokens == 8
+        assert effective.activation_batches == 3
+        assert effective.expert_names == runtime_window.expert_names
+        assert reservation.reserved_bytes == required_bytes(8)
+    finally:
+        reservation.close()
+    assert not budget._reservations
+
+
+def test_runtime_window_admission_keeps_an_admitted_plan(runtime_window):
+    budget = DeviceMemoryBudget(available_bytes=200, safety_reserve_fraction=0)
+    effective, reservation = _admit_runtime_window(
+        runtime_window,
+        required_bytes=lambda tokens: 100 + 10 * tokens,
+        device_budget=budget,
+        device="cpu",
+        label="test",
+        route_tokens={"experts.0": 20},
+    )
+
+    with reservation:
+        assert effective is runtime_window
+        assert reservation.reserved_bytes == 200
+    assert not budget._reservations
+
+
+@pytest.mark.parametrize("capacity", [0, 1, 10])
+def test_runtime_window_admission_rejects_resident_state_that_cannot_fit(
+    runtime_window, capacity
+):
+    window = replace(
+        runtime_window,
+        max_dispatch_tokens=capacity,
+        route_tokens=20 if capacity else 0,
+    )
+    budget = DeviceMemoryBudget(available_bytes=100, safety_reserve_fraction=0.1)
+    with pytest.raises(DeviceMemoryError, match="owner 0 window 1"):
+        _admit_runtime_window(
+            window,
+            required_bytes=lambda tokens: 100 + 10 * tokens,
+            device_budget=budget,
+            device="cpu",
+            label="test",
+            route_tokens={"experts.0": window.route_tokens},
+        )
+    assert not budget._reservations
+
+
+def test_runtime_window_admission_bounds_retries_when_headroom_keeps_changing(
+    runtime_window,
+):
+    headroom = iter([180, 180, 170])
+    budget = DeviceMemoryBudget(
+        available_bytes=lambda _device: next(headroom), safety_reserve_fraction=0
+    )
+    with pytest.raises(DeviceMemoryError, match="runtime_capacity=8") as error:
+        _admit_runtime_window(
+            runtime_window,
+            required_bytes=lambda tokens: 100 + 10 * tokens,
+            device_budget=budget,
+            device="cpu",
+            label="test",
+            route_tokens={"experts.0": 20},
+        )
+    assert isinstance(error.value.__cause__, DeviceMemoryError)
+    assert not budget._reservations
+
+
 def test_region_profile_reads_real_indices_without_executing_experts():
     model = MoE()
     plan = make_plan(model)
@@ -199,11 +307,17 @@ def reference_quantization(model, batches):
 
 
 @pytest.mark.parametrize(
-    "token_budget,memory_bytes",
-    [("auto", 2**20), (2, 2**20), (4, 2**20), ("auto", 5000)],
+    "token_budget,memory_bytes,runtime_memory_bytes",
+    [
+        ("auto", 2**20, None),
+        (2, 2**20, None),
+        (4, 2**20, None),
+        ("auto", 5000, None),
+        ("auto", 10_000, 5000),
+    ],
 )
 def test_region_matches_serial_gptq_statistics_weights_and_propagation(
-    tmp_path, token_budget, memory_bytes
+    tmp_path, monkeypatch, token_budget, memory_bytes, runtime_memory_bytes
 ):
     torch.manual_seed(19)
     source = MoE().eval()
@@ -229,6 +343,22 @@ def test_region_matches_serial_gptq_statistics_weights_and_propagation(
     model.experts[0].register_forward_pre_hook(
         lambda _module, args: dispatches.append(args[0].shape[0])
     )
+    device_budget = DeviceMemoryBudget(available_bytes=memory_bytes)
+    planned_windows = {}
+    saved_windows = {}
+    if runtime_memory_bytes is not None:
+        import llmcompressor.streaming.parallel.region as region
+
+        original_admit = region._admit_runtime_window
+
+        def admit(window, **kwargs):
+            planned_windows[window.owner_rank, window.window_index] = window
+            device_budget._available_bytes = lambda device: (
+                runtime_memory_bytes if device.index == 0 else memory_bytes
+            )
+            return original_admit(window, **kwargs)
+
+        monkeypatch.setattr(region, "_admit_runtime_window", admit)
     with create_session() as session, ExitStack() as stack:
         session.state.layerwise_calibration = True
         session.initialize(model=model, recipe=[quantizer()], start=-1, copy_data=False)
@@ -250,6 +380,7 @@ def test_region_matches_serial_gptq_statistics_weights_and_propagation(
         memory_adapter.update_owner = update
 
         def save(window, loaded, _modules):
+            saved_windows[window.owner_rank, window.window_index] = window
             for name, tensor in loaded.state_tensors():
                 tensors[name] = tensor.clone()
 
@@ -264,7 +395,7 @@ def test_region_matches_serial_gptq_statistics_weights_and_propagation(
             boundary_index=0,
             destination_boundary=4,
             batches=(0, 1),
-            device_budget=DeviceMemoryBudget(available_bytes=memory_bytes),
+            device_budget=device_budget,
             host_budget=HostMemoryBudget(),
             target_dtype=torch.float32,
             token_budget=token_budget,
@@ -274,6 +405,17 @@ def test_region_matches_serial_gptq_statistics_weights_and_propagation(
         assert result["placement"]["policy"] == "activation-aware-v1"
         if memory_bytes == 5000:
             assert len(result["windows"]) >= 4
+        if runtime_memory_bytes is not None:
+            assert any(
+                window.max_dispatch_tokens < planned_windows[key].max_dispatch_tokens
+                for key, window in saved_windows.items()
+            )
+            assert result["windows"] == [
+                window.to_dict() for _key, window in sorted(saved_windows.items())
+            ]
+            capacity = saved_windows[plan._owners["experts.0"], 0].max_dispatch_tokens
+            assert max(dispatches) <= capacity
+        assert not device_budget._reservations
         assert not modifier._hessians
         assert not modifier._num_samples
         assert all(parameter.is_meta for parameter in model.parameters())

@@ -92,6 +92,22 @@ modifier 状态装不下时才切换专家窗口。每个 rank 的容量可不�
 不能直接复用 GPTQ 的每 token 常数。每个窗口的 dispatch 数按各专家分别
 向上取整后求和；空专家也需要一个保留 sample 语义的调用。
 
+窗口执行前、H2D 和安装权重之前再次申请设备预留。规划与执行之间的可用
+显存可能发生变化；若原容量未通过准入，调度层重新查询该 owner 的当前
+可用容量，保留原有安全预留和未兑现的设备 reservation，并使用同一个
+modifier workspace 估算在 `[1, planned_capacity]` 中搜索可准入的容量。
+随后按重新估算的完整窗口工作集重试一次预留，预留成功后才搬运权重。
+
+这次调整只改变 dispatch 的 token 上限，不改变专家归属、常驻专家集合、
+校准 token 总数或 modifier 更新顺序。`activation_batches` 同步重新计算，
+保存回调和区域返回的窗口计划均使用实际准入的容量。日志报告 owner、
+窗口编号、原容量、实际容量与重新查询的可用字节数。该过程在 owner 内部
+执行，不增加设备全局同步。
+
+若常驻状态加一个 token 仍无法容纳、可用显存无法确定，或唯一一次重试
+仍被拒绝，则报告带窗口信息的准入错误并释放预取权重。不降低安全预留，
+不丢弃校准 token，也不通过 CPU offload 绕过设备预算。
+
 窗口包含的总 routed token 超过 capacity 时，将同一专家跨原始 boundary
 的输入合并成尽可能少的调用。单个原始调用仍超过 capacity 时按 token
 切片。不同权重的专家保持独立 GEMM，不将它们当成共享权重的大矩阵。
@@ -205,6 +221,9 @@ tile 和设备 GEMM。大三角系统通过分块前代求解，块间更新仍�
 
 本地单测覆盖路由统计、跨 trace group 合并、空专家、token 切片、
 Hessian/sample counter、权重/qparams、传播合并和上下文隔离。
+运行时准入回归覆盖线性与非线性 dispatch workspace、容量缩小、常驻状态
+无法容纳、重试期间显存继续变化以及 reservation 释放；真实 GPTQ 小模型
+还需核对容量缩小后的统计、权重、传播结果和返回的实际窗口计划。
 
 设备测试使用显式选定的物理设备，先验证 tile、triangular solve、
 factorization 和 GEMM，再验证完整 streaming pipeline 的短例。通过算子
