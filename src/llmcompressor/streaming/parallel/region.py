@@ -679,6 +679,9 @@ def execute_expert_region(
                 )
                 if phase == "update":
                     modifier_adapter.update_owner(device, modules)
+                    after_update = getattr(modifier_adapter, "after_update", None)
+                    if callable(after_update):
+                        after_update(modules)
                 else:
                     reported = started
                     for index, name in enumerate(window.expert_names):

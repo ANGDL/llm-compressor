@@ -8,6 +8,7 @@ from threading import RLock
 
 import torch
 from compressed_tensors.offload.dist_utils import is_source_process as is_src
+from torch.utils.hooks import RemovableHandle
 
 from llmcompressor.modifiers.gptq import GPTQModifier
 from llmcompressor.modifiers.gptq.helpers import (
@@ -36,6 +37,9 @@ class GPTQStreamingMemoryAdapter:
     owner_update_state = "independent"
     _owner_update_baseline: int | None = field(default=None, init=False, repr=False)
     _owner_update_count: int = field(default=0, init=False, repr=False)
+    _window_handles: dict[int, set[RemovableHandle]] = field(
+        default_factory=dict, init=False, repr=False
+    )
 
     @property
     def supports_independent_expert_windows(self) -> bool:
@@ -133,6 +137,24 @@ class GPTQStreamingMemoryAdapter:
         )
         self.modifier.compress_module_list(modules)
 
+    def after_update(self, modules: Sequence[torch.nn.Module]) -> None:
+        """Stop this owner's calibration hooks before propagation starts.
+
+        GPTQ consumes and deletes weight-observer statistics during compression.
+        The iMatrix observer hook must therefore be detached before the same
+        expert is forwarded again for activation propagation. Hooks belonging to
+        other owner windows remain active.
+        """
+        with _WINDOW_INITIALIZATION_LOCK:
+            handles = self._window_handles.pop(id(modules), set())
+            self.modifier.remove_hooks(handles)
+            self.modifier._calibration_hooks.difference_update(handles)
+        for module in modules:
+            for base_name in ("input", "weight", "output", "q", "k", "v"):
+                observer = getattr(module, f"{base_name}_observer", None)
+                if observer is not None:
+                    observer.detach(module)
+
     def begin_owner_update(self, modules: Sequence[torch.nn.Module]) -> None:
         """Snapshot shared bookkeeping before concurrent compression starts."""
 
@@ -164,9 +186,11 @@ class GPTQStreamingMemoryAdapter:
                     modifier.start_layerwise_calibration(model, list(modules))
                 finally:
                     handles = modifier._calibration_hooks - previous
+                self._window_handles[id(modules)] = handles
             yield
         finally:
             with _WINDOW_INITIALIZATION_LOCK:
+                self._window_handles.pop(id(modules), None)
                 modifier.remove_hooks(handles)
                 modifier._calibration_hooks.difference_update(handles)
             for module in modules:
