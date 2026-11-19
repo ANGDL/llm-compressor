@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass, replace
 from math import ceil
@@ -20,7 +21,7 @@ from llmcompressor.utils.helpers import DisableQuantization
 
 from .._logging import streaming_logger
 from ..activations.store import _tensor_bytes
-from ..admission import estimate_modifier_dispatch_memory
+from ..admission import DeviceMemoryError, estimate_modifier_dispatch_memory
 from ..calibration import calibration_batch_context
 from .expert import _join_subgraphs
 from .load_balance import (
@@ -351,6 +352,88 @@ def _split_result(result, lengths):
     return tuple(tree_unflatten(output, specification) for output in outputs)
 
 
+def _window_activation_batches(
+    window,
+    capacity: int,
+    route_tokens: Mapping[str, int],
+) -> int:
+    return sum(
+        max(1, ceil(route_tokens[name] / capacity)) if capacity else 1
+        for name in window.expert_names
+    )
+
+
+def _admit_runtime_window(
+    window,
+    *,
+    required_bytes,
+    device_budget,
+    device,
+    label,
+    route_tokens,
+):
+    """Admit a planned window, adapting its dispatch capacity to live headroom."""
+    owner = f"{label} owner {window.owner_rank} window {window.window_index}"
+    planned_capacity = window.max_dispatch_tokens
+    planned_required = required_bytes(planned_capacity)
+    try:
+        reservation = device_budget.reserve(
+            owner,
+            planned_required,
+            device=device,
+        )
+    except DeviceMemoryError as initial_error:
+        if planned_capacity < 1 or not window.route_tokens:
+            raise
+        usable = device_budget.usable_bytes(device)
+        if usable is None:
+            raise
+        try:
+            capacity = select_token_capacity(
+                owner=f"{owner} runtime fallback",
+                usable_bytes=usable,
+                required_bytes=required_bytes,
+                maximum_tokens=planned_capacity,
+            )
+        except DeviceMemoryError as fallback_error:
+            raise DeviceMemoryError(
+                f"{owner} could not fit after runtime capacity fallback: "
+                f"planned_capacity={planned_capacity}, "
+                f"planned_required={planned_required}, "
+                f"usable={usable}; {fallback_error}"
+            ) from initial_error
+        effective = replace(
+            window,
+            max_dispatch_tokens=capacity,
+            activation_batches=_window_activation_batches(
+                window, capacity, route_tokens
+            ),
+        )
+        try:
+            reservation = device_budget.reserve(
+                owner,
+                required_bytes(effective.max_dispatch_tokens),
+                device=device,
+            )
+        except DeviceMemoryError as retry_error:
+            raise DeviceMemoryError(
+                f"{owner} failed after runtime capacity fallback: "
+                f"planned_capacity={planned_capacity}, "
+                f"runtime_capacity={capacity}, usable={usable}; {retry_error}"
+            ) from initial_error
+        if capacity != planned_capacity:
+            streaming_logger.warning(
+                f"{label} | EP window admission fallback | "
+                f"rank={window.owner_rank} | window={window.window_index} | "
+                f"planned_capacity={planned_capacity:,} | "
+                f"runtime_capacity={capacity:,} | "
+                f"planned_required={planned_required:,} | "
+                f"runtime_usable={usable:,}"
+            )
+        return effective, reservation
+    return window, reservation
+
+
 def execute_expert_region(
     *,
     graph,
@@ -464,11 +547,8 @@ def execute_expert_region(
             replace(
                 window,
                 max_dispatch_tokens=capacity,
-                activation_batches=sum(
-                    max(1, ceil(profile.token_counts[name] / capacity))
-                    if capacity
-                    else 1
-                    for name in window.expert_names
+                activation_batches=_window_activation_batches(
+                    window, capacity, profile.token_counts
                 ),
             )
         )
@@ -650,13 +730,16 @@ def execute_expert_region(
         )
         with device_context, torch.no_grad(), ExitStack() as stack:
             stack.callback(prepared.close)
-            stack.enter_context(
-                device_budget.reserve(
-                    f"{label} owner {window.owner_rank} window {window.window_index}",
-                    required_bytes(window, window.max_dispatch_tokens),
-                    device=device,
-                )
+            planned_window = window
+            window, reservation = _admit_runtime_window(
+                planned_window,
+                required_bytes=lambda tokens: required_bytes(planned_window, tokens),
+                device_budget=device_budget,
+                device=device,
+                label=label,
+                route_tokens=profile.token_counts,
             )
+            stack.enter_context(reservation)
             prepared.move_to(device)
             loaded = stack.enter_context(
                 adapter.weight_session.installed(prepared, reinitialize=False)
@@ -710,15 +793,16 @@ def execute_expert_region(
                 f"{label} | EP window complete | rank={window.owner_rank} | "
                 f"window={window.window_index} | tokens={window.route_tokens:,}"
             )
-        return None
+        return window
 
     try:
-        AsyncResidentWindowScheduler(max_prefetch=1).run(
+        completed_windows = AsyncResidentWindowScheduler(max_prefetch=1).run(
             windows,
             prefetch=prefetch,
             compute=compute,
             discard=lambda prepared: prepared.close(),
         )
+        windows = tuple(window for _planned, window in completed_windows)
         if callable(finalize):
             finalize()
         if not propagate:
