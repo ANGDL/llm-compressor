@@ -79,6 +79,7 @@ def test_gptq_resource_adapter_bounds_compatible_update_batches(batch_size, coun
         adapter = get_modifier_memory_adapter(modifier)
         assert adapter.estimate_update_memory(tuple(model)) == (
             count * quantization_peak_bytes(model[0], modifier.block_size)
+            + 3 * min(4, count) * 8 * 8 * torch.float32.itemsize
         )
         estimate = estimate_modifier_dispatch_memory(
             [modifier], model.modules(), total_tokens=100, dispatch_tokens=11,

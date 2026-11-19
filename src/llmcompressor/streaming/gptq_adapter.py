@@ -96,7 +96,7 @@ class GPTQStreamingMemoryAdapter:
                 scratch,
                 batch_size
                 * quantization_peak_bytes(members[0], self.modifier.block_size)
-                + 2 * min(4, batch_size) * members[0].weight.shape[1] ** 2
+                + 3 * min(4, batch_size) * members[0].weight.shape[1] ** 2
                 * GPTQ_PRECISION.itemsize,
             )
         return scratch
