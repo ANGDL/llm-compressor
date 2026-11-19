@@ -67,7 +67,7 @@ _WO_A_PATTERN = r"re:.*\.attn\.wo_a$"
 _ENGRAM_WKV_PATTERN = r"re:.*\.engram\.wkv$"
 
 
-def _quantization_scheme(bits, targets, *, scale_dtype=None):
+def _quantization_scheme(bits, targets, *, scale_dtype=None, use_imatrix=False):
     return QuantizationScheme(
         targets=targets,
         weights=QuantizationArgs(
@@ -75,7 +75,7 @@ def _quantization_scheme(bits, targets, *, scale_dtype=None):
             type="int",
             strategy="channel",
             symmetric=True,
-            observer="imatrix_mse",
+            observer="imatrix_mse" if use_imatrix else "minmax",
             scale_dtype=scale_dtype,
         ),
         input_activations=QuantizationArgs(
@@ -89,7 +89,12 @@ def _quantization_scheme(bits, targets, *, scale_dtype=None):
 
 
 def _schemes(
-    mode, *, quantize_wo_a=True, quantize_engram_wkv=False, scale_dtype=None
+    mode,
+    *,
+    quantize_wo_a=True,
+    quantize_engram_wkv=False,
+    scale_dtype=None,
+    use_imatrix=False,
 ):
     routed = r"re:model\.(layers|mtp)\.\d+\.ffn\.experts\.\d+\.(w1|w2|w3)$"
     other = [
@@ -104,16 +109,19 @@ def _schemes(
     if mode == "wna8":
         groups = {
             "routed_w4a8": _quantization_scheme(
-                4, [routed], scale_dtype=scale_dtype
+                4, [routed], scale_dtype=scale_dtype, use_imatrix=use_imatrix
             ),
             "other_w8a8": _quantization_scheme(
-                8, other, scale_dtype=scale_dtype
+                8, other, scale_dtype=scale_dtype, use_imatrix=use_imatrix
             ),
         }
     else:
         groups = {
             "all": _quantization_scheme(
-                8 if mode == "w8a8" else 4, [routed, *other], scale_dtype=scale_dtype
+                8 if mode == "w8a8" else 4,
+                [routed, *other],
+                scale_dtype=scale_dtype,
+                use_imatrix=use_imatrix,
             )
         }
     if quantize_engram_wkv:
@@ -121,6 +129,7 @@ def _schemes(
             8,
             [_ENGRAM_WKV_PATTERN],
             scale_dtype=torch.float32,
+            use_imatrix=use_imatrix,
         )
     ignores = [
         "model.lm_head",
@@ -141,9 +150,16 @@ def _schemes(
     return groups, ignores
 
 
-def _higgs_candidate_schemes(candidate_bits, *, scale_dtype=None):
+def _higgs_candidate_schemes(
+    candidate_bits, *, scale_dtype=None, use_imatrix=False
+):
     return [
-        _quantization_scheme(bits, ["Linear"], scale_dtype=scale_dtype)
+        _quantization_scheme(
+            bits,
+            ["Linear"],
+            scale_dtype=scale_dtype,
+            use_imatrix=use_imatrix,
+        )
         for bits in candidate_bits
     ]
 
@@ -561,6 +577,12 @@ def main():
         default=True,
         help="Use float32 for all PTQ weight scale tensors instead of bfloat16.",
     )
+    parser.add_argument(
+        "--use-imatrix",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use the iMatrix MSE observer for weight scales (default: disabled).",
+    )
     parser.add_argument("--num-calibration-samples", type=int, default=128)
     parser.add_argument("--text-calibration-samples", type=int, default=0)
     parser.add_argument("--max-sequence-length", type=int, default=2048)
@@ -697,6 +719,7 @@ def main():
         quantize_wo_a=args.quantize_wo_a,
         quantize_engram_wkv=args.quantize_engram_wkv,
         scale_dtype=torch.float32 if args.use_float32_scale_dtype else None,
+        use_imatrix=args.use_imatrix,
     )
     fixed_groups = dict(groups)
     materializer = DeepSeekV41WeightMaterializer(
@@ -714,6 +737,7 @@ def main():
                 scale_dtype=(
                     torch.float32 if args.use_float32_scale_dtype else None
                 ),
+                use_imatrix=args.use_imatrix,
             ),
             targets=["Linear"],
             ignore=higgs_ignores,
