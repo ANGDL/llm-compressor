@@ -11,6 +11,7 @@ from llmcompressor.streaming import (
     OwnerMemoryProfile,
     RoutePlan,
     RoutePlanCollection,
+    build_fixed_owner_placement,
     build_load_balanced_placement,
     plan_resident_windows,
 )
@@ -94,6 +95,47 @@ def test_load_balanced_placement_rejects_expert_without_memory_fit():
 
     with pytest.raises(MemoryError, match="experts.0"):
         build_load_balanced_placement(costs, 2, owner_memory=memory)
+
+
+def test_fixed_owner_placement_balances_work_under_resident_limits():
+    costs = {
+        "experts.0": ExpertCostProfile(
+            storage_bytes=6, persistent_state_bytes=2, route_tokens=100
+        ),
+        "experts.1": ExpertCostProfile(
+            storage_bytes=6, persistent_state_bytes=2, route_tokens=90
+        ),
+        "experts.2": ExpertCostProfile(
+            storage_bytes=6, persistent_state_bytes=2, route_tokens=10
+        ),
+        "experts.3": ExpertCostProfile(
+            storage_bytes=6, persistent_state_bytes=2, route_tokens=10
+        ),
+    }
+    memory = (
+        OwnerMemoryProfile(usable_bytes=20),
+        OwnerMemoryProfile(usable_bytes=20),
+    )
+
+    placement = build_fixed_owner_placement(
+        costs,
+        2,
+        owner_memory=memory,
+    )
+
+    assert placement.policy == "fixed-owner-v1"
+    assert all(
+        storage + persistent <= memory[owner].usable_bytes
+        for owner, (storage, persistent) in enumerate(
+            zip(
+                placement.owner_storage_bytes,
+                placement.owner_persistent_bytes,
+            )
+        )
+    )
+    assert max(placement.owner_route_tokens) - min(
+        placement.owner_route_tokens
+    ) <= 10
 
 
 def test_resident_windows_split_by_memory_and_report_activation_batches():

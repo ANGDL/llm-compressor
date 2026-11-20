@@ -449,6 +449,25 @@ def test_cleanup_completed_quantization_with_force(web_env) -> None:
     assert (model_dir / "model" / "config.json").exists()
 
 
+@pytest.mark.parametrize("status", ["RESOURCE_TIMEOUT", "EXPIRED"])
+def test_cleanup_resource_failure_statuses(web_env, status: str) -> None:
+    control = make_control(web_env)
+    run_id, model_dir = _failed_quantize_run(
+        web_env, quantize_status=status, write_log=False
+    )
+
+    result = control.cleanup_artifacts(
+        run_id,
+        web_env.model_id,
+        {"idempotency_key": f"cleanup-{status.lower()}"},
+        OPERATOR,
+    )
+
+    assert result["deleted"] is True
+    assert result["quantize_status"] == status
+    assert not (model_dir / "work").exists()
+
+
 def test_cleanup_preview_prefers_current_attempt(web_env) -> None:
     control = make_control(web_env)
     run_id, model_dir = _failed_quantize_run(

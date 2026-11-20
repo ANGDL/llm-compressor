@@ -214,6 +214,8 @@ class ExecutionBoundaryMetadata:
 class BoundaryActivationStore(ABC):
     """Common batch-oriented interface for adjacent target activations."""
 
+    routing_inputs_are_borrowed = False
+
     @abstractmethod
     def put(self, boundary: int, batch: int, value: Any) -> None:
         """Store one complete batch, replacing an existing batch atomically."""
@@ -266,7 +268,7 @@ class BoundaryActivationStore(ABC):
     def read_for_routing(
         self, boundary: int, batch: int, input_names: Collection[str]
     ) -> Any:
-        """Borrow CPU inputs for a verified nonmutating routing graph."""
+        """Read CPU inputs for a verified nonmutating routing graph."""
         return self.get_for_execution(boundary, batch, input_names, device="cpu")
 
     def commit_propagated_batch(
@@ -303,6 +305,8 @@ class BoundaryActivationStore(ABC):
 
 class InMemoryBoundaryActivationStore(BoundaryActivationStore):
     """Keep detached activation snapshots on a configured device."""
+
+    routing_inputs_are_borrowed = True
 
     def __init__(
         self,

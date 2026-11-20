@@ -556,9 +556,16 @@ class ControlPlane:
         model_status = str(model.get("status", "UNKNOWN")).upper()
         force = bool(request.get("force"))
         succeeded = {"PASS", "PASSED", "SUCCESS", "SUCCEEDED"}
+        cleanup_failure_statuses = {
+            "FAIL",
+            "FAILED",
+            "CANCELED",
+            "RESOURCE_TIMEOUT",
+            "EXPIRED",
+        }
         failed = (
-            quantize_status in {"FAIL", "FAILED", "CANCELED"}
-            or model_status in {"FAIL", "FAILED", "CANCELED"}
+            quantize_status in cleanup_failure_statuses
+            or model_status in cleanup_failure_statuses
         )
         if quantize_status in succeeded and not force:
             raise ConflictError(

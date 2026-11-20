@@ -46,9 +46,15 @@ LLM Compressor is an open-source project that values community contributions. We
 - [Streaming inference performance plan](streaming-inference-performance-plan.md):
   CPU packed-weight decoding, staged profiling, prefetch, and explicit weight
   cache modes.
+- [Streaming EP load balancing design](streaming-ep-load-balancing-design.md):
+  activation-aware expert placement, per-owner token/work scheduling, modifier
+  update parallelism, telemetry, fallback, and staged validation.
 
 ## MoE AWQ accuracy
 
 - [MoE AWQ imbalance diagnosis and remediation plan](moe-awq-imbalance-plan.md):
   transform equivalence, router compensation, expert calibration, bounded scales,
   and independent quality evaluation.
+- [AutoSmooth adaptive normalization design and validation](autosmooth-adaptive-normalization-design.md):
+  scale-invariant adaptive candidate normalization, implementation constraints,
+  and staged experiments against AWQ.

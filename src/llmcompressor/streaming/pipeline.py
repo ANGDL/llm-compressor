@@ -106,6 +106,7 @@ from .parallel.region import (
     execute_expert_region,
     profile_expert_region,
 )
+from .parallel.route_cache import ExpertRouteCache
 from .parallel.telemetry import EPPhaseLogger
 from .parallel.token_budget import (
     TOKEN_BUDGET_POLICY,
@@ -1531,13 +1532,6 @@ def run_subgraph_streaming_pipeline(
                     except UnsupportedExpertRegion:
                         pass
                 if region_graph is not None:
-                    with _stage_logger(
-                        adapter.model, f"{target_label} | profile routes", device
-                    ):
-                        route_profile = profile_expert_region(
-                            region_graph, boundaries, group_start, batches
-                        )
-
                     def save_expert_window(window, loaded, modules):
                         _compress_modules(modules)
                         written.update(_write_loaded_target_direct(
@@ -1547,18 +1541,26 @@ def run_subgraph_streaming_pipeline(
                             host_budget=host_budget,
                         ))
 
-                    window_plan = execute_expert_region(
-                        graph=region_graph, profile=route_profile,
-                        adapter=adapter, parallel=expert_parallel,
-                        modifier_adapter=window_adapter, modifiers=modifiers,
-                        boundaries=boundaries, boundary_index=group_start,
-                        destination_boundary=next_boundary, batches=batches,
-                        device_budget=device_budget, host_budget=host_budget,
-                        target_dtype=target_dtype,
-                        token_budget=expert_parallel_token_budget,
-                        label=target_label, save_window=save_expert_window,
-                        propagate=has_next,
-                    )
+                    with ExpertRouteCache(host_budget, target_label) as route_cache:
+                        with _stage_logger(
+                            adapter.model, f"{target_label} | profile routes", device
+                        ):
+                            route_profile = profile_expert_region(
+                                region_graph, boundaries, group_start, batches,
+                                host_budget=host_budget, route_cache=route_cache,
+                            )
+                        window_plan = execute_expert_region(
+                            graph=region_graph, profile=route_profile,
+                            adapter=adapter, parallel=expert_parallel,
+                            modifier_adapter=window_adapter, modifiers=modifiers,
+                            boundaries=boundaries, boundary_index=group_start,
+                            destination_boundary=next_boundary, batches=batches,
+                            device_budget=device_budget, host_budget=host_budget,
+                            target_dtype=target_dtype,
+                            token_budget=expert_parallel_token_budget,
+                            label=target_label, save_window=save_expert_window,
+                            propagate=has_next, route_cache=route_cache,
+                        )
                     ArtifactStore(artifact_dir).commit_ep_token_plan(
                         group_index,
                         {"policy": "routed-resident-windows-v1", **window_plan},

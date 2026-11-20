@@ -19,6 +19,7 @@ __all__ = [
     "LoadBalancedPlacement",
     "OwnerMemoryProfile",
     "ResidentWindow",
+    "build_fixed_owner_placement",
     "build_load_balanced_placement",
     "plan_resident_windows",
 ]
@@ -213,6 +214,7 @@ def build_load_balanced_placement(
     *,
     compute_rates: Sequence[float] | None = None,
     owner_memory: Sequence[OwnerMemoryProfile] | None = None,
+    policy: str = "activation-aware-v1",
 ) -> LoadBalancedPlacement:
     """Place experts by normalized routed work under hard memory limits."""
 
@@ -220,6 +222,8 @@ def build_load_balanced_placement(
         raise ValueError("owner_count must be positive")
     if not expert_costs:
         raise ValueError("expert_costs must not be empty")
+    if not policy:
+        raise ValueError("policy must not be empty")
     rates = (
         tuple(1.0 for _ in range(owner_count))
         if compute_rates is None
@@ -298,6 +302,25 @@ def build_load_balanced_placement(
         owner_route_tokens=tuple(owner_tokens),
         owner_storage_bytes=tuple(owner_storage),
         owner_persistent_bytes=tuple(owner_persistent),
+        policy=policy,
+    )
+
+
+def build_fixed_owner_placement(
+    expert_costs: Mapping[str, ExpertCostProfile],
+    owner_count: int,
+    *,
+    owner_memory: Sequence[OwnerMemoryProfile],
+    compute_rates: Sequence[float] | None = None,
+) -> LoadBalancedPlacement:
+    """Assign experts once while treating owner residency as a hard limit."""
+
+    return build_load_balanced_placement(
+        expert_costs,
+        owner_count,
+        compute_rates=compute_rates,
+        owner_memory=owner_memory,
+        policy="fixed-owner-v1",
     )
 
 

@@ -7,6 +7,7 @@ from .load_balance import (
     LoadBalancedPlacement,
     OwnerMemoryProfile,
     ResidentWindow,
+    build_fixed_owner_placement,
     build_load_balanced_placement,
     plan_resident_windows,
 )
@@ -48,6 +49,7 @@ __all__ = [
     "RoutePlan",
     "RoutePlanCollection",
     "StatisticsScope",
+    "build_fixed_owner_placement",
     "build_load_balanced_placement",
     "build_expert_placement",
     "ensure_streaming_ep_process_group",
