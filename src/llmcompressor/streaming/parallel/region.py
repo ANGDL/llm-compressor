@@ -1026,10 +1026,11 @@ def execute_expert_region(
                 f"original_experts={len(window.expert_names)} | "
                 f"split_windows={len(split)} | usable={usable:,}"
             )
+            actual = []
             for subwindow in split:
                 subprepared = prefetch(subwindow)
-                compute_window(subwindow, subprepared)
-            return split
+                actual.append(compute_window(subwindow, subprepared))
+            return tuple(actual)
 
     try:
         completed_windows = AsyncResidentWindowScheduler(max_prefetch=1).run(
