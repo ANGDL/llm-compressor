@@ -1011,7 +1011,7 @@ def execute_expert_region(
 
     def compute(window, prepared):
         try:
-            return compute_window(window, prepared)
+            return (compute_window(window, prepared),)
         except DeviceMemoryError:
             device = parallel.devices[window.owner_rank]
             usable = device_budget.usable_bytes(device)
@@ -1029,7 +1029,7 @@ def execute_expert_region(
             for subwindow in split:
                 subprepared = prefetch(subwindow)
                 compute_window(subwindow, subprepared)
-            return window
+            return split
 
     try:
         completed_windows = AsyncResidentWindowScheduler(max_prefetch=1).run(
@@ -1038,7 +1038,11 @@ def execute_expert_region(
             compute=compute,
             discard=lambda prepared: prepared.close(),
         )
-        windows = tuple(window for _planned, window in completed_windows)
+        windows = tuple(
+            actual
+            for _planned, results in completed_windows
+            for actual in results
+        )
         if callable(finalize):
             finalize()
         if not propagate:
