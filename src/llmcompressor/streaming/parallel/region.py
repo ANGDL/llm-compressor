@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from contextlib import ExitStack, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from math import ceil
 from threading import Lock
@@ -23,15 +23,18 @@ from .._logging import streaming_logger
 from ..activations.store import _tensor_bytes
 from ..admission import DeviceMemoryError, estimate_modifier_dispatch_memory
 from ..calibration import calibration_batch_context
+from ..loading.host_memory import HostMemoryError
 from .expert import _join_subgraphs
 from .load_balance import (
     AsyncResidentWindowScheduler,
     ExpertCostProfile,
     OwnerMemoryProfile,
+    build_fixed_owner_placement,
     build_load_balanced_placement,
     plan_resident_windows,
 )
 from .placement import PlacementEntry, PlacementPlan
+from .route_cache import is_cacheable_route
 from .token_budget import select_token_capacity
 
 
@@ -97,7 +100,20 @@ class ExpertRegionGraph:
     graph: Graph
     consumed: set[str]
     calls: tuple[Node, ...]
-    required: dict[str, set[Node]]
+    required: dict[str, tuple[Node, ...]]
+
+    def __post_init__(self):
+        self._calls_by_name = {str(call.target): call for call in self.calls}
+        required = set().union(*self.required.values())
+        self._ordered_dependencies = tuple(
+            node for node in self.graph.nodes if node in required
+        )
+        self._input_names = frozenset(
+            str(node.target) for node in self.graph.nodes if node.op == "placeholder"
+        )
+        self.route_nodes = tuple(
+            node for node in self._ordered_dependencies if is_cacheable_route(node)
+        )
 
     @classmethod
     def build(cls, model, plan, subgraphs):
@@ -109,6 +125,7 @@ class ExpertRegionGraph:
             raise UnsupportedExpertRegion(
                 "an expert is called more than once per boundary"
             )
+        positions = {node: index for index, node in enumerate(graph.nodes)}
         required = {}
         for call in calls:
             dependencies = set(call.all_input_nodes)
@@ -133,20 +150,20 @@ class ExpertRegionGraph:
                     if source not in dependencies:
                         dependencies.add(source)
                         pending.append(source)
-            required[str(call.target)] = dependencies
+            required[str(call.target)] = tuple(
+                sorted(dependencies, key=positions.__getitem__)
+            )
         return cls(model, graph, consumed, calls, required)
 
     @property
     def input_names(self):
-        return {
-            str(node.target) for node in self.graph.nodes if node.op == "placeholder"
-        }
+        return self._input_names
 
     @property
     def expert_names(self):
-        return tuple(str(node.target) for node in self.calls)
+        return tuple(self._calls_by_name)
 
-    def _evaluate(self, value, required, *, metadata=False):
+    def _evaluate(self, value, required, *, metadata=False, routes=None):
         memo = {}
 
         def prepare(item):
@@ -159,21 +176,24 @@ class ExpertRegionGraph:
             return item
 
         environment = {}
-        for node in self.graph.nodes:
-            if node not in required:
-                continue
-            args, kwargs = map_arg((node.args, node.kwargs), environment.__getitem__)
-            if node.op == "placeholder":
+        for node in required:
+            if routes is not None and node in routes:
+                result = tree_map(prepare, routes[node]) if metadata else routes[node]
+            elif node.op == "placeholder":
                 result = tree_map(prepare, value[str(node.target)])
             elif node.op == "get_attr":
                 result = self.model
                 for component in str(node.target).split("."):
                     result = getattr(result, component)
                 result = tree_map(prepare, result)
-            elif node.op == "call_function":
-                result = node.target(*args, **kwargs)
-            elif node.op == "call_method":
-                result = getattr(args[0], str(node.target))(*args[1:], **kwargs)
+            elif node.op in ("call_function", "call_method"):
+                args, kwargs = map_arg(
+                    (node.args, node.kwargs), environment.__getitem__
+                )
+                if node.op == "call_function":
+                    result = node.target(*args, **kwargs)
+                else:
+                    result = getattr(args[0], str(node.target))(*args[1:], **kwargs)
             else:
                 raise UnsupportedExpertRegion(
                     f"unsupported routing operation {node.op}"
@@ -181,18 +201,26 @@ class ExpertRegionGraph:
             environment[node] = result
         return environment
 
-    def inputs(self, value, names=None, *, metadata=False):
-        names = set(self.expert_names if names is None else names)
-        required = set().union(*(self.required[name] for name in names))
-        environment = self._evaluate(value, required, metadata=metadata)
-        result = {}
-        for call in self.calls:
-            if str(call.target) in names:
-                args, kwargs = map_arg(
-                    (call.args, call.kwargs), environment.__getitem__
+    def inputs(self, value, names=None, *, metadata=False, routes=None):
+        if names is None:
+            calls, required = self.calls, self._ordered_dependencies
+        else:
+            calls = tuple(dict.fromkeys(self._calls_by_name[name] for name in names))
+            if len(calls) == 1:
+                required = self.required[str(calls[0].target)]
+            else:
+                selected = set().union(
+                    *(self.required[str(call.target)] for call in calls)
                 )
-                _rows(args, kwargs)
-                result[str(call.target)] = (args, kwargs)
+                required = tuple(
+                    node for node in self._ordered_dependencies if node in selected
+                )
+        environment = self._evaluate(value, required, metadata=metadata, routes=routes)
+        result = {}
+        for call in calls:
+            result[str(call.target)] = map_arg(
+                (call.args, call.kwargs), environment.__getitem__
+            )
         return result
 
     def combine_subgraph(self):
@@ -289,26 +317,55 @@ def coalesce_expert_regions(adapter, plan):
 class ExpertRegionProfile:
     token_counts: dict[str, int]
     batch_counts: dict[str, tuple[int, ...]]
+    boundary_bytes: dict[int, int]
+    input_bytes: dict[str, tuple[int, ...]]
 
 
-def profile_expert_region(graph, boundaries, boundary_index, batches):
+def profile_expert_region(
+    graph, boundaries, boundary_index, batches, *, host_budget=None, route_cache=None
+):
     counts = {name: [] for name in graph.expert_names}
+    input_bytes = {name: [] for name in graph.expert_names}
+    boundary_bytes = {}
+    borrowed = boundaries.routing_inputs_are_borrowed
     with torch.no_grad(), HooksMixin.disable_hooks_local():
         for batch in batches:
-            value = boundaries.read_for_routing(
-                boundary_index, batch, graph.input_names
-            )
-            try:
-                inputs = graph.inputs(value, metadata=True)
-            except (RuntimeError, NotImplementedError) as error:
-                raise UnsupportedExpertRegion(
-                    "route metadata requires floating-point model execution"
-                ) from error
-            for name, (args, kwargs) in inputs.items():
-                counts[name].append(_rows(args, kwargs))
+            if not borrowed and host_budget is not None:
+                boundary_bytes[batch] = boundaries.execution_metadata(
+                    boundary_index, batch, graph.input_names
+                ).tensor_bytes
+                read_context = host_budget.reserve(
+                    f"expert route profile batch {batch}", boundary_bytes[batch]
+                )
+            else:
+                read_context = nullcontext()
+            with read_context as reservation:
+                value = boundaries.read_for_routing(
+                    boundary_index, batch, graph.input_names
+                )
+                if reservation is not None:
+                    reservation.commit(reservation.reserved_bytes)
+                else:
+                    boundary_bytes[batch] = _tensor_bytes(value)
+                routes = None
+                if route_cache is not None:
+                    route_cache.prepare(batch, value, graph.route_nodes)
+                    routes = route_cache.batch(batch)
+                try:
+                    inputs = graph.inputs(value, metadata=True, routes=routes)
+                except (RuntimeError, NotImplementedError) as error:
+                    raise UnsupportedExpertRegion(
+                        "route metadata requires floating-point model execution"
+                    ) from error
+                for name, (args, kwargs) in inputs.items():
+                    counts[name].append(_rows(args, kwargs))
+                    input_bytes[name].append(_tensor_bytes((args, kwargs)))
+                del value, inputs, args, kwargs
     return ExpertRegionProfile(
         {name: sum(values) for name, values in counts.items()},
         {name: tuple(values) for name, values in counts.items()},
+        boundary_bytes,
+        {name: tuple(values) for name, values in input_bytes.items()},
     )
 
 
@@ -453,6 +510,7 @@ def execute_expert_region(
     label,
     save_window,
     propagate=True,
+    route_cache=None,
 ):
     """Calibrate, update, propagate, and release each owner's admitted windows."""
     costs = {}
@@ -485,27 +543,67 @@ def execute_expert_region(
         runtime[name] = sum(
             4 * (2 * module.in_features + 2 * module.out_features) for module in linears
         ) + max(8 * module.in_features for module in linears)
-    placement = build_load_balanced_placement(costs, len(parallel.devices))
     memory = []
-    for owner, device in enumerate(parallel.devices):
+    total_tokens = sum(profile.token_counts.values())
+    for device in parallel.devices:
         available = device_budget.usable_bytes(device)
         if available is None:
             raise UnsupportedExpertRegion(
                 "resident windows require a known device budget"
             )
-        names = [name for name, rank in placement.owners if rank == owner]
-        maximum = sum(profile.token_counts[name] for name in names)
-        if token_budget != "auto":
-            maximum = min(maximum, token_budget)
         memory.append(
             OwnerMemoryProfile(
                 usable_bytes=available,
-                dispatch_bytes_per_token=max(
-                    (runtime[name] for name in names), default=1
+                dispatch_bytes_per_token=max(runtime.values(), default=1),
+                max_dispatch_tokens=max(
+                    1,
+                    total_tokens
+                    if token_budget == "auto"
+                    else min(total_tokens, token_budget),
                 ),
-                max_dispatch_tokens=max(1, maximum),
             )
         )
+    try:
+        placement = build_fixed_owner_placement(
+            costs,
+            len(parallel.devices),
+            owner_memory=memory,
+        )
+    except MemoryError:
+        placement = build_load_balanced_placement(costs, len(parallel.devices))
+        streaming_logger.warning(
+            f"{label} | fixed-owner residency does not fit | "
+            "using fixed owner-local resident windows"
+        )
+    memory = tuple(
+        replace(
+            memory[owner],
+            dispatch_bytes_per_token=max(
+                (runtime[name] for name, rank in placement.owners if rank == owner),
+                default=1,
+            ),
+            max_dispatch_tokens=max(
+                1,
+                (
+                    sum(
+                        profile.token_counts[name]
+                        for name, rank in placement.owners
+                        if rank == owner
+                    )
+                    if token_budget == "auto"
+                    else min(
+                        token_budget,
+                        sum(
+                            profile.token_counts[name]
+                            for name, rank in placement.owners
+                            if rank == owner
+                        ),
+                    )
+                ),
+            ),
+        )
+        for owner in range(len(parallel.devices))
+    )
     windows = plan_resident_windows(placement, costs, memory)
 
     def required_bytes(window, tokens):
@@ -618,7 +716,7 @@ def execute_expert_region(
             reservation.close()
             raise
 
-    def forward_expert(name, capacity, *, capture):
+    def forward_expert(name, capacity, *, capture, prepared_inputs=None):
         pieces = []
         entries = []
         lengths = []
@@ -657,30 +755,37 @@ def execute_expert_region(
             samples = tokens = 0
 
         with ExitStack() as inputs_stack:
-            for batch in batches:
-                metadata = boundaries.execution_metadata(
-                    boundary_index, batch, graph.input_names
-                )
-                read_reservation = inputs_stack.enter_context(
-                    host_budget.reserve(
-                        f"{label} routing boundary {name}",
-                        metadata.tensor_bytes,
+            for position, batch in enumerate(batches):
+                if prepared_inputs is None:
+                    read_reservation = None
+                    if not boundaries.routing_inputs_are_borrowed:
+                        read_reservation = inputs_stack.enter_context(
+                            host_budget.reserve(
+                                f"{label} routing boundary {name}",
+                                profile.boundary_bytes[batch],
+                            )
+                        )
+                    value = boundaries.read_for_routing(
+                        boundary_index, batch, graph.input_names
                     )
-                )
-                value = boundaries.read_for_routing(
-                    boundary_index, batch, graph.input_names
-                )
-                read_reservation.commit(read_reservation.reserved_bytes)
-                routed = graph.inputs(value, (name,), metadata=True)[name]
-                reservation = inputs_stack.enter_context(
-                    host_budget.reserve(
-                        f"{label} expert inputs {name}",
-                        _tensor_bytes(routed),
+                    if read_reservation is not None:
+                        read_reservation.commit(read_reservation.reserved_bytes)
+                    reservation = inputs_stack.enter_context(
+                        host_budget.reserve(
+                            f"{label} expert inputs {name}",
+                            profile.input_bytes[name][position],
+                        )
                     )
-                )
-                args, kwargs = graph.inputs(value, (name,))[name]
-                reservation.commit(reservation.reserved_bytes)
-                count = _rows(args, kwargs)
+                    routes = route_cache.batch(batch) if route_cache else None
+                    args, kwargs = graph.inputs(value, (name,), routes=routes)[name]
+                    reservation.commit(reservation.reserved_bytes)
+                else:
+                    args, kwargs = prepared_inputs[batch][name]
+                count = profile.batch_counts[name][position]
+                if _rows(args, kwargs) != count:
+                    raise UnsupportedExpertRegion(
+                        f"expert {name} input rows changed after route profiling"
+                    )
                 offset = 0
                 while offset < count or count == 0:
                     if entries and tokens == capacity:
@@ -722,6 +827,53 @@ def execute_expert_region(
                     output = ordered[0]
                 with result_lock:
                     result_store[batch, name] = output
+
+    def input_groups(names):
+        if not boundaries.routing_inputs_are_borrowed or not graph.route_nodes:
+            for name in names:
+                yield (name,), 0
+            return
+        limit = min(512 * 2**20, host_budget.effective_available_bytes() // 32)
+        pending = []
+        size = 0
+        for name in names:
+            expert_bytes = sum(profile.input_bytes[name])
+            if pending and size + expert_bytes > limit:
+                yield tuple(pending), size
+                pending, size = [], 0
+            if expert_bytes > limit:
+                yield (name,), 0
+            else:
+                pending.append(name)
+                size += expert_bytes
+        if pending:
+            yield tuple(pending), size
+
+    @contextmanager
+    def prepare_group_inputs(names, size, device):
+        if len(names) == 1:
+            yield None
+            return
+        try:
+            reservation = host_budget.reserve(f"{label} {device} routed inputs", size)
+        except HostMemoryError:
+            yield None
+            return
+        prepared_inputs = {}
+        with reservation:
+            try:
+                for position, batch in enumerate(batches):
+                    value = boundaries.read_for_routing(
+                        boundary_index, batch, graph.input_names
+                    )
+                    routes = route_cache.batch(batch) if route_cache else None
+                    prepared_inputs[batch] = graph.inputs(value, names, routes=routes)
+                    reservation.commit(
+                        sum(profile.input_bytes[name][position] for name in names)
+                    )
+                yield prepared_inputs
+            finally:
+                prepared_inputs.clear()
 
     def compute(window, prepared):
         device = parallel.devices[window.owner_rank]
@@ -767,19 +919,26 @@ def execute_expert_region(
                         after_update(modules)
                 else:
                     reported = started
-                    for index, name in enumerate(window.expert_names):
-                        with DisableQuantization(adapter.model.get_submodule(name)):
-                            forward_expert(
-                                name,
-                                window.max_dispatch_tokens,
-                                capture=phase == "propagation",
-                            )
+                    done = 0
+                    for names, size in input_groups(window.expert_names):
+                        with prepare_group_inputs(names, size, device) as inputs:
+                            for name in names:
+                                with DisableQuantization(
+                                    adapter.model.get_submodule(name)
+                                ):
+                                    forward_expert(
+                                        name,
+                                        window.max_dispatch_tokens,
+                                        capture=phase == "propagation",
+                                        prepared_inputs=inputs,
+                                    )
+                                done += 1
                         if perf_counter() - reported >= 30:
                             streaming_logger.info(
                                 f"{label} | EP window {phase} | "
                                 f"rank={window.owner_rank} | "
                                 f"window={window.window_index} | "
-                                f"experts={index + 1}/{len(window.expert_names)}"
+                                f"experts={done}/{len(window.expert_names)}"
                             )
                             reported = perf_counter()
                 streaming_logger.info(

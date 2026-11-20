@@ -127,12 +127,13 @@ from .parallel import (
     RoutePlan,
     RoutePlanCollection,
     StatisticsScope,
-    build_load_balanced_placement,
     build_expert_placement,
+    build_fixed_owner_placement,
+    build_load_balanced_placement,
     ensure_streaming_ep_process_group,
     make_expert_state_filter,
-    plan_resident_windows,
     partition_modules_by_owner,
+    plan_resident_windows,
 )
 from .quantize import quantize_streaming
 from .recovery import (
@@ -246,6 +247,7 @@ __all__ = [
     "execute_expert_group",
     "estimate_modifier_memory",
     "build_expert_placement",
+    "build_fixed_owner_placement",
     "build_load_balanced_placement",
     "build_meta_model",
     "build_modifier_contracts",

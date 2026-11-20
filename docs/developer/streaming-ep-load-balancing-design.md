@@ -39,34 +39,45 @@ GLM5、标准 `ModuleList`/`ModuleDict` MoE、fused/native MoE 通过外部
 
 ### 2.1 专家放置
 
-`src/llmcompressor/streaming/parallel/expert.py` 中的
-`_balanced_expert_owners()` 先按专家模块的参数和 buffer 字节数降序排列，
-然后把每个专家放入当前累计字节数最小的 owner：
+`src/llmcompressor/streaming/parallel/load_balance.py` 中的
+`build_fixed_owner_placement()` 在 route profile 完成后，为当前 target scope
+建立一次固定 owner 映射。专家按 routed work 降序排列，候选 owner 同时受
+resident weight 和 modifier persistent state 的硬显存约束：
 
 ```text
-owner(e) = argmin_r current_weight_bytes[r]
-current_weight_bytes[owner(e)] += weight_bytes[e]
+owner(e) = argmin_r normalized_owner_work_after_placing(e)
+resident_bytes[r] <= usable_bytes[r]
 ```
 
 它的输入只有：
 
 - expert logical name；
 - expert materialized bytes；
+- expert persistent modifier state bytes；
+- route token 数和 per-token work；
+- owner 的可用显存；
 - owner 数量。
 
-它不读取 calibration boundary，不读取 router 结果，也不读取历史
-`dispatch_statistics`。因此当前 placement 是稳定的静态权重平衡。
+route profile 来自当前 target scope 的 calibration boundary。placement 一旦
+建立，在该 scope 的 calibration、update、propagation 和写盘阶段保持不变。
+token capacity 只控制 owner-local dispatch 分段，不会改变 expert owner。
 
 这套策略对以下场景是合理的基础：
 
 - 不同专家形状不同，需要先避免显存集中；
-- 没有可靠路由预测；
+- 有可靠的 calibration route profile；
 - 需要在加载权重前确定 owner；
 - 需要恢复时复用完全相同的 placement fingerprint。
 
-它不能保证计算负载均衡。特别是 DSV4.1 的 384 个 routed experts 形状接近，
-权重字节数几乎相同，placement 接近轮转；如果 calibration 的 routed token
-分布长尾，计算负载会随专家 owner 聚集。
+如果全部专家的 resident state 可以放入固定 owner，所有专家在该 owner 上
+保持常驻。若总 resident state 超过 owner 显存，planner 保留同一份 owner
+映射，并只在 owner 内切成 resident windows。window 只负责本地加载和释放，
+不触发跨 rank 迁移。
+
+如果固定 owner assignment 本身无法满足硬显存约束，系统退回到无 resident
+约束的 work-balanced placement，再由 `plan_resident_windows()` 在每个 owner
+内部切分。这个 fallback 保持 expert 不跨 owner 拆分，兼容 GPTQ、HIGGS 和
+其他具有 owner-local modifier state 的实现。
 
 ### 2.2 token capacity
 

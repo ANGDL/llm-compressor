@@ -12,18 +12,23 @@ from torch import nn
 from torch.fx import Graph
 
 from llmcompressor.core import LifecycleCallbacks, create_session
+from llmcompressor.modeling.moe.routing import group_expert_routes, select_expert_routes
 from llmcompressor.modifiers.gptq import GPTQModifier
 from llmcompressor.modifiers.utils.hooks import HooksMixin
 from llmcompressor.pipelines.sequential.helpers import Subgraph
 from llmcompressor.pipelines.sequential.plan import SequentialExecutionPlan
 from llmcompressor.recipe import Recipe
-from llmcompressor.streaming.activations import InMemoryBoundaryActivationStore
+from llmcompressor.streaming.activations import (
+    DiskBoundaryActivationStore,
+    InMemoryBoundaryActivationStore,
+)
 from llmcompressor.streaming.admission import DeviceMemoryBudget, DeviceMemoryError
 from llmcompressor.streaming.artifacts import ArtifactStore
 from llmcompressor.streaming.checkpoint import SafetensorsWeightSource
 from llmcompressor.streaming.gptq_adapter import GPTQStreamingMemoryAdapter
 from llmcompressor.streaming.loading import (
     HostMemoryBudget,
+    HostMemoryError,
     SubgraphWeightSession,
     TargetWeightLoader,
     build_meta_model,
@@ -40,6 +45,7 @@ from llmcompressor.streaming.parallel.region import (
     execute_expert_region,
     profile_expert_region,
 )
+from llmcompressor.streaming.parallel.route_cache import ExpertRouteCache
 from llmcompressor.streaming.pipeline import run_subgraph_streaming_pipeline
 from llmcompressor.streaming.tracing import (
     TracedBoundaryAdapter,
@@ -54,8 +60,9 @@ class Expert(nn.Module):
         self.up = nn.Linear(4, 8, bias=False)
         self.down = nn.Linear(8, 4, bias=False)
 
-    def forward(self, hidden):
-        return self.down(self.up(hidden).relu())
+    def forward(self, hidden, scales=None):
+        output = self.down(self.up(hidden).relu())
+        return output if scales is None else output * scales
 
 
 class MoE(nn.Module):
@@ -64,20 +71,31 @@ class MoE(nn.Module):
         self.experts = nn.ModuleList([Expert() for _index in range(4)])
 
 
-def subgraph():
+def subgraph(route_op=None):
     graph = Graph()
     hidden = graph.placeholder("hidden")
     indices = graph.placeholder("indices")
+    input_names = {"hidden", "indices"}
+    if route_op is not None:
+        weights = graph.placeholder("weights")
+        grouped = graph.call_function(route_op, (weights, indices, 4))
+        input_names.add("weights")
     output = graph.call_function(torch.zeros_like, (hidden,))
     for index in range(4):
-        selected = graph.call_function(operator.eq, (indices, index))
-        matches = graph.call_function(torch.where, (selected,))
-        rows = graph.call_function(operator.getitem, (matches, 0))
+        if route_op is not None:
+            selected = graph.call_function(select_expert_routes, (grouped, index))
+            rows = graph.call_function(operator.getitem, (selected, 0))
+            scales = graph.call_function(operator.getitem, (selected, 1))
+        else:
+            selected = graph.call_function(operator.eq, (indices, index))
+            matches = graph.call_function(torch.where, (selected,))
+            rows = graph.call_function(operator.getitem, (matches, 0))
         inputs = graph.call_method("index_select", (hidden, 0, rows))
-        result = graph.call_module(f"experts.{index}", (inputs,))
+        args = (inputs, scales) if route_op is not None else (inputs,)
+        result = graph.call_module(f"experts.{index}", args)
         graph.call_method("index_add_", (output, 0, rows, result))
     graph.output({"result": output})
-    return Subgraph(graph, {"hidden", "indices"}, {"hidden", "indices"})
+    return Subgraph(graph, input_names, input_names)
 
 
 def values():
@@ -92,6 +110,14 @@ def values():
             "indices": torch.tensor([0, 0, 0, 0, 1, 1, 2]),
         },
     ]
+
+
+def grouped_values():
+    for batch in values():
+        indices = batch["indices"]
+        batch["indices"] = torch.stack((indices, (indices + 1) % 3), dim=1)
+        batch["weights"] = torch.tensor([0.25, 0.75]).expand_as(batch["indices"])
+        yield batch
 
 
 def quantizer():
@@ -247,6 +273,82 @@ def test_region_profile_reads_real_indices_without_executing_experts():
     assert profile.batch_counts["experts.0"] == (6, 4)
 
 
+@pytest.mark.parametrize("max_bytes", [0, 64 * 2**20])
+def test_grouped_routes_reuse_is_batch_local_and_releases_budget(
+    monkeypatch, max_bytes
+):
+    from llmcompressor.streaming.parallel import route_cache
+
+    calls = []
+
+    def count_routes(weights, indices, experts):
+        calls.append(indices.shape[0])
+        return group_expert_routes(weights, indices, experts)
+
+    monkeypatch.setitem(
+        route_cache._ROUTE_ESTIMATORS,
+        count_routes,
+        route_cache._ROUTE_ESTIMATORS[group_expert_routes],
+    )
+    model = MoE()
+    graph = ExpertRegionGraph.build(model, make_plan(model), (subgraph(count_routes),))
+    reference = ExpertRegionGraph.build(
+        model, make_plan(model), (subgraph(group_expert_routes),)
+    )
+    batches = dict(zip((4, 2), grouped_values()))
+    boundaries = InMemoryBoundaryActivationStore()
+    for index, value in batches.items():
+        boundaries.put(0, index, value)
+    monkeypatch.setattr(
+        boundaries,
+        "execution_metadata",
+        lambda *_args: pytest.fail("in-memory routing should borrow the boundary"),
+    )
+    budget = HostMemoryBudget(
+        system_available=lambda: 2**30, cgroup_available=lambda: None
+    )
+
+    with pytest.raises(RuntimeError, match="stop owners"):
+        with ExpertRouteCache(budget, "test", max_bytes=max_bytes) as cache:
+            profile = profile_expert_region(
+                graph, boundaries, 0, batches, route_cache=cache
+            )
+            assert calls == [10, 7]
+            assert profile.batch_counts["experts.3"] == (0, 0)
+            for index, value in batches.items():
+                expected = reference.inputs(value)
+                if max_bytes:
+                    assert cache.batch(index) is not None
+                    assert budget._reservations
+                else:
+                    assert cache.batch(index) is None
+                for name in graph.expert_names:
+                    result = graph.inputs(value, (name,), routes=cache.batch(index))
+                    torch.testing.assert_close(result[name], expected[name])
+            assert calls == ([10, 7] if max_bytes else [10, 7] + [10] * 4 + [7] * 4)
+            raise RuntimeError("stop owners")
+    assert cache.batch(4) is None
+    assert not budget._reservations
+
+
+def test_copied_route_boundary_is_admitted_before_read(tmp_path, monkeypatch):
+    model = MoE()
+    graph = ExpertRegionGraph.build(model, make_plan(model), (subgraph(),))
+    boundaries = DiskBoundaryActivationStore(tmp_path)
+    boundaries.put(0, 0, values()[0])
+    budget = HostMemoryBudget(
+        system_available=lambda: 32, cgroup_available=lambda: None
+    )
+    monkeypatch.setattr(
+        boundaries,
+        "read_for_routing",
+        lambda *_args: pytest.fail("copied boundary must be admitted before reading"),
+    )
+    with pytest.raises(HostMemoryError, match="expert route profile batch 0"):
+        profile_expert_region(graph, boundaries, 0, (0,), host_budget=budget)
+    assert not budget._reservations
+
+
 def test_region_rejects_experts_with_dependent_inputs():
     model = MoE()
     graph = Graph()
@@ -272,7 +374,8 @@ def test_region_coalescing_crosses_fixed_trace_groups():
     assert coalesce_expert_regions(adapter, make_plan(model)) == ((0, 1, 2, 3),)
 
 
-def reference_quantization(model, batches):
+def reference_quantization(model, batches, routed=None):
+    routed = subgraph() if routed is None else routed
     with create_session() as session:
         session.state.layerwise_calibration = True
         session.initialize(model=model, recipe=[quantizer()], start=-1, copy_data=False)
@@ -282,7 +385,7 @@ def reference_quantization(model, batches):
         modifier.start_layerwise_calibration(model, list(modules))
         with torch.no_grad(), DisableQuantization(model):
             for value in batches:
-                subgraph().forward(model, **value)
+                routed.forward(model, **value)
         statistics = {
             modifier._module_names[module]: (
                 hessian.clone(),
@@ -298,7 +401,7 @@ def reference_quantization(model, batches):
             HooksMixin.disable_hooks_local(),
         ):
             outputs = [
-                subgraph().forward(model, **value)["result"] for value in batches
+                routed.forward(model, **value)["result"] for value in batches
             ]
         tensors = {name: tensor.clone() for name, tensor in model.state_dict().items()}
         LifecycleCallbacks.calibration_end()
@@ -307,33 +410,33 @@ def reference_quantization(model, batches):
 
 
 @pytest.mark.parametrize(
-    "token_budget,memory_bytes,runtime_memory_bytes",
+    "token_budget,memory_bytes,runtime_memory_bytes,grouped",
     [
-        ("auto", 2**20, None),
-        (2, 2**20, None),
-        (4, 2**20, None),
-        ("auto", 5000, None),
-        ("auto", 10_000, 5000),
+        ("auto", 2**20, None, False),
+        (2, 2**20, None, True),
+        (4, 2**20, None, False),
+        ("auto", 5000, None, False),
+        ("auto", 10_000, 5000, False),
     ],
 )
 def test_region_matches_serial_gptq_statistics_weights_and_propagation(
-    tmp_path, monkeypatch, token_budget, memory_bytes, runtime_memory_bytes
+    tmp_path, monkeypatch, token_budget, memory_bytes, runtime_memory_bytes, grouped
 ):
     torch.manual_seed(19)
     source = MoE().eval()
-    batches = values()
+    batches = list(grouped_values()) if grouped else values()
+    routed = subgraph(group_expert_routes if grouped else None)
     expected_statistics, expected_tensors, expected_outputs = reference_quantization(
-        deepcopy(source), deepcopy(batches)
+        deepcopy(source), deepcopy(batches), routed
     )
     save_file(source.state_dict(), tmp_path / "model.safetensors")
     (tmp_path / "config.json").write_text("{}")
     model = build_meta_model(MoE).eval()
     plan = make_plan(model)
-    graph = ExpertRegionGraph.build(model, plan, (subgraph(),))
+    graph = ExpertRegionGraph.build(model, plan, (routed,))
     boundaries = InMemoryBoundaryActivationStore()
     for index, value in enumerate(batches):
         boundaries.put(0, index, value)
-    profile = profile_expert_region(graph, boundaries, 0, (0, 1))
     adapter = SimpleNamespace(
         model=model,
         weight_session=SubgraphWeightSession(model, SafetensorsWeightSource(tmp_path)),
@@ -344,6 +447,9 @@ def test_region_matches_serial_gptq_statistics_weights_and_propagation(
         lambda _module, args: dispatches.append(args[0].shape[0])
     )
     device_budget = DeviceMemoryBudget(available_bytes=memory_bytes)
+    host_budget = HostMemoryBudget(
+        system_available=lambda: 2**30, cgroup_available=lambda: None
+    )
     planned_windows = {}
     saved_windows = {}
     if runtime_memory_bytes is not None:
@@ -360,6 +466,12 @@ def test_region_matches_serial_gptq_statistics_weights_and_propagation(
 
         monkeypatch.setattr(region, "_admit_runtime_window", admit)
     with create_session() as session, ExitStack() as stack:
+        cache = stack.enter_context(ExpertRouteCache(host_budget, "test"))
+        profile = profile_expert_region(
+            graph, boundaries, 0, (0, 1), host_budget=host_budget, route_cache=cache
+        )
+        if grouped:
+            assert cache.batch(0) and cache.batch(1)
         session.state.layerwise_calibration = True
         session.initialize(model=model, recipe=[quantizer()], start=-1, copy_data=False)
         modifier = session.lifecycle.recipe.modifiers[0]
@@ -396,13 +508,14 @@ def test_region_matches_serial_gptq_statistics_weights_and_propagation(
             destination_boundary=4,
             batches=(0, 1),
             device_budget=device_budget,
-            host_budget=HostMemoryBudget(),
+            host_budget=host_budget,
             target_dtype=torch.float32,
             token_budget=token_budget,
             label="test",
             save_window=save,
+            route_cache=cache,
         )
-        assert result["placement"]["policy"] == "activation-aware-v1"
+        assert result["placement"]["policy"] == "fixed-owner-v1"
         if memory_bytes == 5000:
             assert len(result["windows"]) >= 4
         if runtime_memory_bytes is not None:
@@ -421,6 +534,7 @@ def test_region_matches_serial_gptq_statistics_weights_and_propagation(
         assert all(parameter.is_meta for parameter in model.parameters())
         LifecycleCallbacks.calibration_end()
         session.finalize()
+    assert not host_budget._reservations
     assert statistics.keys() == expected_statistics.keys()
     for name, (hessian, count) in expected_statistics.items():
         torch.testing.assert_close(statistics[name][0], hessian, msg=name)
@@ -441,17 +555,19 @@ class PipelineMoE(MoE):
 
 
 @pytest.mark.parametrize(
-    "devices",
+    "devices,grouped",
     [
-        ("cpu:0", "cpu:1"),
+        (("cpu:0", "cpu:1"), False),
+        (("cpu:0", "cpu:1"), True),
         pytest.param(
             ("cuda:0", "cuda:1", "cuda:2", "cuda:3"),
+            True,
             marks=pytest.mark.multi_gpu,
         ),
     ],
 )
 def test_pipeline_uses_routed_windows_and_preserves_downstream_gptq(
-    tmp_path, monkeypatch, devices
+    tmp_path, monkeypatch, devices, grouped
 ):
     import llmcompressor.streaming.pipeline as pipeline
 
@@ -476,8 +592,11 @@ def test_pipeline_uses_routed_windows_and_preserves_downstream_gptq(
     prefix = Graph()
     hidden = prefix.placeholder("hidden")
     indices = prefix.placeholder("indices")
-    prefix.output({"hidden": hidden, "indices": indices})
-    prefix = Subgraph(prefix, {"hidden", "indices"}, set())
+    prefix_outputs = {"hidden": hidden, "indices": indices}
+    if grouped:
+        prefix_outputs["weights"] = prefix.placeholder("weights")
+    prefix.output(prefix_outputs)
+    prefix = Subgraph(prefix, set(prefix_outputs), set())
     tail = Graph()
     result = tail.placeholder("result")
     final = tail.call_module("post", (result,))
@@ -488,7 +607,8 @@ def test_pipeline_uses_routed_windows_and_preserves_downstream_gptq(
         execution_device = torch.device(devices[0] if parallel else "cpu")
         model = build_meta_model(PipelineMoE).eval()
         source = SafetensorsWeightSource(checkpoint)
-        slices = (*_split_target_subgraph(model, subgraph(), targets[:-1]), tail)
+        routed = subgraph(group_expert_routes if grouped else None)
+        slices = (*_split_target_subgraph(model, routed, targets[:-1]), tail)
         adapter = TracedBoundaryAdapter(
             model=model,
             plan=SequentialExecutionPlan(
@@ -504,7 +624,7 @@ def test_pipeline_uses_routed_windows_and_preserves_downstream_gptq(
             adapter=adapter,
             checkpoint=checkpoint,
             work_dir=tmp_path / ("parallel" if parallel else "serial"),
-            calibration_batches=values(),
+            calibration_batches=list(grouped_values()) if grouped else values(),
             recipe=Recipe.create_instance(quantizer()),
             dataset_fingerprint="synthetic-routes",
             materializer=CastWeightMaterializer(),

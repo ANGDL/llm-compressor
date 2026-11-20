@@ -626,7 +626,8 @@ function renderModels() {
     const cleanupLabel = cleanupBusy
       ? state.cleanupPhase.get(model.model_id) || "Working…"
       : cleanupEmpty ? "No tensor remnants" : quantizeSucceeded ? "Clean tensor files" : "Delete tensor remnants";
-    const cleanup = (["FAIL", "FAILED", "CANCELED"].includes(quantizeStatus) || quantizeSucceeded) && canControlPipeline()
+    const cleanupFailure = ["FAIL", "FAILED", "CANCELED", "RESOURCE_TIMEOUT", "EXPIRED"];
+    const cleanup = (cleanupFailure.includes(quantizeStatus) || cleanupFailure.includes(String(model.status || "").toUpperCase()) || quantizeSucceeded) && canControlPipeline()
       ? `<button class="button danger" data-model-action="cleanup" data-model="${escapeHtml(model.model_id)}" data-cleanup-state="${cleanupState}" aria-busy="${cleanupBusy}" ${cleanupBusy || cleanupEmpty ? "disabled" : ""}>${escapeHtml(cleanupLabel)}</button>`
       : "";
     return `<article class="model-card"><div class="model-head"><div><h3>${escapeHtml(model.model_id)}</h3><span class="muted">${escapeHtml(attempts || "No attempt history")}</span></div><div class="model-head-actions">${cleanup}${badge(model.status)}</div></div><div class="fingerprints"><span>Artifact <code>${escapeHtml(model.artifact_fingerprint || "not finalized")}</code></span><span>Evaluation <code>${escapeHtml(model.evaluation_fingerprint || "not finalized")}</code></span><span>Quality report <code>${escapeHtml(report.status || "not available")}</code></span></div>${scores}</article>`;
