@@ -562,6 +562,7 @@ class ControlPlane:
             "CANCELED",
             "RESOURCE_TIMEOUT",
             "EXPIRED",
+            "WARN",
         }
         failed = (
             quantize_status in cleanup_failure_statuses
