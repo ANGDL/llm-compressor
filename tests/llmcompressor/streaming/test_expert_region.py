@@ -515,7 +515,10 @@ def test_region_matches_serial_gptq_statistics_weights_and_propagation(
             save_window=save,
             route_cache=cache,
         )
-        assert result["placement"]["policy"] == "fixed-owner-v1"
+        expected_policy = (
+            "activation-aware-v1" if memory_bytes == 5000 else "fixed-owner-v1"
+        )
+        assert result["placement"]["policy"] == expected_policy
         if memory_bytes == 5000:
             assert len(result["windows"]) >= 4
         if runtime_memory_bytes is not None:
