@@ -334,7 +334,9 @@ def test_plan_scans_global_aliases_once_for_omitted_tied_weight(
             super().__init__()
             self.embed = nn.Embedding(8, 4)
             self.lm_head = nn.Linear(4, 8, bias=False)
+            self.other_head = nn.Linear(4, 8, bias=False)
             self.lm_head.weight = self.embed.weight
+            self.other_head.weight = self.embed.weight
 
     reference = TiedModel()
     path = tmp_path / "model.safetensors"
@@ -351,9 +353,12 @@ def test_plan_scans_global_aliases_once_for_omitted_tied_weight(
     monkeypatch.setattr(model, "named_parameters", record_scan)
     loader = TargetWeightLoader(model, SafetensorsWeightSource(path))
 
-    plan = loader.plan("lm_head")
+    plans = loader.plan_targets(("lm_head", "other_head"))
 
-    assert set(plan.parameter_sources.values()) == {"embed.weight"}
+    assert [set(plan.parameter_sources.values()) for plan in plans] == [
+        {"embed.weight"},
+        {"embed.weight"},
+    ]
     assert scans == 1
 
 

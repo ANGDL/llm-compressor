@@ -462,9 +462,8 @@ class SubgraphWeightSession:
         roots = _minimal_roots(module_names)
         return SubgraphLoadPlan(
             module_names=roots,
-            targets=tuple(
-                self.loader.plan(name, allow_missing_state=allow_missing_state)
-                for name in roots
+            targets=self.loader.plan_targets(
+                roots, allow_missing_state=allow_missing_state
             ),
         )
 

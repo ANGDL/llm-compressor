@@ -24,6 +24,7 @@ from ..activations.store import _tensor_bytes
 from ..admission import DeviceMemoryError, estimate_modifier_dispatch_memory
 from ..calibration import calibration_batch_context
 from ..loading.host_memory import HostMemoryError
+from ..loading.session import SubgraphLoadPlan
 from .expert import _join_subgraphs
 from .load_balance import (
     AsyncResidentWindowScheduler,
@@ -33,6 +34,7 @@ from .load_balance import (
     build_fixed_owner_placement,
     build_load_balanced_placement,
     plan_resident_windows,
+    plan_staging_bytes,
 )
 from .placement import PlacementEntry, PlacementPlan
 from .route_cache import is_cacheable_route
@@ -515,12 +517,25 @@ def execute_expert_region(
     save_window,
     propagate=True,
     route_cache=None,
+    allow_device_prefetch=True,
 ):
     """Calibrate, update, propagate, and release each owner's admitted windows."""
+    planning_started = perf_counter()
     costs = {}
     runtime = {}
-    estimates = {}
+    workspaces = {}
     expert_modules = {}
+    weight_session = adapter.weight_session
+    region_plan = weight_session.plan_modules(
+        graph.expert_names, allow_missing_state=True
+    )
+    target_plans = {target.name: target for target in region_plan.targets}
+    if target_plans.keys() != set(graph.expert_names):
+        raise UnsupportedExpertRegion("resident window expert roots overlap")
+
+    def weight_plan(names):
+        return SubgraphLoadPlan(names, tuple(target_plans[name] for name in names))
+
     for name in graph.expert_names:
         modules = tuple(adapter.model.get_submodule(name).modules())
         expert_modules[name] = modules
@@ -528,18 +543,17 @@ def execute_expert_region(
             modifiers,
             modules,
             total_tokens=profile.token_counts[name],
-            dispatch_tokens=0,
+            dispatch_tokens=int(bool(profile.token_counts[name])),
             phase="calibration",
         )
-        estimates[name] = estimate
-        plan = adapter.weight_session.plan_modules((name,), allow_missing_state=True)
-        weights = adapter.weight_session.estimate_materialized_bytes(
-            plan, dtype=target_dtype
+        workspaces[name] = estimate.scratch_bytes + estimate.batch_bytes
+        weights = weight_session.estimate_materialized_bytes(
+            weight_plan((name,)), dtype=target_dtype
         )
         costs[name] = ExpertCostProfile(
             storage_bytes=weights,
             route_tokens=profile.token_counts[name],
-            persistent_state_bytes=estimate.peak_bytes,
+            persistent_state_bytes=estimate.held_bytes,
         )
         linears = [module for module in modules if isinstance(module, nn.Linear)]
         if not linears:
@@ -548,6 +562,7 @@ def execute_expert_region(
             4 * (2 * module.in_features + 2 * module.out_features) for module in linears
         ) + max(8 * module.in_features for module in linears)
     memory = []
+    workspace = max(workspaces.values(), default=0)
     total_tokens = sum(profile.token_counts.values())
     for device in parallel.devices:
         available = device_budget.usable_bytes(device)
@@ -555,9 +570,15 @@ def execute_expert_region(
             raise UnsupportedExpertRegion(
                 "resident windows require a known device budget"
             )
+        if workspace > available:
+            raise DeviceMemoryError(
+                f"{label} owner {device} has {available} usable bytes for "
+                f"{workspace} bytes of expert workspace"
+            )
         memory.append(
             OwnerMemoryProfile(
                 usable_bytes=available,
+                fixed_bytes=workspace,
                 dispatch_bytes_per_token=max(runtime.values(), default=1),
                 max_dispatch_tokens=max(
                     1,
@@ -609,26 +630,48 @@ def execute_expert_region(
         for owner in range(len(parallel.devices))
     )
     windows = plan_resident_windows(placement, costs, memory)
+    staging_bytes = plan_staging_bytes(
+        windows,
+        costs,
+        memory,
+        {
+            rank
+            for rank, device in enumerate(parallel.devices)
+            if allow_device_prefetch and device.type == "cuda"
+        },
+    )
+    if staging_bytes:
+        windows = plan_resident_windows(
+            placement, costs, memory, staging_bytes=staging_bytes
+        )
 
     def required_bytes(window, tokens):
-        extra = max(
-            max(
-                0,
-                estimate_modifier_dispatch_memory(
+        workspace = max(workspaces[name] for name in window.expert_names)
+        if tokens:
+            for name in window.expert_names:
+                estimate = estimate_modifier_dispatch_memory(
                     modifiers,
                     expert_modules[name],
                     total_tokens=profile.token_counts[name],
-                    dispatch_tokens=tokens,
+                    dispatch_tokens=min(tokens, profile.token_counts[name]),
                     phase="calibration",
-                ).peak_bytes
-                - estimates[name].peak_bytes,
-            )
-            for name in window.expert_names
-        )
+                )
+                workspace = max(
+                    workspace, estimate.scratch_bytes + estimate.batch_bytes
+                )
         return (
             window.resident_bytes
-            + extra
+            + workspace
             + memory[window.owner_rank].dispatch_bytes_per_token * tokens
+        )
+
+    def with_capacity(window, capacity):
+        return replace(
+            window,
+            max_dispatch_tokens=capacity,
+            activation_batches=_window_activation_batches(
+                window, capacity, profile.token_counts
+            ),
         )
 
     admitted_windows = []
@@ -638,22 +681,20 @@ def execute_expert_region(
                 owner=(
                     f"{label} resident window {window.owner_rank}:{window.window_index}"
                 ),
-                usable_bytes=memory[window.owner_rank].usable_bytes,
+                usable_bytes=(
+                    memory[window.owner_rank].usable_bytes
+                    - staging_bytes.get(window.owner_rank, 0)
+                ),
                 required_bytes=lambda tokens: required_bytes(window, tokens),
-                maximum_tokens=window.max_dispatch_tokens,
+                maximum_tokens=min(
+                    window.max_dispatch_tokens,
+                    max(profile.token_counts[name] for name in window.expert_names),
+                ),
             )
             if window.route_tokens
             else 0
         )
-        admitted_windows.append(
-            replace(
-                window,
-                max_dispatch_tokens=capacity,
-                activation_batches=_window_activation_batches(
-                    window, capacity, profile.token_counts
-                ),
-            )
-        )
+        admitted_windows.append(with_capacity(window, capacity))
     windows = tuple(admitted_windows)
     replacements = placement.owner_by_name
     parallel.placement = PlacementPlan(
@@ -677,7 +718,8 @@ def execute_expert_region(
     streaming_logger.info(
         f"{label} | EP routed windows | policy={placement.policy} | "
         f"experts={len(costs)} | windows={len(windows)} | "
-        f"routed_tokens={sum(profile.token_counts.values()):,}"
+        f"routed_tokens={sum(profile.token_counts.values()):,} | "
+        f"planning_s={perf_counter() - planning_started:.2f}"
     )
     for window in windows:
         streaming_logger.info(
@@ -686,7 +728,8 @@ def execute_expert_region(
             f"tokens={window.route_tokens:,} | "
             f"capacity={window.max_dispatch_tokens:,} | "
             f"dispatches={window.activation_batches} | "
-            f"resident_gib={window.resident_bytes / 2**30:.2f}"
+            f"resident_gib={window.resident_bytes / 2**30:.2f} | "
+            f"staging_gib={staging_bytes.get(window.owner_rank, 0) / 2**30:.2f}"
         )
     result_store = {}
     result_reservations = []
@@ -704,21 +747,57 @@ def execute_expert_region(
     if callable(begin):
         begin(all_modules)
 
+    buffered_owners = set()
+
     def prefetch(window):
-        plan = adapter.weight_session.plan_modules(
-            window.expert_names, allow_missing_state=True
-        )
+        started = perf_counter()
+        plan = weight_plan(window.expert_names)
         required = adapter.weight_session.estimate_preparation(plan, dtype=target_dtype)
         reservation = host_budget.reserve(
             f"{label} owner {window.owner_rank} expert weights", required
         )
         try:
-            return adapter.weight_session.prepare(
+            prepared = adapter.weight_session.prepare(
                 plan, dtype=target_dtype, reservation=reservation
             )
         except BaseException:
             reservation.close()
             raise
+        staged = False
+        if window.owner_rank in buffered_owners and window.window_index != 0:
+            device = parallel.devices[window.owner_rank]
+            try:
+                size = prepared.nbytes
+                if size > staging_bytes[window.owner_rank]:
+                    raise DeviceMemoryError(
+                        f"{label} {device} staged weights require {size} bytes, "
+                        f"planned {staging_bytes[window.owner_rank]}"
+                    )
+                transfer = host_budget.reserve(
+                    f"{label} {device} staging pinned weights", size
+                )
+            except HostMemoryError:
+                streaming_logger.warning(
+                    f"{label} | EP pinned prefetch unavailable | device={device} | "
+                    f"window={window.window_index} | using host-only prefetch"
+                )
+            except BaseException:
+                prepared.close()
+                raise
+            else:
+                try:
+                    prepared.move_to_async(device, transfer_reservation=transfer)
+                    staged = True
+                except BaseException:
+                    transfer.close()
+                    prepared.close()
+                    raise
+        streaming_logger.info(
+            f"{label} | EP window prefetch | rank={window.owner_rank} | "
+            f"window={window.window_index} | device_staged={staged} | "
+            f"time={perf_counter() - started:.2f}s"
+        )
+        return prepared
 
     def forward_expert(name, capacity, *, capture, prepared_inputs=None):
         pieces = []
@@ -884,6 +963,8 @@ def execute_expert_region(
     def split_runtime_window(window, usable):
         if len(window.expert_names) < 2:
             return ()
+        minimum_tokens = int(bool(window.route_tokens))
+        usable -= required_bytes(window, minimum_tokens) - window.resident_bytes
         parts = []
         current = []
         current_bytes = 0
@@ -930,24 +1011,41 @@ def execute_expert_region(
             for index, names in enumerate(parts)
         )
 
-    def compute_window(window, prepared):
+    def compute_window(window, prepared, *, buffered=False):
         device = parallel.devices[window.owner_rank]
         device_context = (
             torch.cuda.device(device) if device.type == "cuda" else nullcontext()
         )
         with device_context, torch.no_grad(), ExitStack() as stack:
             stack.callback(prepared.close)
-            planned_window = window
-            window, reservation = _admit_runtime_window(
-                planned_window,
-                required_bytes=lambda tokens: required_bytes(planned_window, tokens),
-                device_budget=device_budget,
-                device=device,
-                label=label,
-                route_tokens=profile.token_counts,
-            )
-            stack.enter_context(reservation)
+            if not buffered:
+                planned_window = window
+                window, reservation = _admit_runtime_window(
+                    planned_window,
+                    required_bytes=lambda tokens: required_bytes(
+                        planned_window, tokens
+                    ),
+                    device_budget=device_budget,
+                    device=device,
+                    label=label,
+                    route_tokens=profile.token_counts,
+                )
+                stack.enter_context(reservation)
+            prefetched_to_device = buffered and prepared.device == device
+            transfer_started = perf_counter()
             prepared.move_to(device)
+            if prefetched_to_device:
+                stream = torch.cuda.current_stream(device)
+                for target in prepared.targets:
+                    for values in (target.parameter_values, target.buffer_values):
+                        for value in values.values():
+                            value.record_stream(stream)
+            streaming_logger.info(
+                f"{label} | EP window activate | rank={window.owner_rank} | "
+                f"window={window.window_index} | "
+                f"device_staged={prefetched_to_device} | "
+                f"transfer_wait_s={perf_counter() - transfer_started:.2f}"
+            )
             loaded = stack.enter_context(
                 adapter.weight_session.installed(prepared, reinitialize=False)
             )
@@ -968,7 +1066,8 @@ def execute_expert_region(
                     f"window={window.window_index} | start"
                 )
                 if phase == "update":
-                    modifier_adapter.update_owner(device, modules)
+                    for name in window.expert_names:
+                        modifier_adapter.update_owner(device, expert_modules[name])
                     after_update = getattr(modifier_adapter, "after_update", None)
                     if callable(after_update):
                         after_update(modules)
@@ -1010,12 +1109,15 @@ def execute_expert_region(
         return window
 
     def compute(window, prepared):
+        if window.owner_rank in buffered_owners:
+            return (compute_window(window, prepared, buffered=True),)
         try:
             return (compute_window(window, prepared),)
         except DeviceMemoryError:
             device = parallel.devices[window.owner_rank]
             usable = device_budget.usable_bytes(device)
-            if usable is None or window.resident_bytes <= usable:
+            minimum_tokens = int(bool(window.route_tokens))
+            if usable is None or required_bytes(window, minimum_tokens) <= usable:
                 raise
             split = split_runtime_window(window, usable)
             if not split:
@@ -1033,12 +1135,34 @@ def execute_expert_region(
             return tuple(actual)
 
     try:
-        completed_windows = AsyncResidentWindowScheduler(max_prefetch=1).run(
-            windows,
-            prefetch=prefetch,
-            compute=compute,
-            discard=lambda prepared: prepared.close(),
-        )
+        with ExitStack() as buffers:
+            for owner, staging in staging_bytes.items():
+                current = max(
+                    required_bytes(window, window.max_dispatch_tokens)
+                    for window in windows
+                    if window.owner_rank == owner
+                )
+                device = parallel.devices[owner]
+                try:
+                    reservation = device_budget.reserve(
+                        f"{label} owner {owner} resident and staged weights",
+                        current + staging,
+                        device=device,
+                    )
+                except DeviceMemoryError:
+                    streaming_logger.warning(
+                        f"{label} | EP double-buffer admission fallback | "
+                        f"rank={owner} | using host-only prefetch"
+                    )
+                else:
+                    buffers.enter_context(reservation)
+                    buffered_owners.add(owner)
+            completed_windows = AsyncResidentWindowScheduler(max_prefetch=1).run(
+                windows,
+                prefetch=prefetch,
+                compute=compute,
+                discard=lambda prepared: prepared.close(),
+            )
         windows = tuple(
             actual
             for _planned, results in completed_windows

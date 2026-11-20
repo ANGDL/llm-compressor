@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from math import ceil, isfinite
 from threading import Event
 from typing import Any, TypeVar
@@ -261,6 +261,11 @@ def build_load_balanced_placement(
                     + cost.storage_bytes
                     + owner_persistent[rank]
                     + cost.persistent_state_bytes
+                    + (
+                        owner_memory[rank].dispatch_bytes_per_token
+                        if owner_tokens[rank] or cost.route_tokens
+                        else 0
+                    )
                 )
                 if required > owner_memory[rank].usable_bytes:
                     continue
@@ -328,6 +333,8 @@ def plan_resident_windows(
     placement: LoadBalancedPlacement,
     expert_costs: Mapping[str, ExpertCostProfile],
     owner_memory: Sequence[OwnerMemoryProfile],
+    *,
+    staging_bytes: Mapping[int, int] | None = None,
 ) -> tuple[ResidentWindow, ...]:
     """Pack each owner's experts into memory-safe resident windows."""
 
@@ -341,6 +348,10 @@ def plan_resident_windows(
 
     windows: list[ResidentWindow] = []
     for owner in range(placement.ep_size):
+        staging = (staging_bytes or {}).get(owner, 0)
+        limits = owner_memory[owner]
+        if staging:
+            limits = replace(limits, fixed_bytes=limits.fixed_bytes + staging)
         names = sorted(
             owner_names[owner],
             key=lambda name: (
@@ -351,15 +362,17 @@ def plan_resident_windows(
         )
         current: list[str] = []
         current_bytes = 0
+        current_storage = 0
         current_tokens = 0
         current_work = 0.0
         window_index = 0
 
         def emit() -> None:
-            nonlocal current, current_bytes, current_tokens, current_work
+            nonlocal current, current_bytes, current_storage, current_tokens
+            nonlocal current_work
             if not current:
                 return
-            capacity = owner_memory[owner].dispatch_capacity(current_bytes)
+            capacity = limits.dispatch_capacity(current_bytes)
             if current_tokens and capacity <= 0:
                 raise MemoryError(
                     f"resident window {owner}:{window_index} has no dispatch "
@@ -385,39 +398,79 @@ def plan_resident_windows(
             )
             current = []
             current_bytes = 0
+            current_storage = 0
             current_tokens = 0
             current_work = 0.0
 
         for name in names:
             cost = expert_costs[name]
             minimum_dispatch = (
-                owner_memory[owner].dispatch_bytes_per_token if cost.route_tokens else 0
+                limits.dispatch_bytes_per_token if cost.route_tokens else 0
             )
             if (
                 cost.total_resident_bytes + minimum_dispatch
-                > owner_memory[owner].resident_budget_bytes
+                > limits.resident_budget_bytes
+                or (staging and cost.storage_bytes > staging)
             ):
                 raise MemoryError(
                     f"expert {name!r} cannot fit in an owner resident window"
                 )
             minimum_dispatch = (
-                owner_memory[owner].dispatch_bytes_per_token
+                limits.dispatch_bytes_per_token
                 if current_tokens + cost.route_tokens else 0
             )
             would_exceed = (
                 current
-                and current_bytes + cost.total_resident_bytes + minimum_dispatch
-                > owner_memory[owner].resident_budget_bytes
+                and (
+                    current_bytes + cost.total_resident_bytes + minimum_dispatch
+                    > limits.resident_budget_bytes
+                    or (staging and current_storage + cost.storage_bytes > staging)
+                )
             )
             if would_exceed:
                 emit()
                 window_index += 1
             current.append(name)
             current_bytes += cost.total_resident_bytes
+            current_storage += cost.storage_bytes
             current_tokens += cost.route_tokens
             current_work += cost.routed_work_units
         emit()
     return tuple(windows)
+
+
+def plan_staging_bytes(windows, costs, owner_memory, enabled_owners):
+    """Find space for the next window's weights on owners that require paging."""
+    by_owner = defaultdict(list)
+    for window in windows:
+        if window.owner_rank in enabled_owners:
+            by_owner[window.owner_rank].append(window)
+    staging = {}
+    for owner, owner_windows in by_owner.items():
+        if len(owner_windows) < 2:
+            continue
+        limits = owner_memory[owner]
+        experts = [
+            costs[name] for window in owner_windows for name in window.expert_names
+        ]
+        largest_expert = max(expert.storage_bytes for expert in experts)
+        active_minimum = max(
+            expert.total_resident_bytes
+            + (limits.dispatch_bytes_per_token if expert.route_tokens else 0)
+            for expert in experts
+        )
+        largest_window = max(
+            sum(costs[name].storage_bytes for name in window.expert_names)
+            for window in owner_windows
+        )
+        candidate = min(
+            limits.resident_budget_bytes - active_minimum,
+            max(largest_expert, limits.resident_budget_bytes // 2),
+            largest_window,
+        )
+        if candidate and candidate >= largest_expert:
+            staging[owner] = candidate
+    return staging
 
 
 class AsyncResidentWindowScheduler:

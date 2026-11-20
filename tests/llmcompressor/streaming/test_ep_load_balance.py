@@ -16,6 +16,7 @@ from llmcompressor.streaming import (
     plan_resident_windows,
 )
 from llmcompressor.streaming.parallel.expert import ExpertParallelPlan
+from llmcompressor.streaming.parallel.load_balance import plan_staging_bytes
 from llmcompressor.streaming.parallel.modifier_update import (
     OwnerModuleGroup,
     OwnerUpdateScheduler,
@@ -177,6 +178,41 @@ def test_resident_windows_keep_capacity_for_a_token_before_loading():
     )
     assert len(windows) == 2
     assert all(window.max_dispatch_tokens == 3 for window in windows)
+
+
+def test_device_staging_only_reserves_memory_for_paged_owners():
+    costs = {
+        f"experts.{index}": ExpertCostProfile(
+            storage_bytes=8, persistent_state_bytes=4, route_tokens=10
+        )
+        for index in range(8)
+    }
+    placement = build_load_balanced_placement(costs, 2)
+    memory = (
+        OwnerMemoryProfile(usable_bytes=74, fixed_bytes=10, dispatch_bytes_per_token=1),
+        OwnerMemoryProfile(usable_bytes=50, fixed_bytes=10, dispatch_bytes_per_token=1),
+    )
+    windows = plan_resident_windows(placement, costs, memory)
+    staging = plan_staging_bytes(windows, costs, memory, {0, 1})
+    buffered = plan_resident_windows(placement, costs, memory, staging_bytes=staging)
+
+    assert {0: 0, **staging} == {0: 0, 1: 20}
+    assert [window for window in windows if window.owner_rank == 0] == [
+        window for window in buffered if window.owner_rank == 0
+    ]
+    assert {name for window in buffered for name in window.expert_names} == set(costs)
+    for window in buffered:
+        owner = memory[window.owner_rank]
+        stage = staging.get(window.owner_rank, 0)
+        assert (
+            owner.fixed_bytes + stage + window.resident_bytes
+            + owner.dispatch_bytes_per_token * window.max_dispatch_tokens
+            <= owner.usable_bytes
+        )
+        if stage:
+            assert sum(
+                costs[name].storage_bytes for name in window.expert_names
+            ) <= stage
 
 
 def test_async_window_scheduler_runs_owners_concurrently():

@@ -222,6 +222,27 @@ class TargetWeightLoader:
     ) -> TargetLoadPlan:
         """Resolve model aliases and source names without loading tensors."""
 
+        return self._plan(target_name, allow_missing_state, {})
+
+    def plan_targets(
+        self,
+        target_names: Sequence[str],
+        *,
+        allow_missing_state: bool = False,
+    ) -> tuple[TargetLoadPlan, ...]:
+        """Share fallback alias lookups across one planning pass."""
+
+        aliases: dict[bool, dict[int, list[str]]] = {}
+        return tuple(
+            self._plan(name, allow_missing_state, aliases) for name in target_names
+        )
+
+    def _plan(
+        self,
+        target_name: str,
+        allow_missing_state: bool,
+        aliases: dict[bool, dict[int, list[str]]],
+    ) -> TargetLoadPlan:
         if target_name in self._active_targets:
             raise RuntimeError(
                 f"Target {target_name!r} is already materialized"
@@ -243,12 +264,14 @@ class TargetWeightLoader:
             parameter_groups,
             parameters=True,
             allow_missing=allow_missing_state,
+            alias_cache=aliases,
         )
         buffer_sources = self._resolve_sources(
             target_name,
             buffer_groups,
             parameters=False,
             allow_missing=allow_missing_state,
+            alias_cache=aliases,
         )
         parameter_groups = [
             group
@@ -702,9 +725,11 @@ class TargetWeightLoader:
         *,
         parameters: bool,
         allow_missing: bool = False,
+        alias_cache: dict[bool, dict[int, list[str]]] | None = None,
     ) -> dict[int, str]:
         resolved = {}
-        global_aliases = None
+        if alias_cache is None:
+            alias_cache = {}
         for tensor, aliases in groups:
             candidates = [_join_name(target_name, alias) for alias in aliases]
             candidates.extend(
@@ -717,11 +742,11 @@ class TargetWeightLoader:
                 name for name in candidates if name in self._source_names
             ]
             if not matches:
-                if global_aliases is None:
-                    global_aliases = self._global_tensor_aliases(
+                if parameters not in alias_cache:
+                    alias_cache[parameters] = self._global_tensor_aliases(
                         parameters=parameters
                     )
-                candidates.extend(global_aliases.get(id(tensor), ()))
+                candidates.extend(alias_cache[parameters].get(id(tensor), ()))
                 candidates = list(dict.fromkeys(candidates))
                 matches = [
                     name for name in candidates if name in self._source_names

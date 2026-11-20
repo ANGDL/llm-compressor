@@ -59,17 +59,27 @@ def test_async_h2d_env_switch(monkeypatch, value, expected):
     assert _async_h2d_enabled() is expected
 
 
-@pytest.mark.parametrize("capacity, expected", [(None, [(0,), (1,), (2,)]),
-                                               (7, [(0, 1), (2,)])])
+@pytest.mark.parametrize(
+    "capacity,input_bytes_capacity,expected",
+    [
+        (None, None, [(0,), (1,), (2,)]),
+        (7, None, [(0, 1), (2,)]),
+        (7, 256, [(0,), (1,), (2,)]),
+        (None, 256, [(0,), (1,), (2,)]),
+    ],
+)
 def test_execution_batches_keep_pipeline_boundaries_and_limit_device_loading(
-    capacity, expected,
+    capacity, input_bytes_capacity, expected,
 ):
     class Boundaries:
         def __init__(self):
             self.loads = []
 
         def get(self, _boundary, index, *, device):
-            return {"hidden": torch.empty(1, [3, 4, 5][index], 8, device=device)}
+            return {
+                "hidden_states": torch.empty(1, [3, 4, 5][index], 8, device=device),
+                "cache": torch.empty(1, 8, device=device),
+            }
 
         def get_for_execution(self, _boundary, index, _names, *, device):
             self.loads.append(index)
@@ -77,8 +87,9 @@ def test_execution_batches_keep_pipeline_boundaries_and_limit_device_loading(
 
     boundaries = Boundaries()
     batches = _iter_execution_batches(
-        boundaries, 0, [0, 1, 2], {"hidden"},
+        boundaries, 0, [0, 1, 2], {"hidden_states", "cache"},
         device=torch.device("cpu"), token_capacity=capacity,
+        input_bytes_capacity=input_bytes_capacity,
     )
     for indices in expected:
         batch_indices, values = next(batches)

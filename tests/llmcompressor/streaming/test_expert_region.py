@@ -521,6 +521,9 @@ def test_region_matches_serial_gptq_statistics_weights_and_propagation(
         assert result["placement"]["policy"] == expected_policy
         if memory_bytes == 5000:
             assert len(result["windows"]) >= 4
+        if memory_bytes == 10_000:
+            assert len(result["windows"]) == 2
+            assert set(saved_windows) == {(0, 0), (1, 0)}
         if runtime_memory_bytes is not None:
             assert any(
                 window.max_dispatch_tokens < planned_windows[key].max_dispatch_tokens
@@ -558,21 +561,29 @@ class PipelineMoE(MoE):
 
 
 @pytest.mark.parametrize(
-    "devices,grouped",
+    "devices,grouped,memory_bytes",
     [
-        (("cpu:0", "cpu:1"), False),
-        (("cpu:0", "cpu:1"), True),
+        (("cpu:0", "cpu:1"), False, 2**22),
+        (("cpu:0", "cpu:1"), True, 2**22),
         pytest.param(
             ("cuda:0", "cuda:1", "cuda:2", "cuda:3"),
             True,
+            2**22,
+            marks=pytest.mark.multi_gpu,
+        ),
+        pytest.param(
+            ("cuda:0", "cuda:1"),
+            False,
+            5000,
             marks=pytest.mark.multi_gpu,
         ),
     ],
 )
 def test_pipeline_uses_routed_windows_and_preserves_downstream_gptq(
-    tmp_path, monkeypatch, devices, grouped
+    tmp_path, monkeypatch, devices, grouped, memory_bytes
 ):
     import llmcompressor.streaming.pipeline as pipeline
+    from llmcompressor.streaming.loading.session import PreparedSubgraphWeights
 
     hardware = devices[0].startswith("cuda")
     if hardware and (
@@ -589,8 +600,18 @@ def test_pipeline_uses_routed_windows_and_preserves_downstream_gptq(
     monkeypatch.setattr(
         pipeline,
         "DeviceMemoryBudget",
-        lambda: DeviceMemoryBudget(available_bytes=2**22),
+        lambda: DeviceMemoryBudget(available_bytes=memory_bytes),
     )
+    staged = []
+    original_transfer = PreparedSubgraphWeights.move_to_async
+
+    def transfer(prepared, device, **kwargs):
+        if prepared.plan.module_names[0].startswith("experts."):
+            staged.append(prepared.plan.module_names)
+        return original_transfer(prepared, device, **kwargs)
+
+    monkeypatch.setattr(PreparedSubgraphWeights, "move_to_async", transfer)
+    monkeypatch.setenv("LLMCOMPRESSOR_STREAMING_ASYNC_H2D", "1")
     targets = (*tuple(f"experts.{index}" for index in range(4)), "post")
     prefix = Graph()
     hidden = prefix.placeholder("hidden")
@@ -660,6 +681,7 @@ def test_pipeline_uses_routed_windows_and_preserves_downstream_gptq(
     assert outputs[0].keys() == outputs[1].keys()
     for name in outputs[0]:
         torch.testing.assert_close(outputs[1][name], outputs[0][name], msg=name)
+    assert bool(staged) == (hardware and memory_bytes == 5000)
 
 
 @pytest.mark.parametrize("dynamic,expected", [(False, False), (True, True)])

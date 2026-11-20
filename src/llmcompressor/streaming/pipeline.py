@@ -815,9 +815,10 @@ def _iter_execution_batches(
     *,
     device: torch.device,
     token_capacity: int | None,
+    input_bytes_capacity: int | None = None,
     telemetry: EPPhaseLogger | None = None,
 ):
-    """Load boundary inputs up to a primary-device token capacity."""
+    """Load independent boundary inputs within token and byte limits."""
 
     def load(batch_index):
         context = (
@@ -829,7 +830,7 @@ def _iter_execution_batches(
                 boundary_index, batch_index, input_names, device=device
             )
 
-    if token_capacity is None:
+    if token_capacity is None and input_bytes_capacity is None:
         for batch_index in batch_indices:
             yield (batch_index,), (load(batch_index),)
         return
@@ -837,6 +838,7 @@ def _iter_execution_batches(
     current_indices = []
     current_values = []
     current_tokens = 0
+    current_bytes = 0
     for batch_index in batch_indices:
         context = (
             telemetry.primary_work("load", "reading boundary metadata")
@@ -844,34 +846,47 @@ def _iter_execution_batches(
         )
         with context:
             describe = getattr(boundaries, "execution_metadata", None)
-            value = (
-                describe(boundary_index, batch_index, input_names).values
-                if callable(describe)
-                else boundaries.get(boundary_index, batch_index, device="meta")
-            )
-            tokens = _boundary_token_count(
-                {name: value[name] for name in input_names}
-            )
+            if callable(describe):
+                metadata = describe(boundary_index, batch_index, input_names)
+                value = metadata.values
+                input_bytes = metadata.tensor_bytes
+                del metadata
+            else:
+                value = boundaries.get(boundary_index, batch_index, device="meta")
+                input_bytes = _boundary_nbytes(value)
+            tokens = _boundary_token_count({name: value[name] for name in input_names})
             del value
-        if tokens > token_capacity:
+        if token_capacity is not None and tokens > token_capacity:
             raise DeviceMemoryError(
                 f"Boundary {boundary_index} batch {batch_index} has {tokens} "
                 f"tokens, exceeding the input token capacity {token_capacity}"
             )
-        exceeds_capacity = (
-            token_capacity is not None
-            and current_values
-            and current_tokens + tokens > token_capacity
+        if input_bytes_capacity is not None and input_bytes > input_bytes_capacity:
+            raise DeviceMemoryError(
+                f"Boundary {boundary_index} batch {batch_index} has {input_bytes} "
+                f"input bytes, exceeding the input byte capacity {input_bytes_capacity}"
+            )
+        exceeds_capacity = current_values and (
+            (
+                token_capacity is not None
+                and current_tokens + tokens > token_capacity
+            )
+            or (
+                input_bytes_capacity is not None
+                and current_bytes + input_bytes > input_bytes_capacity
+            )
         )
         if exceeds_capacity:
             yield tuple(current_indices), tuple(current_values)
             current_indices = []
             current_values = []
             current_tokens = 0
+            current_bytes = 0
         value = load(batch_index)
         current_indices.append(batch_index)
         current_values.append(value)
         current_tokens += tokens
+        current_bytes += input_bytes
     if current_values:
         yield tuple(current_indices), tuple(current_values)
 
@@ -1560,6 +1575,7 @@ def run_subgraph_streaming_pipeline(
                             token_budget=expert_parallel_token_budget,
                             label=target_label, save_window=save_expert_window,
                             propagate=has_next, route_cache=route_cache,
+                            allow_device_prefetch=_async_h2d_enabled(),
                         )
                     ArtifactStore(artifact_dir).commit_ep_token_plan(
                         group_index,
@@ -1607,6 +1623,7 @@ def run_subgraph_streaming_pipeline(
                     max_batch_tokens = 0
                     batch_token_counts = []
                     boundary_bytes = 0
+                    max_boundary_batch_bytes = 0
                     max_boundary_bytes_per_token = 0
                     for batch_index in batches:
                         value = boundaries.get(
@@ -1624,6 +1641,9 @@ def run_subgraph_streaming_pipeline(
                         max_batch_tokens = max(max_batch_tokens, batch_tokens)
                         boundary_bytes += _boundary_nbytes(value)
                         current_boundary_bytes = execution_metadata.tensor_bytes
+                        max_boundary_batch_bytes = max(
+                            max_boundary_batch_bytes, current_boundary_bytes
+                        )
                         if batch_tokens:
                             max_boundary_bytes_per_token = max(
                                 max_boundary_bytes_per_token,
@@ -1635,6 +1655,12 @@ def run_subgraph_streaming_pipeline(
                         del value, execution_metadata
                     num_tokens = max(num_tokens, 1)
                     max_batch_tokens = max(max_batch_tokens, 1)
+                    execution_tokens = (
+                        max_batch_tokens if expert_parallel is not None else None
+                    )
+                    execution_bytes = (
+                        max_boundary_batch_bytes if expert_parallel is not None else None
+                    )
                     with _stage_logger(
                         adapter.model, f"{target_label} | plan weights", device
                     ):
@@ -1807,6 +1833,11 @@ def run_subgraph_streaming_pipeline(
                                 },
                             )
                             ep_executor.set_token_capacity(owner_capacities)
+                            streaming_logger.info(
+                                f"{target_label} | EP FX input window | "
+                                f"token_capacity={max_batch_tokens:,} | "
+                                f"byte_capacity={max_boundary_batch_bytes:,}"
+                            )
                         elif prefetched_prepared is None:
                             weight_stack.enter_context(
                                 device_budget.reserve(
@@ -2046,18 +2077,14 @@ def run_subgraph_streaming_pipeline(
                         total_batches=len(batches),
                     ) as ep_metrics:
                         with DisableQuantization(adapter.model), torch.no_grad():
-                            token_capacity = (
-                                ep_executor.input_token_capacity
-                                if ep_executor is not None
-                                else None
-                            )
                             for batch_indices, values in _iter_execution_batches(
                                 boundaries,
                                 group_start,
                                 batches,
                                 group_inputs,
                                 device=device,
-                                token_capacity=token_capacity,
+                                token_capacity=execution_tokens,
+                                input_bytes_capacity=execution_bytes,
                                 telemetry=ep_metrics,
                             ):
                                 for batch_index in batch_indices:
@@ -2215,11 +2242,6 @@ def run_subgraph_streaming_pipeline(
                                 ),
                                 torch.no_grad(),
                             ):
-                                token_capacity = (
-                                    ep_executor.input_token_capacity
-                                    if ep_executor is not None
-                                    else None
-                                )
                                 for batch_indices, values in (
                                     _iter_execution_batches(
                                         boundaries,
@@ -2227,7 +2249,8 @@ def run_subgraph_streaming_pipeline(
                                         batches,
                                         group_inputs,
                                         device=device,
-                                        token_capacity=token_capacity,
+                                        token_capacity=execution_tokens,
+                                        input_bytes_capacity=execution_bytes,
                                         telemetry=ep_metrics,
                                     )
                                 ):
