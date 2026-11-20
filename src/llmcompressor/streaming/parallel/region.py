@@ -29,6 +29,7 @@ from .load_balance import (
     AsyncResidentWindowScheduler,
     ExpertCostProfile,
     OwnerMemoryProfile,
+    ResidentWindow,
     build_fixed_owner_placement,
     build_load_balanced_placement,
     plan_resident_windows,
@@ -413,10 +414,13 @@ def _window_activation_batches(
     window,
     capacity: int,
     route_tokens: Mapping[str, int],
+    *,
+    expert_names=None,
 ) -> int:
+    names = window.expert_names if expert_names is None else expert_names
     return sum(
         max(1, ceil(route_tokens[name] / capacity)) if capacity else 1
-        for name in window.expert_names
+        for name in names
     )
 
 
@@ -875,7 +879,58 @@ def execute_expert_region(
             finally:
                 prepared_inputs.clear()
 
-    def compute(window, prepared):
+    window_stride = len(costs) + 1
+
+    def split_runtime_window(window, usable):
+        if len(window.expert_names) < 2:
+            return ()
+        parts = []
+        current = []
+        current_bytes = 0
+        for name in window.expert_names:
+            resident_bytes = costs[name].total_resident_bytes
+            if resident_bytes > usable:
+                return ()
+            if current and current_bytes + resident_bytes > usable:
+                parts.append(tuple(current))
+                current = []
+                current_bytes = 0
+            current.append(name)
+            current_bytes += resident_bytes
+        if current:
+            parts.append(tuple(current))
+        if len(parts) < 2:
+            return ()
+        return tuple(
+            ResidentWindow(
+                owner_rank=window.owner_rank,
+                window_index=window.window_index * window_stride + index,
+                expert_names=names,
+                resident_bytes=sum(
+                    costs[name].total_resident_bytes for name in names
+                ),
+                route_tokens=sum(profile.token_counts[name] for name in names),
+                work_units=sum(
+                    costs[name].routed_work_units for name in names
+                ),
+                max_dispatch_tokens=min(
+                    window.max_dispatch_tokens,
+                    sum(profile.token_counts[name] for name in names),
+                ),
+                activation_batches=_window_activation_batches(
+                    window,
+                    min(
+                        window.max_dispatch_tokens,
+                        sum(profile.token_counts[name] for name in names),
+                    ),
+                    profile.token_counts,
+                    expert_names=names,
+                ),
+            )
+            for index, names in enumerate(parts)
+        )
+
+    def compute_window(window, prepared):
         device = parallel.devices[window.owner_rank]
         device_context = (
             torch.cuda.device(device) if device.type == "cuda" else nullcontext()
@@ -953,6 +1008,28 @@ def execute_expert_region(
                 f"window={window.window_index} | tokens={window.route_tokens:,}"
             )
         return window
+
+    def compute(window, prepared):
+        try:
+            return compute_window(window, prepared)
+        except DeviceMemoryError:
+            device = parallel.devices[window.owner_rank]
+            usable = device_budget.usable_bytes(device)
+            if usable is None or window.resident_bytes <= usable:
+                raise
+            split = split_runtime_window(window, usable)
+            if not split:
+                raise
+            streaming_logger.warning(
+                f"{label} | EP runtime resident split | "
+                f"rank={window.owner_rank} | window={window.window_index} | "
+                f"original_experts={len(window.expert_names)} | "
+                f"split_windows={len(split)} | usable={usable:,}"
+            )
+            for subwindow in split:
+                subprepared = prefetch(subwindow)
+                compute_window(subwindow, subprepared)
+            return window
 
     try:
         completed_windows = AsyncResidentWindowScheduler(max_prefetch=1).run(
