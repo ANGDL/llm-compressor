@@ -439,7 +439,10 @@ class AutoRoundModifier(Modifier, QuantizationMixin):
                     )
                     if _found is not None:
                         _refs.append(_found)
-                if len(_refs) == len(cur_inputs):
+                if len(_refs) == len(cur_inputs) and all(
+                    self._reference_output_matches_input(reference, captured_input)
+                    for reference, captured_input in zip(_refs, cur_inputs)
+                ):
                     _fp_ref = _refs
 
             quantize_kwargs = {
@@ -816,6 +819,24 @@ class AutoRoundModifier(Modifier, QuantizationMixin):
         if not args or not isinstance(args[0], torch.Tensor) or args[0].ndim < 2:
             return None
         return args[0].shape[1]
+
+    @staticmethod
+    def _reference_output_matches_input(
+        reference: Any, captured_input: tuple[tuple, dict]
+    ) -> bool:
+        if not isinstance(reference, torch.Tensor) or reference.ndim < 2:
+            return False
+        args, kwargs = captured_input
+        hidden_states = (
+            args[0]
+            if args and isinstance(args[0], torch.Tensor)
+            else kwargs.get("hidden_states")
+        )
+        return (
+            isinstance(hidden_states, torch.Tensor)
+            and hidden_states.ndim == reference.ndim
+            and hidden_states.shape == reference.shape
+        )
 
     @staticmethod
     def _pad_seq_dims(value: Any, seq_len: int, max_seq: int, pad_value: float) -> Any:
