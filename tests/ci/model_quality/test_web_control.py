@@ -449,7 +449,7 @@ def test_cleanup_completed_quantization_with_force(web_env) -> None:
     assert (model_dir / "model" / "config.json").exists()
 
 
-@pytest.mark.parametrize("status", ["RESOURCE_TIMEOUT", "EXPIRED"])
+@pytest.mark.parametrize("status", ["RESOURCE_TIMEOUT", "EXPIRED", "WARN"])
 def test_cleanup_resource_failure_statuses(web_env, status: str) -> None:
     control = make_control(web_env)
     run_id, model_dir = _failed_quantize_run(

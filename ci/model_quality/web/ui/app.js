@@ -626,7 +626,7 @@ function renderModels() {
     const cleanupLabel = cleanupBusy
       ? state.cleanupPhase.get(model.model_id) || "Working…"
       : cleanupEmpty ? "No tensor remnants" : quantizeSucceeded ? "Clean tensor files" : "Delete tensor remnants";
-    const cleanupFailure = ["FAIL", "FAILED", "CANCELED", "RESOURCE_TIMEOUT", "EXPIRED"];
+    const cleanupFailure = ["FAIL", "FAILED", "CANCELED", "RESOURCE_TIMEOUT", "EXPIRED", "WARN"];
     const cleanup = (cleanupFailure.includes(quantizeStatus) || cleanupFailure.includes(String(model.status || "").toUpperCase()) || quantizeSucceeded) && canControlPipeline()
       ? `<button class="button danger" data-model-action="cleanup" data-model="${escapeHtml(model.model_id)}" data-cleanup-state="${cleanupState}" aria-busy="${cleanupBusy}" ${cleanupBusy || cleanupEmpty ? "disabled" : ""}>${escapeHtml(cleanupLabel)}</button>`
       : "";
