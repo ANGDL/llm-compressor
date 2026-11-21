@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 from collections.abc import Iterable, Mapping, Sequence
 from contextlib import ExitStack
 from pathlib import Path
@@ -742,6 +743,11 @@ def run_subgraph_streaming_pipeline(
     artifact_dir = work / "artifacts"
     staging_dir = work / "staging"
     publish_dir = work / "publish"
+    # Direct-writer mode is intentionally non-resumable. Remove any previous
+    # publication attempt before creating the writer so a failed run cannot
+    # make a later run reject an otherwise valid shard id.
+    if not checkpoint_progress and publish_dir.exists():
+        shutil.rmtree(publish_dir)
     run_fingerprint = _initialize_run(
         checkpoint=checkpoint,
         artifact_dir=artifact_dir,
