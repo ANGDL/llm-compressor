@@ -25,6 +25,7 @@ from llmcompressor.pipelines.cache import IntermediatesCache, IntermediateValue
 from llmcompressor.pipelines.sequential.helpers import Subgraph
 from llmcompressor.recipe import Recipe
 from llmcompressor.utils.helpers import DisableQuantization
+from llmcompressor.utils.hardware_ops import available_hardware_ops
 from llmcompressor.utils.int4_packing import DEFAULT_INT4_PACKING_WORKSPACE_BYTES
 from llmcompressor.utils.metric_logging import CompressionLogger
 
@@ -1436,6 +1437,23 @@ def run_subgraph_streaming_pipeline(
         pipeline_failed = True
         ep_executor = None
         try:
+            available_operators = available_hardware_ops()
+            operator_names = {operator["name"] for operator in available_operators}
+            operator_summary = ", ".join(
+                f"{operator['name']}:"
+                f"{operator['backend']}/{operator['implementation']}"
+                for operator in available_operators
+            ) or "none"
+            streaming_logger.info(
+                "setup | hardware operators | "
+                f"available={operator_summary} | "
+                "gptq_factorize_hessian="
+                + (
+                    "available"
+                    if "gptq_factorize_hessian" in operator_names
+                    else "missing"
+                )
+            )
             if expert_parallel is not None:
                 ep_executor = ExpertParallelExecutor(adapter.model, expert_parallel)
                 streaming_logger.info(
@@ -1564,6 +1582,10 @@ def run_subgraph_streaming_pipeline(
                                 region_graph, boundaries, group_start, batches,
                                 host_budget=host_budget, route_cache=route_cache,
                             )
+                        streaming_logger.info(
+                            f"{target_label} | EP route cache | "
+                            f"batches={len(batches)} | {route_cache.report()}"
+                        )
                         window_plan = execute_expert_region(
                             graph=region_graph, profile=route_profile,
                             adapter=adapter, parallel=expert_parallel,

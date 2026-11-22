@@ -748,21 +748,67 @@ def execute_expert_region(
         begin(all_modules)
 
     buffered_owners = set()
+    prepared_windows = {}
+    prepared_windows_lock = Lock()
+    window_plans = tuple(
+        (window, weight_plan(window.expert_names)) for window in windows
+    )
+    if window_plans:
+        aggregate_plan = SubgraphLoadPlan(
+            tuple(
+                dict.fromkeys(
+                    name
+                    for _window, plan in window_plans
+                    for name in plan.module_names
+                )
+            ),
+            tuple(
+                target
+                for _window, plan in window_plans
+                for target in plan.targets
+            ),
+        )
+        required = adapter.weight_session.estimate_preparation(
+            aggregate_plan, dtype=target_dtype
+        )
+        layer_prepare_started = perf_counter()
+        layer_reservation = host_budget.reserve(
+            f"{label} routed MoE layer expert weights", required
+        )
+        try:
+            prepared = adapter.weight_session.prepare_many(
+                tuple(plan for _window, plan in window_plans),
+                dtype=target_dtype,
+                reservation=layer_reservation,
+            )
+        except BaseException:
+            layer_reservation.close()
+            raise
+        with prepared_windows_lock:
+            prepared_windows.update(
+                {
+                    (window.owner_rank, window.window_index): value
+                    for (window, _plan), value in zip(window_plans, prepared)
+                }
+            )
+        streaming_logger.info(
+            f"{label} | EP layer CPU prepare | "
+            f"windows={len(window_plans)} | "
+            f"targets={len(aggregate_plan.targets)} | "
+            f"resident_gib={sum(value.nbytes for value in prepared) / 2**30:.2f} | "
+            f"time={perf_counter() - layer_prepare_started:.2f}s"
+        )
 
     def prefetch(window):
         started = perf_counter()
-        plan = weight_plan(window.expert_names)
-        required = adapter.weight_session.estimate_preparation(plan, dtype=target_dtype)
-        reservation = host_budget.reserve(
-            f"{label} owner {window.owner_rank} expert weights", required
-        )
-        try:
-            prepared = adapter.weight_session.prepare(
-                plan, dtype=target_dtype, reservation=reservation
+        key = (window.owner_rank, window.window_index)
+        with prepared_windows_lock:
+            prepared = prepared_windows.pop(key, None)
+        if prepared is None:
+            raise RuntimeError(
+                f"{label} has no CPU-prepared weights for "
+                f"rank={window.owner_rank}, window={window.window_index}"
             )
-        except BaseException:
-            reservation.close()
-            raise
         staged = False
         if window.owner_rank in buffered_owners and window.window_index != 0:
             device = parallel.devices[window.owner_rank]
@@ -799,7 +845,14 @@ def execute_expert_region(
         )
         return prepared
 
-    def forward_expert(name, capacity, *, capture, prepared_inputs=None):
+    def forward_expert(
+        name,
+        capacity,
+        *,
+        capture,
+        prepared_inputs=None,
+        phase_stats=None,
+    ):
         pieces = []
         entries = []
         lengths = []
@@ -812,16 +865,30 @@ def execute_expert_region(
             nonlocal entries, lengths, segments, samples, tokens
             if not entries:
                 return
+            if phase_stats is not None:
+                phase_stats["dispatches"] += 1
+                phase_stats["tokens"] += tokens
+            pack_started = perf_counter()
             with host_budget.reserve(
                 f"{label} expert dispatch {name}", _tensor_bytes(entries)
             ) as gathered:
                 combined = _concatenate(entries)
                 gathered.commit(_tensor_bytes(combined))
+                if phase_stats is not None:
+                    phase_stats["pack_s"] += perf_counter() - pack_started
+                input_move_started = perf_counter()
                 args, kwargs = _move(combined, device)
+                if phase_stats is not None:
+                    phase_stats["input_move_s"] += (
+                        perf_counter() - input_move_started
+                    )
                 del combined
                 context = HooksMixin.disable_hooks_local() if capture else nullcontext()
                 with context, calibration_batch_context(lengths, sample_count=samples):
+                    forward_started = perf_counter()
                     result = adapter.model.get_submodule(name)(*args, **kwargs)
+                if phase_stats is not None:
+                    phase_stats["forward_s"] += perf_counter() - forward_started
                 if capture:
                     size = _tensor_bytes(result)
                     reservation = host_budget.reserve(
@@ -829,7 +896,12 @@ def execute_expert_region(
                     )
                     with result_lock:
                         result_reservations.append(reservation)
+                    output_move_started = perf_counter()
                     copied = _move(result, "cpu")
+                    if phase_stats is not None:
+                        phase_stats["output_move_s"] += (
+                            perf_counter() - output_move_started
+                        )
                     reservation.commit(size)
                     outputs = _split_result(copied, lengths)
                     pieces.extend(zip(segments, outputs))
@@ -848,9 +920,13 @@ def execute_expert_region(
                                 profile.boundary_bytes[batch],
                             )
                         )
+                    read_started = perf_counter()
                     value = boundaries.read_for_routing(
                         boundary_index, batch, graph.input_names
                     )
+                    if phase_stats is not None:
+                        phase_stats["read_s"] += perf_counter() - read_started
+                        phase_stats["reads"] += 1
                     if read_reservation is not None:
                         read_reservation.commit(read_reservation.reserved_bytes)
                     reservation = inputs_stack.enter_context(
@@ -860,7 +936,10 @@ def execute_expert_region(
                         )
                     )
                     routes = route_cache.batch(batch) if route_cache else None
+                    fx_started = perf_counter()
                     args, kwargs = graph.inputs(value, (name,), routes=routes)[name]
+                    if phase_stats is not None:
+                        phase_stats["fx_s"] += perf_counter() - fx_started
                     reservation.commit(reservation.reserved_bytes)
                 else:
                     args, kwargs = prepared_inputs[batch][name]
@@ -1017,19 +1096,26 @@ def execute_expert_region(
             torch.cuda.device(device) if device.type == "cuda" else nullcontext()
         )
         with device_context, torch.no_grad(), ExitStack() as stack:
-            stack.callback(prepared.close)
             if not buffered:
                 planned_window = window
-                window, reservation = _admit_runtime_window(
-                    planned_window,
-                    required_bytes=lambda tokens: required_bytes(
-                        planned_window, tokens
-                    ),
-                    device_budget=device_budget,
-                    device=device,
-                    label=label,
-                    route_tokens=profile.token_counts,
-                )
+                try:
+                    window, reservation = _admit_runtime_window(
+                        planned_window,
+                        required_bytes=lambda tokens: required_bytes(
+                            planned_window, tokens
+                        ),
+                        device_budget=device_budget,
+                        device=device,
+                        label=label,
+                        route_tokens=profile.token_counts,
+                    )
+                except DeviceMemoryError:
+                    raise
+                except BaseException:
+                    prepared.close()
+                    raise
+            stack.callback(prepared.close)
+            if not buffered:
                 stack.enter_context(reservation)
             prefetched_to_device = buffered and prepared.device == device
             transfer_started = perf_counter()
@@ -1072,6 +1158,17 @@ def execute_expert_region(
                     if callable(after_update):
                         after_update(modules)
                 else:
+                    phase_stats = {
+                        "dispatches": 0,
+                        "tokens": 0,
+                        "reads": 0,
+                        "read_s": 0.0,
+                        "fx_s": 0.0,
+                        "pack_s": 0.0,
+                        "input_move_s": 0.0,
+                        "forward_s": 0.0,
+                        "output_move_s": 0.0,
+                    }
                     reported = started
                     done = 0
                     for names, size in input_groups(window.expert_names):
@@ -1085,6 +1182,7 @@ def execute_expert_region(
                                         window.max_dispatch_tokens,
                                         capture=phase == "propagation",
                                         prepared_inputs=inputs,
+                                        phase_stats=phase_stats,
                                     )
                                 done += 1
                         if perf_counter() - reported >= 30:
@@ -1095,6 +1193,19 @@ def execute_expert_region(
                                 f"experts={done}/{len(window.expert_names)}"
                             )
                             reported = perf_counter()
+                    streaming_logger.info(
+                        f"{label} | EP window {phase} dispatch timing | "
+                        f"rank={window.owner_rank} | window={window.window_index} | "
+                        f"dispatches={phase_stats['dispatches']} | "
+                        f"tokens={phase_stats['tokens']:,} | "
+                        f"reads={phase_stats['reads']} | "
+                        f"read_s={phase_stats['read_s']:.2f} | "
+                        f"fx_s={phase_stats['fx_s']:.2f} | "
+                        f"pack_s={phase_stats['pack_s']:.2f} | "
+                        f"input_move_s={phase_stats['input_move_s']:.2f} | "
+                        f"forward_s={phase_stats['forward_s']:.2f} | "
+                        f"output_move_s={phase_stats['output_move_s']:.2f}"
+                    )
                 streaming_logger.info(
                     f"{label} | EP window {phase} | rank={window.owner_rank} | "
                     f"window={window.window_index} | complete | "
@@ -1128,10 +1239,13 @@ def execute_expert_region(
                 f"original_experts={len(window.expert_names)} | "
                 f"split_windows={len(split)} | usable={usable:,}"
             )
+            subplans = tuple(
+                weight_plan(subwindow.expert_names) for subwindow in split
+            )
+            subprepared = prepared.partition(subplans)
             actual = []
-            for subwindow in split:
-                subprepared = prefetch(subwindow)
-                actual.append(compute_window(subwindow, subprepared))
+            for subwindow, state in zip(split, subprepared):
+                actual.append(compute_window(subwindow, state))
             return tuple(actual)
 
     try:
@@ -1157,12 +1271,21 @@ def execute_expert_region(
                 else:
                     buffers.enter_context(reservation)
                     buffered_owners.add(owner)
-            completed_windows = AsyncResidentWindowScheduler(max_prefetch=1).run(
-                windows,
-                prefetch=prefetch,
-                compute=compute,
-                discard=lambda prepared: prepared.close(),
-            )
+            try:
+                completed_windows = AsyncResidentWindowScheduler(
+                    max_prefetch=1
+                ).run(
+                    windows,
+                    prefetch=prefetch,
+                    compute=compute,
+                    discard=lambda prepared: prepared.close(),
+                )
+            finally:
+                with prepared_windows_lock:
+                    leftovers = tuple(prepared_windows.values())
+                    prepared_windows.clear()
+                for prepared in leftovers:
+                    prepared.close()
         windows = tuple(
             actual
             for _planned, results in completed_windows
@@ -1215,6 +1338,11 @@ def execute_expert_region(
                 )
                 del value, output
     finally:
+        with prepared_windows_lock:
+            leftovers = tuple(prepared_windows.values())
+            prepared_windows.clear()
+        for prepared in leftovers:
+            prepared.close()
         result_store.clear()
         for reservation in result_reservations:
             reservation.close()

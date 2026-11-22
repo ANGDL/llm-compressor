@@ -580,8 +580,8 @@ def main():
     parser.add_argument(
         "--use-imatrix",
         action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Use the iMatrix MSE observer for weight scales (default: disabled).",
+        default=True,
+        help="Use the iMatrix MSE observer for weight scales (default: enabled).",
     )
     parser.add_argument("--num-calibration-samples", type=int, default=128)
     parser.add_argument("--text-calibration-samples", type=int, default=0)

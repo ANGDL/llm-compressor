@@ -1,4 +1,5 @@
 import contextlib
+from time import perf_counter
 from typing import Literal
 
 import torch
@@ -359,7 +360,9 @@ class GPTQModifier(Modifier, QuantizationMixin):
             module_list, self.batched_quantization, self.block_size
         ):
             quant_args = getattr_chain(batch[0], "quantization_scheme.weights")
+            qparams_started = perf_counter()
             batch_qparams = [module.weight_observer.get_qparams() for module in batch]
+            qparams_elapsed = perf_counter() - qparams_started
             names = [self._module_names[module] for module in batch]
             logger.info(f"Quantizing {len(batch)} module(s): {names}")
 
@@ -368,6 +371,7 @@ class GPTQModifier(Modifier, QuantizationMixin):
                 disable_offloading(),
                 contextlib.ExitStack() as ctx_stack,
             ):
+                prepare_started = perf_counter()
                 (
                     weights,
                     hessians,
@@ -380,11 +384,13 @@ class GPTQModifier(Modifier, QuantizationMixin):
                     self._hessians,
                     self._num_samples,
                 )
+                prepare_elapsed = perf_counter() - prepare_started
 
                 comp_loggers = [
                     ctx_stack.enter_context(CompressionLogger(module))
                     for module in batch
                 ]
+                quantize_started = perf_counter()
                 quantized, losses, used_rtn_fallback = quantize_weight(
                     weights=weights,
                     hessians=hessians,
@@ -394,6 +400,22 @@ class GPTQModifier(Modifier, QuantizationMixin):
                     quant_args=quant_args,
                     blocksize=self.block_size,
                     percdamp=self.dampening_frac,
+                )
+                quantize_elapsed = perf_counter() - quantize_started
+                observer_stage = (
+                    "imatrix"
+                    if any(
+                        "IMatrix" in type(module.weight_observer).__name__
+                        for module in batch
+                    )
+                    else "weight_qparams"
+                )
+                logger.info(
+                    f"GPTQ | stage timing | modules={len(batch)} | "
+                    f"observer_stage={observer_stage} | "
+                    f"weight_qparams_s={qparams_elapsed:.2f} | "
+                    f"prepare_s={prepare_elapsed:.2f} | "
+                    f"gptq_quantize_s={quantize_elapsed:.2f}"
                 )
                 for index, comp_logger in enumerate(comp_loggers):
                     comp_logger.set_results(name="GPTQ", loss=losses[index].item())

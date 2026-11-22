@@ -5,9 +5,11 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import wraps
 from threading import RLock
+from time import perf_counter
 
 import torch
 from compressed_tensors.offload.dist_utils import is_source_process as is_src
+from loguru import logger
 from torch.utils.hooks import RemovableHandle
 
 from llmcompressor.modifiers.gptq import GPTQModifier
@@ -128,14 +130,26 @@ class GPTQStreamingMemoryAdapter:
         ]
         if not modules:
             return
+        started = perf_counter()
         observe(modules, base_name="weight")
+        observed = perf_counter()
         self.modifier.sync_obs_act_stats(modules)
+        synced = perf_counter()
         update_qparams(
             modules,
             ACTIVATION_OBS,
             only_update_onload=not is_src(),
         )
+        qparams = perf_counter()
         self.modifier.compress_module_list(modules)
+        compressed = perf_counter()
+        logger.info(
+            f"GPTQ | update timing | device={_owner} | modules={len(modules)} | "
+            f"observe_s={observed - started:.2f} | sync_s={synced - observed:.2f} | "
+            f"qparams_s={qparams - synced:.2f} | "
+            f"compress_s={compressed - qparams:.2f} | "
+            f"total_s={compressed - started:.2f}"
+        )
 
     def after_update(self, modules: Sequence[torch.nn.Module]) -> None:
         """Stop this owner's calibration hooks before propagation starts.

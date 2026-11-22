@@ -45,10 +45,14 @@ class ExpertRouteCache:
         self._used = 0
         self._results = {}
         self._reservations = []
+        self._prepared = 0
+        self._skipped = 0
 
     def __enter__(self):
+        available = self._budget.effective_available_bytes()
         self._limit = min(
-            self._max_bytes, self._budget.effective_available_bytes() // 32
+            self._max_bytes,
+            available // 32,
         )
         return self
 
@@ -64,6 +68,7 @@ class ExpertRouteCache:
 
     def prepare(self, batch, value, nodes):
         if self._used >= self._limit:
+            self._skipped += 1
             return
         prepared = {}
         for node in nodes:
@@ -96,6 +101,17 @@ class ExpertRouteCache:
             self._used += retained
         if prepared:
             self._results[batch] = MappingProxyType(prepared)
+            self._prepared += 1
+        else:
+            self._skipped += 1
+
+    def report(self) -> str:
+        """Summarize route-cache coverage without touching cached tensors."""
+
+        return (
+            f"batches_cached={self._prepared} | batches_skipped={self._skipped} | "
+            f"bytes={self._used:,} | limit={self._limit:,}"
+        )
 
 
 def is_cacheable_route(node):

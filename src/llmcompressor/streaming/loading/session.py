@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Generator, Iterable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
+from threading import Lock
 from time import perf_counter
 from typing import Any
 
@@ -110,6 +111,54 @@ class SubgraphLoadPlan:
     targets: tuple[TargetLoadPlan, ...]
 
 
+class _PreparedReservationLease:
+    """Share one host reservation across partitioned prepared targets."""
+
+    def __init__(self, reservation: HostMemoryReservation):
+        self._reservation = reservation
+        self._references = 1
+        self._lock = Lock()
+
+    def fork(self) -> None:
+        with self._lock:
+            if self._references == 0:
+                raise RuntimeError("Cannot fork a closed prepared reservation")
+            self._references += 1
+
+    @property
+    def reserved_bytes(self) -> int:
+        return self._reservation.reserved_bytes
+
+    @property
+    def committed_bytes(self) -> int:
+        return self._reservation.committed_bytes
+
+    @property
+    def closed(self) -> bool:
+        return self._reservation.closed
+
+    def commit(self, value: int) -> None:
+        self._reservation.commit(value)
+
+    def uncommit(self, value: int) -> None:
+        self._reservation.uncommit(value)
+
+    def release_reserved(self, value: int) -> None:
+        self._reservation.release_reserved(value)
+
+    def release_committed(self, value: int) -> None:
+        self._reservation.release_committed(value)
+
+    def close(self) -> None:
+        with self._lock:
+            if self._references == 0:
+                return
+            self._references -= 1
+            close_reservation = self._references == 0
+        if close_reservation:
+            self._reservation.close()
+
+
 @dataclass
 class PreparedSubgraphWeights:
     """One subgraph's decoded values before model installation."""
@@ -117,7 +166,7 @@ class PreparedSubgraphWeights:
     model: nn.Module
     plan: SubgraphLoadPlan
     targets: list[PreparedTargetWeights]
-    reservation: HostMemoryReservation | None = None
+    reservation: _PreparedReservationLease | None = None
     device_reservation: Any | None = None
     transfer_reservation: HostMemoryReservation | None = None
     _device: torch.device = torch.device("cpu")
@@ -135,6 +184,45 @@ class PreparedSubgraphWeights:
 
     def target_device(self, name: str) -> torch.device:
         return (self._target_devices or {}).get(name, self._device)
+
+    def partition(
+        self, plans: Sequence[SubgraphLoadPlan]
+    ) -> tuple[PreparedSubgraphWeights, ...]:
+        """Split CPU-prepared targets without rereading the checkpoint."""
+
+        if self._device.type != "cpu":
+            raise RuntimeError("Only CPU-prepared weights can be partitioned")
+        if self._transfer_event is not None:
+            raise RuntimeError("Cannot partition weights during an active transfer")
+
+        target_by_name = {target.plan.name: target for target in self.targets}
+        requested_names = [
+            target.name for plan in plans for target in plan.targets
+        ]
+        if len(requested_names) != len(set(requested_names)):
+            raise ValueError("Partition plans contain duplicate prepared targets")
+        if set(requested_names) != set(target_by_name):
+            raise ValueError(
+                "Partition plans must cover every prepared target exactly once"
+            )
+
+        reservation = self.reservation
+        if reservation is not None:
+            for _plan in plans:
+                reservation.fork()
+        partitions = tuple(
+            PreparedSubgraphWeights(
+                self.model,
+                plan,
+                [target_by_name[target.name] for target in plan.targets],
+                reservation=reservation,
+            )
+            for plan in plans
+        )
+        self.targets.clear()
+        if reservation is not None:
+            reservation.close()
+        return partitions
 
     def _close_device_reservation(self) -> None:
         if self.device_reservation is not None:
@@ -591,8 +679,40 @@ class SubgraphWeightSession:
             reservation.close()
             raise
         return PreparedSubgraphWeights(
-            self.model, plan, prepared, reservation=reservation
+            self.model,
+            plan,
+            prepared,
+            reservation=_PreparedReservationLease(reservation),
         )
+
+    def prepare_many(
+        self,
+        plans: Sequence[SubgraphLoadPlan],
+        *,
+        dtype: torch.dtype = torch.bfloat16,
+        reservation: HostMemoryReservation,
+    ) -> tuple[PreparedSubgraphWeights, ...]:
+        """Prepare several disjoint plans in one CPU materialization pass."""
+
+        plans = tuple(plans)
+        if not plans:
+            raise ValueError("prepare_many() requires at least one plan")
+        targets = tuple(target for plan in plans for target in plan.targets)
+        target_names = [target.name for target in targets]
+        if len(target_names) != len(set(target_names)):
+            raise ValueError("prepare_many() plans contain duplicate targets")
+        combined = SubgraphLoadPlan(
+            module_names=_minimal_roots(
+                name for plan in plans for name in plan.module_names
+            ),
+            targets=targets,
+        )
+        prepared = self.prepare(combined, dtype=dtype, reservation=reservation)
+        try:
+            return prepared.partition(plans)
+        except BaseException:
+            prepared.close()
+            raise
 
     @contextmanager
     def installed(

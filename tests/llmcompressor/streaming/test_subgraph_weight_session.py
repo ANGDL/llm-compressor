@@ -13,6 +13,7 @@ from llmcompressor.streaming import (
     SubgraphWeightSession,
     build_meta_model,
 )
+from llmcompressor.streaming.loading import SubgraphLoadPlan
 
 
 class Block(nn.Module):
@@ -319,6 +320,49 @@ def test_prepares_subgraph_without_installing_it(tmp_path):
     with session.installed(prepared) as loaded:
         assert loaded.module_names == ("layers.0",)
         assert not next(model.layers[0].parameters()).is_meta
+
+    assert reservation.closed
+    assert_all_meta(model)
+
+
+def test_prepare_many_partitions_one_cpu_preparation(tmp_path):
+    reference = SessionModel()
+    checkpoint = checkpoint_for(reference, tmp_path)
+    model = build_meta_model(SessionModel)
+    session = SubgraphWeightSession(
+        model, SafetensorsWeightSource(checkpoint)
+    )
+    plans = (
+        session.plan(subgraph_for("layers.0")),
+        session.plan(subgraph_for("layers.1")),
+    )
+    combined = SubgraphLoadPlan(
+        ("layers.0", "layers.1"),
+        tuple(target for plan in plans for target in plan.targets),
+    )
+    required = session.estimate_preparation(combined, dtype=torch.float32)
+    reservation = HostMemoryBudget(
+        safety_reserve_bytes=0,
+        system_available=lambda: 1 << 30,
+        cgroup_available=lambda: None,
+    ).reserve("test", required)
+
+    prepared = session.prepare_many(
+        plans, dtype=torch.float32, reservation=reservation
+    )
+
+    assert [value.plan.module_names for value in prepared] == [
+        ("layers.0",),
+        ("layers.1",),
+    ]
+    assert sum(value.nbytes for value in prepared) == reservation.committed_bytes
+    with session.installed(prepared[0]) as loaded:
+        assert loaded.module_names == ("layers.0",)
+        assert not model.layers[0].proj.weight.is_meta
+        assert model.layers[1].proj.weight.is_meta
+    with session.installed(prepared[1]) as loaded:
+        assert loaded.module_names == ("layers.1",)
+        assert not model.layers[1].proj.weight.is_meta
 
     assert reservation.closed
     assert_all_meta(model)
