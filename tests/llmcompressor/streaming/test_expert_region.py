@@ -41,6 +41,8 @@ from llmcompressor.streaming.parallel.region import (
     ExpertRegionGraph,
     UnsupportedExpertRegion,
     _admit_runtime_window,
+    _output_storage_bytes,
+    _select_destination_output,
     coalesce_expert_regions,
     execute_expert_region,
     profile_expert_region,
@@ -71,7 +73,7 @@ class MoE(nn.Module):
         self.experts = nn.ModuleList([Expert() for _index in range(4)])
 
 
-def subgraph(route_op=None):
+def subgraph(route_op=None, *, skip_output=False):
     graph = Graph()
     hidden = graph.placeholder("hidden")
     indices = graph.placeholder("indices")
@@ -94,7 +96,10 @@ def subgraph(route_op=None):
         args = (inputs, scales) if route_op is not None else (inputs,)
         result = graph.call_module(f"experts.{index}", args)
         graph.call_method("index_add_", (output, 0, rows, result))
-    graph.output({"result": output})
+    outputs = {"result": output}
+    if skip_output:
+        outputs["skip"] = graph.call_function(torch.neg, (output,))
+    graph.output(outputs)
     return Subgraph(graph, input_names, input_names)
 
 
@@ -400,9 +405,7 @@ def reference_quantization(model, batches, routed=None):
             DisableQuantization(model),
             HooksMixin.disable_hooks_local(),
         ):
-            outputs = [
-                routed.forward(model, **value)["result"] for value in batches
-            ]
+            outputs = [routed.forward(model, **value)["result"] for value in batches]
         tensors = {name: tensor.clone() for name, tensor in model.state_dict().items()}
         LifecycleCallbacks.calibration_end()
         session.finalize()
@@ -410,17 +413,24 @@ def reference_quantization(model, batches, routed=None):
 
 
 @pytest.mark.parametrize(
-    "token_budget,memory_bytes,runtime_memory_bytes,grouped",
+    "token_budget,memory_bytes,runtime_memory_bytes,grouped,combine_memory_bytes",
     [
-        ("auto", 2**20, None, False),
-        (2, 2**20, None, True),
-        (4, 2**20, None, False),
-        ("auto", 5000, None, False),
-        ("auto", 10_000, 5000, False),
+        ("auto", 2**20, None, False, None),
+        (2, 2**20, None, True, None),
+        (4, 2**20, None, False, None),
+        ("auto", 5000, None, False, None),
+        ("auto", 10_000, 5000, False, None),
+        pytest.param("auto", 2**20, None, False, 2048, id="combine-prefetch-fallback"),
     ],
 )
 def test_region_matches_serial_gptq_statistics_weights_and_propagation(
-    tmp_path, monkeypatch, token_budget, memory_bytes, runtime_memory_bytes, grouped
+    tmp_path,
+    monkeypatch,
+    token_budget,
+    memory_bytes,
+    runtime_memory_bytes,
+    grouped,
+    combine_memory_bytes,
 ):
     torch.manual_seed(19)
     source = MoE().eval()
@@ -452,6 +462,26 @@ def test_region_matches_serial_gptq_statistics_weights_and_propagation(
     )
     planned_windows = {}
     saved_windows = {}
+    rejected_combines = []
+    if combine_memory_bytes is not None:
+        original_reserve = device_budget.reserve
+
+        def reserve(owner, required_bytes, *, device):
+            if " combine batch " not in owner:
+                return original_reserve(owner, required_bytes, device=device)
+            with monkeypatch.context() as context:
+                context.setattr(
+                    device_budget,
+                    "_available_bytes",
+                    lambda _device: combine_memory_bytes,
+                )
+                try:
+                    return original_reserve(owner, required_bytes, device=device)
+                except DeviceMemoryError:
+                    rejected_combines.append(owner)
+                    raise
+
+        monkeypatch.setattr(device_budget, "reserve", reserve)
     if runtime_memory_bytes is not None:
         import llmcompressor.streaming.parallel.region as region
 
@@ -556,35 +586,42 @@ def test_region_matches_serial_gptq_statistics_weights_and_propagation(
         torch.testing.assert_close(boundaries.get(4, index)["result"], expected)
     if token_budget == 4:
         assert dispatches == [4, 4, 2, 4, 4, 2]
+    if combine_memory_bytes is not None:
+        assert rejected_combines == ["test combine batch 1"]
 
 
 class PipelineMoE(MoE):
-    def __init__(self):
+    def __init__(self, *, skip=False):
         super().__init__()
         self.post = nn.Linear(4, 4, bias=False)
+        if skip:
+            self.post_skip = nn.Linear(4, 4, bias=False)
 
 
 @pytest.mark.parametrize(
-    "devices,grouped,memory_bytes",
+    "devices,grouped,memory_bytes,skip",
     [
-        (("cpu:0", "cpu:1"), False, 2**22),
-        (("cpu:0", "cpu:1"), True, 2**22),
+        (("cpu:0", "cpu:1"), False, 2**22, False),
+        (("cpu:0", "cpu:1"), True, 2**22, False),
+        pytest.param(("cpu:0", "cpu:1"), True, 2**22, True, id="cross-group-skip"),
         pytest.param(
             ("cuda:0", "cuda:1", "cuda:2", "cuda:3"),
             True,
             2**22,
+            False,
             marks=pytest.mark.multi_gpu,
         ),
         pytest.param(
             ("cuda:0", "cuda:1"),
             False,
             5000,
+            False,
             marks=pytest.mark.multi_gpu,
         ),
     ],
 )
 def test_pipeline_uses_routed_windows_and_preserves_downstream_gptq(
-    tmp_path, monkeypatch, devices, grouped, memory_bytes
+    tmp_path, monkeypatch, devices, grouped, memory_bytes, skip
 ):
     import llmcompressor.streaming.pipeline as pipeline
     from llmcompressor.streaming.loading.session import PreparedSubgraphWeights
@@ -599,7 +636,7 @@ def test_pipeline_uses_routed_windows_and_preserves_downstream_gptq(
     torch.manual_seed(29)
     checkpoint = tmp_path / "checkpoint"
     checkpoint.mkdir()
-    save_file(PipelineMoE().state_dict(), checkpoint / "model.safetensors")
+    save_file(PipelineMoE(skip=skip).state_dict(), checkpoint / "model.safetensors")
     (checkpoint / "config.json").write_text("{}")
     monkeypatch.setattr(
         pipeline,
@@ -616,7 +653,8 @@ def test_pipeline_uses_routed_windows_and_preserves_downstream_gptq(
 
     monkeypatch.setattr(PreparedSubgraphWeights, "move_to_async", transfer)
     monkeypatch.setenv("LLMCOMPRESSOR_STREAMING_ASYNC_H2D", "1")
-    targets = (*tuple(f"experts.{index}" for index in range(4)), "post")
+    expert_targets = tuple(f"experts.{index}" for index in range(4))
+    targets = (*expert_targets, "post")
     prefix = Graph()
     hidden = prefix.placeholder("hidden")
     indices = prefix.placeholder("indices")
@@ -630,13 +668,24 @@ def test_pipeline_uses_routed_windows_and_preserves_downstream_gptq(
     final = tail.call_module("post", (result,))
     tail.output({"final": final})
     tail = Subgraph(tail, {"result"}, {"result"})
+    downstream = (tail,)
+    if skip:
+        targets = (*targets, "post_skip")
+        skip_graph = Graph()
+        skip_input = skip_graph.placeholder("skip")
+        post_output = skip_graph.placeholder("final")
+        combined = skip_graph.call_function(operator.add, (post_output, skip_input))
+        model_output = skip_graph.call_module("post_skip", (combined,))
+        skip_graph.output({"model_output": model_output})
+        skip_inputs = {"skip", "final"}
+        downstream = (*downstream, Subgraph(skip_graph, skip_inputs, skip_inputs))
     outputs = []
     for parallel in (False, True):
         execution_device = torch.device(devices[0] if parallel else "cpu")
-        model = build_meta_model(PipelineMoE).eval()
+        model = build_meta_model(lambda: PipelineMoE(skip=skip)).eval()
         source = SafetensorsWeightSource(checkpoint)
-        routed = subgraph(group_expert_routes if grouped else None)
-        slices = (*_split_target_subgraph(model, routed, targets[:-1]), tail)
+        routed = subgraph(group_expert_routes if grouped else None, skip_output=skip)
+        slices = (*_split_target_subgraph(model, routed, expert_targets), *downstream)
         adapter = TracedBoundaryAdapter(
             model=model,
             plan=SequentialExecutionPlan(
@@ -736,3 +785,19 @@ def test_failed_expert_window_releases_its_own_hessians_and_hooks():
         assert not modifier._num_samples
         LifecycleCallbacks.calibration_end()
         session.finalize()
+
+
+def test_destination_output_keeps_only_live_inputs():
+    first = torch.tensor([1])
+    second = torch.tensor([2])
+    output = {"needed": first, "expert_scratch": second}
+
+    filtered = _select_destination_output(output, {"needed", "carried_elsewhere"})
+
+    assert filtered == {"needed": first}
+    assert _select_destination_output(output, None) is output
+
+
+def test_output_storage_bytes_counts_shared_backing_storage_once():
+    storage = torch.empty(4096, dtype=torch.uint8)
+    assert _output_storage_bytes({"views": [storage[:1], storage[1:2]]}) == 4096

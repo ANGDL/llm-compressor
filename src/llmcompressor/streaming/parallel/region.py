@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Mapping
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, replace
@@ -20,7 +21,8 @@ from llmcompressor.pipelines.sequential.helpers import Subgraph
 from llmcompressor.utils.helpers import DisableQuantization
 
 from .._logging import streaming_logger
-from ..activations.store import _tensor_bytes
+from ..activations.store import _tensor_bytes, _tensors
+from ..activations.transfer import transfer_tree, transfer_tree_to_cpu
 from ..admission import DeviceMemoryError, estimate_modifier_dispatch_memory
 from ..calibration import calibration_batch_context
 from ..loading.host_memory import HostMemoryError
@@ -43,6 +45,24 @@ from .token_budget import select_token_capacity
 
 class UnsupportedExpertRegion(ValueError):
     """A graph cannot expose independent expert inputs without model execution."""
+
+
+def _select_destination_output(output, destination_input_names):
+    """Drop values no downstream target consumes from a combined boundary."""
+
+    if destination_input_names is None or not isinstance(output, dict):
+        return output
+    return {
+        name: value for name, value in output.items() if name in destination_input_names
+    }
+
+
+def _output_storage_bytes(value):
+    storages = {}
+    for tensor in _tensors(value):
+        storage = tensor.untyped_storage()
+        storages[storage.device, storage.data_ptr()] = storage.nbytes()
+    return sum(storages.values())
 
 
 def _mutates(node):
@@ -421,8 +441,7 @@ def _window_activation_batches(
 ) -> int:
     names = window.expert_names if expert_names is None else expert_names
     return sum(
-        max(1, ceil(route_tokens[name] / capacity)) if capacity else 1
-        for name in names
+        max(1, ceil(route_tokens[name] / capacity)) if capacity else 1 for name in names
     )
 
 
@@ -517,6 +536,7 @@ def execute_expert_region(
     save_window,
     propagate=True,
     route_cache=None,
+    destination_input_names=None,
     allow_device_prefetch=True,
 ):
     """Calibrate, update, propagate, and release each owner's admitted windows."""
@@ -539,9 +559,7 @@ def execute_expert_region(
     for name in graph.expert_names:
         modules = tuple(adapter.model.get_submodule(name).modules())
         expert_modules[name] = modules
-        estimate_update_work = getattr(
-            modifier_adapter, "estimate_update_work", None
-        )
+        estimate_update_work = getattr(modifier_adapter, "estimate_update_work", None)
         update_work = (
             float(estimate_update_work(modules))
             if callable(estimate_update_work)
@@ -774,16 +792,10 @@ def execute_expert_region(
         aggregate_plan = SubgraphLoadPlan(
             tuple(
                 dict.fromkeys(
-                    name
-                    for _window, plan in window_plans
-                    for name in plan.module_names
+                    name for _window, plan in window_plans for name in plan.module_names
                 )
             ),
-            tuple(
-                target
-                for _window, plan in window_plans
-                for target in plan.targets
-            ),
+            tuple(target for _window, plan in window_plans for target in plan.targets),
         )
         required = adapter.weight_session.estimate_preparation(
             aggregate_plan, dtype=target_dtype
@@ -882,6 +894,7 @@ def execute_expert_region(
             nonlocal entries, lengths, segments, samples, tokens
             if not entries:
                 return
+            submit_started = perf_counter()
             if phase_stats is not None:
                 phase_stats["dispatches"] += 1
                 phase_stats["tokens"] += tokens
@@ -896,9 +909,7 @@ def execute_expert_region(
                 input_move_started = perf_counter()
                 args, kwargs = _move(combined, device)
                 if phase_stats is not None:
-                    phase_stats["input_move_s"] += (
-                        perf_counter() - input_move_started
-                    )
+                    phase_stats["input_move_s"] += perf_counter() - input_move_started
                 del combined
                 context = HooksMixin.disable_hooks_local() if capture else nullcontext()
                 with context, calibration_batch_context(lengths, sample_count=samples):
@@ -907,10 +918,15 @@ def execute_expert_region(
                 if phase_stats is not None:
                     phase_stats["forward_s"] += perf_counter() - forward_started
                 if capture:
+                    reserve_started = perf_counter()
                     size = _tensor_bytes(result)
                     reservation = host_budget.reserve(
                         f"{label} expert output {name}", size
                     )
+                    if phase_stats is not None:
+                        phase_stats["output_reserve_s"] += (
+                            perf_counter() - reserve_started
+                        )
                     with result_lock:
                         result_reservations.append(reservation)
                     output_move_started = perf_counter()
@@ -920,23 +936,34 @@ def execute_expert_region(
                             perf_counter() - output_move_started
                         )
                     reservation.commit(size)
+                    split_started = perf_counter()
                     outputs = _split_result(copied, lengths)
+                    if phase_stats is not None:
+                        phase_stats["split_s"] += perf_counter() - split_started
                     pieces.extend(zip(segments, outputs))
                 del args, kwargs, result
             entries, lengths, segments = [], [], []
             samples = tokens = 0
+            if phase_stats is not None:
+                phase_stats["submit_s"] += perf_counter() - submit_started
 
         with ExitStack() as inputs_stack:
+            loop_started = perf_counter()
             for position, batch in enumerate(batches):
                 if prepared_inputs is None:
                     read_reservation = None
                     if not boundaries.routing_inputs_are_borrowed:
+                        reserve_started = perf_counter()
                         read_reservation = inputs_stack.enter_context(
                             host_budget.reserve(
                                 f"{label} routing boundary {name}",
                                 profile.boundary_bytes[batch],
                             )
                         )
+                        if phase_stats is not None:
+                            phase_stats["reserve_s"] += (
+                                perf_counter() - reserve_started
+                            )
                     read_started = perf_counter()
                     value = boundaries.read_for_routing(
                         boundary_index, batch, graph.input_names
@@ -946,12 +973,17 @@ def execute_expert_region(
                         phase_stats["reads"] += 1
                     if read_reservation is not None:
                         read_reservation.commit(read_reservation.reserved_bytes)
+                    reserve_started = perf_counter()
                     reservation = inputs_stack.enter_context(
                         host_budget.reserve(
                             f"{label} expert inputs {name}",
                             profile.input_bytes[name][position],
                         )
                     )
+                    if phase_stats is not None:
+                        phase_stats["reserve_s"] += (
+                            perf_counter() - reserve_started
+                        )
                     routes = route_cache.batch(batch) if route_cache else None
                     fx_started = perf_counter()
                     args, kwargs = graph.inputs(value, (name,), routes=routes)[name]
@@ -970,6 +1002,7 @@ def execute_expert_region(
                     if entries and tokens == capacity:
                         submit()
                     length = min(capacity - tokens, count - offset)
+                    slice_started = perf_counter()
                     entry = tree_map(
                         lambda item: (
                             item[offset : offset + length]
@@ -978,6 +1011,8 @@ def execute_expert_region(
                         ),
                         (args, kwargs),
                     )
+                    if phase_stats is not None:
+                        phase_stats["slice_s"] += perf_counter() - slice_started
                     entries.append(entry)
                     lengths.append(length)
                     segments.append((batch, offset))
@@ -986,6 +1021,8 @@ def execute_expert_region(
                     if not count:
                         break
                     offset += length
+            if phase_stats is not None:
+                phase_stats["loop_s"] += perf_counter() - loop_started
             submit()
         if capture:
             by_batch = {}
@@ -1083,13 +1120,9 @@ def execute_expert_region(
                 owner_rank=window.owner_rank,
                 window_index=window.window_index * window_stride + index,
                 expert_names=names,
-                resident_bytes=sum(
-                    costs[name].total_resident_bytes for name in names
-                ),
+                resident_bytes=sum(costs[name].total_resident_bytes for name in names),
                 route_tokens=sum(profile.token_counts[name] for name in names),
-                work_units=sum(
-                    costs[name].routed_work_units for name in names
-                ),
+                work_units=sum(costs[name].routed_work_units for name in names),
                 max_dispatch_tokens=min(
                     window.max_dispatch_tokens,
                     sum(profile.token_counts[name] for name in names),
@@ -1178,12 +1211,19 @@ def execute_expert_region(
                         "dispatches": 0,
                         "tokens": 0,
                         "reads": 0,
+                        "expert_s": 0.0,
+                        "loop_s": 0.0,
+                        "submit_s": 0.0,
+                        "reserve_s": 0.0,
+                        "slice_s": 0.0,
                         "read_s": 0.0,
                         "fx_s": 0.0,
                         "pack_s": 0.0,
                         "input_move_s": 0.0,
                         "forward_s": 0.0,
                         "output_move_s": 0.0,
+                        "output_reserve_s": 0.0,
+                        "split_s": 0.0,
                     }
                     reported = started
                     done = 0
@@ -1193,12 +1233,16 @@ def execute_expert_region(
                                 with DisableQuantization(
                                     adapter.model.get_submodule(name)
                                 ):
+                                    expert_started = perf_counter()
                                     forward_expert(
                                         name,
                                         window.max_dispatch_tokens,
                                         capture=phase == "propagation",
                                         prepared_inputs=inputs,
                                         phase_stats=phase_stats,
+                                    )
+                                    phase_stats["expert_s"] += (
+                                        perf_counter() - expert_started
                                     )
                                 done += 1
                         if perf_counter() - reported >= 30:
@@ -1217,10 +1261,17 @@ def execute_expert_region(
                         f"reads={phase_stats['reads']} | "
                         f"read_s={phase_stats['read_s']:.2f} | "
                         f"fx_s={phase_stats['fx_s']:.2f} | "
+                        f"expert_s={phase_stats['expert_s']:.2f} | "
+                        f"loop_s={phase_stats['loop_s']:.2f} | "
+                        f"submit_s={phase_stats['submit_s']:.2f} | "
+                        f"reserve_s={phase_stats['reserve_s']:.2f} | "
+                        f"slice_s={phase_stats['slice_s']:.2f} | "
                         f"pack_s={phase_stats['pack_s']:.2f} | "
                         f"input_move_s={phase_stats['input_move_s']:.2f} | "
                         f"forward_s={phase_stats['forward_s']:.2f} | "
-                        f"output_move_s={phase_stats['output_move_s']:.2f}"
+                        f"output_move_s={phase_stats['output_move_s']:.2f} | "
+                        f"output_reserve_s={phase_stats['output_reserve_s']:.2f} | "
+                        f"split_s={phase_stats['split_s']:.2f}"
                     )
                 streaming_logger.info(
                     f"{label} | EP window {phase} | rank={window.owner_rank} | "
@@ -1255,9 +1306,7 @@ def execute_expert_region(
                 f"original_experts={len(window.expert_names)} | "
                 f"split_windows={len(split)} | usable={usable:,}"
             )
-            subplans = tuple(
-                weight_plan(subwindow.expert_names) for subwindow in split
-            )
+            subplans = tuple(weight_plan(subwindow.expert_names) for subwindow in split)
             subprepared = prepared.partition(subplans)
             actual = []
             for subwindow, state in zip(split, subprepared):
@@ -1288,9 +1337,7 @@ def execute_expert_region(
                     buffers.enter_context(reservation)
                     buffered_owners.add(owner)
             try:
-                completed_windows = AsyncResidentWindowScheduler(
-                    max_prefetch=1
-                ).run(
+                completed_windows = AsyncResidentWindowScheduler(max_prefetch=1).run(
                     windows,
                     prefetch=prefetch,
                     compute=compute,
@@ -1303,9 +1350,7 @@ def execute_expert_region(
                 for prepared in leftovers:
                     prepared.close()
         windows = tuple(
-            actual
-            for _planned, results in completed_windows
-            for actual in results
+            actual for _planned, results in completed_windows for actual in results
         )
         if callable(finalize):
             finalize()
@@ -1316,43 +1361,220 @@ def execute_expert_region(
             }
         combine = graph.combine_subgraph()
         primary = parallel.devices[0]
+        copy_stream = (
+            torch.cuda.Stream(device=primary) if primary.type == "cuda" else None
+        )
+        output_stream = (
+            torch.cuda.Stream(device=primary) if primary.type == "cuda" else None
+        )
         call_names = {
             f"ep_result_{node.name}": str(node.target) for node in graph.calls
         }
         input_names = combine.input_names - call_names.keys()
-        for batch in batches:
-            metadata = boundaries.execution_metadata(boundary_index, batch, input_names)
-            outputs_size = sum(
-                _tensor_bytes(result_store[batch, name])
-                for placeholder, name in call_names.items()
-                if placeholder in combine.input_names
+        result_names = {
+            placeholder: name
+            for placeholder, name in call_names.items()
+            if placeholder in combine.input_names
+        }
+
+        def prepare_batch(batch):
+            prepare_started = perf_counter()
+            payload = dict(
+                boundaries.read_for_routing(boundary_index, batch, input_names)
             )
-            with device_budget.reserve(
-                f"{label} combine batch {batch}",
-                2 * (metadata.tensor_bytes + outputs_size),
-                device=primary,
-            ):
-                value = boundaries.get_for_execution(
-                    boundary_index, batch, input_names, device=primary
-                )
-                for placeholder, name in call_names.items():
-                    if placeholder in combine.input_names:
-                        value[placeholder] = _move(
-                            result_store.pop((batch, name)), primary
-                        )
-                with torch.no_grad(), HooksMixin.disable_hooks_local():
-                    output = combine.forward(
-                        adapter.model,
-                        **{name: value[name] for name in combine.input_names},
-                    )
+            for placeholder, name in result_names.items():
+                payload[placeholder] = result_store[batch, name]
+            transfer = transfer_tree(
+                payload,
+                primary,
+                stream=copy_stream,
+                host_budget=host_budget,
+                device_budget=device_budget,
+                owner=f"{label} combine batch {batch}",
+            )
+            for name in result_names.values():
+                del result_store[batch, name]
+            return transfer, perf_counter() - prepare_started
+
+        output_cap = 512 * 2**20
+        if primary.type == "cuda":
+            usable = device_budget.usable_bytes(primary)
+            if usable is not None:
+                output_cap = max(1, min(output_cap, usable // 8))
+        max_output_batches = 8
+        max_output_transfers = 2
+        admission_errors = (DeviceMemoryError, HostMemoryError, torch.OutOfMemoryError)
+
+        combined_tensors = 0
+        combined_bytes = 0
+        allocate_seconds = 0.0
+        pack_seconds = 0.0
+        submit_seconds = 0.0
+        prepare_seconds = 0.0
+        wait_seconds = 0.0
+        combine_seconds = 0.0
+        commit_seconds = 0.0
+        close_seconds = 0.0
+        output_pack_seconds = 0.0
+        output_wait_seconds = 0.0
+        output_tensors = 0
+        output_bytes = 0
+        output_flushes = 0
+        prefetch_fallbacks = 0
+        pending_outputs = {}
+        pending_output_bytes = 0
+        inflight_outputs = deque()
+        inflight_output_bytes = 0
+        pending = None
+        current = None
+
+        def commit_outputs(cpu_outputs):
+            nonlocal commit_seconds
+            for output_batch, output_value in cpu_outputs.items():
+                commit_started = perf_counter()
                 boundaries.commit_propagated_batch(
                     boundary_index,
                     destination_boundary,
-                    batch,
-                    output,
+                    output_batch,
+                    output_value,
                     consumed_names=graph.consumed,
                 )
-                del value, output
+                commit_seconds += perf_counter() - commit_started
+
+        def drain_outputs(*, keep):
+            nonlocal output_wait_seconds, output_tensors, output_bytes
+            nonlocal inflight_output_bytes
+            while len(inflight_outputs) > keep:
+                transfer, storage_bytes = inflight_outputs.popleft()
+                try:
+                    wait_started = perf_counter()
+                    cpu_outputs = transfer.wait()
+                    output_wait_seconds += perf_counter() - wait_started
+                    output_tensors += transfer.tensor_count
+                    output_bytes += transfer.total_bytes
+                    commit_outputs(cpu_outputs)
+                    del cpu_outputs
+                finally:
+                    transfer.close()
+                    inflight_output_bytes -= storage_bytes
+
+        def flush_outputs(*, keep):
+            nonlocal pending_output_bytes, inflight_output_bytes
+            nonlocal output_pack_seconds, output_flushes
+            if pending_outputs:
+                flushed = pending_outputs.copy()
+                storage_bytes = pending_output_bytes
+                pending_outputs.clear()
+                pending_output_bytes = 0
+                pack_started = perf_counter()
+                output_flushes += 1
+                try:
+                    transfer = transfer_tree_to_cpu(
+                        flushed,
+                        stream=output_stream,
+                        wait_stream=(
+                            torch.cuda.current_stream(primary)
+                            if output_stream is not None
+                            else None
+                        ),
+                        host_budget=host_budget,
+                        owner=f"{label} combine output staging",
+                    )
+                except (HostMemoryError, torch.OutOfMemoryError):
+                    output_pack_seconds += perf_counter() - pack_started
+                    drain_outputs(keep=0)
+                    commit_outputs(flushed)
+                else:
+                    output_pack_seconds += perf_counter() - pack_started
+                    inflight_outputs.append((transfer, storage_bytes))
+                    inflight_output_bytes += storage_bytes
+                del flushed
+            drain_outputs(keep=keep)
+
+        try:
+            for index, batch in enumerate(batches):
+                current, pending = pending, None
+                if current is None:
+                    flush_outputs(keep=0)
+                    current = prepare_batch(batch)
+                if index + 1 < len(batches):
+                    try:
+                        pending = prepare_batch(batches[index + 1])
+                    except admission_errors:
+                        prefetch_fallbacks += 1
+                transfer, prepare_elapsed = current
+                prepare_seconds += prepare_elapsed
+                allocate_seconds += transfer.allocate_seconds
+                pack_seconds += transfer.pack_seconds
+                submit_seconds += transfer.submit_seconds
+                with transfer:
+                    wait_started = perf_counter()
+                    value = transfer.wait()
+                    wait_seconds += perf_counter() - wait_started
+                    combine_started = perf_counter()
+                    with torch.no_grad(), HooksMixin.disable_hooks_local():
+                        output = combine.forward(
+                            adapter.model,
+                            **{name: value[name] for name in combine.input_names},
+                        )
+                    combine_seconds += perf_counter() - combine_started
+                    output = _select_destination_output(output, destination_input_names)
+                    combined_tensors += transfer.tensor_count
+                    combined_bytes += transfer.total_bytes
+                    del value
+                    close_started = perf_counter()
+                close_seconds += perf_counter() - close_started
+                current = None
+                output_size = _output_storage_bytes(output)
+                if pending_output_bytes + output_size > output_cap:
+                    flush_outputs(keep=max_output_transfers - 1)
+                while (
+                    inflight_outputs
+                    and inflight_output_bytes + pending_output_bytes + output_size
+                    > output_cap
+                ):
+                    drain_outputs(keep=len(inflight_outputs) - 1)
+                pending_outputs[batch] = output
+                del output
+                pending_output_bytes += output_size
+                if (
+                    pending_output_bytes >= output_cap
+                    or len(pending_outputs) >= max_output_batches
+                ):
+                    flush_outputs(
+                        keep=0 if output_size > output_cap else max_output_transfers - 1
+                    )
+            flush_outputs(keep=0)
+            if batches:
+                streaming_logger.info(
+                    f"{label} | EP combine coalesced transfer | "
+                    f"batches={len(batches)} | tensors={combined_tensors} | "
+                    f"bytes={combined_bytes} | copy_stream={copy_stream is not None} | "
+                    f"allocate_s={allocate_seconds:.2f} | "
+                    f"pack_s={pack_seconds:.2f} | "
+                    f"submit_s={submit_seconds:.2f} | "
+                    f"prepare_s={prepare_seconds:.2f} | "
+                    f"wait_s={wait_seconds:.2f} | "
+                    f"prefetch_fallbacks={prefetch_fallbacks} | "
+                    f"combine_s={combine_seconds:.2f} | "
+                    f"output_flushes={output_flushes} | "
+                    f"output_pack_s={output_pack_seconds:.2f} | "
+                    f"output_wait_s={output_wait_seconds:.2f} | "
+                    f"output_tensors={output_tensors} | "
+                    f"output_bytes={output_bytes} | "
+                    f"commit_s={commit_seconds:.2f} | "
+                    f"close_s={close_seconds:.2f}"
+                )
+        finally:
+            for transfer, _storage_bytes in inflight_outputs:
+                transfer.close()
+            inflight_outputs.clear()
+            pending_outputs.clear()
+            for item in (current, pending):
+                if item is None:
+                    continue
+                transfer, _elapsed = item
+                transfer.close()
     finally:
         with prepared_windows_lock:
             leftovers = tuple(prepared_windows.values())
