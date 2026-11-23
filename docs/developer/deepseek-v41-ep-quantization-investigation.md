@@ -11,6 +11,97 @@
 - 每次改变 kernel、batch、并发或派发方式后，记录可对比的首个 routed
   MoE window 数据。
 
+## 2026-11-23 19:52 CST - EP4/EP8 同版本对比：均跑通，EP8 仍慢 9.7%
+
+**实验**
+
+```text
+commit=5bbac9ed7
+EP4=/ssd3/model-quality/e2e/20261123_dsv41_wna8_ep4_5bbac9ed7_20261123T110844Z
+EP8=/ssd3/model-quality/e2e/20261123_dsv41_wna8_ep8_5bbac9ed7_20261123T113120Z
+EP4 FIRST_ROUTED_REGION_SECONDS=242.983
+EP8 FIRST_ROUTED_REGION_SECONDS=266.559
+```
+
+两版修复后 EP4 和 EP8 都能完整跑完首个 routed region，无 OOM、
+无 `prefetch_fallbacks`。
+
+**阶段对比**
+
+| 阶段 | EP4 | EP8 | EP8/EP4 |
+|---|---:|---:|---:|
+| CPU layer prepare | 29.19s | 31.19s | 1.07x |
+| calibration | 13.82–23.10s | 11.32–30.11s | 最慢 1.30x |
+| update | 44.39–45.70s | 55.60–57.04s | 1.25x |
+| propagation | 21.70–25.71s | 13.32–19.82s | 0.77x |
+| combine | 约 113.9s | 约 115.0s | 1.01x |
+| 首个 region 总计 | 242.983s | 266.559s | 1.097x |
+
+目标仍是 EP8 达到 EP4 的 0.5x，当前 EP8 反而慢 `9.7%`。
+
+**update：EP8 的 per-module 成本约为 EP4 的 2.5 倍**
+
+```text
+EP4 rank2: modules=288 batch_cap=152 batch_budget_gib=51.63 total_s=45.69
+EP8 rank2: modules=144 batch_cap=96  batch_budget_gib=61.76 total_s=57.03
+```
+
+- EP4：`45.69 / 288 = 0.159 s/module`
+- EP8：`57.03 / 144 = 0.396 s/module`
+- 若 EP8 达到 EP4 的单位成本，update 应约 `144 * 0.159 = 22.9s`，
+  实测 `57.0s`，多出约 `34s`。
+- 这与之前 8 路 native factorize 争用的量级一致（8 路单次约
+  `0.90s`、4 路约 `0.34s`）。新的 per-batch 显存准入解决了 OOM，
+  但没有改变 8 个 owner 同时 `gptq_factorize_hessian` 的争用。
+- EP8 的 `batch_cap=96` 是 w1/w3 组只有 96 个 module 的上限，不是
+  显存限制；重新分批无法再扩大单批。
+
+**propagation：EP8 只快 23%**
+
+- EP4：`21.70–25.71s`，`submit_s=20.63–24.75`，
+  `output_move_s=8.13–10.44`。
+- EP8：`13.32–19.82s`，`submit_s=17.04–18.91`，
+  `output_move_s=5.98–7.81`。
+- 复用 borrowed expert inputs 后，两边 calibration 的
+  `read_s/reserve_s` 都降为 0，`loop_s` 只剩 `0.9–3.6s`。
+  propagation 已不再受 host budget 读取支配。
+
+**combine 已成为两边共同的最大阶段**
+
+```text
+EP4: bytes=235959981568 output_bytes=235959981568 output_flushes=266
+     pack_s=26.59 submit_s=15.57 prepare_s=44.46
+     output_pack_s=10.18 output_wait_s=0.98 commit_s=32.96 combine_s=0.68
+EP8: pack_s=25.73 submit_s=18.81 prepare_s=46.89
+     output_pack_s=14.48 output_wait_s=0.14 commit_s=36.01 combine_s=0.69
+```
+
+- 两边都是 `236 GiB` H2D 加 `236 GiB` D2H，`266` 次回填，
+  说明仍是整边界往返，EP 并行不改变 combine 的字节量。
+- combine 占 EP4 总时长约 `47%`、EP8 约 `43%`。即使 update 完全
+  消除 8 路争用，combine 不降下来也无法达到 2x。
+- `EP route cache` 两边均为 `route_nodes=0 / batches_cached=0`，
+  slang 的连续 layout 复用尚未进入实际路径。
+
+**结论**
+
+- 两版修复达成了“跑通、无 OOM”的目标；EP4 update 从崩溃变为
+  `44–46s`。
+- EP8 目前没有性能收益：propagation 快 `23%`，但 update 慢
+  `25%`，combine 持平，合计反而慢 `9.7%`。
+- 后续优先级：第一，解决 8 路 native factorize 的争用（决定 update
+  能否从 `57s` 降到 `23s`）；第二，消除 combine 的整边界重复往返
+  （决定 2x 上限）；第三，路由 layout 复用目前未生效。
+
+**避免重复踩坑**
+
+- 不能只用“EP8 的 AP/EP 并行度更高”推断 update 会线性变快；
+  当前 native factorize 在 8 owner 下单位成本约为 4 owner 的 2.5 倍。
+- `batch_cap` 在 EP8 受组内 module 数限制，不是显存限制；继续调
+  显存预算不会改善 EP8 update。
+- combine 的 `output_bytes == bytes` 在 EP4/EP8 都成立，说明它仍
+  在回传整个下游 boundary，而不是 expert 新输出。
+
 ## 2026-11-23 18:53 CST - EP4 当前版本 update OOM：auto batch 组成 132 个 w1/w3
 
 **实验**
