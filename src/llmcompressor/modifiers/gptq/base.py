@@ -29,10 +29,10 @@ from llmcompressor.modifiers.gptq.gptq_quantize import quantize_weight
 from llmcompressor.modifiers.gptq.helpers import (
     GPTQ_PRECISION,
     accumulate_hessian,
-    assign_batches,
+    iter_batches,
     make_empty_hessian,
     prepare_batch,
-    quantization_peak_bytes,
+    quantization_batch_peak_bytes,
     update_batch_qparams,
 )
 from llmcompressor.modifiers.quantization.calibration import (
@@ -281,7 +281,7 @@ class GPTQModifier(Modifier, QuantizationMixin):
             if isinstance(self.batched_quantization, int)
             else 1
         )
-        scratch = batch_size * quantization_peak_bytes(module, self.block_size)
+        scratch = quantization_batch_peak_bytes(module, batch_size, self.block_size)
 
         return held, scratch
 
@@ -363,7 +363,7 @@ class GPTQModifier(Modifier, QuantizationMixin):
         *,
         batch_size_cap: int | None = None,
     ):
-        for batch in assign_batches(
+        for batch in iter_batches(
             module_list,
             self.batched_quantization,
             self.block_size,
@@ -410,6 +410,7 @@ class GPTQModifier(Modifier, QuantizationMixin):
                     quant_args=quant_args,
                     blocksize=self.block_size,
                     percdamp=self.dampening_frac,
+                    consume_inputs=True,
                 )
                 quantize_elapsed = perf_counter() - quantize_started
                 observer_stage = (
@@ -442,6 +443,8 @@ class GPTQModifier(Modifier, QuantizationMixin):
                     quant_args,
                 )
                 self._num_compressed_modules += len(batch)
+                del weights, hessians, scales, zero_points, global_scales
+                del quantized, losses, used_rtn_fallback, batch_qparams
 
     def _reduce_hessian_to_target_rank(self, module_list, module_to_rank):
         rank = dist.get_rank()

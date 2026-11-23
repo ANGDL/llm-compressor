@@ -1,6 +1,6 @@
 import math
 import os
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 
 import torch
 import transformers
@@ -124,13 +124,14 @@ def prepare_batch(
     dictionaries, normalizes its Hessian, and stacks it with weights and
     observer qparams for a single call to ``quantize_weight``.
     """
-    hessian_list = []
-    for module in batch:
+    first_hessian = hessians_by_module[batch[0]]
+    hessians = first_hessian.new_empty((len(batch), *first_hessian.shape))
+    del first_hessian
+    for index, module in enumerate(batch):
         hessian = hessians_by_module.pop(module)
         num_samples = num_samples_by_module.pop(module).to(device=hessian.device)
-        hessian_list.append(hessian / num_samples)
-    hessians = torch.stack(hessian_list)
-    del hessian_list
+        torch.div(hessian, num_samples, out=hessians[index])
+        del hessian
 
     weights = torch.empty(
         (len(batch), *batch[0].weight.shape),
@@ -186,13 +187,25 @@ def assign_batches(
     *,
     batch_size_cap: int | None = None,
 ) -> list[list[torch.nn.Module]]:
-    """Partition modules into compatible GPTQ execution batches based on
-    having the same batch_key.
+    """Partition modules into compatible GPTQ execution batches."""
+    return list(
+        iter_batches(
+            module_list, batched_quantization, block_size, batch_size_cap=batch_size_cap
+        )
+    )
 
-    ``None`` produces singleton batches; an integer caps every compatible
-    batch; and ``"auto"`` derives a cap from the available device memory.
-    ``batch_size_cap`` is a caller-owned cap that has already been bounded
-    against the target device.
+
+def iter_batches(
+    module_list: list[torch.nn.Module],
+    batched_quantization: str | int | None,
+    block_size: int,
+    *,
+    batch_size_cap: int | None = None,
+) -> Iterator[list[torch.nn.Module]]:
+    """Yield compatible GPTQ batches, sizing each auto batch from live memory.
+
+    The caller must finish and release one batch before requesting the next.
+    ``batch_size_cap`` is an optional upper bound from the caller.
     """
     if batch_size_cap is not None and (
         isinstance(batch_size_cap, bool)
@@ -202,27 +215,38 @@ def assign_batches(
         raise ValueError("batch_size_cap must be a positive integer or None")
 
     if batched_quantization is None:
-        return [[module] for module in module_list]
+        for module in module_list:
+            yield [module]
+        return
 
-    batches: list[list[torch.nn.Module]] = []
+    if batched_quantization != "auto" and not isinstance(batched_quantization, int):
+        raise ValueError(
+            f"Unknown batched_quantization value: {batched_quantization!r}"
+        )
     pending: dict[tuple, list[torch.nn.Module]] = {}
     for module in module_list:
         key = batch_key(module)
         if key is None:
-            batches.append([module])
+            yield [module]
         else:
             pending.setdefault(key, []).append(module)
 
     for members in pending.values():
-        if batch_size_cap is None:
-            max_batch = max_batch_size(members[0], batched_quantization, block_size)
-        elif isinstance(batched_quantization, int):
-            max_batch = min(batched_quantization, batch_size_cap)
-        else:
-            max_batch = batch_size_cap
-        for start in range(0, len(members), max_batch):
-            batches.append(members[start : start + max_batch])
-    return batches
+        start = 0
+        while start < len(members):
+            upper = min(len(members) - start, batch_size_cap or len(members))
+            if isinstance(batched_quantization, int):
+                size = min(upper, batched_quantization)
+            else:
+                device = get_execution_device(members[start])
+                available_bytes = available_batch_bytes(device) if upper > 1 else None
+                size = (
+                    _fit_batch_size(members[start], upper, block_size, available_bytes)
+                    if available_bytes is not None
+                    else min(upper, batch_size_cap or 1)
+                )
+            yield members[start : start + size]
+            start += size
 
 
 def batch_key(module: torch.nn.Module) -> tuple | None:
@@ -249,33 +273,6 @@ def batch_key(module: torch.nn.Module) -> tuple | None:
     )
 
 
-def max_batch_size(
-    module: torch.nn.Module,
-    batched_quantization: str | int,
-    block_size: int,
-    *,
-    available_bytes: int | None = None,
-) -> int:
-    """Return the safe batch cap for one representative compatible module.
-
-    An explicit integer cap bypasses memory estimation. ``"auto"`` predicts
-    the largest batch whose stacked weights, Hessians, and activation-ordering
-    workspaces fit in the available device memory.
-    """
-    if isinstance(batched_quantization, int):
-        return batched_quantization
-
-    device = get_execution_device(module)
-    if available_bytes is None:
-        available_bytes = available_batch_bytes(device)
-    return predict_batch_size(
-        [module],
-        batched_quantization,
-        block_size,
-        available_bytes,
-    )
-
-
 def available_batch_bytes(device: torch.device | str) -> int | None:
     """Return reusable accelerator memory after the GPTQ batch headroom."""
 
@@ -298,20 +295,50 @@ def available_batch_bytes(device: torch.device | str) -> int | None:
 def quantization_batch_peak_bytes(
     module: torch.nn.Module, batch_size: int, block_size: int
 ) -> int:
-    """Bound the peak memory of one compatible GPTQ batch.
+    """Estimate additional peak bytes while quantizing a resident batch.
 
-    The per-module estimate covers stacked weights, Hessians, and the
-    activation-ordering permutation. The small Hessian term covers the
-    per-module normalisation buffers that remain live while the batch is
-    assembled.
+    Existing module weights and Hessian accumulators are already reflected in
+    live memory. The stack is normalized into its destination and reused by
+    the solve. Temporary buffers are counted by the phase where they are live.
+    The device budget keeps headroom for allocator and backend-specific scratch.
     """
     out_features = module.weight.shape[0]
     in_features = module.weight.numel() // out_features
-    hessian_bytes = in_features * in_features * GPTQ_PRECISION.itemsize
-    return (
-        batch_size * quantization_peak_bytes(module, block_size)
-        + 3 * min(4, batch_size) * hessian_bytes
+    width = min(block_size, in_features)
+    itemsize = GPTQ_PRECISION.itemsize
+    weight_bytes = out_features * in_features * itemsize
+    hessian_bytes = in_features**2 * itemsize
+    stack_bytes = batch_size * (weight_bytes + hessian_bytes)
+
+    actorder = getattr_chain(module, "quantization_scheme.weights.actorder", None)
+    permutation_bytes = batch_size * in_features * torch.int64.itemsize
+    ordering_scratch = (
+        max(hessian_bytes, weight_bytes) + 2 * permutation_bytes if actorder else 0
     )
+    factorization_batch = (
+        batch_size if batch_size >= MIN_BATCHED_CHOLESKY_SIZE else 1
+    )
+    factorization_scratch = (2 * factorization_batch + 1) * hessian_bytes
+    solve_scratch = batch_size * itemsize * (
+        out_features * (in_features + 8 * width + 2) + width * in_features
+    )
+    if actorder:
+        solve_scratch += 2 * permutation_bytes
+        factorization_scratch += 2 * permutation_bytes
+    return stack_bytes + max(ordering_scratch, factorization_scratch, solve_scratch)
+
+
+def _fit_batch_size(
+    module: torch.nn.Module, upper: int, block_size: int, available_bytes: int
+) -> int:
+    low, high = 1, upper
+    while low < high:
+        middle = (low + high + 1) // 2
+        if quantization_batch_peak_bytes(module, middle, block_size) <= available_bytes:
+            low = middle
+        else:
+            high = middle - 1
+    return low
 
 
 def predict_batch_size(
@@ -347,56 +374,24 @@ def predict_batch_size(
     if not groups:
         return 1
 
-    def fits(batch_size: int) -> bool:
-        for members in groups.values():
-            representative = max(
-                members,
-                key=lambda module: (
-                    quantization_peak_bytes(module, block_size),
-                    module.weight.shape[1],
-                ),
-            )
-            if (
-                quantization_batch_peak_bytes(representative, batch_size, block_size)
-                > available_bytes
-            ):
-                return False
-        return True
-
     upper = max(len(members) for members in groups.values())
-    low, high = 1, upper
-    while low < high:
-        middle = (low + high + 1) // 2
-        if fits(middle):
-            low = middle
-        else:
-            high = middle - 1
-    return low
+    return min(
+        _fit_batch_size(members[0], upper, block_size, available_bytes)
+        for members in groups.values()
+    )
 
 
 def quantization_peak_bytes(module: torch.nn.Module, block_size: int) -> int:
-    """Return the peak temporary memory needed to quantize one module with GPTQ,
-    which is the largest of the quantization and activation ordering phases.
+    """Estimate a single-module GPTQ update from its shape and scheme."""
+    return quantization_batch_peak_bytes(module, 1, block_size)
 
-    Only the weight shape is read. Call under ``disable_onloading()`` to avoid
-    onloading offloaded weights. Weights which are not 2D are counted as
-    [rows, everything else].
-    """
-    out_features = module.weight.shape[0]
-    in_features = module.weight.numel() // out_features
-    weight_size = out_features * in_features
-    hessian_size = in_features * in_features
-    block_matrix_size = out_features * block_size
-    quantization_peak = (
-        hessian_size  # stacked Hessian, reused in place as its inverse
-        + 3 * weight_size  # module weight, stacked working weight, and w_err
-        + 4 * block_matrix_size  # W1, Q1, Err1, and losses1
-    )
-    actorder_peak = (
-        3 * hessian_size  # original Hessian and both gather outputs
-        + 2 * weight_size  # module weight and stacked working weight
-    )
-    return max(quantization_peak, actorder_peak) * GPTQ_PRECISION.itemsize
+
+def permute_weight_columns(weights: torch.Tensor, permutation: torch.Tensor) -> None:
+    """Reorder working weights using a single matrix of scratch."""
+    scratch = torch.empty_like(weights[0])
+    for weight, indices in zip(weights, permutation):
+        torch.index_select(weight, -1, indices, out=scratch)
+        weight.copy_(scratch)
 
 
 def apply_activation_ordering(
@@ -417,31 +412,16 @@ def apply_activation_ordering(
             " are supported for GPTQ."
         )
 
-    num_rows, num_columns = weights.shape[-2:]
     perm = torch.argsort(
         torch.diagonal(hessians, dim1=-2, dim2=-1), dim=-1, descending=True
     )
-    hessian_perm = perm.to(device=hessians.device)
     weight_perm = perm.to(device=weights.device)
-    permuted_hessians = torch.gather(
-        hessians,
-        -1,
-        hessian_perm.unsqueeze(-2).expand(-1, num_columns, -1),
-    )
-    permuted_hessians = torch.gather(
-        permuted_hessians,
-        -2,
-        hessian_perm.unsqueeze(-1).expand(-1, -1, num_columns),
-    )
-    hessians.copy_(permuted_hessians)
-    del permuted_hessians
-
-    permuted_weights = torch.gather(
-        weights,
-        -1,
-        weight_perm.unsqueeze(-2).expand(-1, num_rows, -1),
-    )
-    weights.copy_(permuted_weights)
+    scratch = torch.empty_like(hessians[0])
+    for hessian, indices in zip(hessians, perm):
+        torch.index_select(hessian, -2, indices, out=scratch)
+        torch.index_select(scratch, -1, indices, out=hessian)
+    del scratch
+    permute_weight_columns(weights, weight_perm)
     return weights, hessians, weight_perm
 
 

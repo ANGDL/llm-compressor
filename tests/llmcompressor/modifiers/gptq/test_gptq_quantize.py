@@ -8,7 +8,11 @@ from compressed_tensors.quantization import (
 
 from llmcompressor.modifiers.gptq import GPTQModifier
 from llmcompressor.modifiers.gptq.gptq_quantize import quantize_weight
-from llmcompressor.modifiers.gptq.helpers import assign_batches, make_empty_hessian
+from llmcompressor.modifiers.gptq.helpers import (
+    apply_activation_ordering,
+    assign_batches,
+    make_empty_hessian,
+)
 from llmcompressor.modifiers.quantization.calibration import (
     initialize_observer,
     observe,
@@ -570,6 +574,68 @@ def test_quantize_weight_batch_singular_hessian_uses_rtn(device):
     )
 
     assert used_rtn_fallback.tolist() == [False, True, False]
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda", "xpu"])
+def test_activation_ordering_reuses_matrix_scratch(device, monkeypatch):
+    if device != "cpu" and not torch.get_device_module(device).is_available():
+        pytest.skip(f"{device} is not available")
+    weights = torch.arange(24, device=device, dtype=torch.float32).reshape(3, 2, 4)
+    hessians = torch.arange(48, device=device, dtype=torch.float32).reshape(3, 4, 4)
+    hessians[1] = hessians[1].flip((0, 1))
+    hessians[2] = hessians[2].roll((1, 1), (0, 1))
+    expected_perm = hessians.diagonal(dim1=-2, dim2=-1).argsort(descending=True)
+    expected_weights = torch.stack(
+        [weight[:, perm] for weight, perm in zip(weights, expected_perm)]
+    )
+    expected_hessians = torch.stack(
+        [hessian[perm][:, perm] for hessian, perm in zip(hessians, expected_perm)]
+    )
+    hessian_scratch = set()
+    original = torch.index_select
+
+    def record_select(tensor, dim, index, *, out):
+        assert tensor.ndim == out.ndim == 2
+        assert index.ndim == 1
+        if dim == -2:
+            hessian_scratch.add(out.data_ptr())
+        return original(tensor, dim, index, out=out)
+
+    monkeypatch.setattr(torch, "index_select", record_select)
+    _, _, perm = apply_activation_ordering(weights, hessians, ActivationOrdering.WEIGHT)
+
+    assert len(hessian_scratch) == 1
+    torch.testing.assert_close(weights, expected_weights, rtol=0, atol=0)
+    torch.testing.assert_close(hessians, expected_hessians, rtol=0, atol=0)
+    torch.testing.assert_close(perm, expected_perm)
+
+
+@torch.no_grad()
+def test_quantize_weight_consumes_only_disposable_stacks():
+    quant_args = QuantizationArgs(
+        num_bits=4, strategy="group", group_size=2, actorder=ActivationOrdering.WEIGHT
+    )
+    modules = [_make_observed_linear(8, 4, quant_args, seed=seed) for seed in range(3)]
+    weights, hessians, scales, zero_points, global_scales = _quantization_inputs(
+        modules, [_make_spd_hessian(8, "cpu", seed=seed) for seed in range(3)]
+    )
+    original_weights, original_hessians = weights.clone(), hessians.clone()
+    kwargs = {
+        "scale": scales,
+        "zero_point": zero_points,
+        "global_scale": global_scales,
+        "quant_args": quant_args,
+        "blocksize": 4,
+    }
+    expected = quantize_weight(weights, hessians, **kwargs)
+    torch.testing.assert_close(weights, original_weights, rtol=0, atol=0)
+    torch.testing.assert_close(hessians, original_hessians, rtol=0, atol=0)
+
+    actual = quantize_weight(weights, hessians, consume_inputs=True, **kwargs)
+
+    assert actual[0].data_ptr() == weights.data_ptr()
+    assert not torch.equal(hessians, original_hessians)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 @torch.no_grad()

@@ -11,6 +11,107 @@
 - 每次改变 kernel、batch、并发或派发方式后，记录可对比的首个 routed
   MoE window 数据。
 
+## 2026-11-23 18:53 CST - EP4 当前版本 update OOM：auto batch 组成 132 个 w1/w3
+
+**实验**
+
+```text
+commit=fb5efbc41
+dir=/ssd3/model-quality/e2e/20261123_dsv41_wna8_ep4_bounded_output_20261123T102926Z
+EP4 / 266 calibration samples / 与 EP8 相同 recipe
+```
+
+EP4 在首个 routed region 的 update 阶段 OOM，未进入 propagation 和
+combine，因此当前 commit 上还没有可用的 EP4 首个 region 总时长。
+
+**已完成的阶段**
+
+| 阶段 | EP4 本次 |
+|---|---:|
+| EP layer CPU prepare | 29.20s |
+| calibration rank=0 | 50.10s |
+| calibration rank=1 | 42.04s |
+| calibration rank=2 | 47.83s |
+| calibration rank=3 | 45.05s |
+
+每个 owner 的 routed tokens 约 `103.8–104.9 万`，4 个 owner 合计
+`4,164,184`，与 EP8 的总量一致。
+
+**OOM 证据**
+
+```text
+File ".../modifiers/gptq/helpers.py", line 426, in apply_activation_ordering
+    permuted_hessians = torch.gather(
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 25.78 GiB.
+GPU 0 total 96.00 GiB, free 18.39 GiB, PyTorch allocated 64.43 GiB,
+reserved but unallocated 12.89 GiB.
+```
+
+紧邻崩溃前的批次日志：
+
+```text
+Quantizing 132 module(s):
+model.layers.0.ffn.experts.*.w1 / *.w3 ...
+```
+
+即 66 个 expert 的 `w1` 与 `w3` 被合并成 132 个同 shape module。
+DeepSeek-V4.1-Flash 的 `hidden_size=5120`，单个 Hessian 为
+`5120 * 5120 * 4 = 100 MiB`，132 个合计 `12.891 GiB`（`13.84 GB`）。
+报错请求的 `25.78 GiB` 相当于两份 FP32 batch Hessian，或一份同 shape
+的 int64 张量。日志未记录分配对象，无法确认该请求对应哪个底层缓冲区。
+
+**估算对照**
+
+用当前 helper 在 CPU 上按真实 shape 计算：
+
+```text
+shape=(2304, 5120): quantization_peak_bytes=0.381 GiB
+quantization_batch_peak_bytes(batch=132)=51.445 GiB
+单个 batch 的 Hessian gather=12.891 GiB
+shape=(5120, 5120): batch_peak(batch=132)=65.625 GiB
+```
+
+崩溃时 `free + reserved_unallocated = 18.39 + 12.89 = 31.28 GiB`，
+乘 `_AUTO_BATCH_MEMORY_FRACTION=0.75` 约为 `23.46 GiB`。这是崩溃时
+的快照，准入时的预算需要从 update 日志单独获取。单笔 `25.78 GiB`
+分配超过设备当时空闲的 `18.39 GiB`，缓存能否满足这笔请求需用 allocator
+trace 验证。
+
+**结论**
+
+- EP4 每个 owner 承担约 96 个 expert（288 个 Linear），Hessian 常驻量
+  约为 EP8 的两倍；EP8 相同 batch 公式下 `batch_cap=94/96` 能跑完，
+  EP4 在同样 auto 预测下组成 132 个 w1/w3 后 OOM。
+- 旧代码先保留逐模块归一化结果再堆叠，量化入口又复制整批 weight 和
+  Hessian。重排的两次整批 gather 还会在第二次申请期间同时存活。旧公式
+  没有按这些张量的实际生命周期计费。
+- 旧代码在 owner compression 开始时读取一次显存，为所有 batch 使用
+  同一个 cap。校准 hook 在模块执行设备上分配 Hessian，“部分 Hessian
+  在更新阶段才物化”的推测尚无证据。
+- 当前 commit 下无法得到 EP4 基线，EP8 是否达到 EP4 两倍仍待 EP4
+  修复后重测。
+
+**避免重复踩坑**
+
+- EP4 的 per-owner Hessian 常驻量约为 EP8 的两倍，auto batch 需按
+  当前设备的可用显存准入，并覆盖重排和分解阶段的临时量。
+- 本次 OOM 与 17:20 修复的 combine OOM 是两个独立问题：combine
+  有界回填已验证通过，EP4 崩溃点在 GPTQ update 的 batch 准入。
+
+**修复与验证**
+
+- 归一化直接写入 stacked Hessian。Modifier 显式复用它拥有的 weight
+  和 Hessian stack。`quantize_weight()` 默认继续保留输入。
+- Actorder 逐矩阵重排，两轴使用同一个 `100 MiB` Hessian 工作区。权重
+  的重排和逆重排也各自复用单矩阵工作区。Auto 模式在每批准备前重新
+  读取设备预算，并按重排、分解和 block update 的峰值选批。
+- 本地 `meta` 回归用 `(2304, 5120)` 和 132 个模块模拟预算变化。
+  以崩溃快照构造的 `23.46 GiB` 预算可接纳 69 个模块，预算减半后
+  下一批缩为 34 个。这个数字来自合成预算，实跑的批大小由更新时的显存决定。
+- 本地 GPTQ、expert parallel 和 subgraph pipeline 回归共 101 项通过。
+  P800 上用 `5120 × 5120` 合成矩阵验证了两轴 `index_select(out=...)`
+  和 `div(out=...)`。原 EP4 recipe 的首个 routed region 仍待复测。
+
 ## 2026-11-23 18:00 CST - 有界回填验证：OOM 已解决，瓶颈转为预算读取和整边界回传
 
 **实验**

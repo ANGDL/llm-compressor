@@ -1,10 +1,13 @@
 import pytest
 import torch
+from compressed_tensors.quantization import QuantizationArgs, QuantizationScheme
 from torch import nn
 
 from llmcompressor.core import LifecycleCallbacks, create_session
 from llmcompressor.modifiers.gptq import GPTQModifier
+from llmcompressor.modifiers.gptq import helpers as gptq_helpers
 from llmcompressor.modifiers.gptq.helpers import (
+    iter_batches,
     predict_batch_size,
     quantization_batch_peak_bytes,
 )
@@ -159,6 +162,42 @@ def test_gptq_auto_update_batch_uses_the_largest_shape_group():
             )
             == 3
         )
+
+
+def test_gptq_ep4_auto_batches_use_live_budget(monkeypatch):
+    modules = [
+        nn.Linear(5120, 2304, bias=False, device="meta", dtype=torch.bfloat16)
+        for _module in range(132)
+    ]
+    scheme = QuantizationScheme(
+        targets=["Linear"],
+        weights=QuantizationArgs(
+            num_bits=4, strategy="group", group_size=128, actorder="weight"
+        ),
+    )
+    for module in modules:
+        module.quantization_scheme = scheme
+
+    block_size = 128
+    reported_budget = int((18.39 + 12.89) * 0.75 * 2**30)
+    reduced_budget = reported_budget // 2
+    budgets = iter((reported_budget, reduced_budget, reduced_budget))
+    monkeypatch.setattr(
+        gptq_helpers, "available_batch_bytes", lambda device: next(budgets)
+    )
+    batches = iter_batches(modules, "auto", block_size, batch_size_cap=len(modules))
+
+    first = next(batches)
+    second = next(batches)
+
+    assert 1 < len(second) < len(first) < len(modules)
+    for batch, budget in ((first, reported_budget), (second, reduced_budget)):
+        assert (
+            quantization_batch_peak_bytes(batch[0], len(batch), block_size)
+            <= budget
+            < quantization_batch_peak_bytes(batch[0], len(batch) + 1, block_size)
+        )
+    assert first + second + [module for batch in batches for module in batch] == modules
 
 
 @pytest.mark.parametrize(

@@ -25,8 +25,9 @@ from llmcompressor.modifiers.gptq.helpers import (
     column_scale_window,
     factorize_hessian,
     get_triton_gptq_config,
-    make_empty_hessian,
     make_empty_gptq_statistics,
+    make_empty_hessian,
+    permute_weight_columns,
 )
 from llmcompressor.utils.hardware_ops import optional_hardware_backend
 from llmcompressor.utils.triton_backend import is_triton_disabled
@@ -48,7 +49,9 @@ def _quantize_weight_batched(
     quant_args: QuantizationArgs,
     blocksize: int = 128,
     percdamp: float = 0.01,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    *,
+    consume_inputs: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Quantize a batch of weights according to the GPTQ algorithm.
 
@@ -60,6 +63,7 @@ def _quantize_weight_batched(
     :param quant_args: quantization arguments used to find quantization parameters
     :param blocksize: chunk size of quantization updates
     :param percdamp: dampening factor on hessian diagonal
+    :param consume_inputs: allow overwriting disposable weights and Hessians
     :return: quantized weights, per-batch losses, and RTN fallback flags
     """
     if weights.ndim != 3 or hessians.ndim != 3:
@@ -72,11 +76,12 @@ def _quantize_weight_batched(
     actorder = quant_args.actorder
     final_dtype = weights.dtype
     device = weights.device
-    # The caller provides a disposable stacked weight tensor, so use it as the
-    # working buffer when it is already FP32 instead of allocating another copy.
-    W = weights.detach().to(device=device, dtype=GPTQ_PRECISION).clone()
-    # The stacked Hessian is the disposable working buffer.
-    H = hessians.detach().to(device=device, dtype=GPTQ_PRECISION).clone()
+    W = weights.detach().to(
+        device=device, dtype=GPTQ_PRECISION, copy=not consume_inputs
+    )
+    H = hessians.detach().to(
+        device=device, dtype=GPTQ_PRECISION, copy=not consume_inputs
+    )
     del weights, hessians
     scale = scale.to(device=device)
     zero_point = zero_point.to(device=device)
@@ -135,13 +140,11 @@ def _quantize_weight_batched(
 
         w_err = torch.bmm(Err1, Hinv[:, i1:i2, i2:])
         W[:, :, i2:] -= w_err
+        del W1, Q1, Err1, losses1, Hinv1, w_err
 
     if perm is not None:
-        # restore original permutation
-        # Release block-local tensors before allocating the restored output.
-        del W1, Q1, Err1, losses1, Hinv1, w_err
         invperm = torch.argsort(perm, dim=-1)
-        W = torch.gather(W, -1, invperm.unsqueeze(-2).expand(-1, num_rows, -1))
+        permute_weight_columns(W, invperm)
 
     return W.to(final_dtype), losses.sum(dim=1), used_rtn_fallback
 
