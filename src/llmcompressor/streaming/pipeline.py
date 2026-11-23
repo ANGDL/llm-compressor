@@ -1612,6 +1612,7 @@ def run_subgraph_streaming_pipeline(
                             )
                         streaming_logger.info(
                             f"{target_label} | EP route cache | "
+                            f"route_nodes={len(region_graph.route_nodes)} | "
                             f"batches={len(batches)} | {route_cache.report()}"
                         )
                         window_plan = execute_expert_region(

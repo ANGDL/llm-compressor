@@ -137,6 +137,11 @@ class ExpertRegionGraph:
         self.route_nodes = tuple(
             node for node in self._ordered_dependencies if is_cacheable_route(node)
         )
+        self.direct_input_experts = frozenset(
+            name
+            for name, dependencies in self.required.items()
+            if all(node.op == "placeholder" for node in dependencies)
+        )
 
     @classmethod
     def build(cls, model, plan, subgraphs):
@@ -874,6 +879,13 @@ def execute_expert_region(
         )
         return prepared
 
+    borrowed_experts = (
+        graph.direct_input_experts
+        if boundaries.routing_inputs_are_borrowed
+        else frozenset()
+    )
+    borrowed_boundaries = {}
+
     def forward_expert(
         name,
         capacity,
@@ -889,6 +901,7 @@ def execute_expert_region(
         samples = 0
         tokens = 0
         device = parallel.device_for(name)
+        borrow_inputs = name in borrowed_experts
 
         def submit():
             nonlocal entries, lengths, segments, samples, tokens
@@ -950,7 +963,14 @@ def execute_expert_region(
         with ExitStack() as inputs_stack:
             loop_started = perf_counter()
             for position, batch in enumerate(batches):
-                if prepared_inputs is None:
+                if borrow_inputs:
+                    fx_started = perf_counter()
+                    args, kwargs = graph.inputs(
+                        borrowed_boundaries[batch], (name,)
+                    )[name]
+                    if phase_stats is not None:
+                        phase_stats["fx_s"] += perf_counter() - fx_started
+                elif prepared_inputs is None:
                     read_reservation = None
                     if not boundaries.routing_inputs_are_borrowed:
                         reserve_started = perf_counter()
@@ -1053,7 +1073,9 @@ def execute_expert_region(
         pending = []
         size = 0
         for name in names:
-            expert_bytes = sum(profile.input_bytes[name])
+            expert_bytes = (
+                0 if name in borrowed_experts else sum(profile.input_bytes[name])
+            )
             if pending and size + expert_bytes > limit:
                 yield tuple(pending), size
                 pending, size = [], 0
@@ -1067,7 +1089,8 @@ def execute_expert_region(
 
     @contextmanager
     def prepare_group_inputs(names, size, device):
-        if len(names) == 1:
+        names = tuple(name for name in names if name not in borrowed_experts)
+        if len(names) < 2:
             yield None
             return
         try:
@@ -1314,6 +1337,18 @@ def execute_expert_region(
             return tuple(actual)
 
     try:
+        if borrowed_experts:
+            read_started = perf_counter()
+            for batch in batches:
+                borrowed_boundaries[batch] = boundaries.read_for_routing(
+                    boundary_index, batch, graph.input_names
+                )
+            streaming_logger.info(
+                f"{label} | EP borrowed expert inputs | "
+                f"experts={len(borrowed_experts)} | "
+                f"batches={len(borrowed_boundaries)} | "
+                f"read_s={perf_counter() - read_started:.2f}"
+            )
         with ExitStack() as buffers:
             for owner, staging in staging_bytes.items():
                 current = max(
@@ -1349,6 +1384,7 @@ def execute_expert_region(
                     prepared_windows.clear()
                 for prepared in leftovers:
                     prepared.close()
+        borrowed_boundaries.clear()
         windows = tuple(
             actual for _planned, results in completed_windows for actual in results
         )
@@ -1576,6 +1612,7 @@ def execute_expert_region(
                 transfer, _elapsed = item
                 transfer.close()
     finally:
+        borrowed_boundaries.clear()
         with prepared_windows_lock:
             leftovers = tuple(prepared_windows.values())
             prepared_windows.clear()

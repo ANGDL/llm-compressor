@@ -11,6 +11,88 @@
 - 每次改变 kernel、batch、并发或派发方式后，记录可对比的首个 routed
   MoE window 数据。
 
+## 2026-11-23 18:00 CST - 有界回填验证：OOM 已解决，瓶颈转为预算读取和整边界回传
+
+**实验**
+
+```text
+commit=fb5efbc41
+dir=/ssd3/model-quality/e2e/20261123_dsv41_wna8_ep8_bounded_output_20261123T093743Z
+EP8 / 266 calibration samples / 相同 recipe
+FIRST_ROUTED_REGION_SECONDS=323.684
+```
+
+首个 routed region 完整跑完，**没有再出现 batch 110 OOM**；有界分块
+回填和 staging 准入修复有效。
+
+**阶段数据**
+
+| 阶段 | EP8 本次 | EP4 参考 |
+|---|---:|---:|
+| CPU layer prepare | 31.67s | - |
+| calibration | 48.92–65.52s | - |
+| update | 40.78–46.87s | 36.77s |
+| propagation | 48.30–60.11s | 49.19s |
+| combine | 约 112s | - |
+
+combine 计数：
+
+```text
+batches=266 tensors=208313 bytes=235959981568
+allocate_s=1.18 pack_s=24.56 submit_s=15.74 prepare_s=42.55
+wait_s=0.01 combine_s=0.70
+output_flushes=266 output_pack_s=11.00 output_wait_s=0.23
+output_tensors=208313 output_bytes=235959981568
+commit_s=36.00
+```
+
+propagation 归因（rank=1，其余 rank 同量级）：
+
+```text
+expert_s=58.22 loop_s=40.22 submit_s=8.55
+reserve_s=18.67 read_s=2.08 fx_s=0.24 slice_s=0.41
+pack_s=3.08 input_move_s=0.96 forward_s=0.12 output_move_s=3.22
+```
+
+**结论**
+
+- propagation 的未归因时间已经定位：`loop_s` 内 `reserve_s` 为
+  `16.91–21.68s`，是逐 batch、逐 expert 调用
+  `HostMemoryBudget.reserve()` 的总和。每次 reserve 都会在全局锁内重新
+  读取 `/proc/meminfo` 和 cgroup 用量，8 个 owner 线程因此串行化。
+- combine 仍约 `112s`，`combine_s` 只有 `0.70s`，主要成本是
+  `pack/submit/prepare` 与 D2H/commit。H2D 字节和 D2H 字节完全相同
+  （均为 `235,959,981,568`），说明回传的是**整个下游 boundary**，
+  包含本层未生产、只是跨层携带的 tensor，而不是仅 expert 新输出。
+- `output_flushes=266`：单个 batch 的输出 backing storage 约 `887 MiB`，
+  大于 `512 MiB` 上限，因此每个 batch 都触发一次回填；有界性成立，
+  但批量摊销失效。
+- `EP route cache` 为 `batches_cached=0 / skipped=266 / limit=67,108,864`，
+  日志仅记录缓存覆盖情况。本地用 WNa8/EP8 配置追踪小型 V4.1 模型，
+  复现了 `route_nodes=0`。上游子图已完成分组和 expert 输入切片，
+  routed region 直接读取 CPU boundary。该次 P800 实验的 FX 分图待核对。
+
+**下一步（待验证）**
+
+1. 给 `HostMemoryBudget` 的 OS 可用量读取加短 TTL，并在准入失败时强制
+   刷新；避免每次 reserve 都在锁内读 sysfs/proc。目标是消掉
+   propagation 中每 rank 的 `17–21s`。
+2. combine 只回传本层新产生或被改写的 tensor；跨层携带的 tensor 直接
+   复用 CPU 原值 commit，避免 236 GiB 重复 H2D/D2H。
+3. 统计 `route_nodes` 和借用输入的 expert 数量。对于直接从内存
+   boundary 取值的 expert，每批读取一次并供各 owner 复用，省去逐
+   expert、逐 batch 的输入预留。CPU 回归已验证 GPTQ 统计量、权重和
+   传播结果，P800 上的 `reserve_s` 降幅待实测。
+
+**避免重复踩坑**
+
+- OOM 解决不等于 combine 变快：本次 first region 仍为 `323.7s`，
+  EP8 update/propagation 与 EP4 基本持平，距离 2x 目标仍远。
+- propagation 的 `reserve_s` 是全局锁内的 info 文件读取，不是显存或
+  host 真正不足；不要据此扩大预算。
+- `output_bytes == combined_bytes` 表示整边界往返，不能把这份字节数
+  当成 expert 输出规模。
+
 ## 2026-11-23 17:20 CST - 批量 D2H 仍会 OOM：改为有界分块回填
 
 **现象**

@@ -15,7 +15,7 @@ from llmcompressor.core import LifecycleCallbacks, create_session
 from llmcompressor.modeling.moe.routing import group_expert_routes, select_expert_routes
 from llmcompressor.modifiers.gptq import GPTQModifier
 from llmcompressor.modifiers.utils.hooks import HooksMixin
-from llmcompressor.pipelines.sequential.helpers import Subgraph
+from llmcompressor.pipelines.sequential.helpers import Subgraph, partition_graph
 from llmcompressor.pipelines.sequential.plan import SequentialExecutionPlan
 from llmcompressor.recipe import Recipe
 from llmcompressor.streaming.activations import (
@@ -413,14 +413,17 @@ def reference_quantization(model, batches, routed=None):
 
 
 @pytest.mark.parametrize(
-    "token_budget,memory_bytes,runtime_memory_bytes,grouped,combine_memory_bytes",
+    "token_budget,memory_bytes,runtime_memory_bytes,routing,combine_memory_bytes",
     [
-        ("auto", 2**20, None, False, None),
-        (2, 2**20, None, True, None),
-        (4, 2**20, None, False, None),
-        ("auto", 5000, None, False, None),
-        ("auto", 10_000, 5000, False, None),
-        pytest.param("auto", 2**20, None, False, 2048, id="combine-prefetch-fallback"),
+        ("auto", 2**20, None, "where", None),
+        (2, 2**20, None, "grouped", None),
+        (4, 2**20, None, "where", None),
+        ("auto", 5000, None, "where", None),
+        ("auto", 10_000, 5000, "where", None),
+        pytest.param(
+            "auto", 2**20, None, "where", 2048, id="combine-prefetch-fallback"
+        ),
+        pytest.param(2, 2**20, None, "pre-routed", None, id="borrowed-expert-inputs"),
     ],
 )
 def test_region_matches_serial_gptq_statistics_weights_and_propagation(
@@ -429,11 +432,12 @@ def test_region_matches_serial_gptq_statistics_weights_and_propagation(
     token_budget,
     memory_bytes,
     runtime_memory_bytes,
-    grouped,
+    routing,
     combine_memory_bytes,
 ):
     torch.manual_seed(19)
     source = MoE().eval()
+    grouped = routing != "where"
     batches = list(grouped_values()) if grouped else values()
     routed = subgraph(group_expert_routes if grouped else None)
     expected_statistics, expected_tensors, expected_outputs = reference_quantization(
@@ -444,6 +448,19 @@ def test_region_matches_serial_gptq_statistics_weights_and_propagation(
     model = build_meta_model(MoE).eval()
     plan = make_plan(model)
     graph = ExpertRegionGraph.build(model, plan, (routed,))
+    if routing == "pre-routed":
+        input_nodes = set().union(*graph.required.values())
+        prefix, experts = partition_graph(
+            model,
+            [
+                [node for node in graph.graph.nodes if node in input_nodes],
+                [node for node in graph.graph.nodes if node not in input_nodes],
+            ],
+        )
+        graph = ExpertRegionGraph.build(model, plan, (experts,))
+        assert graph.direct_input_experts == set(graph.expert_names)
+        assert not graph.route_nodes
+        batches = [prefix.forward(model, **value) for value in batches]
     boundaries = InMemoryBoundaryActivationStore()
     for index, value in enumerate(batches):
         boundaries.put(0, index, value)
@@ -500,7 +517,7 @@ def test_region_matches_serial_gptq_statistics_weights_and_propagation(
         profile = profile_expert_region(
             graph, boundaries, 0, (0, 1), host_budget=host_budget, route_cache=cache
         )
-        if grouped:
+        if routing == "grouped":
             assert cache.batch(0) and cache.batch(1)
         session.state.layerwise_calibration = True
         session.initialize(model=model, recipe=[quantizer()], start=-1, copy_data=False)
@@ -528,6 +545,23 @@ def test_region_matches_serial_gptq_statistics_weights_and_propagation(
             for name, tensor in loaded.state_tensors():
                 tensors[name] = tensor.clone()
 
+        routing_reads = []
+        host_reservations = []
+        if routing == "pre-routed":
+            original_read = boundaries.read_for_routing
+            original_host_reserve = host_budget.reserve
+
+            def read_for_routing(boundary, batch, names):
+                routing_reads.append(batch)
+                return original_read(boundary, batch, names)
+
+            def reserve_host(owner, required_bytes):
+                host_reservations.append(owner)
+                return original_host_reserve(owner, required_bytes)
+
+            monkeypatch.setattr(boundaries, "read_for_routing", read_for_routing)
+            monkeypatch.setattr(host_budget, "reserve", reserve_host)
+
         result = execute_expert_region(
             graph=graph,
             profile=profile,
@@ -547,6 +581,11 @@ def test_region_matches_serial_gptq_statistics_weights_and_propagation(
             save_window=save,
             route_cache=cache,
         )
+        if routing == "pre-routed":
+            assert routing_reads == [0, 1, 0, 1]
+            assert not any(" expert inputs " in owner for owner in host_reservations)
+            assert any(" expert dispatch " in owner for owner in host_reservations)
+            assert any(" expert output " in owner for owner in host_reservations)
         expected_policy = (
             "activation-aware-v1" if memory_bytes == 5000 else "fixed-owner-v1"
         )
