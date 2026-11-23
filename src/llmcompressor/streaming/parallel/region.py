@@ -539,6 +539,14 @@ def execute_expert_region(
     for name in graph.expert_names:
         modules = tuple(adapter.model.get_submodule(name).modules())
         expert_modules[name] = modules
+        estimate_update_work = getattr(
+            modifier_adapter, "estimate_update_work", None
+        )
+        update_work = (
+            float(estimate_update_work(modules))
+            if callable(estimate_update_work)
+            else 0.0
+        )
         estimate = estimate_modifier_dispatch_memory(
             modifiers,
             modules,
@@ -554,6 +562,7 @@ def execute_expert_region(
             storage_bytes=weights,
             route_tokens=profile.token_counts[name],
             persistent_state_bytes=estimate.held_bytes,
+            update_work_units=update_work,
         )
         linears = [module for module in modules if isinstance(module, nn.Linear)]
         if not linears:
@@ -715,10 +724,18 @@ def execute_expert_region(
         for module in adapter.model.get_submodule(name).modules():
             parallel.module_devices[module] = parallel.devices[owner]
     parallel.placement_policy = placement.policy
+    owner_expert_counts = tuple(
+        sum(owner == rank for _name, owner in placement.owners)
+        for rank in range(placement.ep_size)
+    )
+    owner_work_units = tuple(round(value, 2) for value in placement.owner_work_units)
     streaming_logger.info(
         f"{label} | EP routed windows | policy={placement.policy} | "
         f"experts={len(costs)} | windows={len(windows)} | "
         f"routed_tokens={sum(profile.token_counts.values()):,} | "
+        f"owner_experts={owner_expert_counts} | "
+        f"owner_route_tokens={placement.owner_route_tokens} | "
+        f"owner_work_units={owner_work_units} | "
         f"planning_s={perf_counter() - planning_started:.2f}"
     )
     for window in windows:
@@ -1152,8 +1169,7 @@ def execute_expert_region(
                     f"window={window.window_index} | start"
                 )
                 if phase == "update":
-                    for name in window.expert_names:
-                        modifier_adapter.update_owner(device, expert_modules[name])
+                    modifier_adapter.update_owner(device, modules)
                     after_update = getattr(modifier_adapter, "after_update", None)
                     if callable(after_update):
                         after_update(modules)

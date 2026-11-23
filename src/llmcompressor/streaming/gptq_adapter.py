@@ -15,7 +15,10 @@ from torch.utils.hooks import RemovableHandle
 from llmcompressor.modifiers.gptq import GPTQModifier
 from llmcompressor.modifiers.gptq.helpers import (
     GPTQ_PRECISION,
+    available_batch_bytes,
     batch_key,
+    predict_batch_size,
+    quantization_batch_peak_bytes,
     quantization_peak_bytes,
 )
 from llmcompressor.modifiers.quantization.calibration import (
@@ -82,30 +85,49 @@ class GPTQStreamingMemoryAdapter:
                         )
 
     def estimate_update_memory(self, modules: Sequence[torch.nn.Module]) -> int:
-        """Bound the largest compatible compression batch before admission."""
+        """Bound compression scratch before admission.
+
+        ``"auto"`` is sized from live device memory at update time, so the
+        admission estimate only requires one module to fit. Explicit integer
+        caps retain their configured bound.
+        """
         batches = {}
         for module in modules:
             if not self.modifier._is_calibrated(module):
                 continue
             key = batch_key(module)
-            batches.setdefault(
-                key if key is not None else id(module), []
-            ).append(module)
+            batches.setdefault(key if key is not None else id(module), []).append(
+                module
+            )
         scratch = 0
         for members in batches.values():
             batch_size = (
-                len(members)
+                1
                 if self.modifier.batched_quantization == "auto"
-                else min(len(members), self.modifier.batched_quantization or 1)
+                else min(
+                    len(members),
+                    self.modifier.batched_quantization or 1,
+                )
             )
             scratch = max(
                 scratch,
-                batch_size
-                * quantization_peak_bytes(members[0], self.modifier.block_size)
-                + 3 * min(4, batch_size) * members[0].weight.shape[1] ** 2
-                * GPTQ_PRECISION.itemsize,
+                quantization_batch_peak_bytes(
+                    members[0],
+                    batch_size,
+                    self.modifier.block_size,
+                ),
             )
         return scratch
+
+    def estimate_update_work(self, modules: Sequence[torch.nn.Module]) -> float:
+        """Estimate owner placement work for GPTQ compression."""
+        return float(
+            sum(
+                quantization_peak_bytes(module, self.modifier.block_size)
+                for module in modules
+                if self.modifier._is_calibrated(module)
+            )
+        )
 
     def estimate_batch_memory(
         self, module: torch.nn.Module, dispatch_tokens: int, phase: str
@@ -120,14 +142,14 @@ class GPTQStreamingMemoryAdapter:
 
     def update_owner(
         self,
-        _owner: torch.device,
+        owner: torch.device,
         modules: Sequence[torch.nn.Module],
+        *,
+        available_bytes: int | None = None,
     ) -> None:
         """Observe and compress only the Hessians owned by one EP device."""
 
-        modules = [
-            module for module in modules if self.modifier._is_calibrated(module)
-        ]
+        modules = [module for module in modules if self.modifier._is_calibrated(module)]
         if not modules:
             return
         started = perf_counter()
@@ -141,13 +163,50 @@ class GPTQStreamingMemoryAdapter:
             only_update_onload=not is_src(),
         )
         qparams = perf_counter()
-        self.modifier.compress_module_list(modules)
+        batch_size_cap = None
+        if self.modifier.batched_quantization == "auto":
+            device_batch_bytes = (
+                available_batch_bytes(owner)
+                if available_bytes is None
+                else available_bytes
+            )
+            batch_size_cap = predict_batch_size(
+                list(modules),
+                self.modifier.batched_quantization,
+                self.modifier.block_size,
+                device_batch_bytes,
+            )
+            available_bytes = device_batch_bytes
+        predicted = perf_counter()
+        self.modifier.compress_module_list(
+            modules,
+            batch_size_cap=batch_size_cap,
+        )
         compressed = perf_counter()
+        max_weight_bytes = max(
+            module.weight.numel() * module.weight.element_size() for module in modules
+        )
+        max_module_peak_bytes = max(
+            quantization_peak_bytes(module, self.modifier.block_size)
+            for module in modules
+        )
+        batch_groups = len(
+            {key for module in modules if (key := batch_key(module)) is not None}
+        )
+        available_text = (
+            f"{available_bytes / 2**30:.2f}" if available_bytes is not None else "n/a"
+        )
         logger.info(
-            f"GPTQ | update timing | device={_owner} | modules={len(modules)} | "
+            f"GPTQ | update timing | device={owner} | modules={len(modules)} | "
+            f"groups={batch_groups} | "
+            f"batch_cap={batch_size_cap or self.modifier.batched_quantization} | "
+            f"batch_budget_gib={available_text} | "
+            f"weight_max_gib={max_weight_bytes / 2**30:.3f} | "
+            f"module_peak_gib={max_module_peak_bytes / 2**30:.3f} | "
+            f"predict_s={predicted - qparams:.2f} | "
             f"observe_s={observed - started:.2f} | sync_s={synced - observed:.2f} | "
             f"qparams_s={qparams - synced:.2f} | "
-            f"compress_s={compressed - qparams:.2f} | "
+            f"compress_s={compressed - predicted:.2f} | "
             f"total_s={compressed - started:.2f}"
         )
 

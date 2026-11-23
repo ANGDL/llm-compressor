@@ -104,9 +104,11 @@ class GPTQModifier(Modifier, QuantizationMixin):
         activation ordering, which achieves best accuracy recovery with no runtime cost.
         For more information, see https://github.com/vllm-project/vllm/pull/8135.
     :param batched_quantization: Controls batching of same-shape modules (e.g.
-        linearized MoE experts). ``"auto"`` (the default) limits batches to 75% of
-        available CUDA memory. A positive integer sets a maximum batch size without
-        consulting available memory. ``None`` disables batching.
+        linearized MoE experts). ``"auto"`` (the default) predicts the largest
+        batch whose stacked weights and Hessians fit in the reusable device
+        memory after an allocator reserve. A positive integer sets a maximum
+        batch size without consulting available memory. ``None`` disables
+        batching.
 
     :param config_groups: dictionary specifying quantization schemes to apply to target
         modules. Modules not matching a scheme target will NOT be quantized.
@@ -355,9 +357,17 @@ class GPTQModifier(Modifier, QuantizationMixin):
         # broadcast compressed modules to each rank
         broadcast_qparams_and_cleanup(module_list, module_to_rank, _GPTQ_Q_PARAMS)
 
-    def compress_module_list(self, module_list):
+    def compress_module_list(
+        self,
+        module_list,
+        *,
+        batch_size_cap: int | None = None,
+    ):
         for batch in assign_batches(
-            module_list, self.batched_quantization, self.block_size
+            module_list,
+            self.batched_quantization,
+            self.block_size,
+            batch_size_cap=batch_size_cap,
         ):
             quant_args = getattr_chain(batch[0], "quantization_scheme.weights")
             qparams_started = perf_counter()

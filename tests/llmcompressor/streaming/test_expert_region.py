@@ -479,8 +479,10 @@ def test_region_matches_serial_gptq_statistics_weights_and_propagation(
         LifecycleCallbacks.calibration_start()
         memory_adapter = GPTQStreamingMemoryAdapter(modifier)
         original_update = memory_adapter.update_owner
+        update_groups = []
 
         def update(owner, modules):
+            update_groups.append((owner, tuple(modules)))
             for module in modules:
                 if module in modifier._hessians:
                     statistics[modifier._module_names[module]] = (
@@ -524,6 +526,8 @@ def test_region_matches_serial_gptq_statistics_weights_and_propagation(
         if memory_bytes == 10_000:
             assert len(result["windows"]) == 2
             assert set(saved_windows) == {(0, 0), (1, 0)}
+            assert len(update_groups) == 2
+            assert sorted(len(modules) for _owner, modules in update_groups) == [3, 6]
         if runtime_memory_bytes is not None:
             assert any(
                 window.max_dispatch_tokens < planned_windows[key].max_dispatch_tokens

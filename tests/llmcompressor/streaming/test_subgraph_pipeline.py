@@ -1136,9 +1136,9 @@ def test_streaming_gptq_matches_sequential_oneshot(
             metadata_reads.append((boundary, batch))
         return original_get(store, boundary, batch, device=device)
 
-    def record_release(self, modules):
+    def record_release(self, modules, *, batch_size_cap=None):
         sample_counts.extend(count.item() for count in self._num_samples.values())
-        result = original(self, modules)
+        result = original(self, modules, batch_size_cap=batch_size_cap)
         remaining_statistics.append(
             (len(self._hessians), len(self._num_samples))
         )

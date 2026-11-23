@@ -1,5 +1,6 @@
 import math
 import os
+from collections.abc import Sequence
 
 import torch
 import transformers
@@ -20,6 +21,7 @@ from llmcompressor._torch_accelerator_compat import accelerator_is_available
 
 GPTQ_PRECISION = torch.float32
 MIN_BATCHED_CHOLESKY_SIZE = 16
+_AUTO_BATCH_MEMORY_FRACTION = 0.75
 _USE_INPLACE_HESSIAN = os.getenv("LLM_COMPRESSOR_USE_INPLACE_HESSIAN", "0").lower() in {
     "1",
     "true",
@@ -181,13 +183,24 @@ def assign_batches(
     module_list: list[torch.nn.Module],
     batched_quantization: str | int | None,
     block_size: int,
+    *,
+    batch_size_cap: int | None = None,
 ) -> list[list[torch.nn.Module]]:
     """Partition modules into compatible GPTQ execution batches based on
     having the same batch_key.
 
     ``None`` produces singleton batches; an integer caps every compatible
-    batch; and ``"auto"`` derives a cap from the available CUDA memory.
+    batch; and ``"auto"`` derives a cap from the available device memory.
+    ``batch_size_cap`` is a caller-owned cap that has already been bounded
+    against the target device.
     """
+    if batch_size_cap is not None and (
+        isinstance(batch_size_cap, bool)
+        or not isinstance(batch_size_cap, int)
+        or batch_size_cap <= 0
+    ):
+        raise ValueError("batch_size_cap must be a positive integer or None")
+
     if batched_quantization is None:
         return [[module] for module in module_list]
 
@@ -201,7 +214,12 @@ def assign_batches(
             pending.setdefault(key, []).append(module)
 
     for members in pending.values():
-        max_batch = max_batch_size(members[0], batched_quantization, block_size)
+        if batch_size_cap is None:
+            max_batch = max_batch_size(members[0], batched_quantization, block_size)
+        elif isinstance(batched_quantization, int):
+            max_batch = min(batched_quantization, batch_size_cap)
+        else:
+            max_batch = batch_size_cap
         for start in range(0, len(members), max_batch):
             batches.append(members[start : start + max_batch])
     return batches
@@ -232,23 +250,128 @@ def batch_key(module: torch.nn.Module) -> tuple | None:
 
 
 def max_batch_size(
-    module: torch.nn.Module, batched_quantization: str | int, block_size: int
+    module: torch.nn.Module,
+    batched_quantization: str | int,
+    block_size: int,
+    *,
+    available_bytes: int | None = None,
 ) -> int:
     """Return the safe batch cap for one representative compatible module.
 
-    An explicit integer cap bypasses memory estimation. ``"auto"`` reserves
-    75% of currently free CUDA memory for the largest estimated GPTQ phase.
+    An explicit integer cap bypasses memory estimation. ``"auto"`` predicts
+    the largest batch whose stacked weights, Hessians, and activation-ordering
+    workspaces fit in the available device memory.
     """
     if isinstance(batched_quantization, int):
         return batched_quantization
 
     device = get_execution_device(module)
-    per_module_bytes = quantization_peak_bytes(module, block_size)
+    if available_bytes is None:
+        available_bytes = available_batch_bytes(device)
+    return predict_batch_size(
+        [module],
+        batched_quantization,
+        block_size,
+        available_bytes,
+    )
 
-    if torch.device(device).type != "cuda" or not accelerator_is_available():
+
+def available_batch_bytes(device: torch.device | str) -> int | None:
+    """Return reusable accelerator memory after the GPTQ batch headroom."""
+
+    device = torch.device(device)
+    if device.type not in {"cuda", "xpu"} or not accelerator_is_available():
+        return None
+    device_module = torch.get_device_module(device)
+    mem_get_info = getattr(device_module, "mem_get_info", None)
+    if not callable(mem_get_info):
+        return None
+    free_bytes, _ = mem_get_info(device)
+    memory_reserved = getattr(device_module, "memory_reserved", None)
+    memory_allocated = getattr(device_module, "memory_allocated", None)
+    if callable(memory_reserved) and callable(memory_allocated):
+        cached_bytes = int(memory_reserved(device)) - int(memory_allocated(device))
+        free_bytes += max(0, cached_bytes)
+    return int(free_bytes * _AUTO_BATCH_MEMORY_FRACTION)
+
+
+def quantization_batch_peak_bytes(
+    module: torch.nn.Module, batch_size: int, block_size: int
+) -> int:
+    """Bound the peak memory of one compatible GPTQ batch.
+
+    The per-module estimate covers stacked weights, Hessians, and the
+    activation-ordering permutation. The small Hessian term covers the
+    per-module normalisation buffers that remain live while the batch is
+    assembled.
+    """
+    out_features = module.weight.shape[0]
+    in_features = module.weight.numel() // out_features
+    hessian_bytes = in_features * in_features * GPTQ_PRECISION.itemsize
+    return (
+        batch_size * quantization_peak_bytes(module, block_size)
+        + 3 * min(4, batch_size) * hessian_bytes
+    )
+
+
+def predict_batch_size(
+    modules: Sequence[torch.nn.Module],
+    batched_quantization: str | int | None,
+    block_size: int,
+    available_bytes: int | None,
+) -> int:
+    """Predict one compatible batch upper bound from module and device bytes.
+
+    Modules are grouped by :func:`batch_key`. The returned cap is the minimum
+    safe cap across those groups so the streaming owner update can pass one
+    integer to every GPTQ batch. Activation and token workspaces are already
+    reflected in ``available_bytes`` because this prediction runs after the
+    owner window is resident.
+    """
+    if batched_quantization is None:
         return 1
-    free_bytes, _ = torch.get_device_module().mem_get_info(device)
-    return max(1, int(free_bytes * 0.75) // per_module_bytes)
+    if isinstance(batched_quantization, int):
+        return batched_quantization
+    if batched_quantization != "auto":
+        raise ValueError(
+            f"Unknown batched_quantization value: {batched_quantization!r}"
+        )
+    if not modules or available_bytes is None or available_bytes <= 0:
+        return 1
+
+    groups: dict[object, list[torch.nn.Module]] = {}
+    for module in modules:
+        key = batch_key(module)
+        if key is not None:
+            groups.setdefault(key, []).append(module)
+    if not groups:
+        return 1
+
+    def fits(batch_size: int) -> bool:
+        for members in groups.values():
+            representative = max(
+                members,
+                key=lambda module: (
+                    quantization_peak_bytes(module, block_size),
+                    module.weight.shape[1],
+                ),
+            )
+            if (
+                quantization_batch_peak_bytes(representative, batch_size, block_size)
+                > available_bytes
+            ):
+                return False
+        return True
+
+    upper = max(len(members) for members in groups.values())
+    low, high = 1, upper
+    while low < high:
+        middle = (low + high + 1) // 2
+        if fits(middle):
+            low = middle
+        else:
+            high = middle - 1
+    return low
 
 
 def quantization_peak_bytes(module: torch.nn.Module, block_size: int) -> int:

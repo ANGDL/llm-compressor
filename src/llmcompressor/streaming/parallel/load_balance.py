@@ -111,7 +111,7 @@ class OwnerMemoryProfile:
 
 @dataclass(frozen=True)
 class LoadBalancedPlacement:
-    """A stable mapping that balances weighted routed work and memory."""
+    """A stable mapping that balances routed and update work under memory limits."""
 
     ep_size: int
     owners: tuple[tuple[str, int], ...]
@@ -236,6 +236,21 @@ def build_load_balanced_placement(
     if owner_memory is not None and len(owner_memory) != owner_count:
         raise ValueError("owner_memory must match owner_count")
 
+    total_routed_work = sum(
+        cost.routed_work_units for cost in expert_costs.values()
+    )
+    total_update_work = sum(
+        float(cost.update_work_units) for cost in expert_costs.values()
+    )
+    update_scale = (
+        total_routed_work / total_update_work
+        if total_routed_work and total_update_work
+        else 1.0
+    )
+
+    def placement_work(cost: ExpertCostProfile) -> float:
+        return cost.routed_work_units + float(cost.update_work_units) * update_scale
+
     owner_work = [0.0] * owner_count
     owner_tokens = [0] * owner_count
     owner_storage = [0] * owner_count
@@ -244,13 +259,14 @@ def build_load_balanced_placement(
     ordered = sorted(
         expert_costs,
         key=lambda name: (
-            -expert_costs[name].routed_work_units,
+            -placement_work(expert_costs[name]),
             -expert_costs[name].total_resident_bytes,
             name,
         ),
     )
     for name in ordered:
         cost = expert_costs[name]
+        expert_work = placement_work(cost)
         candidates = []
         for rank in range(owner_count):
             if owner_memory is not None:
@@ -269,7 +285,7 @@ def build_load_balanced_placement(
                 )
                 if required > owner_memory[rank].usable_bytes:
                     continue
-            new_work = owner_work[rank] + cost.routed_work_units
+            new_work = owner_work[rank] + expert_work
             normalized = new_work / rates[rank]
             other_max = max(
                 (
@@ -295,7 +311,7 @@ def build_load_balanced_placement(
             )
         rank = min(candidates)[-1]
         owners[name] = rank
-        owner_work[rank] += cost.routed_work_units
+        owner_work[rank] += expert_work
         owner_tokens[rank] += cost.route_tokens
         owner_storage[rank] += cost.storage_bytes
         owner_persistent[rank] += cost.persistent_state_bytes

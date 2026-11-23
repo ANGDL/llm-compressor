@@ -1342,12 +1342,12 @@ def test_streaming_grouped_gptq_covers_native_dspark(tmp_path, monkeypatch, ep_s
         observations.setdefault(name, []).append(tuple(args[0].shape))
         return original_calibrate(modifier, module, args, output)
 
-    def record_samples(modifier, modules):
+    def record_samples(modifier, modules, *, batch_size_cap=None):
         for module in modules:
             compressed[modifier._module_names[module]] = modifier._num_samples[
                 module
             ].item()
-        return original(modifier, modules)
+        return original(modifier, modules, batch_size_cap=batch_size_cap)
 
     monkeypatch.setattr(GPTQModifier, "compress_module_list", record_samples)
     monkeypatch.setattr(GPTQModifier, "calibrate_module", record_observation)
@@ -1487,14 +1487,18 @@ def test_streaming_ep_native_checkpoint_matches_same_group_single_device(
     statistics = []
     original_compress = GPTQModifier.compress_module_list
 
-    def record_statistics(modifier, modules):
+    def record_statistics(modifier, modules, *, batch_size_cap=None):
         for module in modules:
             name = modifier._module_names[module]
             statistics[-1][name] = (
                 modifier._hessians[module].detach().cpu().clone(),
                 modifier._num_samples[module].detach().cpu().clone(),
             )
-        return original_compress(modifier, modules)
+        return original_compress(
+            modifier,
+            modules,
+            batch_size_cap=batch_size_cap,
+        )
 
     monkeypatch.setattr(GPTQModifier, "compress_module_list", record_statistics)
     for parallel in (False, True):

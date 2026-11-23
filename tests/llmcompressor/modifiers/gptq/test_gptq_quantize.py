@@ -8,7 +8,7 @@ from compressed_tensors.quantization import (
 
 from llmcompressor.modifiers.gptq import GPTQModifier
 from llmcompressor.modifiers.gptq.gptq_quantize import quantize_weight
-from llmcompressor.modifiers.gptq.helpers import make_empty_hessian
+from llmcompressor.modifiers.gptq.helpers import assign_batches, make_empty_hessian
 from llmcompressor.modifiers.quantization.calibration import (
     initialize_observer,
     observe,
@@ -630,3 +630,37 @@ def test_compress_module_list_batches_same_shape(tmp_path):
         assert torch.allclose(m_single.weight_scale, m_batched.weight_scale)
         # quantized weights were written back through update_offload_parameter
         assert torch.allclose(m_single.weight, m_batched.weight, rtol=1e-4, atol=1e-5)
+
+
+def test_compress_module_list_respects_streaming_batch_cap():
+    quant_args = QuantizationArgs(
+        num_bits=4, symmetric=True, strategy="group", group_size=16
+    )
+    modules = [
+        _make_observed_linear(64, 48, quant_args, seed=seed)
+        for seed in range(6)
+    ]
+    modifier = GPTQModifier()
+    modifier._module_names = {
+        module: f"model.layers.0.experts.{index}"
+        for index, module in enumerate(modules)
+    }
+    modifier._hessians = {
+        module: _make_spd_hessian(
+            module.weight.shape[1], module.weight.device, seed=index
+        )
+        for index, module in enumerate(modules)
+    }
+    modifier._num_samples = {
+        module: torch.tensor(1.0) for module in modules
+    }
+    modifier.batched_quantization = "auto"
+
+    batches = assign_batches(
+        modules,
+        modifier.batched_quantization,
+        modifier.block_size,
+        batch_size_cap=2,
+    )
+
+    assert [len(batch) for batch in batches] == [2, 2, 2]

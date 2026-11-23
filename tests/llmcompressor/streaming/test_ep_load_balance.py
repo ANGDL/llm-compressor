@@ -98,6 +98,25 @@ def test_load_balanced_placement_rejects_expert_without_memory_fit():
         build_load_balanced_placement(costs, 2, owner_memory=memory)
 
 
+def test_load_balanced_placement_uses_update_work_when_route_is_empty():
+    costs = {
+        f"experts.{index}": ExpertCostProfile(
+            storage_bytes=10,
+            route_tokens=0,
+            update_work_units=1.0,
+        )
+        for index in range(6)
+    }
+
+    placement = build_load_balanced_placement(costs, 3)
+
+    assert [
+        sum(owner == rank for owner in placement.owner_by_name.values())
+        for rank in range(3)
+    ] == [2, 2, 2]
+    assert placement.owner_work_units == (2.0, 2.0, 2.0)
+
+
 def test_fixed_owner_placement_balances_work_under_resident_limits():
     costs = {
         "experts.0": ExpertCostProfile(
