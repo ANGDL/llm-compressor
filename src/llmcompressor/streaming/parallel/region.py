@@ -1301,11 +1301,16 @@ def execute_expert_region(
                     f"window={window.window_index} | complete | "
                     f"time={perf_counter() - started:.2f}s"
                 )
+            save_wait_started = perf_counter()
             with save_lock:
+                save_started = perf_counter()
                 save_window(window, loaded, modules)
+                save_elapsed = perf_counter() - save_started
             streaming_logger.info(
                 f"{label} | EP window complete | rank={window.owner_rank} | "
-                f"window={window.window_index} | tokens={window.route_tokens:,}"
+                f"window={window.window_index} | tokens={window.route_tokens:,} | "
+                f"save_wait_s={save_started - save_wait_started:.2f} | "
+                f"save_s={save_elapsed:.2f}"
             )
         return window
 
@@ -1395,14 +1400,8 @@ def execute_expert_region(
                 "placement": placement.to_dict(),
                 "windows": [window.to_dict() for window in windows],
             }
+        combine_started_at = perf_counter()
         combine = graph.combine_subgraph()
-        primary = parallel.devices[0]
-        copy_stream = (
-            torch.cuda.Stream(device=primary) if primary.type == "cuda" else None
-        )
-        output_stream = (
-            torch.cuda.Stream(device=primary) if primary.type == "cuda" else None
-        )
         call_names = {
             f"ep_result_{node.name}": str(node.target) for node in graph.calls
         }
@@ -1412,6 +1411,67 @@ def execute_expert_region(
             for placeholder, name in call_names.items()
             if placeholder in combine.input_names
         }
+
+        if all(node.op in {"placeholder", "output"} for node in combine.graph.nodes):
+            output_node = combine.graph.find_nodes(op="output")[0]
+            live_outputs = _select_destination_output(
+                output_node.args[0], destination_input_names
+            )
+            live_inputs = set()
+            map_arg(live_outputs, live_inputs.add)
+            source_inputs = (
+                {str(node.target) for node in live_inputs} - call_names.keys()
+            )
+            host_bytes = 0
+            commit_seconds = 0.0
+            for batch in batches:
+                source = (
+                    boundaries.read_for_routing(boundary_index, batch, source_inputs)
+                    if source_inputs
+                    else {}
+                )
+                projected = {
+                    node: (
+                        result_store[batch, call_names[node.target]]
+                        if node.target in call_names
+                        else source[node.target]
+                    )
+                    for node in live_inputs
+                }
+                output = map_arg(live_outputs, projected.__getitem__)
+                host_bytes += _tensor_bytes(output)
+                commit_started = perf_counter()
+                boundaries.commit_propagated_batch(
+                    boundary_index,
+                    destination_boundary,
+                    batch,
+                    output,
+                    consumed_names=graph.consumed,
+                )
+                commit_seconds += perf_counter() - commit_started
+                for name in result_names.values():
+                    del result_store[batch, name]
+                del source, projected, output
+            streaming_logger.info(
+                f"{label} | EP combine coalesced transfer | "
+                f"batches={len(batches)} | mode=cpu_passthrough | "
+                f"tensors=0 | bytes=0 | output_tensors=0 | output_bytes=0 | "
+                f"output_flushes=0 | prefetch_fallbacks=0 | host_bytes={host_bytes} | "
+                f"commit_s={commit_seconds:.2f} | "
+                f"wall_s={perf_counter() - combine_started_at:.2f}"
+            )
+            return {
+                "placement": placement.to_dict(),
+                "windows": [window.to_dict() for window in windows],
+            }
+
+        primary = parallel.devices[0]
+        copy_stream = (
+            torch.cuda.Stream(device=primary) if primary.type == "cuda" else None
+        )
+        output_stream = (
+            torch.cuda.Stream(device=primary) if primary.type == "cuda" else None
+        )
 
         def prepare_batch(batch):
             prepare_started = perf_counter()
@@ -1599,7 +1659,8 @@ def execute_expert_region(
                     f"output_tensors={output_tensors} | "
                     f"output_bytes={output_bytes} | "
                     f"commit_s={commit_seconds:.2f} | "
-                    f"close_s={close_seconds:.2f}"
+                    f"close_s={close_seconds:.2f} | "
+                    f"wall_s={perf_counter() - combine_started_at:.2f}"
                 )
         finally:
             for transfer, _storage_bytes in inflight_outputs:

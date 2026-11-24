@@ -424,6 +424,9 @@ def reference_quantization(model, batches, routed=None):
             "auto", 2**20, None, "where", 2048, id="combine-prefetch-fallback"
         ),
         pytest.param(2, 2**20, None, "pre-routed", None, id="borrowed-expert-inputs"),
+        pytest.param(
+            2, 2**20, None, "pre-routed-passthrough", None, id="cpu-only-combine"
+        ),
     ],
 )
 def test_region_matches_serial_gptq_statistics_weights_and_propagation(
@@ -448,15 +451,44 @@ def test_region_matches_serial_gptq_statistics_weights_and_propagation(
     model = build_meta_model(MoE).eval()
     plan = make_plan(model)
     graph = ExpertRegionGraph.build(model, plan, (routed,))
-    if routing == "pre-routed":
+    suffix = None
+    if routing.startswith("pre-routed"):
         input_nodes = set().union(*graph.required.values())
-        prefix, experts = partition_graph(
-            model,
-            [
-                [node for node in graph.graph.nodes if node in input_nodes],
-                [node for node in graph.graph.nodes if node not in input_nodes],
-            ],
-        )
+        prefix_nodes = [node for node in graph.graph.nodes if node in input_nodes]
+        remaining_nodes = [
+            node for node in graph.graph.nodes if node not in input_nodes
+        ]
+        if routing == "pre-routed-passthrough":
+            import llmcompressor.streaming.parallel.region as region
+
+            prefix, experts, suffix = partition_graph(
+                model,
+                [
+                    prefix_nodes,
+                    list(graph.calls),
+                    [node for node in remaining_nodes if node not in graph.calls],
+                ],
+            )
+            with experts.graph.inserting_before(next(iter(experts.graph.nodes))):
+                carried = experts.graph.placeholder("hidden")
+            experts.input_names.add("hidden")
+            expert_output = experts.graph.find_nodes(op="output")[0]
+            expert_output.args = (
+                {
+                    **expert_output.args[0],
+                    "forwarded_hidden": carried,
+                    "unused_hidden": carried,
+                },
+            )
+            experts.graph.lint()
+
+            def unexpected_transfer(*args, **kwargs):
+                pytest.fail("a passthrough combine must not stage activations")
+
+            monkeypatch.setattr(region, "transfer_tree", unexpected_transfer)
+            monkeypatch.setattr(region, "transfer_tree_to_cpu", unexpected_transfer)
+        else:
+            prefix, experts = partition_graph(model, [prefix_nodes, remaining_nodes])
         graph = ExpertRegionGraph.build(model, plan, (experts,))
         assert graph.direct_input_experts == set(graph.expert_names)
         assert not graph.route_nodes
@@ -580,6 +612,11 @@ def test_region_matches_serial_gptq_statistics_weights_and_propagation(
             label="test",
             save_window=save,
             route_cache=cache,
+            destination_input_names=(
+                suffix.input_names | {"forwarded_hidden"}
+                if suffix is not None
+                else None
+            ),
         )
         if routing == "pre-routed":
             assert routing_reads == [0, 1, 0, 1]
@@ -622,7 +659,16 @@ def test_region_matches_serial_gptq_statistics_weights_and_propagation(
     for name, expected in expected_tensors.items():
         torch.testing.assert_close(tensors[name], expected, msg=name)
     for index, expected in enumerate(expected_outputs):
-        torch.testing.assert_close(boundaries.get(4, index)["result"], expected)
+        propagated = boundaries.get(4, index)
+        if suffix is not None:
+            torch.testing.assert_close(
+                propagated["forwarded_hidden"], batches[index]["hidden"]
+            )
+            assert "unused_hidden" not in propagated
+            propagated = suffix.forward(
+                model, **{name: propagated[name] for name in suffix.input_names}
+            )
+        torch.testing.assert_close(propagated["result"], expected)
     if token_budget == 4:
         assert dispatches == [4, 4, 2, 4, 4, 2]
     if combine_memory_bytes is not None:

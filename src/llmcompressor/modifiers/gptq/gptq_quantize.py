@@ -17,6 +17,7 @@ from compressed_tensors.utils.triton import (
     triton,
     triton_req,
 )
+from torch.profiler import record_function
 
 from llmcompressor.modifiers.gptq.helpers import (
     GPTQ_PRECISION,
@@ -88,7 +89,8 @@ def _quantize_weight_batched(
     if global_scale is not None:
         global_scale = global_scale.to(device=device)
 
-    W, H, perm = apply_activation_ordering(W, H, quant_args.actorder)
+    with record_function("gptq.actorder"):
+        W, H, perm = apply_activation_ordering(W, H, quant_args.actorder)
     # handle g_idx
     g_idx = None
     if strategy in (
@@ -109,42 +111,45 @@ def _quantize_weight_batched(
 
     losses = torch.zeros(batch_size, num_rows, device=device)
     used_rtn_fallback = torch.zeros(batch_size, dtype=torch.bool, device=device)
-    Hinv = factorize_hessian(W, H, percdamp, used_rtn_fallback)
+    with record_function("gptq.factorize_hessian"):
+        Hinv = factorize_hessian(W, H, percdamp, used_rtn_fallback)
     # See section 3.4 of https://arxiv.org/abs/2203.07259
-    for i1 in range(0, num_columns, blocksize):
-        i2 = min(i1 + blocksize, num_columns)
+    with record_function("gptq.block_update"):
+        for i1 in range(0, num_columns, blocksize):
+            i2 = min(i1 + blocksize, num_columns)
 
-        W1 = W[:, :, i1:i2].clone()
-        Q1 = torch.zeros_like(W1)
-        Err1 = torch.zeros_like(W1)
-        losses1 = torch.zeros_like(W1)
-        Hinv1 = Hinv[:, i1:i2, i1:i2]
+            W1 = W[:, :, i1:i2].clone()
+            Q1 = torch.zeros_like(W1)
+            Err1 = torch.zeros_like(W1)
+            losses1 = torch.zeros_like(W1)
+            Hinv1 = Hinv[:, i1:i2, i1:i2]
 
-        gptq_block_update(
-            W1,
-            Hinv1,
-            Q1,
-            Err1,
-            losses1,
-            scale=scale,
-            zero_point=zero_point,
-            global_scale=global_scale,
-            g_idx=g_idx,
-            quant_args=quant_args,
-            i1=i1,
-        )
+            gptq_block_update(
+                W1,
+                Hinv1,
+                Q1,
+                Err1,
+                losses1,
+                scale=scale,
+                zero_point=zero_point,
+                global_scale=global_scale,
+                g_idx=g_idx,
+                quant_args=quant_args,
+                i1=i1,
+            )
 
-        # propagate block error
-        W[:, :, i1:i2] = Q1
-        losses += torch.sum(losses1, 2) / 2
+            # propagate block error
+            W[:, :, i1:i2] = Q1
+            losses += torch.sum(losses1, 2) / 2
 
-        w_err = torch.bmm(Err1, Hinv[:, i1:i2, i2:])
-        W[:, :, i2:] -= w_err
-        del W1, Q1, Err1, losses1, Hinv1, w_err
+            w_err = torch.bmm(Err1, Hinv[:, i1:i2, i2:])
+            W[:, :, i2:] -= w_err
+            del W1, Q1, Err1, losses1, Hinv1, w_err
 
     if perm is not None:
-        invperm = torch.argsort(perm, dim=-1)
-        permute_weight_columns(W, invperm)
+        with record_function("gptq.restore_actorder"):
+            invperm = torch.argsort(perm, dim=-1)
+            permute_weight_columns(W, invperm)
 
     return W.to(final_dtype), losses.sum(dim=1), used_rtn_fallback
 
