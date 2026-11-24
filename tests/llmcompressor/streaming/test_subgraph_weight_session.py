@@ -325,7 +325,8 @@ def test_prepares_subgraph_without_installing_it(tmp_path):
     assert_all_meta(model)
 
 
-def test_prepare_many_partitions_one_cpu_preparation(tmp_path):
+@pytest.mark.parametrize("prefetched", [False, True])
+def test_prepare_many_partitions_one_cpu_preparation(tmp_path, prefetched):
     reference = SessionModel()
     checkpoint = checkpoint_for(reference, tmp_path)
     model = build_meta_model(SessionModel)
@@ -347,9 +348,16 @@ def test_prepare_many_partitions_one_cpu_preparation(tmp_path):
         cgroup_available=lambda: None,
     ).reserve("test", required)
 
-    prepared = session.prepare_many(
-        plans, dtype=torch.float32, reservation=reservation
-    )
+    if prefetched:
+        aggregate = session.prepare(
+            combined, dtype=torch.float32, reservation=reservation
+        )
+        prepared = aggregate.partition(plans)
+        aggregate.close()
+    else:
+        prepared = session.prepare_many(
+            plans, dtype=torch.float32, reservation=reservation
+        )
 
     assert [value.plan.module_names for value in prepared] == [
         ("layers.0",),
@@ -360,6 +368,7 @@ def test_prepare_many_partitions_one_cpu_preparation(tmp_path):
         assert loaded.module_names == ("layers.0",)
         assert not model.layers[0].proj.weight.is_meta
         assert model.layers[1].proj.weight.is_meta
+    assert not reservation.closed
     with session.installed(prepared[1]) as loaded:
         assert loaded.module_names == ("layers.1",)
         assert not model.layers[1].proj.weight.is_meta

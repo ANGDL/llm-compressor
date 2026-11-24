@@ -384,7 +384,7 @@ def streaming_oneshot_from_pretrained(
     validate_config: bool,
     checkpoint_progress: bool,
     overwrite_output: bool,
-    async_save: bool,
+    async_save: bool | None,
     pack_to_int8: bool,
     finalize_only: bool = False,
     dtype_policy: StreamingDTypePolicy | None = None,

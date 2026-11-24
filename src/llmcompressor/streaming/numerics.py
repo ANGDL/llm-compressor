@@ -3,6 +3,7 @@
 from contextlib import contextmanager
 from threading import RLock
 
+import torch
 from loguru import logger
 
 from llmcompressor.modifiers.gptq.helpers import factorize_hessian as torch_factorize
@@ -15,11 +16,31 @@ _PATCH_LOCK = RLock()
 _PATCH_USERS = 0
 _ORIGINAL_FACTORIZE = None
 _FALLBACK_WARNED = False
+_MAX_FACTORIZE_INDEX = torch.iinfo(torch.int32).max
 
 
 @optional_hardware_backend("gptq_factorize_hessian", contract_version=1)
-def factorize_hessian(weights, hessians, percdamp, used_rtn_fallback):
+def _factorize_hessian(weights, hessians, percdamp, used_rtn_fallback):
     return torch_factorize(weights, hessians, percdamp, used_rtn_fallback)
+
+
+def factorize_hessian(weights, hessians, percdamp, used_rtn_fallback):
+    """Keep CUDA-compatible factorization views within 32-bit index range."""
+    batch_size = hessians.shape[0]
+    if not hessians.is_cuda or batch_size <= 1:
+        return _factorize_hessian(weights, hessians, percdamp, used_rtn_fallback)
+    batch_stride = max(hessians.stride(0), weights.stride(0), 1)
+    chunk_size = max(1, _MAX_FACTORIZE_INDEX // batch_stride)
+    if batch_size <= chunk_size:
+        return _factorize_hessian(weights, hessians, percdamp, used_rtn_fallback)
+
+    for weight_chunk, hessian_chunk, fallback_chunk in zip(
+        weights.split(chunk_size),
+        hessians.split(chunk_size),
+        used_rtn_fallback.split(chunk_size),
+    ):
+        _factorize_hessian(weight_chunk, hessian_chunk, percdamp, fallback_chunk)
+    return hessians
 
 
 @contextmanager

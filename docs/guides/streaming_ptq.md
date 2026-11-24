@@ -561,10 +561,23 @@ two-GPU weight-prefetch implementation, not pipeline parallel execution, and it
 would conflict with a future expert-placement API. Callers provide exactly one
 `device` for target execution.
 
-`async_save=True` remains independent of weight prefetch. It transfers completed
-output tensors to independent CPU ownership synchronously, then performs
-safetensors encoding and durable publication on one bounded background worker.
-At most one output snapshot may be pending.
+Normal pretrained expert-parallel runs enable `async_save` by default. Each
+owner prepares an independently owned CPU snapshot before releasing its
+resident weights. A bounded background worker encodes and writes those shards
+while the owners and the pipeline continue into later windows, combine, and
+subsequent targets. The queue admits up to one snapshot per EP device in total,
+including the active write. The single-device path admits one snapshot with
+`async_save=True`. All writes are drained before the final index is published.
+Use `async_save=False` for synchronous output. Progress checkpoint transactions
+require synchronous saves.
+
+Normal expert-parallel runs also prepare one upcoming target group on a
+background CPU worker. Preparation can overlap ordinary group execution or
+routed-region combine. The worker decodes the next routed layer into one CPU
+aggregate. Once routing determines the resident windows, the owners use their
+partitions of that aggregate. Device transfers follow the owner windows and
+their admission budgets. If host capacity cannot cover current-group headroom
+and the next aggregate, the pipeline prepares weights at the next group boundary.
 
 The advanced boundary-mode API remains available for adapters that provide an
 explicit meta-model factory, target order, calibration boundaries, and exact
@@ -1060,9 +1073,9 @@ Before submitting next-target prefetch, a host-memory reservation checks both
 operating-system available memory and any active cgroup limit. That reservation
 includes the next prepared target and its bounded materialization workspace.
 Live activation batches and an asynchronous writer snapshot hold separate
-reservations in the same shared budget. Each component therefore fails before
-its corresponding allocation begins; insufficient capacity never disables
-prefetch or switches to lazy checkpoint reads.
+reservations in the same shared budget. Each component checks capacity before
+allocating. The next group can fall back to synchronous preparation under
+memory pressure and still materializes its complete admitted working set.
 
 `HostMemoryBudget.effective_available_bytes()` uses the smaller of operating-
 system available memory and cgroup remaining capacity, then subtracts `R_h` and
@@ -1096,7 +1109,7 @@ smaller.
 | `streaming/loading/target.py` | Source-name planning, CPU-only target materialization, shape validation, and model installation |
 | `streaming/materialization/` | CPU decoding, physical-order group reads, workspace estimates, and format-specific transforms |
 | `streaming/checkpoint/weight_source.py` | Native CPU safetensors reads without manual header or offset parsing |
-| `streaming/checkpoint/writer.py` | Direct output and one bounded asynchronous CPU snapshot with independent reservation ownership |
+| `streaming/checkpoint/writer.py` | Direct output and bounded asynchronous CPU snapshots with independent reservation ownership |
 
 `async_save` is an output-I/O optimization and does not change target placement.
 The removed multi-device and deferred-expert APIs have no compatibility aliases.

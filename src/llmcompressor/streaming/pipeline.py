@@ -6,8 +6,10 @@ import os
 from collections.abc import Iterable, Mapping, Sequence
 from contextlib import ExitStack, nullcontext
 from dataclasses import replace
+from functools import lru_cache
 from math import prod
 from pathlib import Path
+from threading import Lock
 from time import perf_counter
 from typing import Any
 
@@ -501,6 +503,23 @@ def _target_roots(target_name: str | Sequence[str]) -> tuple[str, ...]:
     return roots
 
 
+def _loaded_target_formats(model, roots, exclude_modules):
+    formats = {}
+    for root in roots:
+        try:
+            module = model.get_submodule(root)
+        except AttributeError:
+            continue
+        formats.update(
+            quantized_module_formats(module.named_modules(prefix=root), prefix=root)
+        )
+    return {
+        name: value
+        for name, value in formats.items()
+        if not _is_under_any(name, exclude_modules)
+    }
+
+
 def _write_loaded_target(
     transaction,
     loaded,
@@ -513,16 +532,7 @@ def _write_loaded_target(
 ) -> set[str]:
     target_roots = _target_roots(target_name)
     written = set()
-    formats = {}
-    for root in target_roots:
-        formats.update(
-            quantized_module_formats(loaded.model.named_modules(), prefix=root)
-        )
-    formats = {
-        name: value
-        for name, value in formats.items()
-        if not _is_under_any(name, exclude_modules)
-    }
+    formats = _loaded_target_formats(loaded.model, target_roots, exclude_modules)
     for name, tensor in loaded.state_tensors_under(target_roots):
         owner_name = name.rpartition(".")[0]
         if _is_under_any(owner_name, exclude_modules):
@@ -564,16 +574,7 @@ def _loaded_target_delta(
     exclude_modules: Sequence[str] = (),
 ):
     target_roots = _target_roots(target_name)
-    formats = {}
-    for root in target_roots:
-        formats.update(
-            quantized_module_formats(loaded.model.named_modules(), prefix=root)
-        )
-    formats = {
-        name: value
-        for name, value in formats.items()
-        if not _is_under_any(name, exclude_modules)
-    }
+    formats = _loaded_target_formats(loaded.model, target_roots, exclude_modules)
     tensors = {}
     written = set()
     owned_cpu_tensors = set()
@@ -616,11 +617,7 @@ def _estimate_loaded_target_snapshot_bytes(
     exclude_modules: Sequence[str] = (),
 ) -> int:
     target_roots = _target_roots(target_name)
-    formats = {}
-    for root in target_roots:
-        formats.update(
-            quantized_module_formats(loaded.model.named_modules(), prefix=root)
-        )
+    formats = _loaded_target_formats(loaded.model, target_roots, exclude_modules)
     total = 0
     workspace = 0
     for name, tensor in loaded.state_tensors_under(target_roots):
@@ -1159,7 +1156,7 @@ def run_subgraph_streaming_pipeline(
     max_seq_length: int | None,
     seed: int | None,
     checkpoint_progress: bool = False,
-    async_save: bool = False,
+    async_save: bool | None = None,
     pack_to_int8: bool = True,
     dtype_policy: StreamingDTypePolicy | None = None,
     execution: StreamingExecutionDescriptor | None = None,
@@ -1182,6 +1179,8 @@ def run_subgraph_streaming_pipeline(
             "Streaming admission currently requires a single participant; "
             "multi-rank statistics and communication require an EP-B adapter"
         )
+    if async_save is None:
+        async_save = expert_parallel is not None and not checkpoint_progress
     if checkpoint_progress and async_save:
         raise ValueError(
             "Asynchronous saving is not supported with checkpoint_progress=True"
@@ -1410,12 +1409,14 @@ def run_subgraph_streaming_pipeline(
             if direct_writer_base is None:
                 raise RuntimeError("Asynchronous saving requires a direct writer")
             async_direct_writer = AsyncDirectSafetensorsWriter(
-                direct_writer_base, max_pending=1
+                direct_writer_base,
+                max_pending=len(expert_parallel.devices) if expert_parallel else 1,
             )
             direct_writer = async_direct_writer
+        ep_prefetch = expert_parallel is not None and not checkpoint_progress
         prefetcher = (
             SubgraphPrefetcher(adapter.weight_session)
-            if adapter.targets and expert_parallel is None
+            if expert_parallel is None or ep_prefetch
             else None
         )
         streaming_logger.info(
@@ -1425,7 +1426,9 @@ def run_subgraph_streaming_pipeline(
         streaming_logger.info(
             "setup | weight prefetch | "
             + (
-                "disabled for expert parallel execution"
+                "prepare only (expert parallel)"
+                if ep_prefetch
+                else "disabled for expert parallel progress checkpoints"
                 if expert_parallel is not None
                 else "prepare + pinned async H2D"
                 if _async_h2d_enabled() and device.type == "cuda"
@@ -1476,6 +1479,53 @@ def run_subgraph_streaming_pipeline(
                 for group_index, input_names in enumerate(group_input_names)
                 for name in input_names
             }
+
+            @lru_cache(maxsize=2)
+            def region_for_group(index):
+                if not getattr(
+                    window_adapter, "supports_independent_expert_windows", False
+                ):
+                    return None
+                try:
+                    return ExpertRegionGraph.build(
+                        adapter.model,
+                        expert_parallel,
+                        tuple(
+                            adapter.target_subgraphs[target]
+                            for target in target_groups[index]
+                        ),
+                    )
+                except UnsupportedExpertRegion:
+                    return None
+
+            def submit_ep_prefetch(index, plan, headroom_bytes):
+                nonlocal prefetch_pending
+                indices = target_groups[index]
+                names = tuple(adapter.targets[target] for target in indices)
+                label = _target_label(index, target_count, " + ".join(names))
+                required = adapter.weight_session.estimate_preparation(
+                    plan, dtype=target_dtype
+                )
+                try:
+                    with host_budget.reserve(
+                        f"{label} current group headroom", headroom_bytes
+                    ):
+                        reservation = host_budget.reserve(f"{label} weights", required)
+                except HostMemoryError:
+                    streaming_logger.info(
+                        f"{label} | EP prefetch deferred | "
+                        f"headroom_bytes={headroom_bytes} | prefetch_bytes={required}"
+                    )
+                    return
+                prefetcher.submit(
+                    plan,
+                    dtype=target_dtype,
+                    reservation=reservation,
+                    label=f"{label} | prepare weights",
+                )
+                prefetch_pending = True
+                streaming_logger.info(f"{label} | EP prefetch submitted | prepare")
+
             streaming_logger.info(
                 f"setup | progress counts target groups | groups={target_count} | "
                 "calibration batches and routed tokens are reported separately"
@@ -1564,16 +1614,17 @@ def run_subgraph_streaming_pipeline(
                     f"{target_label} | start | batches={len(batches)} | device={device}"
                 )
                 target_started_at = perf_counter()
-                region_graph = None
-                if getattr(
-                    window_adapter, "supports_independent_expert_windows", False
-                ):
-                    try:
-                        region_graph = ExpertRegionGraph.build(
-                            adapter.model, expert_parallel, subgraphs
+                region_graph = region_for_group(group_index)
+                next_ep_plan = None
+                if ep_prefetch and has_next:
+                    next_region = region_for_group(group_index + 1)
+                    next_ep_plan = (
+                        adapter.weight_session.plan_modules(
+                            next_region.expert_names, allow_missing_state=True
                         )
-                    except UnsupportedExpertRegion:
-                        pass
+                        if next_region is not None
+                        else adapter.plan_group(target_groups[group_index + 1])
+                    )
                 if region_graph is not None:
                     region_output = next(
                         node for node in region_graph.graph.nodes if node.op == "output"
@@ -1584,21 +1635,39 @@ def run_subgraph_streaming_pipeline(
                         if last_input_use.get(name, -1) > group_index
                     }
 
+                    written_lock = Lock()
+
                     def save_expert_window(window, loaded, modules):
                         _compress_modules(modules)
-                        written.update(
-                            _write_loaded_target_direct(
-                                direct_writer,
-                                loaded,
-                                window.expert_names,
-                                f"{transaction_id}-r{window.owner_rank}-w{window.window_index}",
-                                materializer,
-                                pack_to_int8=pack_to_int8,
-                                host_budget=host_budget,
+                        saved = _write_loaded_target_direct(
+                            direct_writer,
+                            loaded,
+                            window.expert_names,
+                            f"{transaction_id}-r{window.owner_rank}-w{window.window_index}",
+                            materializer,
+                            pack_to_int8=pack_to_int8,
+                            host_budget=host_budget,
+                        )
+                        with written_lock:
+                            written.update(saved)
+
+                    def prefetch_during_combine(expert_output_bytes):
+                        boundary_bytes = sum(
+                            _boundary_nbytes(
+                                boundaries.get(group_start, batch, device="meta")
                             )
+                            for batch in batches
+                        )
+                        submit_ep_prefetch(
+                            group_index + 1,
+                            next_ep_plan,
+                            boundary_bytes + expert_output_bytes,
                         )
 
-                    with ExpertRouteCache(host_budget, target_label) as route_cache:
+                    with (
+                        ExitStack() as region_stack,
+                        ExpertRouteCache(host_budget, target_label) as route_cache,
+                    ):
                         with _stage_logger(
                             adapter.model, f"{target_label} | profile routes", device
                         ):
@@ -1615,6 +1684,11 @@ def run_subgraph_streaming_pipeline(
                             f"route_nodes={len(region_graph.route_nodes)} | "
                             f"batches={len(batches)} | {route_cache.report()}"
                         )
+                        prepared_weights = None
+                        if prefetch_pending:
+                            prepared_weights = prefetcher.take()
+                            prefetch_pending = False
+                            region_stack.callback(prepared_weights.close)
                         window_plan = execute_expert_region(
                             graph=region_graph,
                             profile=route_profile,
@@ -1632,10 +1706,17 @@ def run_subgraph_streaming_pipeline(
                             token_budget=expert_parallel_token_budget,
                             label=target_label,
                             save_window=save_expert_window,
+                            async_save=async_save,
                             propagate=has_next,
                             route_cache=route_cache,
                             destination_input_names=destination_input_names,
                             allow_device_prefetch=_async_h2d_enabled(),
+                            prepared_weights=prepared_weights,
+                            on_combine_start=(
+                                prefetch_during_combine
+                                if next_ep_plan is not None
+                                else None
+                            ),
                         )
                     ArtifactStore(artifact_dir).commit_ep_token_plan(
                         group_index,
@@ -1997,7 +2078,17 @@ def run_subgraph_streaming_pipeline(
                             adapter.weight_session.installed(prepared)
                         )
 
-                    if prefetcher is not None and has_next:
+                    if next_ep_plan is not None:
+                        submit_ep_prefetch(
+                            group_index + 1,
+                            next_ep_plan,
+                            boundary_bytes
+                            + max_boundary_batch_bytes
+                            + _estimate_loaded_target_snapshot_bytes(
+                                loaded, target_names, pack_to_int8=pack_to_int8
+                            ),
+                        )
+                    elif prefetcher is not None and has_next:
                         next_indices = target_groups[group_index + 1]
                         next_names = tuple(
                             adapter.targets[index] for index in next_indices
@@ -2532,7 +2623,12 @@ def run_subgraph_streaming_pipeline(
     finally:
         if async_direct_writer is not None:
             try:
+                drain_started = perf_counter()
                 async_direct_writer.close()
+                streaming_logger.info(
+                    f"finalize | checkpoint drain | "
+                    f"time={perf_counter() - drain_started:.2f}s"
+                )
             except Exception:
                 if not remaining_failed:
                     raise

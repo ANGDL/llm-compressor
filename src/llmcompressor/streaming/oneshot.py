@@ -243,7 +243,7 @@ def streaming_oneshot(
     validate_config: bool = True,
     checkpoint_progress: bool = False,
     overwrite_output: bool = False,
-    async_save: bool = False,
+    async_save: bool | None = None,
     pack_to_int8: bool = True,
     finalize_only: bool = False,
     sequential_targets: Sequence[str] | str | None = None,
@@ -265,6 +265,9 @@ def streaming_oneshot(
     By default, INT4 weights using the ``int-quantized`` W4A8 layout are packed
     two values per INT8 immediately before checkpoint I/O. Set
     ``pack_to_int8=False`` to retain the legacy unpacked layout.
+
+    Normal pretrained expert-parallel runs default to ``async_save=True``.
+    Set ``async_save=False`` to write shards synchronously.
 
     GPTQ pretrained runs with expert collections automatically use the same
     fine-grained ``Linear`` target policy as

@@ -221,6 +221,7 @@ class PreparedSubgraphWeights:
         )
         self.targets.clear()
         if reservation is not None:
+            self.reservation = None
             reservation.close()
         return partitions
 

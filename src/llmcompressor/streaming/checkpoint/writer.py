@@ -14,6 +14,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Condition
 from time import perf_counter
 from typing import TYPE_CHECKING, Any
 
@@ -814,9 +815,9 @@ class DirectSafetensorsWriter:
 class AsyncDirectSafetensorsWriter(AbstractContextManager):
     """Write final shards on one bounded background worker.
 
-    GPU-to-CPU snapshots remain synchronous so a submitted task never retains
-    model-owned accelerator storage. ``max_pending=1`` overlaps one disk write
-    with quantization while keeping host memory bounded to one target snapshot.
+    Producers snapshot on their current device stream before enqueueing, so
+    the worker never retains model-owned accelerator storage. ``max_pending``
+    bounds snapshots being prepared, queued, and written across all producers.
     """
 
     def __init__(
@@ -833,6 +834,8 @@ class AsyncDirectSafetensorsWriter(AbstractContextManager):
             max_workers=1, thread_name_prefix="streaming-safetensors"
         )
         self._pending: list[tuple[str, Future[Path]]] = []
+        self._condition = Condition()
+        self._preparing = 0
         self._closed = False
 
     def _check_open(self) -> None:
@@ -851,9 +854,17 @@ class AsyncDirectSafetensorsWriter(AbstractContextManager):
     def poll(self) -> None:
         """Raise completed worker failures without blocking active writes."""
 
-        self._check_open()
+        with self._condition:
+            self._check_open()
+            self._poll_completed()
+
+    def _poll_completed(self) -> None:
         while self._pending and self._pending[0][1].done():
             self._wait_oldest()
+
+    def _notify_completed(self, _future: Future[Path]) -> None:
+        with self._condition:
+            self._condition.notify_all()
 
     def _write(
         self,
@@ -871,6 +882,7 @@ class AsyncDirectSafetensorsWriter(AbstractContextManager):
                 values,
                 quantized_modules=quantized_modules,
                 omitted_tied_weights=omitted_tied_weights,
+                owned_cpu_tensors=values.keys(),
             )
             streaming_logger.info(
                 f"save | shard={shard_id} | complete | "
@@ -904,15 +916,20 @@ class AsyncDirectSafetensorsWriter(AbstractContextManager):
         this method returns.
         """
 
+        admitted = False
+        queued = False
+        wait_started = perf_counter()
         try:
-            self.poll()
-            while len(self._pending) >= self.max_pending:
-                self._wait_oldest()
-        except Exception:
-            if reservation is not None:
-                reservation.close()
-            raise
-        try:
+            with self._condition:
+                while True:
+                    self._check_open()
+                    self._poll_completed()
+                    if len(self._pending) + self._preparing < self.max_pending:
+                        self._preparing += 1
+                        admitted = True
+                        break
+                    self._condition.wait()
+            snapshot_started = perf_counter()
             values = _cpu_snapshot(
                 tensors,
                 clone_cpu=True,
@@ -921,35 +938,45 @@ class AsyncDirectSafetensorsWriter(AbstractContextManager):
             if reservation is not None:
                 reservation.commit(self.estimate_snapshot_bytes(values))
                 reservation.release_reserved(reservation.reserved_bytes)
-        except Exception:
-            if reservation is not None:
-                reservation.close()
-            raise
-        output = self.writer.shards_dir / f"model-{shard_id}.safetensors"
-        try:
-            future = self._executor.submit(
-                self._write,
-                shard_id,
-                values,
-                dict(quantized_modules or {}),
-                dict(omitted_tied_weights or {}),
-                reservation,
+            snapshot_elapsed = perf_counter() - snapshot_started
+            with self._condition:
+                future = self._executor.submit(
+                    self._write,
+                    shard_id,
+                    values,
+                    dict(quantized_modules or {}),
+                    dict(omitted_tied_weights or {}),
+                    reservation,
+                )
+                self._pending.append((shard_id, future))
+                self._preparing -= 1
+                admitted = False
+                queued = True
+                future.add_done_callback(self._notify_completed)
+                self._condition.notify_all()
+            streaming_logger.info(
+                f"save | shard={shard_id} | queued | "
+                f"queue_wait_s={snapshot_started - wait_started:.2f} | "
+                f"snapshot_s={snapshot_elapsed:.2f}"
             )
-        except Exception:
-            values.clear()
-            if reservation is not None:
+            return self.writer.shards_dir / f"model-{shard_id}.safetensors"
+        finally:
+            if admitted:
+                with self._condition:
+                    self._preparing -= 1
+                    self._condition.notify_all()
+            if not queued and reservation is not None:
                 reservation.close()
-            raise
-        self._pending.append((shard_id, future))
-        streaming_logger.info(f"save | shard={shard_id} | queued")
-        return output
 
     def close(self) -> None:
         """Drain all writes and propagate the first durable-write failure."""
 
-        if self._closed:
-            return
-        self._closed = True
+        with self._condition:
+            if self._closed:
+                return
+            self._closed = True
+            self._condition.notify_all()
+            self._condition.wait_for(lambda: self._preparing == 0)
         error = None
         try:
             while self._pending:

@@ -130,12 +130,17 @@ class SubgraphPrefetcher(AbstractContextManager):
             raise RuntimeError("No subgraph prefetch is pending")
         label, future = self._pending
         self._pending = None
+        started_at = perf_counter()
         try:
-            return future.result()
+            prepared = future.result()
         except Exception as error:
             raise RuntimeError(
                 f"Subgraph weight prefetch failed for {label!r}"
             ) from error
+        streaming_logger.info(
+            f"{label} | acquired | wait_s={perf_counter() - started_at:.2f}"
+        )
+        return prepared
 
     def close(self, *, suppress_errors: bool = False) -> None:
         if self._closed:

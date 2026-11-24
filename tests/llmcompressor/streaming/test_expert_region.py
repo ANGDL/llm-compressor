@@ -3,6 +3,7 @@ import os
 from contextlib import ExitStack
 from copy import deepcopy
 from dataclasses import replace
+from threading import Event, current_thread
 from types import SimpleNamespace
 
 import pytest
@@ -24,7 +25,10 @@ from llmcompressor.streaming.activations import (
 )
 from llmcompressor.streaming.admission import DeviceMemoryBudget, DeviceMemoryError
 from llmcompressor.streaming.artifacts import ArtifactStore
-from llmcompressor.streaming.checkpoint import SafetensorsWeightSource
+from llmcompressor.streaming.checkpoint import (
+    DirectSafetensorsWriter,
+    SafetensorsWeightSource,
+)
 from llmcompressor.streaming.gptq_adapter import GPTQStreamingMemoryAdapter
 from llmcompressor.streaming.loading import (
     HostMemoryBudget,
@@ -73,11 +77,11 @@ class MoE(nn.Module):
         self.experts = nn.ModuleList([Expert() for _index in range(4)])
 
 
-def subgraph(route_op=None, *, skip_output=False):
+def subgraph(route_op=None, *, skip_output=False, hidden_name="hidden"):
     graph = Graph()
-    hidden = graph.placeholder("hidden")
+    hidden = graph.placeholder(hidden_name)
     indices = graph.placeholder("indices")
-    input_names = {"hidden", "indices"}
+    input_names = {hidden_name, "indices"}
     if route_op is not None:
         weights = graph.placeholder("weights")
         grouped = graph.call_function(route_op, (weights, indices, 4))
@@ -676,23 +680,31 @@ def test_region_matches_serial_gptq_statistics_weights_and_propagation(
 
 
 class PipelineMoE(MoE):
-    def __init__(self, *, skip=False):
+    def __init__(self, *, skip=False, pre=False):
         super().__init__()
         self.post = nn.Linear(4, 4, bias=False)
         if skip:
             self.post_skip = nn.Linear(4, 4, bias=False)
+        if pre:
+            self.pre = nn.Linear(4, 4, bias=False)
 
 
 @pytest.mark.parametrize(
-    "devices,grouped,memory_bytes,skip",
+    "devices,grouped,memory_bytes,skip,defer_prefetch",
     [
-        (("cpu:0", "cpu:1"), False, 2**22, False),
-        (("cpu:0", "cpu:1"), True, 2**22, False),
-        pytest.param(("cpu:0", "cpu:1"), True, 2**22, True, id="cross-group-skip"),
+        (("cpu:0", "cpu:1"), False, 2**22, False, False),
+        (("cpu:0", "cpu:1"), True, 2**22, False, False),
+        pytest.param(
+            ("cpu:0", "cpu:1"), True, 2**22, False, True, id="prefetch-host-pressure"
+        ),
+        pytest.param(
+            ("cpu:0", "cpu:1"), True, 2**22, True, False, id="cross-group-skip"
+        ),
         pytest.param(
             ("cuda:0", "cuda:1", "cuda:2", "cuda:3"),
             True,
             2**22,
+            False,
             False,
             marks=pytest.mark.multi_gpu,
         ),
@@ -701,12 +713,13 @@ class PipelineMoE(MoE):
             False,
             5000,
             False,
+            False,
             marks=pytest.mark.multi_gpu,
         ),
     ],
 )
 def test_pipeline_uses_routed_windows_and_preserves_downstream_gptq(
-    tmp_path, monkeypatch, devices, grouped, memory_bytes, skip
+    tmp_path, monkeypatch, devices, grouped, memory_bytes, skip, defer_prefetch
 ):
     import llmcompressor.streaming.pipeline as pipeline
     from llmcompressor.streaming.loading.session import PreparedSubgraphWeights
@@ -718,10 +731,15 @@ def test_pipeline_uses_routed_windows_and_preserves_downstream_gptq(
         or torch.cuda.device_count() < 4
     ):
         pytest.skip("This pipeline validation requires physical devices 4-7")
+    with_upstream = grouped and not skip
+    check_overlap = with_upstream and not defer_prefetch
     torch.manual_seed(29)
     checkpoint = tmp_path / "checkpoint"
     checkpoint.mkdir()
-    save_file(PipelineMoE(skip=skip).state_dict(), checkpoint / "model.safetensors")
+    save_file(
+        PipelineMoE(skip=skip, pre=with_upstream).state_dict(),
+        checkpoint / "model.safetensors",
+    )
     (checkpoint / "config.json").write_text("{}")
     monkeypatch.setattr(
         pipeline,
@@ -738,7 +756,67 @@ def test_pipeline_uses_routed_windows_and_preserves_downstream_gptq(
 
     monkeypatch.setattr(PreparedSubgraphWeights, "move_to_async", transfer)
     monkeypatch.setenv("LLMCOMPRESSOR_STREAMING_ASYNC_H2D", "1")
+    parallel_model = None
     expert_targets = tuple(f"experts.{index}" for index in range(4))
+    denied = []
+    if defer_prefetch:
+        original_reserve = HostMemoryBudget.reserve
+
+        def reserve(budget, owner, required_bytes):
+            if owner.endswith(" current group headroom"):
+                denied.append(owner)
+                raise HostMemoryError("injected prefetch pressure")
+            return original_reserve(budget, owner, required_bytes)
+
+        monkeypatch.setattr(HostMemoryBudget, "reserve", reserve)
+
+    if check_overlap:
+        write_started = Event()
+        combine_started = Event()
+        post_prepared = Event()
+        expert_prepare_threads = []
+        original_write = DirectSafetensorsWriter.write_shard
+        original_combine = ExpertRegionGraph.combine_subgraph
+        original_prepare = SubgraphWeightSession.prepare
+        original_commit = InMemoryBoundaryActivationStore.commit_propagated_batch
+
+        def block_owner_write(writer, shard_id, tensors, **kwargs):
+            if shard_id.startswith("subgraph-00001-r"):
+                assert all(tensor.device.type == "cpu" for tensor in tensors.values())
+                write_started.set()
+                assert combine_started.wait(timeout=10)
+            return original_write(writer, shard_id, tensors, **kwargs)
+
+        def start_combine(graph):
+            try:
+                assert write_started.wait(timeout=10)
+                publish_dir = tmp_path / "parallel" / "publish"
+                assert not list(publish_dir.glob("*-r*.safetensors"))
+            finally:
+                combine_started.set()
+            return original_combine(graph)
+
+        def track_prepare(session, plan, **kwargs):
+            prepared = original_prepare(session, plan, **kwargs)
+            if session.model is parallel_model:
+                if set(plan.module_names) == set(expert_targets):
+                    expert_prepare_threads.append(current_thread().name)
+                elif plan.module_names == ("post",):
+                    assert current_thread().name.startswith("streaming-weight-prefetch")
+                    post_prepared.set()
+            return prepared
+
+        def commit_boundary(store, source, destination, batch, value, **kwargs):
+            if parallel_model is not None and source == 1 and destination == 5:
+                assert post_prepared.wait(timeout=10)
+            return original_commit(store, source, destination, batch, value, **kwargs)
+
+        monkeypatch.setattr(DirectSafetensorsWriter, "write_shard", block_owner_write)
+        monkeypatch.setattr(ExpertRegionGraph, "combine_subgraph", start_combine)
+        monkeypatch.setattr(SubgraphWeightSession, "prepare", track_prepare)
+        monkeypatch.setattr(
+            InMemoryBoundaryActivationStore, "commit_propagated_batch", commit_boundary
+        )
     targets = (*expert_targets, "post")
     prefix = Graph()
     hidden = prefix.placeholder("hidden")
@@ -748,6 +826,13 @@ def test_pipeline_uses_routed_windows_and_preserves_downstream_gptq(
         prefix_outputs["weights"] = prefix.placeholder("weights")
     prefix.output(prefix_outputs)
     prefix = Subgraph(prefix, set(prefix_outputs), set())
+    upstream = ()
+    if with_upstream:
+        targets = ("pre", *targets)
+        pre = Graph()
+        pre_input = pre.placeholder("hidden")
+        pre.output({"prepared_hidden": pre.call_module("pre", (pre_input,))})
+        upstream = (Subgraph(pre, {"hidden"}, {"hidden"}),)
     tail = Graph()
     result = tail.placeholder("result")
     final = tail.call_module("post", (result,))
@@ -767,10 +852,22 @@ def test_pipeline_uses_routed_windows_and_preserves_downstream_gptq(
     outputs = []
     for parallel in (False, True):
         execution_device = torch.device(devices[0] if parallel else "cpu")
-        model = build_meta_model(lambda: PipelineMoE(skip=skip)).eval()
+        model = build_meta_model(
+            lambda: PipelineMoE(skip=skip, pre=with_upstream)
+        ).eval()
+        if parallel:
+            parallel_model = model
         source = SafetensorsWeightSource(checkpoint)
-        routed = subgraph(group_expert_routes if grouped else None, skip_output=skip)
-        slices = (*_split_target_subgraph(model, routed, expert_targets), *downstream)
+        routed = subgraph(
+            group_expert_routes if grouped else None,
+            skip_output=skip,
+            hidden_name="prepared_hidden" if with_upstream else "hidden",
+        )
+        slices = (
+            *upstream,
+            *_split_target_subgraph(model, routed, expert_targets),
+            *downstream,
+        )
         adapter = TracedBoundaryAdapter(
             model=model,
             plan=SequentialExecutionPlan(
@@ -813,13 +910,20 @@ def test_pipeline_uses_routed_windows_and_preserves_downstream_gptq(
         assert all(parameter.is_meta for parameter in model.parameters())
         if parallel:
             assert (
-                ArtifactStore(artifacts).load_ep_token_plan(0)["policy"]
+                ArtifactStore(artifacts).load_ep_token_plan(int(with_upstream))["policy"]
                 == "routed-resident-windows-v1"
             )
+            if check_overlap:
+                assert combine_started.is_set()
+                assert post_prepared.is_set()
+                assert len(expert_prepare_threads) == 1
+                assert expert_prepare_threads[0].startswith("streaming-weight-prefetch")
+                assert len(list(output.glob("*-r*.safetensors"))) == len(devices)
     assert outputs[0].keys() == outputs[1].keys()
     for name in outputs[0]:
         torch.testing.assert_close(outputs[1][name], outputs[0][name], msg=name)
     assert bool(staged) == (hardware and memory_bytes == 5000)
+    assert len(denied) == (2 if defer_prefetch else 0)
 
 
 @pytest.mark.parametrize("dynamic,expected", [(False, False), (True, True)])

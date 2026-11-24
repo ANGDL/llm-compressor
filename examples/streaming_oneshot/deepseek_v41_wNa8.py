@@ -617,8 +617,9 @@ def main():
     parser.add_argument(
         "--async-save",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Overlap checkpoint writes with the next layer (default: enabled).",
+        default=None,
+        help="Overlap checkpoint writes with computation (default: enabled "
+        "unless --checkpoint-progress is set).",
     )
     parser.add_argument(
         "--save-raw-checkpoint-format",
@@ -668,6 +669,10 @@ def main():
         help="Allow HIGGS to leave selected matched weights unquantized.",
     )
     args = parser.parse_args()
+    if args.async_save is None:
+        args.async_save = not args.checkpoint_progress
+    if args.checkpoint_progress and args.async_save:
+        parser.error("--async-save cannot be combined with --checkpoint-progress")
     if args.expert_parallel_token_budget != "auto":
         try:
             args.expert_parallel_token_budget = int(args.expert_parallel_token_budget)

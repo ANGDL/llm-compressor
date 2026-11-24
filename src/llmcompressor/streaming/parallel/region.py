@@ -539,10 +539,13 @@ def execute_expert_region(
     token_budget,
     label,
     save_window,
+    async_save=False,
     propagate=True,
     route_cache=None,
     destination_input_names=None,
     allow_device_prefetch=True,
+    prepared_weights=None,
+    on_combine_start=None,
 ):
     """Calibrate, update, propagate, and release each owner's admitted windows."""
     planning_started = perf_counter()
@@ -551,8 +554,10 @@ def execute_expert_region(
     workspaces = {}
     expert_modules = {}
     weight_session = adapter.weight_session
-    region_plan = weight_session.plan_modules(
-        graph.expert_names, allow_missing_state=True
+    region_plan = (
+        prepared_weights.plan
+        if prepared_weights is not None
+        else weight_session.plan_modules(graph.expert_names, allow_missing_state=True)
     )
     target_plans = {target.name: target for target in region_plan.targets}
     if target_plans.keys() != set(graph.expert_names):
@@ -774,7 +779,7 @@ def execute_expert_region(
     result_store = {}
     result_reservations = []
     result_lock = Lock()
-    save_lock = Lock()
+    save_context = nullcontext() if async_save else Lock()
     all_modules = tuple(
         dict.fromkeys(
             module
@@ -794,30 +799,24 @@ def execute_expert_region(
         (window, weight_plan(window.expert_names)) for window in windows
     )
     if window_plans:
-        aggregate_plan = SubgraphLoadPlan(
-            tuple(
-                dict.fromkeys(
-                    name for _window, plan in window_plans for name in plan.module_names
-                )
-            ),
-            tuple(target for _window, plan in window_plans for target in plan.targets),
-        )
-        required = adapter.weight_session.estimate_preparation(
-            aggregate_plan, dtype=target_dtype
-        )
         layer_prepare_started = perf_counter()
-        layer_reservation = host_budget.reserve(
-            f"{label} routed MoE layer expert weights", required
-        )
-        try:
-            prepared = adapter.weight_session.prepare_many(
-                tuple(plan for _window, plan in window_plans),
-                dtype=target_dtype,
-                reservation=layer_reservation,
+        plans = tuple(plan for _window, plan in window_plans)
+        if prepared_weights is None:
+            required = weight_session.estimate_preparation(
+                region_plan, dtype=target_dtype
             )
-        except BaseException:
-            layer_reservation.close()
-            raise
+            layer_reservation = host_budget.reserve(
+                f"{label} routed MoE layer expert weights", required
+            )
+            try:
+                prepared = weight_session.prepare_many(
+                    plans, dtype=target_dtype, reservation=layer_reservation
+                )
+            except BaseException:
+                layer_reservation.close()
+                raise
+        else:
+            prepared = prepared_weights.partition(plans)
         with prepared_windows_lock:
             prepared_windows.update(
                 {
@@ -828,8 +827,9 @@ def execute_expert_region(
         streaming_logger.info(
             f"{label} | EP layer CPU prepare | "
             f"windows={len(window_plans)} | "
-            f"targets={len(aggregate_plan.targets)} | "
+            f"targets={len(region_plan.targets)} | "
             f"resident_gib={sum(value.nbytes for value in prepared) / 2**30:.2f} | "
+            f"prefetched={prepared_weights is not None} | "
             f"time={perf_counter() - layer_prepare_started:.2f}s"
         )
 
@@ -1302,15 +1302,22 @@ def execute_expert_region(
                     f"time={perf_counter() - started:.2f}s"
                 )
             save_wait_started = perf_counter()
-            with save_lock:
+            with save_context:
                 save_started = perf_counter()
                 save_window(window, loaded, modules)
                 save_elapsed = perf_counter() - save_started
+            save_timing = (
+                f"save_submit_s={save_elapsed:.2f}"
+                if async_save
+                else (
+                    f"save_wait_s={save_started - save_wait_started:.2f} | "
+                    f"save_s={save_elapsed:.2f}"
+                )
+            )
             streaming_logger.info(
                 f"{label} | EP window complete | rank={window.owner_rank} | "
                 f"window={window.window_index} | tokens={window.route_tokens:,} | "
-                f"save_wait_s={save_started - save_wait_started:.2f} | "
-                f"save_s={save_elapsed:.2f}"
+                f"{save_timing}"
             )
         return window
 
@@ -1411,6 +1418,10 @@ def execute_expert_region(
             for placeholder, name in call_names.items()
             if placeholder in combine.input_names
         }
+        if on_combine_start is not None:
+            on_combine_start(
+                sum(reservation.committed_bytes for reservation in result_reservations)
+            )
 
         if all(node.op in {"placeholder", "output"} for node in combine.graph.nodes):
             output_node = combine.graph.find_nodes(op="output")[0]
