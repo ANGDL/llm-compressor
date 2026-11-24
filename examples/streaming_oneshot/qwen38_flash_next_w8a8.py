@@ -26,6 +26,7 @@ import argparse
 import base64
 import json
 import re
+import shutil
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -40,6 +41,7 @@ from compressed_tensors.quantization.quant_args import (
     QuantizationStrategy,
     QuantizationType,
 )
+from datasets import Dataset, load_dataset
 from safetensors import safe_open
 from safetensors.torch import save_file
 from torch import nn
@@ -51,7 +53,6 @@ from transformers import (
     AutoTokenizer,
 )
 
-from datasets import Dataset, load_dataset
 from llmcompressor.modifiers.quantization import QuantizationModifier
 from llmcompressor.streaming import (
     CastWeightMaterializer,
@@ -498,6 +499,23 @@ QWEN38_W4A8_W8_PATTERNS = [
     r"re:.*\.ple\.(?:key_proj|value_proj)$",
 ]
 
+QWEN38_TOKENIZER_FILES = (
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "added_tokens.json",
+    "vocab.json",
+    "merges.txt",
+    "tokenizer.model",
+    "spiece.model",
+    "sentencepiece.bpe.model",
+    "chat_template.jinja",
+    "chat_template.json",
+    "preprocessor_config.json",
+    "processor_config.json",
+    "video_preprocessor_config.json",
+)
+
 
 def _w8a8_other_targets(same_as_klx: bool, quantize_ple: bool) -> list[str]:
     targets = []
@@ -757,6 +775,37 @@ def _update_w4a8_runtime_config(output: Path, enabled: bool) -> None:
     )
 
 
+def _restore_tokenizer_files(source: Path, output: Path) -> None:
+    copied = []
+    for name in QWEN38_TOKENIZER_FILES:
+        source_path = source / name
+        output_path = output / name
+        if source_path.is_file():
+            shutil.copy2(source_path, output_path)
+            copied.append(name)
+        elif output_path.exists():
+            output_path.unlink()
+
+    source_tiktoken = {
+        path.name: path for path in source.glob("*.tiktoken") if path.is_file()
+    }
+    output_tiktoken = {
+        path.name: path for path in output.glob("*.tiktoken") if path.is_file()
+    }
+    for name, source_path in source_tiktoken.items():
+        shutil.copy2(source_path, output / name)
+        copied.append(name)
+    for name, output_path in output_tiktoken.items():
+        if name not in source_tiktoken:
+            output_path.unlink()
+
+    if not copied:
+        raise RuntimeError(
+            f"no tokenizer or processor files found under source model: {source}"
+        )
+    print(f"restored {len(copied)} tokenizer/processor files from {source}")
+
+
 def _verify_mtp_preserved(source: Path, output: Path) -> None:
     def index(path: Path) -> dict[str, str]:
         return json.loads((path / "model.safetensors.index.json").read_text())[
@@ -925,6 +974,7 @@ def main() -> None:
         pack_to_int8=args.w4a8,
     )
     processor.save_pretrained(output)
+    _restore_tokenizer_files(args.model_id, Path(output))
     if quantize_ple:
         _quantize_ple_embeddings(args.model_id, Path(output))
         _verify_ple_quantized(Path(output))
