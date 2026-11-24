@@ -823,6 +823,7 @@ uv.lock
 .venv/
 
 .local-experiments/
+docs/developer/deepseek-v41-ep-quantization-investigation.md
 docs/developer/*-e2e-[0-9]*.md
 docs/reports/
 **/ep8-test-evidence/
