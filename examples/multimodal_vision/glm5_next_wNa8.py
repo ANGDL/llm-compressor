@@ -58,14 +58,15 @@ from compressed_tensors.quantization.quant_args import (
     QuantizationType,
 )
 from compressed_tensors.utils.match import match_name
+
+# don't move this import to the top of the file
+from datasets import load_dataset
 from loguru import logger
 from transformers import AutoProcessor
 from transformers.models.glm5_next.modeling_glm5_next import (
     Glm5NextForConditionalGeneration,
 )
 
-# don't move this import to the top of the file
-from datasets import load_dataset
 from llmcompressor import oneshot
 from llmcompressor.core import active_session
 from llmcompressor.logger import LoggerConfig, configure_logger
@@ -112,10 +113,7 @@ def build_glm5_next_w8a8_targets(model, ignores: list[str]) -> list[str]:
         name
         for name, module in model.named_modules()
         if isinstance(module, torch.nn.Linear)
-        and not (
-            ".mlp.experts." in name
-            and name.rsplit(".", 1)[-1] in expert_suffixes
-        )
+        and not (".mlp.experts." in name and name.rsplit(".", 1)[-1] in expert_suffixes)
     ]
     linear_names = [
         name
@@ -477,9 +475,7 @@ def activation_debug_logging(model, layer_indices: list[int] | None):
             f"{prefix}.mlp.gate": getattr(layer.mlp, "gate", None),
         }
         stage_modules = {
-            name: module
-            for name, module in stage_modules.items()
-            if module is not None
+            name: module for name, module in stage_modules.items() if module is not None
         }
         handles.append(layer.register_forward_pre_hook(make_pre_hook(prefix)))
         for name, module in stage_modules.items():
@@ -489,11 +485,7 @@ def activation_debug_logging(model, layer_indices: list[int] | None):
 
         stage_ids = {id(module) for module in stage_modules.values()}
         for relative_name, module in layer.named_modules():
-            if (
-                not relative_name
-                or id(module) in stage_ids
-                or any(module.children())
-            ):
+            if not relative_name or id(module) in stage_ids or any(module.children()):
                 continue
             name = f"{prefix}.{relative_name}"
             handles.append(module.register_forward_hook(make_output_hook(name)))
@@ -804,15 +796,11 @@ logger.info(
     "quantizable Linear modules with W8A8",
 )
 
-GLM5_NEXT_W8A8_TARGETS = build_glm5_next_w8a8_targets(
-    model, GLM5_NEXT_W8A8_IGNORES
-)
+GLM5_NEXT_W8A8_TARGETS = build_glm5_next_w8a8_targets(model, GLM5_NEXT_W8A8_IGNORES)
 # Match the GLM-5 MoE WNA8 recipe: channel-wise static weights and dynamic
 # per-token activations.  The preset W4A8 scheme uses group-wise weights, which
 # is a different quantization contract from this model's per-channel recipe.
-weight_scale_dtype = (
-    torch.float32 if args.use_float32_scale_dtype else None
-)
+weight_scale_dtype = torch.float32 if args.use_float32_scale_dtype else None
 weights_args_4 = QuantizationArgs(
     num_bits=4,
     type=QuantizationType.INT,
@@ -892,7 +880,7 @@ oneshot_kwargs = dict(
     processor=processor,
     moe_calibrate_all_experts=args.moe_calibrate_all_experts,
     pipeline=args.pipeline,
-    shuffle_calibration_samples=False
+    shuffle_calibration_samples=False,
 )
 with activation_debug_logging(model, args.debug_activation_layers):
     if args.observer == "imatrix_mse":

@@ -34,7 +34,9 @@ class _FakeWeightObserver:
         return self._scale is not None
 
     def __call__(self, weight: torch.Tensor):
-        self._scale = torch.ones(weight.shape[0], device=weight.device, dtype=weight.dtype)
+        self._scale = torch.ones(
+            weight.shape[0], device=weight.device, dtype=weight.dtype
+        )
         self._zero_point = torch.zeros_like(self._scale)
         self._global_scale = torch.ones(1, device=weight.device, dtype=weight.dtype)
         return self
@@ -67,12 +69,20 @@ def test_get_grid_search_params(n_grid, duo_scaling, expected_len):
     assert all(ratio <= 1.0 for ratio, _ in grid_search_params)
     assert len(grid_search_params) == expected_len
 
-    n_false = len([
-        ratio for ratio, use_duo_scaling in grid_search_params if use_duo_scaling is False
-    ])
-    n_true = len([
-        ratio for ratio, use_duo_scaling in grid_search_params if use_duo_scaling is True
-    ])
+    n_false = len(
+        [
+            ratio
+            for ratio, use_duo_scaling in grid_search_params
+            if use_duo_scaling is False
+        ]
+    )
+    n_true = len(
+        [
+            ratio
+            for ratio, use_duo_scaling in grid_search_params
+            if use_duo_scaling is True
+        ]
+    )
 
     if duo_scaling is False:
         assert n_false == n_grid
@@ -137,7 +147,9 @@ def test_compute_best_scale_uses_autosmooth_snapshot_qargs(monkeypatch):
         "load_from_registry",
         staticmethod(_fake_load_from_registry),
     )
-    monkeypatch.setattr(autosmooth_base, "fuse_weight_observers", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        autosmooth_base, "fuse_weight_observers", lambda *args, **kwargs: None
+    )
     captured_update_modules = []
 
     def _fake_update_qparams(modules, *_args, **_kwargs):
@@ -210,7 +222,9 @@ def test_compute_best_scale_non_quantized_uses_identity(monkeypatch):
         "load_from_registry",
         staticmethod(_fake_load_from_registry),
     )
-    monkeypatch.setattr(autosmooth_base, "fuse_weight_observers", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        autosmooth_base, "fuse_weight_observers", lambda *args, **kwargs: None
+    )
     monkeypatch.setattr(autosmooth_base, "update_qparams", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         autosmooth_base,
@@ -255,9 +269,7 @@ def test_compute_best_scale_all_non_quantized_balance_layers_use_identity(monkey
         )
 
     def _unexpected_update_qparams(*_args, **_kwargs):
-        raise AssertionError(
-            "update_qparams should not run for non-quantized layers"
-        )
+        raise AssertionError("update_qparams should not run for non-quantized layers")
 
     monkeypatch.setattr(
         autosmooth_base.Observer,
@@ -311,7 +323,9 @@ def test_compute_best_scale_duo_scaling_uses_snapshot_qargs(monkeypatch):
         "load_from_registry",
         staticmethod(lambda *_args, **_kwargs: _FakeWeightObserver()),
     )
-    monkeypatch.setattr(autosmooth_base, "fuse_weight_observers", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        autosmooth_base, "fuse_weight_observers", lambda *args, **kwargs: None
+    )
     monkeypatch.setattr(autosmooth_base, "update_qparams", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         autosmooth_base,
@@ -327,7 +341,9 @@ def test_compute_best_scale_duo_scaling_uses_snapshot_qargs(monkeypatch):
 
 @pytest.mark.unit
 @torch.no_grad()
-def test_compute_best_scale_duo_scaling_includes_non_quantized_in_weight_scales(monkeypatch):
+def test_compute_best_scale_duo_scaling_includes_non_quantized_in_weight_scales(
+    monkeypatch,
+):
     parent = _ToyParent()
     smooth = torch.nn.LayerNorm(4)
 
@@ -375,7 +391,9 @@ def test_compute_best_scale_duo_scaling_includes_non_quantized_in_weight_scales(
         "load_from_registry",
         staticmethod(lambda *_args, **_kwargs: _FakeWeightObserver()),
     )
-    monkeypatch.setattr(autosmooth_base, "fuse_weight_observers", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        autosmooth_base, "fuse_weight_observers", lambda *args, **kwargs: None
+    )
     monkeypatch.setattr(autosmooth_base, "update_qparams", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         autosmooth_base,
@@ -398,7 +416,9 @@ def test_compute_best_scale_duo_scaling_includes_non_quantized_in_weight_scales(
 
 @pytest.mark.unit
 @torch.no_grad()
-def test_compute_best_scale_duo_scaling_can_exclude_non_quantized_from_weight_scales(monkeypatch):
+def test_compute_best_scale_duo_scaling_can_exclude_non_quantized_from_weight_scales(
+    monkeypatch,
+):
     parent = _ToyParent()
     smooth = torch.nn.LayerNorm(4)
 
@@ -450,7 +470,9 @@ def test_compute_best_scale_duo_scaling_can_exclude_non_quantized_from_weight_sc
         "load_from_registry",
         staticmethod(lambda *_args, **_kwargs: _FakeWeightObserver()),
     )
-    monkeypatch.setattr(autosmooth_base, "fuse_weight_observers", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        autosmooth_base, "fuse_weight_observers", lambda *args, **kwargs: None
+    )
     monkeypatch.setattr(autosmooth_base, "update_qparams", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         autosmooth_base,
@@ -504,7 +526,9 @@ def test_compute_best_scale_sanitizes_scales_before_scalesview(monkeypatch):
         "load_from_registry",
         staticmethod(lambda *_args, **_kwargs: _FakeWeightObserver()),
     )
-    monkeypatch.setattr(autosmooth_base, "fuse_weight_observers", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        autosmooth_base, "fuse_weight_observers", lambda *args, **kwargs: None
+    )
     monkeypatch.setattr(autosmooth_base, "update_qparams", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         autosmooth_base,
@@ -586,7 +610,9 @@ def test_compute_best_scale_preserves_existing_weight_scale(monkeypatch):
         "load_from_registry",
         staticmethod(lambda *_args, **_kwargs: _FakeWeightObserver()),
     )
-    monkeypatch.setattr(autosmooth_base, "fuse_weight_observers", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        autosmooth_base, "fuse_weight_observers", lambda *args, **kwargs: None
+    )
     monkeypatch.setattr(autosmooth_base, "update_qparams", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         autosmooth_base,
@@ -639,7 +665,9 @@ def test_compute_best_scale_does_not_leak_temporary_qparams(monkeypatch):
         "load_from_registry",
         staticmethod(lambda *_args, **_kwargs: _FakeWeightObserver()),
     )
-    monkeypatch.setattr(autosmooth_base, "fuse_weight_observers", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        autosmooth_base, "fuse_weight_observers", lambda *args, **kwargs: None
+    )
     monkeypatch.setattr(autosmooth_base, "update_qparams", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         autosmooth_base,
@@ -679,7 +707,9 @@ def test_setup_activation_cache_hooks_uses_signed_values_for_minmax():
     finally:
         modifier.remove_hooks()
 
-    (min_vals, max_vals), count = modifier._smooth_activation_scales[mapping.smooth_name]
+    (min_vals, max_vals), count = modifier._smooth_activation_scales[
+        mapping.smooth_name
+    ]
 
     assert count == 2
     assert torch.equal(min_vals, torch.tensor([-3.0, -4.0]))

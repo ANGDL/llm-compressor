@@ -94,14 +94,8 @@ def test_k3_multimodal_message_uses_image_field():
     [
         "language_model.model.layers.1.self_attention_res_proj",
         "language_model.model.layers.1.mlp_res_proj",
-        (
-            "language_model.model.layers.1.block_sparse_moe."
-            "routed_expert_down_proj"
-        ),
-        (
-            "language_model.model.layers.1.block_sparse_moe."
-            "routed_expert_up_proj"
-        ),
+        ("language_model.model.layers.1.block_sparse_moe." "routed_expert_down_proj"),
+        ("language_model.model.layers.1.block_sparse_moe." "routed_expert_up_proj"),
         "language_model.model.output_attn_res_proj",
     ],
 )
@@ -143,9 +137,7 @@ def test_expert_targets_reject_scale_without_packed_weight(tmp_path):
     _write_expert_index(tmp_path, include_all_packed=False)
 
     with pytest.raises(ValueError, match="weight_scale/weight_packed targets differ"):
-        KIMI_K3_WNA8._expert_targets_from_index(
-            tmp_path, _tiny_text_config()
-        )
+        KIMI_K3_WNA8._expert_targets_from_index(tmp_path, _tiny_text_config())
 
 
 def test_expert_targets_reject_config_index_mismatch(tmp_path):

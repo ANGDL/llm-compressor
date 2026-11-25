@@ -1,24 +1,24 @@
 import base64
-import argparse
-from io import BytesIO
 import os
+from io import BytesIO
 
 os.environ["DISABLE_OFFSET_NORM_CALIBRATION"] = "1"
 
-import torch
-from datasets import load_dataset
-from transformers import AutoProcessor, Qwen3_5MoeForConditionalGeneration
-from qwen_vl_utils import process_vision_info
+import torch  # noqa: E402
+from datasets import load_dataset  # noqa: E402
+from qwen_vl_utils import process_vision_info  # noqa: E402
+from transformers import AutoProcessor, Qwen3_5MoeForConditionalGeneration  # noqa: E402
 
-from llmcompressor import oneshot
-from llmcompressor.utils import dispatch_for_generation
-from llmcompressor.modifiers.awq import AWQMapping
-from llmcompressor.modifiers.autosmooth import AutoSmoothModifier
-from llmcompressor.modifiers.quantization import QuantizationModifier
+from llmcompressor import oneshot  # noqa: E402
+from llmcompressor.modifiers.autosmooth import AutoSmoothModifier  # noqa: E402
+from llmcompressor.modifiers.awq import AWQMapping  # noqa: E402
+from llmcompressor.modifiers.quantization import QuantizationModifier  # noqa: E402
 
 # Load model.
 model_id = "/data/models/Qwen3.5-35B-A3B"
-model = Qwen3_5MoeForConditionalGeneration.from_pretrained(model_id, device_map=None, dtype="auto",local_files_only=True)
+model = Qwen3_5MoeForConditionalGeneration.from_pretrained(
+    model_id, device_map=None, dtype="auto", local_files_only=True
+)
 processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
 
 # Oneshot argume32
@@ -53,13 +53,8 @@ def preprocess_and_tokenize(example):
         },
         {
             "role": "assistant",
-            "content": [
-                {
-                "text": f"{example['caption'][0]}",
-                "type": "text"
-                }
-            ],
-        }
+            "content": [{"text": f"{example['caption'][0]}", "type": "text"}],
+        },
     ]
     text = processor.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
@@ -92,6 +87,7 @@ def data_collator(batch):
         for key, value in batch[0].items()
     }
 
+
 def build_layer_input_ln_regex(layer_indices):
     if not layer_indices:
         return None
@@ -115,7 +111,8 @@ for idx, layer in enumerate(layers):
 
     if has_full_attn and has_linear_attn:
         raise ValueError(
-            f"Layer {idx} has both self_attn and linear_attn, expected mutual exclusivity"
+            f"Layer {idx} has both self_attn and linear_attn, "
+            "expected mutual exclusivity"
         )
 
     if has_full_attn:
@@ -144,7 +141,9 @@ for idx, layer in enumerate(layers):
 
 # Fallback for models where submodule layout is opaque.
 if not full_attn_layer_indices and not linear_attn_layer_indices:
-    full_attention_interval = getattr(model.config, "full_attention_layer_interval", None)
+    full_attention_interval = getattr(
+        model.config, "full_attention_layer_interval", None
+    )
     if isinstance(full_attention_interval, int) and full_attention_interval > 0:
         full_attn_layer_indices = list(
             range(full_attention_interval - 1, num_layers, full_attention_interval)
@@ -165,7 +164,9 @@ if not linear_attn_balance_layers:
 
 overlap = set(full_attn_layer_indices) & set(linear_attn_layer_indices)
 if overlap:
-    raise ValueError(f"Found overlap between full_attn and linear_attn indices: {sorted(overlap)}")
+    raise ValueError(
+        f"Found overlap between full_attn and linear_attn indices: {sorted(overlap)}"
+    )
 
 self_attn_input_ln_regex = build_layer_input_ln_regex(full_attn_layer_indices)
 linear_attn_input_ln_regex = build_layer_input_ln_regex(linear_attn_layer_indices)
@@ -180,7 +181,7 @@ if self_attn_input_ln_regex:
                 "re:.*self_attn.k_proj$",
                 "re:.*self_attn.v_proj$",
             ],
-            norm_bias=1.0
+            norm_bias=1.0,
         )
     )
     mapping.append(AWQMapping("re:.*self_attn.v_proj$", ["re:.*self_attn.o_proj$"]))
@@ -188,9 +189,7 @@ if self_attn_input_ln_regex:
 if linear_attn_input_ln_regex:
     mapping.append(
         AWQMapping(
-            linear_attn_input_ln_regex,
-            linear_attn_balance_layers,
-            norm_bias=1.0
+            linear_attn_input_ln_regex, linear_attn_balance_layers, norm_bias=1.0
         )
     )
 
@@ -206,7 +205,7 @@ mapping.extend(
                 "re:.*mlp.shared_expert_gate$",
             ],
             activation_hook_target="shared_expert_gate",
-            norm_bias=1.0
+            norm_bias=1.0,
         ),
         AWQMapping("re:.*up_proj$", ["re:.*down_proj$"]),
     ]
@@ -214,11 +213,13 @@ mapping.extend(
 
 recipe = [
     AutoSmoothModifier(
-        activation_scale_type="mean", 
-        norm_func='adaptive',
+        activation_scale_type="mean",
+        norm_func="adaptive",
         mappings=mapping,
         scheme="W8A8",
-        offload_device=torch.device("cuda:1") if torch.cuda.device_count() > 1 else torch.device("cpu"),
+        offload_device=torch.device("cuda:1")
+        if torch.accelerator.device_count() > 1
+        else torch.device("cpu"),
         ignore=[
             "re:.*lm_head",
             "re:visual.*",
@@ -237,7 +238,7 @@ recipe = [
             "re:.*mlp.gate$",
             "re:.*embed_tokens$",
             "re:.*shared_expert_gate$",
- #           "re:.*linear_attn.*",
+            #           "re:.*linear_attn.*",
         ],
     ),
 ]

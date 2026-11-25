@@ -83,9 +83,15 @@ def test_basic_pipeline_qac_true_keeps_quantization_enabled(monkeypatch):
     monkeypatch.setattr(basic_pipeline, "active_session", lambda: _make_fake_session())
     monkeypatch.setattr(basic_pipeline, "dispatch_model", lambda _model: None)
     monkeypatch.setattr(basic_pipeline, "get_execution_device", lambda _model: "cpu")
-    monkeypatch.setattr(basic_pipeline, "tensors_to_device", lambda batch, _device: batch)
-    monkeypatch.setattr(basic_pipeline, "calibration_forward_context", lambda _model: nullcontext())
-    monkeypatch.setattr(basic_pipeline, "DisableQuantization", _record_disable_quantization)
+    monkeypatch.setattr(
+        basic_pipeline, "tensors_to_device", lambda batch, _device: batch
+    )
+    monkeypatch.setattr(
+        basic_pipeline, "calibration_forward_context", lambda _model: nullcontext()
+    )
+    monkeypatch.setattr(
+        basic_pipeline, "DisableQuantization", _record_disable_quantization
+    )
     monkeypatch.setattr(
         basic_pipeline.LifecycleCallbacks,
         "calibration_epoch_start",
@@ -123,9 +129,15 @@ def test_basic_pipeline_qac_false_disables_quantization(monkeypatch):
     monkeypatch.setattr(basic_pipeline, "active_session", lambda: _make_fake_session())
     monkeypatch.setattr(basic_pipeline, "dispatch_model", lambda _model: None)
     monkeypatch.setattr(basic_pipeline, "get_execution_device", lambda _model: "cpu")
-    monkeypatch.setattr(basic_pipeline, "tensors_to_device", lambda batch, _device: batch)
-    monkeypatch.setattr(basic_pipeline, "calibration_forward_context", lambda _model: nullcontext())
-    monkeypatch.setattr(basic_pipeline, "DisableQuantization", _record_disable_quantization)
+    monkeypatch.setattr(
+        basic_pipeline, "tensors_to_device", lambda batch, _device: batch
+    )
+    monkeypatch.setattr(
+        basic_pipeline, "calibration_forward_context", lambda _model: nullcontext()
+    )
+    monkeypatch.setattr(
+        basic_pipeline, "DisableQuantization", _record_disable_quantization
+    )
     monkeypatch.setattr(
         basic_pipeline.LifecycleCallbacks,
         "calibration_epoch_start",

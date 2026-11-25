@@ -108,7 +108,7 @@ class SequentialStep3p5Experts(nn.ModuleList):
             )
 
         gate_w = original.gate_proj.weight.data  # [E, I, H]
-        up_w = original.up_proj.weight.data      # [E, I, H]
+        up_w = original.up_proj.weight.data  # [E, I, H]
         down_w = original.down_proj.weight.data  # [E, H, I]
 
         for i in range(num_experts):
@@ -119,7 +119,8 @@ class SequentialStep3p5Experts(nn.ModuleList):
 
 @MoECalibrationModule.register("Step3p5MoEMLP")
 class CalibrationStep3p5MoEMLP(MoECalibrationModule):
-    """Calibration version of ``Step3p5MoEMLP`` with experts unpacked into ``nn.Linear``.
+    """Calibration version of ``Step3p5MoEMLP`` with experts unpacked into
+    ``nn.Linear``.
 
     Behaviour matches the original module bit-for-bit when
     ``calibrate_all_experts=False``.  When ``calibrate_all_experts=True``
@@ -160,8 +161,8 @@ class CalibrationStep3p5MoEMLP(MoECalibrationModule):
         if hasattr(original, "router_bias"):
             self.router_bias = original.router_bias
         if getattr(original_custom_routing_function, "__self__", None) is original:
-            self.custom_routing_function = original_custom_routing_function.__func__.__get__(
-                self, type(self)
+            self.custom_routing_function = (
+                original_custom_routing_function.__func__.__get__(self, type(self))
             )
         else:
             self.custom_routing_function = original_custom_routing_function
@@ -199,9 +200,7 @@ class CalibrationStep3p5MoEMLP(MoECalibrationModule):
             )
         else:
             routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-            routing_weights, indices = torch.topk(
-                routing_weights, self.top_k, dim=-1
-            )
+            routing_weights, indices = torch.topk(routing_weights, self.top_k, dim=-1)
 
         routing_weights = routing_weights * self.routed_scaling_factor
         return routing_weights, indices
@@ -219,9 +218,9 @@ class CalibrationStep3p5MoEMLP(MoECalibrationModule):
         )
 
         # (num_experts, top_k, num_tokens)
-        expert_mask = F.one_hot(
-            selected_experts, num_classes=self.num_experts
-        ).permute(2, 1, 0)
+        expert_mask = F.one_hot(selected_experts, num_classes=self.num_experts).permute(
+            2, 1, 0
+        )
 
         for expert_idx, expert_layer in enumerate(self.experts):
             idx, top_x = torch.where(expert_mask[expert_idx])
@@ -242,6 +241,4 @@ class CalibrationStep3p5MoEMLP(MoECalibrationModule):
                 0, top_x, current_hidden_states.to(hidden_states.dtype)
             )
 
-        return final_hidden_states.reshape(
-            batch_size, sequence_length, hidden_dim
-        )
+        return final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)

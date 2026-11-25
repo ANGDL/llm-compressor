@@ -11,12 +11,12 @@ from ci.model_quality.state import atomic_write_json
 from ci.model_quality.web import (
     ConflictError,
     LaunchPolicy,
+    NotFoundError,
     PermissionDenied,
     Principal,
     PublishService,
     QueueExecutor,
     RunStore,
-    NotFoundError,
     ValidationError,
     create_app,
 )

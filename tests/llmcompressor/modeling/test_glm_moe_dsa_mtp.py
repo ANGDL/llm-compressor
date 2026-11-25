@@ -90,9 +90,7 @@ def test_attached_mtp_uses_shifted_inputs_and_explicit_causal_mask(monkeypatch):
     call = mtp.calls[0]
     backbone_hidden = torch.arange(10, dtype=torch.float32).view(2, 5, 1)
     torch.testing.assert_close(call["input_ids"], input_ids[:, 1:])
-    torch.testing.assert_close(
-        call["token_hidden_states"], backbone_hidden[:, :-1, :]
-    )
+    torch.testing.assert_close(call["token_hidden_states"], backbone_hidden[:, :-1, :])
     torch.testing.assert_close(call["position_ids"], torch.arange(1, 5).unsqueeze(0))
     assert call["cache_position"] is None
 
@@ -109,9 +107,7 @@ def test_attached_mtp_uses_shifted_inputs_and_explicit_causal_mask(monkeypatch):
     torch.testing.assert_close(call["attention_mask"][0, 0], expected_mask)
     expected_padded_mask = expected_mask.clone()
     expected_padded_mask[:, 0] = mask_value
-    torch.testing.assert_close(
-        call["attention_mask"][1, 0], expected_padded_mask
-    )
+    torch.testing.assert_close(call["attention_mask"][1, 0], expected_padded_mask)
 
 
 def test_attached_mtp_supports_inputs_embeds(monkeypatch):

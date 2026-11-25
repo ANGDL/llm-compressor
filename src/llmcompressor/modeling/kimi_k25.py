@@ -28,7 +28,9 @@ def _patch_flash_attn_varlen_func() -> None:
     if function is None or getattr(function, "_kimi_k25_compat_patched", False):
         return
     try:
-        supports_deterministic = "deterministic" in inspect.signature(function).parameters
+        supports_deterministic = (
+            "deterministic" in inspect.signature(function).parameters
+        )
     except (TypeError, ValueError):
         supports_deterministic = False
     if supports_deterministic:
@@ -116,7 +118,13 @@ def _prepare_checkpoint_model_class(
     if config is None:
         config_kwargs = {
             key: kwargs[key]
-            for key in ("cache_dir", "revision", "token", "local_files_only", "code_revision")
+            for key in (
+                "cache_dir",
+                "revision",
+                "token",
+                "local_files_only",
+                "code_revision",
+            )
             if key in kwargs
         }
         config = AutoConfig.from_pretrained(
@@ -130,7 +138,13 @@ def _prepare_checkpoint_model_class(
     if model_ref is not None:
         class_kwargs = {
             key: kwargs[key]
-            for key in ("cache_dir", "revision", "token", "local_files_only", "code_revision")
+            for key in (
+                "cache_dir",
+                "revision",
+                "token",
+                "local_files_only",
+                "code_revision",
+            )
             if key in kwargs
         }
         model_class = get_class_from_dynamic_module(

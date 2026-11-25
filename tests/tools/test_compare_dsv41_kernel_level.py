@@ -109,7 +109,7 @@ def test_untrusted_instrumentation_cannot_attribute_first_divergence(
     assert not all(check["passed"] for check in checks.values())
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(not torch.accelerator.is_available(), reason="CUDA required")
 def test_official_gpu_trace_preserves_unmodified_output(tmp_path):
     source = os.environ.get("DSV41_OFFICIAL_KERNEL")
     if not source:

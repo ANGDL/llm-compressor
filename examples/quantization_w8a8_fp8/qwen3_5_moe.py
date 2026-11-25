@@ -3,7 +3,10 @@ from transformers import AutoProcessor, Qwen3_5MoeForConditionalGeneration
 from llmcompressor import oneshot
 from llmcompressor.modifiers.quantization import QuantizationModifier
 
-MODEL_ID = "/raid/engine/dsikka/models--Qwen--Qwen3.5-397B-A17B/snapshots/7cad2bae11cb49ca79f7d6a0954de2e2756f4e27"
+MODEL_ID = (
+    "/raid/engine/dsikka/models--Qwen--Qwen3.5-397B-A17B/"
+    "snapshots/7cad2bae11cb49ca79f7d6a0954de2e2756f4e27"
+)
 
 # Load model.
 model = Qwen3_5MoeForConditionalGeneration.from_pretrained(MODEL_ID, dtype="auto")

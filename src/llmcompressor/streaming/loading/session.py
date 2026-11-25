@@ -81,13 +81,9 @@ class LoadedSubgraph:
                     ):
                         continue
                     relative = (
-                        f"{owner_name}.{local_name}"
-                        if owner_name
-                        else local_name
+                        f"{owner_name}.{local_name}" if owner_name else local_name
                     )
-                    name = (
-                        f"{module_name}.{relative}" if module_name else relative
-                    )
+                    name = f"{module_name}.{relative}" if module_name else relative
                     if name not in seen:
                         seen.add(name)
                         yield name, buffer
@@ -191,9 +187,7 @@ class SubgraphWeightSession:
             model, source, materializer, dtype_policy=dtype_policy
         )
         self._source_names = set(source.tensor_names())
-        self._checkpoint_modules = self._build_checkpoint_modules(
-            self._source_names
-        )
+        self._checkpoint_modules = self._build_checkpoint_modules(self._source_names)
 
     @property
     def dtype_policy(self) -> StreamingDTypePolicy | None:
@@ -289,9 +283,7 @@ class SubgraphWeightSession:
     ) -> Generator[LoadedSubgraph, None, None]:
         """Load an explicit module aggregate through the streaming H2D boundary."""
 
-        plan = self.plan_modules(
-            module_names, allow_missing_state=allow_missing_state
-        )
+        plan = self.plan_modules(module_names, allow_missing_state=allow_missing_state)
         with self.loaded_plan(plan, device=device, dtype=dtype) as loaded:
             yield loaded
 
@@ -437,9 +429,7 @@ class SubgraphWeightSession:
         with ExitStack() as stack:
             stack.callback(prepared.close)
             stack.callback(self._restore_registered_state, registered_state)
-            stack.callback(
-                self._restore_runtime_tensor_attributes, runtime_attributes
-            )
+            stack.callback(self._restore_runtime_tensor_attributes, runtime_attributes)
             for target in prepared.targets:
                 stack.enter_context(self.loader.installed(target))
             # Loading one subgraph can require several module contexts. A
@@ -493,9 +483,10 @@ class SubgraphWeightSession:
         return module_name in self._checkpoint_modules
 
     def _has_loadable_state(self, module_name: str) -> bool:
-        return self.has_checkpoint_state(module_name) or next(
-            self.model.get_submodule(module_name).buffers(), None
-        ) is not None
+        return (
+            self.has_checkpoint_state(module_name)
+            or next(self.model.get_submodule(module_name).buffers(), None) is not None
+        )
 
     def _registered_state(
         self, module_names: Sequence[str]

@@ -53,9 +53,8 @@ def _materialization_dtype(
 ) -> torch.dtype:
     if dtype_policy is None:
         return target_dtype
-    return dtype_policy.resolve(
-        tensor_name, source_dtype, fallback_dtype=target_dtype
-    )
+    return dtype_policy.resolve(tensor_name, source_dtype, fallback_dtype=target_dtype)
+
 
 __all__ = ["quantize_streaming"]
 
@@ -133,9 +132,7 @@ def _validate_statistics(
 def _restore_imatrix(module: torch.nn.Module, statistics: Mapping[str, torch.Tensor]):
     observer = module.weight_observer
     observer._imatrix_sum = statistics["imatrix_sum"].to(module.weight.device)
-    observer._imatrix_count = statistics["imatrix_count"].to(
-        module.weight.device
-    )
+    observer._imatrix_count = statistics["imatrix_count"].to(module.weight.device)
 
 
 def _quantize_module(
@@ -241,9 +238,10 @@ def quantize_streaming(
         raise ArtifactCompatibilityError(
             "Calibration artifacts belong to a different source checkpoint"
         )
-    if materializer.manifest_info(
-        target_dtype=target_dtype, dtype_policy=dtype_policy
-    ) != manifest.materializer:
+    if (
+        materializer.manifest_info(target_dtype=target_dtype, dtype_policy=dtype_policy)
+        != manifest.materializer
+    ):
         raise ArtifactCompatibilityError(
             "Calibration artifacts were created with a different materializer "
             "or target dtype"
@@ -265,14 +263,11 @@ def quantize_streaming(
     ]
     if missing_weights:
         raise KeyError(
-            "Quantized weights are absent from checkpoint: "
-            f"{missing_weights}"
+            "Quantized weights are absent from checkpoint: " f"{missing_weights}"
         )
 
     staging = Path(staging_dir)
-    writer = StreamingCheckpointWriter(
-        staging, run_fingerprint=run_fingerprint
-    )
+    writer = StreamingCheckpointWriter(staging, run_fingerprint=run_fingerprint)
     device = torch.device(device)
     source_names = set(source.tensor_names())
     omitted_tied_weights = {}
@@ -295,9 +290,7 @@ def quantize_streaming(
         output_name = source_shard.name
         transaction_id = f"source-shard-{output_name}"
         if writer.is_transaction_complete(transaction_id):
-            logger.info(
-                f"streaming quantize: skipping complete shard {output_name}"
-            )
+            logger.info(f"streaming quantize: skipping complete shard {output_name}")
             continue
 
         logger.info(f"streaming quantize: processing shard {output_name}")
@@ -379,9 +372,7 @@ def quantize_streaming(
                     name, source.metadata(name)
                 )
                 if dependency_names:
-                    raw_values.update(
-                        source.load_tensors_cpu(dependency_names)
-                    )
+                    raw_values.update(source.load_tensors_cpu(dependency_names))
                     value = materializer.materialize_cpu(
                         name,
                         raw_values,
@@ -392,9 +383,10 @@ def quantize_streaming(
                             target_dtype,
                         ),
                     )
-                for serialized_name, serialized_tensor in (
-                    materializer.prepare_output_tensors(name, value).items()
-                ):
+                for (
+                    serialized_name,
+                    serialized_tensor,
+                ) in materializer.prepare_output_tensors(name, value).items():
                     transaction.write_tensor(
                         serialized_name,
                         serialized_tensor,

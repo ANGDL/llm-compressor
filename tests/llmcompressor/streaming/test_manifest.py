@@ -56,12 +56,11 @@ def test_manifest_round_trip_and_stable_fingerprint(checkpoint):
     restored = StreamingRunManifest.from_dict(manifest.to_dict())
 
     assert restored == manifest
-    assert source.content_fingerprint == fingerprint_checkpoint(
-        checkpoint
-    ).content_fingerprint
-    assert fingerprint_json({"b": 2, "a": 1}) == fingerprint_json(
-        {"a": 1, "b": 2}
+    assert (
+        source.content_fingerprint
+        == fingerprint_checkpoint(checkpoint).content_fingerprint
     )
+    assert fingerprint_json({"b": 2, "a": 1}) == fingerprint_json({"a": 1, "b": 2})
 
 
 def test_manifest_rejects_unknown_schema(checkpoint):
@@ -81,9 +80,7 @@ def test_manifest_rejects_unknown_fields(checkpoint):
 
 
 @pytest.mark.parametrize("changed_section", ["recipe", "sequential", "materializer"])
-def test_compatibility_rejects_result_affecting_changes(
-    checkpoint, changed_section
-):
+def test_compatibility_rejects_result_affecting_changes(checkpoint, changed_section):
     source = fingerprint_checkpoint(checkpoint)
     stored = make_manifest(source)
     replacements = {

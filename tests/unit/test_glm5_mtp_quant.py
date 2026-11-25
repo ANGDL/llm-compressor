@@ -132,6 +132,7 @@ SAMPLE_TEXTS = [
 # Tokenizer helpers
 # ---------------------------------------------------------------------------
 
+
 def build_minimal_tokenizer(vocab_size: int) -> PreTrainedTokenizerFast:
     """
     Build a byte-level BPE tokenizer trained on SAMPLE_TEXTS with at most
@@ -221,6 +222,7 @@ def make_calibration_dataset(
 # Model construction helpers
 # ---------------------------------------------------------------------------
 
+
 def build_mini_config() -> GlmMoeDsaConfig:
     cfg = GlmMoeDsaConfig(**MINI_CONFIG)
     print(
@@ -282,6 +284,7 @@ def build_mtp_state_dict(config: GlmMoeDsaConfig) -> dict[str, torch.Tensor]:
 # Checkpoint save / load
 # ---------------------------------------------------------------------------
 
+
 def save_checkpoint(
     model: GlmMoeDsaForCausalLM,
     tokenizer: PreTrainedTokenizerBase,
@@ -314,9 +317,12 @@ def save_checkpoint(
 # Verification
 # ---------------------------------------------------------------------------
 
+
 def verify_mtp_quantized(model: GlmMoeDsaForCausalLM) -> None:
     assert hasattr(model, "mtp"), "model.mtp not found - attach_mtp_layer failed"
-    assert isinstance(model.mtp.eh_proj, nn.Linear), "mtp.eh_proj should remain an nn.Linear"
+    assert isinstance(
+        model.mtp.eh_proj, nn.Linear
+    ), "mtp.eh_proj should remain an nn.Linear"
 
     mtp_linears = {
         name: mod
@@ -332,15 +338,18 @@ def verify_mtp_quantized(model: GlmMoeDsaForCausalLM) -> None:
         if scheme is not None:
             quantized += 1
 
-    assert getattr(model.mtp.eh_proj, "quantization_scheme", None) is None, (
-        "mtp.eh_proj should stay in BF16 and be excluded from quantization"
-    )
+    assert (
+        getattr(model.mtp.eh_proj, "quantization_scheme", None) is None
+    ), "mtp.eh_proj should stay in BF16 and be excluded from quantization"
 
     assert quantized > 0, (
         "No MTP Linear layers were quantized! "
         "Check that the ignore list does not exclude model.mtp.*"
     )
-    print(f"\n[verify] PASSED - {quantized}/{len(mtp_linears)} MTP Linear layers quantized.")
+    print(
+        f"\n[verify] PASSED - {quantized}/{len(mtp_linears)} "
+        "MTP Linear layers quantized."
+    )
 
 
 def verify_layer78_export(save_dir: str, mtp_idx: int) -> None:
@@ -364,11 +373,16 @@ def verify_layer78_export(save_dir: str, mtp_idx: int) -> None:
             }:
                 dtype_summary[key] = f.get_tensor(key).dtype
 
-    assert eh_proj_weight_key in dtype_summary, "eh_proj.weight missing from exported checkpoint"
+    assert (
+        eh_proj_weight_key in dtype_summary
+    ), "eh_proj.weight missing from exported checkpoint"
     assert dtype_summary[eh_proj_weight_key] == torch.bfloat16, (
-        f"Expected {eh_proj_weight_key} to remain bf16, got {dtype_summary[eh_proj_weight_key]}"
+        f"Expected {eh_proj_weight_key} to remain bf16, "
+        f"got {dtype_summary[eh_proj_weight_key]}"
     )
-    assert not bad_keys, f"eh_proj should not export quantization side tensors: {bad_keys}"
+    assert (
+        not bad_keys
+    ), f"eh_proj should not export quantization side tensors: {bad_keys}"
 
     for key, dtype in dtype_summary.items():
         assert dtype == torch.bfloat16, f"Expected {key} to be bf16, got {dtype}"

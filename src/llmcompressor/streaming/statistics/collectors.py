@@ -60,9 +60,7 @@ class _StatisticsCollector(AbstractContextManager):
             raise RuntimeError("Statistics collector is already attached")
         try:
             for name, module in self.modules.items():
-                handle = module.register_forward_pre_hook(
-                    self._make_hook(name, module)
-                )
+                handle = module.register_forward_pre_hook(self._make_hook(name, module))
                 self._handles.append(handle)
         except Exception:
             self.detach()
@@ -118,9 +116,7 @@ class GPTQStatisticsCollector(_StatisticsCollector):
                 return
             if name not in self._hessians:
                 self._hessians[name], self._num_samples[name] = (
-                    make_empty_gptq_statistics(
-                        module, device=self.storage_device
-                    )
+                    make_empty_gptq_statistics(module, device=self.storage_device)
                 )
             hessian, count = accumulate_hessian(
                 inputs.detach(),
@@ -155,9 +151,7 @@ class IMatrixStatisticsCollector(_StatisticsCollector):
     def _make_hook(self, name: str, module: nn.Module):
         in_features = getattr(module, "in_features", None)
         if not isinstance(in_features, int) or in_features <= 0:
-            raise TypeError(
-                f"iMatrix module {name!r} must define positive in_features"
-            )
+            raise TypeError(f"iMatrix module {name!r} must define positive in_features")
 
         def hook(_module: nn.Module, args: tuple[Any, ...]) -> None:
             inputs = _canonical_input(args)
@@ -170,24 +164,18 @@ class IMatrixStatisticsCollector(_StatisticsCollector):
                     f"{module.in_features}"
                 )
             if name not in self._sums:
-                self._sums[name], self._counts[name] = (
-                    make_empty_imatrix_statistics(
-                        in_features, device=self.storage_device
-                    )
+                self._sums[name], self._counts[name] = make_empty_imatrix_statistics(
+                    in_features, device=self.storage_device
                 )
-            self._sums[name], self._counts[name] = (
-                accumulate_imatrix_statistics(
-                    inputs, self._sums[name], self._counts[name]
-                )
+            self._sums[name], self._counts[name] = accumulate_imatrix_statistics(
+                inputs, self._sums[name], self._counts[name]
             )
 
         return hook
 
     def _require_initialized(self, name: str) -> None:
         if name not in self._sums:
-            raise RuntimeError(
-                f"No iMatrix inputs were collected for module {name!r}"
-            )
+            raise RuntimeError(f"No iMatrix inputs were collected for module {name!r}")
 
     def _export_module(self, name: str) -> dict[str, torch.Tensor]:
         return {

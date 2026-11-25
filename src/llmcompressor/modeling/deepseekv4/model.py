@@ -21,9 +21,7 @@ block_size = 128
 
 def _runtime_buffer_device(args: ModelConfig) -> torch.device | None:
     return (
-        torch.device("meta")
-        if getattr(args, "_streaming_meta_init", False)
-        else None
+        torch.device("meta") if getattr(args, "_streaming_meta_init", False) else None
     )
 
 
@@ -51,13 +49,21 @@ def _dequantize_block_weight(weight: torch.Tensor, scale: torch.Tensor) -> torch
     return view.reshape(weight.shape[0], weight.shape[1])
 
 
-def linear(x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] = None, scale: Optional[torch.Tensor] = None) -> torch.Tensor:
+def linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    scale: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
     if scale is not None:
         weight = _dequantize_block_weight(weight, scale)
-    return F.linear(x.float(), weight.float(), None if bias is None else bias.float()).to(x.dtype)
+    return F.linear(
+        x.float(), weight.float(), None if bias is None else bias.float()
+    ).to(x.dtype)
 
 
 Linear = nn.Linear
+
 
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -84,7 +90,11 @@ def precompute_freqs_cis(
     beta_slow: int,
 ) -> torch.Tensor:
     def find_correction_dim(num_rotations, dim, base, max_seq_len):
-        return dim * math.log(max_seq_len / (num_rotations * 2 * math.pi)) / (2 * math.log(base))
+        return (
+            dim
+            * math.log(max_seq_len / (num_rotations * 2 * math.pi))
+            / (2 * math.log(base))
+        )
 
     def find_correction_range(low_rot, high_rot, dim, base, max_seq_len):
         low = math.floor(find_correction_dim(low_rot, dim, base, max_seq_len))
@@ -102,7 +112,9 @@ def precompute_freqs_cis(
 
     freqs = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
     if original_seq_len > 0:
-        low, high = find_correction_range(beta_fast, beta_slow, dim, base, original_seq_len)
+        low, high = find_correction_range(
+            beta_fast, beta_slow, dim, base, original_seq_len
+        )
         smooth = 1 - linear_ramp_factor(low, high, dim // 2)
         freqs = freqs / factor * (1 - smooth) + freqs * smooth
 
@@ -111,7 +123,9 @@ def precompute_freqs_cis(
     return torch.polar(torch.ones_like(freqs), freqs)
 
 
-def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = False) -> torch.Tensor:
+def apply_rotary_emb(
+    x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = False
+) -> torch.Tensor:
     y = x
     x_complex = torch.view_as_complex(x.float().unflatten(-1, (-1, 2)))
     if inverse:
@@ -154,13 +168,17 @@ def get_window_topk_idxs(window_size: int, bsz: int, seqlen: int, start_pos: int
         )
     else:
         base = torch.arange(seqlen).unsqueeze(1)
-        matrix = (base - window_size + 1).clamp(0) + torch.arange(min(seqlen, window_size))
+        matrix = (base - window_size + 1).clamp(0) + torch.arange(
+            min(seqlen, window_size)
+        )
         matrix = torch.where(matrix > base, -1, matrix)
     return matrix.unsqueeze(0).expand(bsz, -1, -1)
 
 
 @lru_cache(2)
-def get_compress_topk_idxs(ratio: int, bsz: int, seqlen: int, start_pos: int, offset: int):
+def get_compress_topk_idxs(
+    ratio: int, bsz: int, seqlen: int, start_pos: int, offset: int
+):
     if start_pos > 0:
         matrix = torch.arange(0, (start_pos + 1) // ratio) + offset
     else:
@@ -181,7 +199,13 @@ def hc_split_softmax(
 
 
 class Compressor(nn.Module):
-    def __init__(self, args: ModelConfig, compress_ratio: int = 4, head_dim: Optional[int] = None, rotate: bool = False):
+    def __init__(
+        self,
+        args: ModelConfig,
+        compress_ratio: int = 4,
+        head_dim: Optional[int] = None,
+        rotate: bool = False,
+    ):
         super().__init__()
         self.dim = args.dim
         self.head_dim = head_dim or args.head_dim
@@ -189,7 +213,11 @@ class Compressor(nn.Module):
         self.compress_ratio = compress_ratio
         self.rotate = rotate
         overlap_factor = 1 + self.overlap
-        self.ape = nn.Parameter(torch.empty(compress_ratio, overlap_factor * self.head_dim, dtype=torch.float32))
+        self.ape = nn.Parameter(
+            torch.empty(
+                compress_ratio, overlap_factor * self.head_dim, dtype=torch.float32
+            )
+        )
         self.wkv = Linear(self.dim, overlap_factor * self.head_dim, bias=False)
         self.wgate = Linear(self.dim, overlap_factor * self.head_dim, bias=False)
         self.norm = RMSNorm(self.head_dim, args.norm_eps)
@@ -210,7 +238,11 @@ class Compressor(nn.Module):
         self.register_buffer(
             "score_state",
             torch.full(
-                (args.max_batch_size, overlap_factor * compress_ratio, overlap_factor * self.head_dim),
+                (
+                    args.max_batch_size,
+                    overlap_factor * compress_ratio,
+                    overlap_factor * self.head_dim,
+                ),
                 float("-inf"),
                 dtype=torch.float32,
                 device=_runtime_buffer_device(args),
@@ -218,7 +250,9 @@ class Compressor(nn.Module):
             persistent=False,
         )
 
-    def overlap_transform(self, tensor: torch.Tensor, value: float = 0.0) -> torch.Tensor:
+    def overlap_transform(
+        self, tensor: torch.Tensor, value: float = 0.0
+    ) -> torch.Tensor:
         bsz, seqlen, _, _ = tensor.size()
         ratio = self.compress_ratio
         dim = self.head_dim
@@ -249,8 +283,12 @@ class Compressor(nn.Module):
                 kv_state[:bsz, :ratio] = kv[:, cutoff - ratio : cutoff]
                 score_state[:bsz, :ratio] = score[:, cutoff - ratio : cutoff] + self.ape
             if remainder > 0:
-                kv, kv_state[:bsz, offset : offset + remainder] = kv.split([cutoff, remainder], dim=1)
-                score_state[:bsz, offset : offset + remainder] = score[:, cutoff:] + self.ape[:remainder]
+                kv, kv_state[:bsz, offset : offset + remainder] = kv.split(
+                    [cutoff, remainder], dim=1
+                )
+                score_state[:bsz, offset : offset + remainder] = (
+                    score[:, cutoff:] + self.ape[:remainder]
+                )
                 score = score[:, :cutoff]
             if not should_compress:
                 return None
@@ -274,8 +312,13 @@ class Compressor(nn.Module):
             kv_state[:bsz, ratio + start_pos % ratio] = kv[:, 0]
             score_state[:bsz, ratio + start_pos % ratio] = score[:, 0]
             if should_compress:
-                kv_live = torch.cat([kv_state[:bsz, :ratio, :dim], kv_state[:bsz, ratio:, dim:]], dim=1)
-                score_live = torch.cat([score_state[:bsz, :ratio, :dim], score_state[:bsz, ratio:, dim:]], dim=1)
+                kv_live = torch.cat(
+                    [kv_state[:bsz, :ratio, :dim], kv_state[:bsz, ratio:, dim:]], dim=1
+                )
+                score_live = torch.cat(
+                    [score_state[:bsz, :ratio, :dim], score_state[:bsz, ratio:, dim:]],
+                    dim=1,
+                )
                 kv = (kv_live * score_live.softmax(dim=1)).sum(dim=1, keepdim=True)
                 kv_state[:bsz, :ratio] = kv_state[:bsz, ratio:]
                 score_state[:bsz, :ratio] = score_state[:bsz, ratio:]
@@ -284,14 +327,20 @@ class Compressor(nn.Module):
             kv_state[:bsz, slot, :dim] = kv[:, 0, :dim]
             score_state[:bsz, slot, :dim] = score[:, 0, :dim]
             if should_compress:
-                kv = (kv_state[:bsz, :, :dim] * score_state[:bsz, :, :dim].softmax(dim=1)).sum(dim=1, keepdim=True)
+                kv = (
+                    kv_state[:bsz, :, :dim] * score_state[:bsz, :, :dim].softmax(dim=1)
+                ).sum(dim=1, keepdim=True)
         if not should_compress:
             return None
         compressed = self.norm(kv.to(x.dtype))
-        freqs_cis = cast(torch.Tensor, self.freqs_cis)[start_pos + 1 - ratio].unsqueeze(0)
+        freqs_cis = cast(torch.Tensor, self.freqs_cis)[start_pos + 1 - ratio].unsqueeze(
+            0
+        )
         if self.rope_head_dim > 0:
             apply_rotary_emb(compressed[..., -self.rope_head_dim :], freqs_cis)
-        cast(torch.Tensor, self.kv_cache)[:bsz, start_pos // ratio] = compressed[:, 0].float()
+        cast(torch.Tensor, self.kv_cache)[:bsz, start_pos // ratio] = compressed[
+            :, 0
+        ].float()
         return compressed
 
 
@@ -340,7 +389,9 @@ class Indexer(nn.Module):
         compressed_len = end_pos // ratio
         if compressed_len == 0:
             return torch.full((bsz, seqlen, 0), -1, dtype=torch.long, device=x.device)
-        weights = self.weights_proj(x).float() * (self.softmax_scale * self.n_heads**-0.5)
+        weights = self.weights_proj(x).float() * (
+            self.softmax_scale * self.n_heads**-0.5
+        )
         score = torch.einsum(
             "bshd,btd->bsht",
             q.float(),
@@ -355,7 +406,9 @@ class Indexer(nn.Module):
         topk = min(self.index_topk, compressed_len)
         indices = score.topk(topk, dim=-1).indices
         if start_pos == 0:
-            mask = indices >= (torch.arange(1, seqlen + 1, device=x.device).unsqueeze(1) // ratio)
+            mask = indices >= (
+                torch.arange(1, seqlen + 1, device=x.device).unsqueeze(1) // ratio
+            )
             indices = torch.where(mask, torch.full_like(indices, -1), indices + offset)
         else:
             indices = indices + offset
@@ -376,10 +429,16 @@ class Attention(nn.Module):
         self.n_groups = args.o_groups
         self.n_local_groups = args.o_groups
         self.window_size = args.window_size
-        self.compress_ratio = args.compress_ratios[layer_id] if layer_id < len(args.compress_ratios) else 0
+        self.compress_ratio = (
+            args.compress_ratios[layer_id]
+            if layer_id < len(args.compress_ratios)
+            else 0
+        )
         self.eps = args.norm_eps
 
-        self.attn_sink = nn.Parameter(torch.empty(self.n_local_heads, dtype=torch.float32))
+        self.attn_sink = nn.Parameter(
+            torch.empty(self.n_local_heads, dtype=torch.float32)
+        )
         self.wq_a = Linear(self.dim, self.q_lora_rank, bias=False)
         self.q_norm = RMSNorm(self.q_lora_rank, args.norm_eps)
         self.wq_b = Linear(self.q_lora_rank, self.n_heads * self.head_dim, bias=False)
@@ -394,11 +453,15 @@ class Attention(nn.Module):
         self.softmax_scale = self.head_dim**-0.5
         if self.compress_ratio:
             self.compressor = Compressor(args, self.compress_ratio, self.head_dim)
-            self.indexer = Indexer(args, self.compress_ratio) if self.compress_ratio == 4 else None
+            self.indexer = (
+                Indexer(args, self.compress_ratio) if self.compress_ratio == 4 else None
+            )
         else:
             self.compressor = None
             self.indexer = None
-        kv_cache_size = self.window_size + (args.max_seq_len // self.compress_ratio if self.compress_ratio else 0)
+        kv_cache_size = self.window_size + (
+            args.max_seq_len // self.compress_ratio if self.compress_ratio else 0
+        )
         if self.compress_ratio:
             original_seq_len = args.original_seq_len
             rope_theta = args.compress_rope_theta
@@ -434,7 +497,9 @@ class Attention(nn.Module):
                 args.rope_factor,
                 args.beta_fast,
                 args.beta_slow,
-            ).clone().to(device=_runtime_buffer_device(args)),
+            )
+            .clone()
+            .to(device=_runtime_buffer_device(args)),
             persistent=False,
         )
 
@@ -445,7 +510,9 @@ class Attention(nn.Module):
         win = self.window_size
         qr = self.q_norm(self.wq_a(x))
         q = self.wq_b(qr).view(bsz, seqlen, self.n_local_heads, self.head_dim)
-        q = q * torch.rsqrt(q.float().square().mean(-1, keepdim=True) + self.eps).to(q.dtype)
+        q = q * torch.rsqrt(q.float().square().mean(-1, keepdim=True) + self.eps).to(
+            q.dtype
+        )
         if self.rope_head_dim > 0:
             apply_rotary_emb(q[..., -self.rope_head_dim :], freqs_cis)
 
@@ -453,7 +520,11 @@ class Attention(nn.Module):
         if self.rope_head_dim > 0:
             apply_rotary_emb(kv[..., -self.rope_head_dim :], freqs_cis)
 
-        if self.compress_ratio and self.compressor is not None and self.compressor.kv_cache is None:
+        if (
+            self.compress_ratio
+            and self.compressor is not None
+            and self.compressor.kv_cache is None
+        ):
             self.compressor.kv_cache = kv_cache[:, win:]
             self.compressor.freqs_cis = cast(torch.Tensor, self.freqs_cis)
             if self.indexer is not None:
@@ -465,7 +536,9 @@ class Attention(nn.Module):
             if self.indexer is not None:
                 compress_topk_idxs = self.indexer(x, qr, start_pos, offset)
             else:
-                compress_topk_idxs = get_compress_topk_idxs(self.compress_ratio, bsz, seqlen, start_pos, offset).to(x.device)
+                compress_topk_idxs = get_compress_topk_idxs(
+                    self.compress_ratio, bsz, seqlen, start_pos, offset
+                ).to(x.device)
             topk_idxs = torch.cat([topk_idxs, compress_topk_idxs.int()], dim=-1)
 
         if self.compress_ratio == 0:
@@ -474,7 +547,9 @@ class Attention(nn.Module):
                     kv_cache[:bsz, :seqlen] = kv.float()
                 else:
                     cutoff = seqlen % win
-                    left, right = kv[:, -win:].float().split([win - cutoff, cutoff], dim=1)
+                    left, right = (
+                        kv[:, -win:].float().split([win - cutoff, cutoff], dim=1)
+                    )
                     kv_cache[:bsz, cutoff:win] = left
                     kv_cache[:bsz, :cutoff] = right
                 attn_kv = kv
@@ -487,32 +562,50 @@ class Attention(nn.Module):
                     kv_cache[:bsz, :seqlen] = kv.float()
                 else:
                     cutoff = seqlen % win
-                    left, right = kv[:, -win:].float().split([win - cutoff, cutoff], dim=1)
+                    left, right = (
+                        kv[:, -win:].float().split([win - cutoff, cutoff], dim=1)
+                    )
                     kv_cache[:bsz, cutoff:win] = left
                     kv_cache[:bsz, :cutoff] = right
-                kv_compress = self.compressor(x, start_pos) if self.compressor is not None else None
-                attn_kv = torch.cat([kv, kv_compress], dim=1) if kv_compress is not None else kv
+                kv_compress = (
+                    self.compressor(x, start_pos)
+                    if self.compressor is not None
+                    else None
+                )
+                attn_kv = (
+                    torch.cat([kv, kv_compress], dim=1)
+                    if kv_compress is not None
+                    else kv
+                )
             else:
                 kv_cache[:bsz, start_pos % win] = kv[:, 0].float()
                 if self.compressor is not None:
                     self.compressor(x, start_pos)
                 attn_kv = kv_cache[:bsz]
 
-        output = sparse_attention(q, attn_kv, self.attn_sink, topk_idxs, self.softmax_scale).to(x.dtype)
+        output = sparse_attention(
+            q, attn_kv, self.attn_sink, topk_idxs, self.softmax_scale
+        ).to(x.dtype)
         if self.rope_head_dim > 0:
-            apply_rotary_emb(output[..., -self.rope_head_dim :], freqs_cis, inverse=True)
+            apply_rotary_emb(
+                output[..., -self.rope_head_dim :], freqs_cis, inverse=True
+            )
         output = output.view(bsz, seqlen, self.n_local_groups, -1)
         # Call wo_a through forward() so quantization hooks can observe activations.
-        # wo_a is a block-diagonal grouped projection: each group's input (per_group_dim)
+        # wo_a is a block-diagonal grouped projection: each group's input
+        # (per_group_dim)
         # maps to its own o_lora_rank outputs via the corresponding weight rows.
         per_group_dim = output.size(-1)
         all_inputs = output.reshape(-1, per_group_dim)
         all_outputs = self.wo_a(all_inputs)
         all_outputs = all_outputs.view(bsz * seqlen, self.n_local_groups, -1)
-        output = torch.stack([
-            all_outputs[:, g, g * self.o_lora_rank : (g + 1) * self.o_lora_rank]
-            for g in range(self.n_local_groups)
-        ], dim=1).view(bsz, seqlen, self.n_local_groups, self.o_lora_rank)
+        output = torch.stack(
+            [
+                all_outputs[:, g, g * self.o_lora_rank : (g + 1) * self.o_lora_rank]
+                for g in range(self.n_local_groups)
+            ],
+            dim=1,
+        ).view(bsz, seqlen, self.n_local_groups, self.o_lora_rank)
         return self.wo_b(output.flatten(2).to(x.dtype))
 
 
@@ -523,15 +616,22 @@ class Gate(nn.Module):
         self.score_func = args.score_func
         self.route_scale = args.route_scale
         self.hash = layer_id < args.n_hash_layers
-        self.weight = nn.Parameter(torch.empty(args.n_routed_experts, args.dim, dtype=torch.float32))
+        self.weight = nn.Parameter(
+            torch.empty(args.n_routed_experts, args.dim, dtype=torch.float32)
+        )
         if self.hash:
             self.tid2eid = nn.Parameter(
-                torch.arange(args.vocab_size, dtype=torch.int64).unsqueeze(-1).repeat(1, self.topk) % args.n_routed_experts,
+                torch.arange(args.vocab_size, dtype=torch.int64)
+                .unsqueeze(-1)
+                .repeat(1, self.topk)
+                % args.n_routed_experts,
                 requires_grad=False,
             )
             self.register_parameter("bias", None)
         else:
-            self.bias = nn.Parameter(torch.empty(args.n_routed_experts, dtype=torch.float32))
+            self.bias = nn.Parameter(
+                torch.empty(args.n_routed_experts, dtype=torch.float32)
+            )
 
     def forward(self, x: torch.Tensor, input_ids: Optional[torch.Tensor] = None):
         scores = F.linear(x.float(), self.weight.float())
@@ -541,7 +641,9 @@ class Gate(nn.Module):
             original_scores = scores.sigmoid()
         else:
             original_scores = F.softplus(scores).sqrt()
-        routed_scores = original_scores if self.bias is None else original_scores + self.bias
+        routed_scores = (
+            original_scores if self.bias is None else original_scores + self.bias
+        )
         if self.hash and input_ids is not None:
             indices = self.tid2eid[input_ids]
         else:
@@ -561,7 +663,9 @@ class Expert(nn.Module):
         self.w3 = Linear(dim, inter_dim, bias=False)
         self.swiglu_limit = swiglu_limit
 
-    def forward(self, x: torch.Tensor, weights: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, weights: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         gate = self.w1(x).float()
         up = self.w3(x).float()
         if self.swiglu_limit > 0:
@@ -587,13 +691,17 @@ class DeepseekV4MoE(nn.Module):
         )
         self.shared_experts = Expert(args.dim, args.moe_inter_dim)
 
-    def forward(self, x: torch.Tensor, input_ids: Optional[torch.Tensor]) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, input_ids: Optional[torch.Tensor]
+    ) -> torch.Tensor:
         orig_shape = x.shape
         x = x.view(-1, self.dim)
         flat_ids = None if input_ids is None else input_ids.flatten()
         weights, indices = self.gate(x, flat_ids)
         output = torch.zeros_like(x, dtype=torch.float32)
-        counts = torch.bincount(indices.flatten(), minlength=self.n_routed_experts).tolist()
+        counts = torch.bincount(
+            indices.flatten(), minlength=self.n_routed_experts
+        ).tolist()
         for expert_index in range(self.n_routed_experts):
             if counts[expert_index] == 0:
                 continue
@@ -625,7 +733,13 @@ class Block(nn.Module):
             self.hc_attn_scale = nn.Parameter(torch.empty(3))
             self.hc_ffn_scale = nn.Parameter(torch.empty(3))
 
-    def hc_pre(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor):
+    def hc_pre(
+        self,
+        x: torch.Tensor,
+        hc_fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+    ):
         orig_shape = x.shape
         flat = x.flatten(2).float()
         rsqrt = torch.rsqrt(flat.square().mean(-1, keepdim=True) + self.norm_eps)
@@ -641,19 +755,33 @@ class Block(nn.Module):
         reduced = torch.sum(pre.unsqueeze(-1) * flat.view(orig_shape), dim=2)
         return reduced.to(x.dtype), post, comb
 
-    def hc_post(self, x: torch.Tensor, residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor):
-        mixed = post.unsqueeze(-1) * x.unsqueeze(-2) + torch.sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2)
+    def hc_post(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        post: torch.Tensor,
+        comb: torch.Tensor,
+    ):
+        mixed = post.unsqueeze(-1) * x.unsqueeze(-2) + torch.sum(
+            comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2
+        )
         return mixed.to(x.dtype)
 
-    def forward(self, x: torch.Tensor, start_pos: int, input_ids: Optional[torch.Tensor]) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, start_pos: int, input_ids: Optional[torch.Tensor]
+    ) -> torch.Tensor:
         residual = x
-        x, post, comb = self.hc_pre(x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
+        x, post, comb = self.hc_pre(
+            x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
+        )
         x = self.attn_norm(x)
         x = self.attn(x, start_pos)
         x = self.hc_post(x, residual, post, comb)
 
         residual = x
-        x, post, comb = self.hc_pre(x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
+        x, post, comb = self.hc_pre(
+            x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base
+        )
         x = self.ffn_norm(x)
         x = self.ffn(x, input_ids)
         x = self.hc_post(x, residual, post, comb)
@@ -661,15 +789,25 @@ class Block(nn.Module):
 
 
 class ParallelHead(nn.Module):
-    def __init__(self, vocab_size: int, dim: int, norm_eps: float = 1e-6, hc_eps: float = 1e-6):
+    def __init__(
+        self, vocab_size: int, dim: int, norm_eps: float = 1e-6, hc_eps: float = 1e-6
+    ):
         super().__init__()
         self.vocab_size = vocab_size
         self.dim = dim
         self.norm_eps = norm_eps
         self.hc_eps = hc_eps
-        self.weight = nn.Parameter(torch.empty(self.vocab_size, self.dim, dtype=torch.float32))
+        self.weight = nn.Parameter(
+            torch.empty(self.vocab_size, self.dim, dtype=torch.float32)
+        )
 
-    def hc_head(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor):
+    def hc_head(
+        self,
+        x: torch.Tensor,
+        hc_fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+    ):
         orig_shape = x.shape
         flat = x.flatten(2).float()
         rsqrt = torch.rsqrt(flat.square().mean(-1, keepdim=True) + self.norm_eps)
@@ -677,7 +815,14 @@ class ParallelHead(nn.Module):
         pre = torch.sigmoid(mixes * hc_scale.float() + hc_base.float()) + self.hc_eps
         return torch.sum(pre.unsqueeze(-1) * flat.view(orig_shape), dim=2).to(x.dtype)
 
-    def forward(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor, norm: RMSNorm):
+    def forward(
+        self,
+        x: torch.Tensor,
+        hc_fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+        norm: RMSNorm,
+    ):
         hidden = self.hc_head(x, hc_fn, hc_scale, hc_base)
         logits = F.linear(norm(hidden).float(), self.weight.float())
         return logits
@@ -694,18 +839,24 @@ class MTPBlock(Block):
         self.embed: Optional[Embedding] = None
         self.lm_head: Optional[ParallelHead] = None
         with set_dtype(torch.float32):
-            self.hc_head_fn = nn.Parameter(torch.empty(args.hc_mult, args.hc_mult * args.dim))
+            self.hc_head_fn = nn.Parameter(
+                torch.empty(args.hc_mult, args.hc_mult * args.dim)
+            )
             self.hc_head_base = nn.Parameter(torch.empty(args.hc_mult))
             self.hc_head_scale = nn.Parameter(torch.empty(1))
 
-    def forward(self, x: torch.Tensor, start_pos: int, input_ids: Optional[torch.Tensor]) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, start_pos: int, input_ids: Optional[torch.Tensor]
+    ) -> torch.Tensor:
         assert self.embed is not None and self.lm_head is not None
         assert input_ids is not None
         e = self.enorm(self.embed(input_ids))
         x = self.hnorm(x)
         x = self.e_proj(e).unsqueeze(2) + self.h_proj(x)
         x = super().forward(x, start_pos, input_ids)
-        return self.lm_head(x, self.hc_head_fn, self.hc_head_scale, self.hc_head_base, self.norm)
+        return self.lm_head(
+            x, self.hc_head_fn, self.hc_head_scale, self.hc_head_base, self.norm
+        )
 
 
 class Transformer(nn.Module):
@@ -714,19 +865,34 @@ class Transformer(nn.Module):
         self.max_seq_len = args.max_seq_len
         self.hc_mult = args.hc_mult
         self.embed = Embedding(args.vocab_size, args.dim)
-        self.layers = nn.ModuleList([Block(layer_id, args) for layer_id in range(args.n_layers)])
+        self.layers = nn.ModuleList(
+            [Block(layer_id, args) for layer_id in range(args.n_layers)]
+        )
         self.norm = RMSNorm(args.dim, args.norm_eps)
-        self.lm_head = ParallelHead(args.vocab_size, args.dim, args.norm_eps, args.hc_eps)
-        self.mtp = nn.ModuleList([MTPBlock(args.n_layers + layer_id, args) for layer_id in range(args.n_mtp_layers)])
+        self.lm_head = ParallelHead(
+            args.vocab_size, args.dim, args.norm_eps, args.hc_eps
+        )
+        self.mtp = nn.ModuleList(
+            [
+                MTPBlock(args.n_layers + layer_id, args)
+                for layer_id in range(args.n_mtp_layers)
+            ]
+        )
         for mtp_block in self.mtp:
             mtp_block.embed = self.embed
             mtp_block.lm_head = self.lm_head
         self._dynamic_tied_weights_keys = {}
         for layer_id in range(args.n_mtp_layers):
-            self._dynamic_tied_weights_keys[f"mtp.{layer_id}.embed.weight"] = "embed.weight"
-            self._dynamic_tied_weights_keys[f"mtp.{layer_id}.lm_head.weight"] = "lm_head.weight"
+            self._dynamic_tied_weights_keys[f"mtp.{layer_id}.embed.weight"] = (
+                "embed.weight"
+            )
+            self._dynamic_tied_weights_keys[f"mtp.{layer_id}.lm_head.weight"] = (
+                "lm_head.weight"
+            )
         with set_dtype(torch.float32):
-            self.hc_head_fn = nn.Parameter(torch.empty(args.hc_mult, args.hc_mult * args.dim))
+            self.hc_head_fn = nn.Parameter(
+                torch.empty(args.hc_mult, args.hc_mult * args.dim)
+            )
             self.hc_head_base = nn.Parameter(torch.empty(args.hc_mult))
             self.hc_head_scale = nn.Parameter(torch.empty(1))
 
@@ -735,7 +901,13 @@ class Transformer(nn.Module):
         hidden_states = hidden_states.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
         for layer in self.layers:
             hidden_states = layer(hidden_states, start_pos, input_ids)
-        logits = self.lm_head(hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base, self.norm)
+        logits = self.lm_head(
+            hidden_states,
+            self.hc_head_fn,
+            self.hc_head_scale,
+            self.hc_head_base,
+            self.norm,
+        )
         for mtp_block in self.mtp:
             mtp_block(hidden_states, start_pos, input_ids)
         return logits
@@ -773,7 +945,9 @@ class DeepseekV4NativePreTrainedModel(PreTrainedModel):
         legacy_removals = []
         for key in list(state_dict.keys()):
             if key.startswith("model.head."):
-                legacy_updates[key.replace("model.head.", "model.lm_head.", 1)] = state_dict[key]
+                legacy_updates[key.replace("model.head.", "model.lm_head.", 1)] = (
+                    state_dict[key]
+                )
                 legacy_removals.append(key)
 
         for key in legacy_removals:
@@ -837,7 +1011,9 @@ class DeepseekV4NativePreTrainedModel(PreTrainedModel):
             if isinstance(module, Attention):
                 compress_ratio = module.compress_ratio
                 original_seq_len = args.original_seq_len if compress_ratio else 0
-                rope_theta = args.compress_rope_theta if compress_ratio else args.rope_theta
+                rope_theta = (
+                    args.compress_rope_theta if compress_ratio else args.rope_theta
+                )
                 freqs_cis = precompute_freqs_cis(
                     module.rope_head_dim,
                     args.max_seq_len,
@@ -847,7 +1023,9 @@ class DeepseekV4NativePreTrainedModel(PreTrainedModel):
                     args.beta_fast,
                     args.beta_slow,
                 )
-                module._buffers["freqs_cis"] = freqs_cis.clone().to(module.freqs_cis.device)
+                module._buffers["freqs_cis"] = freqs_cis.clone().to(
+                    module.freqs_cis.device
+                )
                 kv_cache_size = module.window_size + (
                     args.max_seq_len // compress_ratio if compress_ratio else 0
                 )
@@ -933,7 +1111,7 @@ class DeepseekV4NativeForCausalLM(DeepseekV4NativePreTrainedModel, GenerationMix
         for key, value in list(state_dict.items()):
             new_key = key
             if new_key.startswith("model."):
-                new_key = new_key[len("model."):]
+                new_key = new_key[len("model.") :]
             new_key = new_key.replace(".weight_scale", ".scale")
             new_key = new_key.replace("lm_head.", "head.")
             remapped[new_key] = value
@@ -961,7 +1139,11 @@ class DeepseekV4NativeForCausalLM(DeepseekV4NativePreTrainedModel, GenerationMix
         **kwargs: Unpack[TransformersKwargs],
     ) -> CausalLMOutputWithPast:
         logits = self.model(input_ids=input_ids)
-        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) and logits_to_keep > 0 else logits_to_keep
+        slice_indices = (
+            slice(-logits_to_keep, None)
+            if isinstance(logits_to_keep, int) and logits_to_keep > 0
+            else logits_to_keep
+        )
         if isinstance(slice_indices, slice):
             logits = logits[:, slice_indices, :]
         elif isinstance(slice_indices, torch.Tensor):

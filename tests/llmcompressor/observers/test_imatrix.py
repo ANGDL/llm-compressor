@@ -3,19 +3,17 @@ import torch
 from compressed_tensors.quantization.quant_args import QuantizationArgs
 
 import llmcompressor.observers.imatrix as imatrix
+from llmcompressor.modifiers.utils.hooks import HooksMixin
+from llmcompressor.observers.base import Observer
 from llmcompressor.observers.imatrix import (
+    _grid_search,
     accumulate_imatrix_statistics,
     make_empty_imatrix_statistics,
 )
-from llmcompressor.modifiers.utils.hooks import HooksMixin
-from llmcompressor.observers.base import Observer
-from llmcompressor.observers.imatrix import _grid_search
 
 
 def test_shared_statistics_primitives_match_sum_squared_definition():
-    inputs = torch.tensor(
-        [[[1.0, 2.0, 3.0], [2.0, 3.0, 4.0]]], dtype=torch.bfloat16
-    )
+    inputs = torch.tensor([[[1.0, 2.0, 3.0], [2.0, 3.0, 4.0]]], dtype=torch.bfloat16)
     imatrix_sum, imatrix_count = make_empty_imatrix_statistics(3)
 
     imatrix_sum, imatrix_count = accumulate_imatrix_statistics(
@@ -25,6 +23,7 @@ def test_shared_statistics_primitives_match_sum_squared_definition():
     expected = inputs.float().square().sum(dim=(0, 1))
     assert torch.equal(imatrix_sum, expected)
     assert imatrix_count.item() == 2
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -548,11 +547,11 @@ class TestChunkBehavior:
         ), "chunk_size=1 should split qparams into single-column chunks"
 
     @pytest.mark.skipif(
-        not (torch.cuda.is_available() or torch.backends.mps.is_available()),
+        not (torch.accelerator.is_available() or torch.backends.mps.is_available()),
         reason="No accelerator available",
     )
     def test_grid_search_accelerator_oom_retries_chunk_before_cpu(self, monkeypatch):
-        accelerator = "cuda" if torch.cuda.is_available() else "mps"
+        accelerator = "cuda" if torch.accelerator.is_available() else "mps"
         observed = torch.randn(2, 4, 8).to(accelerator)
         importance = torch.rand_like(observed)
         args = QuantizationArgs(
@@ -610,11 +609,11 @@ class TestChunkBehavior:
 
 
 @pytest.mark.skipif(
-    not (torch.cuda.is_available() or torch.backends.mps.is_available()),
+    not (torch.accelerator.is_available() or torch.backends.mps.is_available()),
     reason="No accelerator available",
 )
 def test_grid_search_falls_back_to_cpu_on_accelerator_oom(monkeypatch):
-    accelerator = "cuda" if torch.cuda.is_available() else "mps"
+    accelerator = "cuda" if torch.accelerator.is_available() else "mps"
     observed_cpu = torch.randn(3, 4, 8)
     observed_accelerator = observed_cpu.to(accelerator)
     importance_cpu = torch.rand_like(observed_cpu)

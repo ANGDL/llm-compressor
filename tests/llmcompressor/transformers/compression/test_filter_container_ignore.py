@@ -1,8 +1,6 @@
 """Tests for _filter_container_modules_from_ignore in compressed_tensors_utils."""
 
-import torch
 import torch.nn as nn
-
 from compressed_tensors.quantization.quant_args import (
     QuantizationArgs,
     QuantizationStrategy,
@@ -44,9 +42,7 @@ class TestFilterContainerModulesFromIgnore:
         class Model(nn.Module):
             def __init__(self):
                 super().__init__()
-                self.experts = nn.ModuleList(
-                    [ExpertContainer() for _ in range(3)]
-                )
+                self.experts = nn.ModuleList([ExpertContainer() for _ in range(3)])
                 self.gate = nn.Linear(16, 3, bias=False)  # router
 
         model = Model()

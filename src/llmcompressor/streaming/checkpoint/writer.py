@@ -210,9 +210,7 @@ class _Transaction(AbstractContextManager["_Transaction"]):
         if not name or name in self.records:
             raise ValueError(f"Duplicate or empty tensor name {name!r}")
         if not output_shard.endswith(".safetensors"):
-            raise ValueError(
-                f"Output shard must end in .safetensors: {output_shard!r}"
-            )
+            raise ValueError(f"Output shard must end in .safetensors: {output_shard!r}")
         value = tensor.detach().to("cpu").contiguous()
         try:
             dtype_name = _SAFETENSORS_DTYPES[value.dtype]
@@ -223,9 +221,7 @@ class _Transaction(AbstractContextManager["_Transaction"]):
         # NumPy cannot expose every dtype supported by safetensors (notably
         # bfloat16). Viewing the contiguous tensor as bytes keeps the exact
         # storage representation without a full-size dtype conversion.
-        storage = memoryview(
-            value.reshape(-1).view(torch.uint8).numpy()
-        ).cast("B")
+        storage = memoryview(value.reshape(-1).view(torch.uint8).numpy()).cast("B")
         with payload.open("wb") as file:
             file.write(storage)
             digest.update(storage)
@@ -261,9 +257,7 @@ class _Transaction(AbstractContextManager["_Transaction"]):
             raise ValueError(f"Conflicting config updates: {sorted(overlap)}")
         self.config_updates.update(updates)
 
-    def write_boundary(
-        self, batch_index: int, value: Any, *, boundary: int
-    ) -> None:
+    def write_boundary(self, batch_index: int, value: Any, *, boundary: int) -> None:
         """Stage one next-boundary batch inside this transaction."""
 
         if batch_index < 0 or boundary < 0:
@@ -288,8 +282,7 @@ class _Transaction(AbstractContextManager["_Transaction"]):
             "transaction_id": self.transaction_id,
             "run_fingerprint": self.writer.run_fingerprint,
             "records": [
-                record.to_dict(root=self.pending)
-                for record in self.records.values()
+                record.to_dict(root=self.pending) for record in self.records.values()
             ],
             "quantized_modules": self.quantized_modules,
             "omitted_tied_weights": self.omitted_tied_weights,
@@ -375,9 +368,7 @@ class StreamingCheckpointWriter:
                     boundary_path = path.parent / relative_path
                     if not boundary_path.is_file():
                         return False
-                    torch.load(
-                        boundary_path, map_location="cpu", weights_only=False
-                    )
+                    torch.load(boundary_path, map_location="cpu", weights_only=False)
             return True
         except (
             OSError,
@@ -414,9 +405,7 @@ class StreamingCheckpointWriter:
             result.append(json.loads(path.read_text(encoding="utf-8")))
         return result
 
-    def committed_boundary(
-        self, transaction_id: str
-    ) -> tuple[int, list[Any]] | None:
+    def committed_boundary(self, transaction_id: str) -> tuple[int, list[Any]] | None:
         """Load a boundary committed with a subgraph transaction."""
 
         if not self.is_transaction_complete(transaction_id):
@@ -446,9 +435,7 @@ class StreamingCheckpointWriter:
                         f"Tensor {record.name!r} is produced by multiple transactions"
                     )
                 records_by_shard[record.output_shard][record.name] = record
-            self._merge_unique(
-                quantized_modules, metadata.get("quantized_modules", {})
-            )
+            self._merge_unique(quantized_modules, metadata.get("quantized_modules", {}))
             self._merge_unique(
                 omitted_tied_weights, metadata.get("omitted_tied_weights", {})
             )
@@ -497,9 +484,7 @@ class StreamingCheckpointWriter:
                 raise ValueError(f"Conflicting output metadata for {key!r}")
 
     @staticmethod
-    def _assemble_safetensors(
-        path: Path, records: Mapping[str, TensorRecord]
-    ) -> int:
+    def _assemble_safetensors(path: Path, records: Mapping[str, TensorRecord]) -> int:
         path.parent.mkdir(parents=True, exist_ok=True)
         offset = 0
         header = {}

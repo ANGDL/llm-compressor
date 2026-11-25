@@ -8,6 +8,14 @@ import sys
 from contextlib import contextmanager
 
 import torch
+from compressed_tensors.offload import load_offloaded_model
+from compressed_tensors.offload.dispatch import dispatch_model as _dispatch_model
+from compressed_tensors.quantization import QuantizationScheme
+from compressed_tensors.quantization.quant_args import (
+    QuantizationArgs,
+    QuantizationStrategy,
+    QuantizationType,
+)
 from datasets import concatenate_datasets, load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -21,15 +29,6 @@ from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
 from llmcompressor.pipelines.basic import pipeline as basic_pipeline
 from llmcompressor.pipelines.data_free import pipeline as data_free_pipeline
 from llmcompressor.utils import ImatrixFallbackStats
-
-from compressed_tensors.offload import load_offloaded_model
-from compressed_tensors.offload.dispatch import dispatch_model as _dispatch_model
-from compressed_tensors.quantization import QuantizationScheme
-from compressed_tensors.quantization.quant_args import (
-    QuantizationArgs,
-    QuantizationStrategy,
-    QuantizationType,
-)
 
 configure_logger(LoggerConfig(console_log_level="DEBUG"))
 
@@ -81,10 +80,14 @@ parser.add_argument(
     help="Observer for weights quantization: empty(default), mse, or imatrix_mse.",
 )
 parser.add_argument("--modifier", type=str, default="GPTQ", choices=["GPTQ", "RTN"])
-parser.add_argument("--dataset_id", type=str, nargs="+",
-                    default=["HuggingFaceH4/ultrachat_200k"],
-                    help="HuggingFace dataset ID(s) or path(s) to local JSON/JSONL files. "
-                         "Multiple sources can be specified and will be concatenated.")
+parser.add_argument(
+    "--dataset_id",
+    type=str,
+    nargs="+",
+    default=["HuggingFaceH4/ultrachat_200k"],
+    help="HuggingFace dataset ID(s) or path(s) to local JSON/JSONL files. "
+    "Multiple sources can be specified and will be concatenated.",
+)
 parser.add_argument("--dataset_split", type=str, default="train_sft")
 parser.add_argument(
     "--num_calibration_samples",
@@ -163,7 +166,10 @@ parser.add_argument(
     "--max-memory-cpu-gb",
     type=float,
     default=1500.0,
-    help="Max CPU memory in GB for model loading (passed as max_memory={'cpu': <value>e9}).",
+    help=(
+        "Max CPU memory in GB for model loading "
+        "(passed as max_memory={'cpu': <value>e9})."
+    ),
 )
 parser.add_argument(
     "--pack",
@@ -337,7 +343,9 @@ def preprocess(example):
 
 # Preprocess each source to unified {"text": ...} schema before concatenation,
 # since different sources may have different column schemas.
-all_datasets = [part.map(preprocess, remove_columns=part.column_names) for part in all_datasets]
+all_datasets = [
+    part.map(preprocess, remove_columns=part.column_names) for part in all_datasets
+]
 
 if len(all_datasets) == 1:
     ds = all_datasets[0]
@@ -540,8 +548,8 @@ if args.pack:
     # exited. Release its large objects before starting the packing subprocess.
     del model, ds, oneshot_kwargs, recipes
     gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    if torch.accelerator.is_available():
+        torch.accelerator.empty_cache()
 
     subprocess.run(
         [

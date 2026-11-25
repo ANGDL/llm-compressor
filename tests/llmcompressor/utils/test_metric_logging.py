@@ -79,6 +79,4 @@ def test_compression_logger_compact_summary(monkeypatch):
     assert record["message"].startswith(
         "[03/44] model.layers.2 | calibration | device=cuda:1 | time="
     )
-    assert record["message"].endswith(
-        "cuda:1 peak=2.00/10.0 GB (20.0%)"
-    )
+    assert record["message"].endswith("cuda:1 peak=2.00/10.0 GB (20.0%)")

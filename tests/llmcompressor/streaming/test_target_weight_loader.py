@@ -34,9 +34,7 @@ class TinyModel(nn.Module):
     def __init__(self, hidden_size: int = 4, layers: int = 2):
         super().__init__()
         self.embed_tokens = nn.Embedding(8, hidden_size)
-        self.layers = nn.ModuleList(
-            [TinyBlock(hidden_size) for _ in range(layers)]
-        )
+        self.layers = nn.ModuleList([TinyBlock(hidden_size) for _ in range(layers)])
         self.final_norm = nn.LayerNorm(hidden_size)
         self.lm_head = nn.Linear(hidden_size, 8, bias=False)
 
@@ -243,9 +241,7 @@ def test_mixed_dtype_policy_preserves_non_quantized_fp32_state(tmp_path):
     path = tmp_path / "mixed-dtype.safetensors"
     _write_checkpoint(reference, path)
     model = build_meta_model(MixedDTypeTarget)
-    policy = StreamingDTypePolicy.for_quantized_modules(
-        torch.bfloat16, ("proj",)
-    )
+    policy = StreamingDTypePolicy.for_quantized_modules(torch.bfloat16, ("proj",))
     loader = TargetWeightLoader(
         model,
         SafetensorsWeightSource(path),
@@ -258,8 +254,7 @@ def test_mixed_dtype_policy_preserves_non_quantized_fp32_state(tmp_path):
         assert model.attn_sink.dtype == torch.float32
         assert model.control_scale.dtype == torch.float32
         assert (
-            model.proj(torch.ones(1, 4, dtype=torch.bfloat16)).dtype
-            == torch.bfloat16
+            model.proj(torch.ones(1, 4, dtype=torch.bfloat16)).dtype == torch.bfloat16
         )
 
     _assert_all_meta(model)
@@ -295,9 +290,7 @@ def test_prepare_does_not_mutate_model_before_install(tiny_checkpoint):
         assert not prepared.buffer_values
         assert prepared.nbytes == 0
         assert not model.layers[0].proj.weight.is_meta
-        assert torch.equal(
-            model.layers[0].proj.weight, reference.layers[0].proj.weight
-        )
+        assert torch.equal(model.layers[0].proj.weight, reference.layers[0].proj.weight)
 
     _assert_all_meta(model)
 
@@ -326,9 +319,7 @@ def test_plan_uses_local_names_without_scanning_the_full_model(
     assert set(plan.buffer_sources.values()) == {"layers.0.step"}
 
 
-def test_plan_scans_global_aliases_once_for_omitted_tied_weight(
-    tmp_path, monkeypatch
-):
+def test_plan_scans_global_aliases_once_for_omitted_tied_weight(tmp_path, monkeypatch):
     class TiedModel(nn.Module):
         def __init__(self):
             super().__init__()
@@ -368,9 +359,7 @@ def test_plan_uses_declared_tied_weight_source_without_shared_identity(tmp_path)
 
     reference = DeclaredTiedModel()
     path = tmp_path / "model.safetensors"
-    save_file(
-        {"canonical.weight": reference.canonical.weight.detach().clone()}, path
-    )
+    save_file({"canonical.weight": reference.canonical.weight.detach().clone()}, path)
     model = build_meta_model(DeclaredTiedModel)
     loader = TargetWeightLoader(model, SafetensorsWeightSource(path))
 
@@ -387,9 +376,7 @@ def test_install_rejects_stale_prepared_plan(tiny_checkpoint):
     _, path = tiny_checkpoint
     model = build_meta_model(TinyModel)
     loader = TargetWeightLoader(model, SafetensorsWeightSource(path))
-    prepared = loader.materialize_cpu(
-        loader.plan("layers.0"), dtype=torch.float32
-    )
+    prepared = loader.materialize_cpu(loader.plan("layers.0"), dtype=torch.float32)
     model.layers[0].proj.weight = nn.Parameter(
         torch.empty_like(model.layers[0].proj.weight, device="meta")
     )
@@ -411,9 +398,7 @@ def test_materialized_storage_does_not_grow_with_model_depth(tmp_path):
         model = build_meta_model(TinyModel, hidden_size=32, layers=layer_count)
         loader = TargetWeightLoader(model, SafetensorsWeightSource(path))
 
-        with loader.loaded(
-            "layers.0", device=torch.device("cpu"), dtype=torch.float32
-        ):
+        with loader.loaded("layers.0", device=torch.device("cpu"), dtype=torch.float32):
             active_bytes.append(_real_storage_bytes(model))
             assert _real_storage_bytes(model.layers[1]) == 0
 
@@ -428,15 +413,11 @@ def test_exception_exit_restores_target_to_meta(tiny_checkpoint):
     loader = TargetWeightLoader(model, SafetensorsWeightSource(path))
 
     with pytest.raises(RuntimeError, match="forward failed"):
-        with loader.loaded(
-            "layers.0", device=torch.device("cpu"), dtype=torch.float32
-        ):
+        with loader.loaded("layers.0", device=torch.device("cpu"), dtype=torch.float32):
             raise RuntimeError("forward failed")
 
     _assert_all_meta(model)
-    with loader.loaded(
-        "layers.1", device=torch.device("cpu"), dtype=torch.float32
-    ):
+    with loader.loaded("layers.1", device=torch.device("cpu"), dtype=torch.float32):
         assert not next(model.layers[1].parameters()).is_meta
 
 
@@ -530,9 +511,7 @@ def test_rejects_shape_mismatch_before_installing(tiny_checkpoint, tmp_path):
     loader = TargetWeightLoader(model, SafetensorsWeightSource(path))
 
     with pytest.raises(ValueError, match="model expects"):
-        with loader.loaded(
-            "layers.0", device=torch.device("cpu"), dtype=torch.float32
-        ):
+        with loader.loaded("layers.0", device=torch.device("cpu"), dtype=torch.float32):
             pass
 
     _assert_all_meta(model)
@@ -561,16 +540,11 @@ def test_kimi_k3_routed_experts_reside_with_complete_parent(tmp_path):
     values = {f"{prefix}.gate.weight": torch.eye(4)}
     for expert_index in range(2):
         for projection in ("w1", "w2", "w3"):
-            name = (
-                f"{prefix}.block_sparse_moe.experts.{expert_index}."
-                f"{projection}"
-            )
+            name = f"{prefix}.block_sparse_moe.experts.{expert_index}." f"{projection}"
             values[f"{name}.weight_packed"] = torch.full(
                 (4, 2), 0x22 + expert_index, dtype=torch.uint8
             )
-            values[f"{name}.weight_scale"] = torch.full(
-                (4, 1), 127, dtype=torch.uint8
-            )
+            values[f"{name}.weight_scale"] = torch.full((4, 1), 127, dtype=torch.uint8)
     save_file(values, path)
     model = build_meta_model(ResidentExpertModel)
     loader = TargetWeightLoader(
@@ -600,16 +574,11 @@ def test_kimi_k3_plan_includes_all_896_routed_experts(tmp_path):
     values = {f"{prefix}.gate.weight": torch.eye(4)}
     for expert_index in range(896):
         for projection in ("w1", "w2", "w3"):
-            name = (
-                f"{prefix}.block_sparse_moe.experts.{expert_index}."
-                f"{projection}"
-            )
+            name = f"{prefix}.block_sparse_moe.experts.{expert_index}." f"{projection}"
             values[f"{name}.weight_packed"] = torch.full(
                 (4, 2), 0x22, dtype=torch.uint8
             )
-            values[f"{name}.weight_scale"] = torch.full(
-                (4, 1), 127, dtype=torch.uint8
-            )
+            values[f"{name}.weight_scale"] = torch.full((4, 1), 127, dtype=torch.uint8)
     save_file(values, path)
     model = build_meta_model(ResidentExpertModel, expert_count=896)
     loader = TargetWeightLoader(

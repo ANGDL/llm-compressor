@@ -1,6 +1,7 @@
 import gc
 
 from compressed_tensors.utils import deprecated
+
 from llmcompressor._torch_accelerator_compat import (
     accelerator_max_memory_allocated,
     accelerator_reset_peak_memory_stats,

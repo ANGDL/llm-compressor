@@ -10,7 +10,9 @@ from ci.model_quality.evaluators import informational
 
 
 def test_informational_writes_passing_scores(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setattr(informational, "_discover_model", lambda url, key: "served-model")
+    monkeypatch.setattr(
+        informational, "_discover_model", lambda url, key: "served-model"
+    )
     monkeypatch.setattr(
         informational,
         "_scores",
@@ -43,7 +45,9 @@ def test_informational_writes_passing_scores(tmp_path: Path, monkeypatch) -> Non
 
 
 def test_informational_errors_when_no_scores(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setattr(informational, "_discover_model", lambda url, key: "served-model")
+    monkeypatch.setattr(
+        informational, "_discover_model", lambda url, key: "served-model"
+    )
     monkeypatch.setattr(informational, "_scores", lambda tool, args, model: {})
     argv = [
         "informational",
