@@ -31,6 +31,7 @@ from llmcompressor.pipelines.sequential.grouping import (
 )
 from llmcompressor.pipelines.sequential.transformers_helpers import HFTracer
 from llmcompressor.utils.helpers import calibration_forward_context
+from llmcompressor.utils.pytorch.module import iter_module_ancestors
 
 from .ast_helpers import append_autowrap_source_on_fail, autowrap_forwards
 
@@ -218,9 +219,11 @@ def _match_sequential_targets(
     matched = {
         module: name for name, module in named_modules.items() if name in exact_names
     }
-    matched.update(
-        {module: name for name, module in match_named_modules(model, pattern_targets)}
-    )
+    if pattern_targets:
+        matched.update(
+            (module, name)
+            for name, module in match_named_modules(model, pattern_targets)
+        )
     return matched
 
 
@@ -247,10 +250,7 @@ def _resolve_sequential_targets(
     outer_targets = {
         target
         for name, target in target_names.items()
-        if not any(
-            name.startswith(f"{other_name}.")  # if not a child of another
-            for other_name in target_names.keys()
-        )
+        if not any(parent in target_names for parent in iter_module_ancestors(name))
     }
 
     if any(

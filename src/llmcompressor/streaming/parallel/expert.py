@@ -529,10 +529,7 @@ def _balanced_expert_owners(
 
     totals = [0] * owner_count
     owners = {}
-    ordered = sorted(
-        names,
-        key=lambda name: (-sizes.get(name, 0), names.index(name)),
-    )
+    ordered = sorted(names, key=lambda name: -sizes.get(name, 0))
     for name in ordered:
         owner = min(range(owner_count), key=lambda rank: (totals[rank], rank))
         owners[name] = owner

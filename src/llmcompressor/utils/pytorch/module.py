@@ -2,6 +2,8 @@
 Utility / helper functions
 """
 
+from collections.abc import Iterator
+
 import torch
 from compressed_tensors.quantization.utils import is_module_quantized
 from loguru import logger
@@ -76,6 +78,14 @@ def infer_sequential_targets(
             return [sequential_targets]
         case _:
             return sequential_targets
+
+
+def iter_module_ancestors(name: str) -> Iterator[str]:
+    """Yield the non-root parents of a qualified module name, nearest first."""
+    parent = name.rpartition(".")[0]
+    while parent:
+        yield parent
+        parent = parent.rpartition(".")[0]
 
 
 # https://discuss.pytorch.org/t/how-to-access-to-a-layer-by-module-name/83797/8

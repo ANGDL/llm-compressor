@@ -330,6 +330,21 @@ def test_sequential_targets_only_cover_quantized_model_branches():
     )
 
 
+def test_sequential_target_coverage_respects_module_path_segments():
+    model = _MultimodalModel()
+    model.layers.extend(_DecoderLayer() for _ in range(9))
+    schemes = {"layers.1.proj": Mock(), "layers.10.proj": Mock()}
+
+    assert _quantized_sequential_targets(
+        model,
+        schemes,
+        sequential_targets=["layers.1", "layers.1.proj", "layers.10.proj"],
+    ) == ("layers.1", "layers.10.proj")
+
+    with pytest.raises(ValueError, match=r"\['layers\.10\.proj'\]"):
+        _quantized_sequential_targets(model, schemes, sequential_targets=["layers.1"])
+
+
 def test_sequential_targets_include_registered_glm5_mtp_layer():
     from llmcompressor.modeling.glm5_next import (
         Glm5NextMTPLayer,

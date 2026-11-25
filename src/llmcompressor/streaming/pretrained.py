@@ -8,6 +8,7 @@ from collections.abc import Callable, Sequence
 from contextlib import ExitStack
 from copy import deepcopy
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 import torch
@@ -39,7 +40,10 @@ from llmcompressor.modeling.offset_norm import norm_calibration_context
 from llmcompressor.modifiers.gptq import GPTQModifier
 from llmcompressor.modifiers.quantization import QuantizationModifier
 from llmcompressor.recipe import Recipe
-from llmcompressor.utils.pytorch.module import infer_sequential_targets
+from llmcompressor.utils.pytorch.module import (
+    infer_sequential_targets,
+    iter_module_ancestors,
+)
 
 from ._cleanup import cleanup_successful_work_dir as _cleanup_successful_work_dir
 from .artifacts import fingerprint_json
@@ -138,23 +142,22 @@ def _exact_schemes(
     return schemes
 
 
-def _is_module_or_descendant(name: str, ancestor: str) -> bool:
-    return name == ancestor or name.startswith(f"{ancestor}.")
-
-
-def _target_contains_scheme(target_name: str, schemes: dict[str, QuantizationScheme]):
-    return any(
-        scheme_name == target_name or scheme_name.startswith(f"{target_name}.")
-        for scheme_name in schemes
-    )
+def _uncovered_scheme_names(
+    schemes: dict[str, QuantizationScheme], targets: Sequence[str]
+) -> list[str]:
+    target_names = set(targets)
+    return [
+        name
+        for name in schemes
+        if name not in target_names
+        and not any(parent in target_names for parent in iter_module_ancestors(name))
+    ]
 
 
 def _attention_ancestor(model: nn.Module, module_name: str) -> str | None:
-    current = module_name
-    while current:
-        current, _, _ = current.rpartition(".")
-        if current and _is_streaming_attention_module(model.get_submodule(current)):
-            return current
+    for parent in iter_module_ancestors(module_name):
+        if _is_streaming_attention_module(model.get_submodule(parent)):
+            return parent
     return None
 
 
@@ -190,13 +193,10 @@ def _expert_owner(
 ) -> str | None:
     current = module_name
     while current:
-        module = model.get_submodule(current)
-        if (
-            expert_descendant_counts.get(current, 0) > 1
-            and _is_expert_path(current)
-            and not isinstance(module, (nn.ModuleList, nn.ModuleDict))
-        ):
-            return current
+        if expert_descendant_counts.get(current, 0) > 1:
+            module = model.get_submodule(current)
+            if not isinstance(module, (nn.ModuleList, nn.ModuleDict)):
+                return current
         current, _, _ = current.rpartition(".")
     return None
 
@@ -214,20 +214,14 @@ def _group_expert_targets(
                     expert_descendant_counts.get(current, 0) + 1
                 )
             current, _, _ = current.rpartition(".")
-    owners = {
-        owner
-        for name in candidate_names
-        if (
-            owner := _expert_owner(model, name, expert_descendant_counts)
-        ) is not None
-    }
-    if not owners:
-        return candidate_names, 0
-    grouped = set(candidate_names)
+    grouped = set()
+    owners = set()
     for name in candidate_names:
         owner = _expert_owner(model, name, expert_descendant_counts)
-        if owner is not None:
-            grouped.discard(name)
+        if owner is None:
+            grouped.add(name)
+        else:
+            owners.add(owner)
     grouped.update(owners)
     return grouped, len(owners)
 
@@ -266,11 +260,13 @@ def _quantized_sequential_targets(
     patterns = infer_sequential_targets(model, sequential_targets)
     if isinstance(patterns, str):
         patterns = [patterns]
-    matched_names = {name for name, _ in match_named_modules(model, patterns)}
+    scheme_paths = set(schemes)
+    for name in schemes:
+        scheme_paths.update(iter_module_ancestors(name))
     candidates = {
         name
-        for name in matched_names
-        if _target_contains_scheme(name, schemes)
+        for name, _ in match_named_modules(model, patterns)
+        if name in scheme_paths
     }
 
     promoted = set(candidates)
@@ -289,18 +285,16 @@ def _quantized_sequential_targets(
             )
 
     selected = []
+    selected_names = set()
     for name, _ in model.named_modules():
         if name not in promoted:
             continue
-        if any(_is_module_or_descendant(name, ancestor) for ancestor in selected):
+        if any(parent in selected_names for parent in iter_module_ancestors(name)):
             continue
         selected.append(name)
+        selected_names.add(name)
 
-    missing = [
-        name
-        for name in schemes
-        if not any(_is_module_or_descendant(name, target) for target in selected)
-    ]
+    missing = _uncovered_scheme_names(schemes, selected)
     if missing:
         raise ValueError(
             "Recipe matches modules outside the inferred sequential targets: "
@@ -546,6 +540,7 @@ def streaming_oneshot_from_pretrained(
         )
         if automatic_gptq_targets:
             target_patterns = ["Linear"]
+        target_started = perf_counter()
         sequential_targets = _quantized_sequential_targets(
             meta_model,
             schemes,
@@ -568,8 +563,10 @@ def streaming_oneshot_from_pretrained(
         )
         logger.info(
             "Streaming sequential targets: "
-            f"{len(sequential_targets)} target(s) ({target_mode})"
+            f"{len(sequential_targets)} target(s) ({target_mode}) | "
+            f"selection_s={perf_counter() - target_started:.2f}"
         )
+        trace_started = perf_counter()
         adapter = trace_streaming_boundaries(
             model=meta_model,
             source=materializer.create_source(str(checkpoint)),
@@ -583,10 +580,20 @@ def streaming_oneshot_from_pretrained(
             tracing_ignore=dataset_args.tracing_ignore,
             targets_per_subgraph=sequential_targets_per_subgraph,
         )
-        expert_parallel = (
-            ExpertParallelPlan.from_model(meta_model, adapter.targets, ep_devices)
-            if ep_devices else None
+        logger.info(
+            "Streaming sequential trace ready | "
+            f"trace_s={perf_counter() - trace_started:.2f}"
         )
+        expert_parallel = None
+        if ep_devices:
+            placement_started = perf_counter()
+            expert_parallel = ExpertParallelPlan.from_model(
+                meta_model, adapter.targets, ep_devices
+            )
+            logger.info(
+                "Streaming EP placement ready | "
+                f"placement_s={perf_counter() - placement_started:.2f}"
+            )
         adapter.execution = adapter.execution.with_inputs(
             dataloader.fingerprint,
             {
@@ -617,19 +624,11 @@ def streaming_oneshot_from_pretrained(
                 ),
             },
         )
-        targets = adapter.targets
-        covered = tuple(
-            name
-            for name in schemes
-            if any(
-                name == target or name.startswith(f"{target}.") for target in targets
-            )
-        )
-        missing = sorted(set(schemes) - set(covered))
+        missing = _uncovered_scheme_names(schemes, adapter.targets)
         if missing:
             raise ValueError(
                 "Recipe matches modules outside the inferred sequential targets: "
-                f"{missing}"
+                f"{sorted(missing)}"
             )
 
         if finalize_only:
