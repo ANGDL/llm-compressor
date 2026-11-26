@@ -218,9 +218,9 @@ class GPTQStreamingMemoryAdapter:
         expert is forwarded again for activation propagation. Hooks belonging to
         other owner windows remain active.
         """
+        handles = self._window_handles.pop(id(modules), set())
+        self.modifier.remove_hooks(handles)
         with _WINDOW_INITIALIZATION_LOCK:
-            handles = self._window_handles.pop(id(modules), set())
-            self.modifier.remove_hooks(handles)
             self.modifier._calibration_hooks.difference_update(handles)
         for module in modules:
             for base_name in ("input", "weight", "output", "q", "k", "v"):
@@ -253,18 +253,19 @@ class GPTQStreamingMemoryAdapter:
         modifier = self.modifier
         handles = set()
         try:
+            modifier.start_layerwise_calibration(
+                model,
+                list(modules),
+                hook_registry=handles,
+            )
             with _WINDOW_INITIALIZATION_LOCK:
-                previous = set(modifier._calibration_hooks)
-                try:
-                    modifier.start_layerwise_calibration(model, list(modules))
-                finally:
-                    handles = modifier._calibration_hooks - previous
-                self._window_handles[id(modules)] = handles
+                modifier._calibration_hooks.update(handles)
+            self._window_handles[id(modules)] = handles
             yield
         finally:
+            self._window_handles.pop(id(modules), None)
+            modifier.remove_hooks(handles)
             with _WINDOW_INITIALIZATION_LOCK:
-                self._window_handles.pop(id(modules), None)
-                modifier.remove_hooks(handles)
                 modifier._calibration_hooks.difference_update(handles)
             for module in modules:
                 freeze_module_quantization(module)

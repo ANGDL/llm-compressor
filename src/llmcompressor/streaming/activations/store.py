@@ -47,6 +47,7 @@ def _snapshot(
     *,
     memo: dict[int, torch.Tensor] | None = None,
     content_candidates: dict[tuple, list[torch.Tensor]] | None = None,
+    identity_candidates: dict[int, torch.Tensor] | None = None,
 ) -> Any:
     """Detach supported values and reject opaque or KV-cache objects."""
 
@@ -55,6 +56,11 @@ def _snapshot(
         identity = id(value)
         if identity in memo:
             return memo[identity]
+        if identity_candidates is not None:
+            reused = identity_candidates.get(identity)
+            if reused is not None:
+                memo[identity] = reused
+                return reused
         detached = value.detach()
         snapshot = detached.to(device=device)
         if snapshot.device == detached.device:
@@ -85,6 +91,7 @@ def _snapshot(
                 f"{path}.{field.name}",
                 memo=memo,
                 content_candidates=content_candidates,
+                identity_candidates=identity_candidates,
             )
         try:
             return type(value)(**values)
@@ -100,6 +107,7 @@ def _snapshot(
                 f"{path}[{index}]",
                 memo=memo,
                 content_candidates=content_candidates,
+                identity_candidates=identity_candidates,
             )
             for index, item in enumerate(value)
         ]
@@ -111,6 +119,7 @@ def _snapshot(
                 f"{path}[{index}]",
                 memo=memo,
                 content_candidates=content_candidates,
+                identity_candidates=identity_candidates,
             )
             for index, item in enumerate(value)
         )
@@ -131,6 +140,7 @@ def _snapshot(
                 f"{path}.{key}",
                 memo=memo,
                 content_candidates=content_candidates,
+                identity_candidates=identity_candidates,
             )
         return result
     raise TypeError(
@@ -279,9 +289,11 @@ class BoundaryActivationStore(ABC):
         value: Any,
         *,
         consumed_names: Collection[str] | None = None,
+        reuse_source_aliases: bool = False,
     ) -> None:
         """Commit a CPU destination before consuming its matching source batch."""
 
+        del reuse_source_aliases
         if source_boundary == destination_boundary:
             raise ValueError("Propagation boundaries must be distinct")
         if consumed_names is not None:
@@ -335,6 +347,7 @@ class InMemoryBoundaryActivationStore(BoundaryActivationStore):
         batch: int,
         value: Any,
         carried: Mapping[str, Any] | None = None,
+        reused: Collection[torch.Tensor] | None = None,
     ) -> None:
         _check_index(boundary, "boundary")
         _check_index(batch, "batch")
@@ -361,6 +374,11 @@ class InMemoryBoundaryActivationStore(BoundaryActivationStore):
                 self.storage_device,
                 memo={},
                 content_candidates=candidates,
+                identity_candidates=(
+                    {id(tensor): tensor for tensor in reused}
+                    if reused is not None
+                    else None
+                ),
             )
             if carried is not None:
                 snapshot = {**carried, **snapshot}
@@ -463,6 +481,7 @@ class InMemoryBoundaryActivationStore(BoundaryActivationStore):
         value: Any,
         *,
         consumed_names: Collection[str] | None = None,
+        reuse_source_aliases: bool = False,
     ) -> None:
         if consumed_names is None:
             return super().commit_propagated_batch(
@@ -470,6 +489,7 @@ class InMemoryBoundaryActivationStore(BoundaryActivationStore):
                 destination_boundary,
                 batch,
                 value,
+                reuse_source_aliases=reuse_source_aliases,
             )
         if source_boundary == destination_boundary:
             raise ValueError("Propagation boundaries must be distinct")
@@ -485,7 +505,8 @@ class InMemoryBoundaryActivationStore(BoundaryActivationStore):
             name: item for name, item in source.items()
             if name not in consumed_names and name not in value
         }
-        self._put(destination_boundary, batch, value, carried)
+        reused = tuple(_tensors(source)) if reuse_source_aliases else None
+        self._put(destination_boundary, batch, value, carried, reused=reused)
         self._delete_batch(source_boundary, batch)
 
     def batch_indices(self, boundary: int) -> tuple[int, ...]:

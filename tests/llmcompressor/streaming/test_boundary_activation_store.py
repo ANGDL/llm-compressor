@@ -380,6 +380,24 @@ def test_selective_execution_carries_unread_snapshots_without_copy(monkeypatch):
     assert torch.equal(store._boundaries[1][0]["result"], torch.full((3,), 3.0))
 
 
+def test_routing_commit_reuses_source_aliases_without_snapshot_copy():
+    store = InMemoryBoundaryActivationStore(deduplicate_tensors=True)
+    store.put(0, 0, {"carry": torch.arange(128)})
+    stored_carry = store._boundaries[0][0]["carry"]
+
+    store.commit_propagated_batch(
+        0,
+        1,
+        0,
+        {"carry": stored_carry},
+        consumed_names=(),
+        reuse_source_aliases=True,
+    )
+
+    assert store._boundaries[1][0]["carry"] is stored_carry
+    assert store.tensor_bytes() == stored_carry.numel() * stored_carry.element_size()
+
+
 def test_selective_execution_expands_transitive_nested_aliases():
     store = InMemoryBoundaryActivationStore(deduplicate_tensors=True)
     first, second = torch.ones(3), torch.arange(3)

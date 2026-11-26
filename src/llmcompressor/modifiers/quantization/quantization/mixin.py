@@ -449,7 +449,11 @@ class QuantizationMixin(HooksMixin):
         model.apply(enable_quantization)  # keep quantization enabled
 
     def start_layerwise_calibration(
-        self, model: torch.nn.Module, modules: list[torch.nn.Module]
+        self,
+        model: torch.nn.Module,
+        modules: list[torch.nn.Module],
+        *,
+        hook_registry: set[RemovableHandle] | None = None,
     ):
         """
         Set up quantization for a subset of resident modules after loading or
@@ -459,13 +463,15 @@ class QuantizationMixin(HooksMixin):
 
         :param model: the full model (needed for config application)
         :param modules: modules in the current subgraph to prepare
+        :param hook_registry: optional per-window hook collection
         """
+        hooks = self._calibration_hooks if hook_registry is None else hook_registry
         apply_quantization_config(model, self.resolved_config, allowed_modules=modules)
         for module in modules:
             if is_module_quantized(module):
                 set_quantization_scale_dtype(module)
                 self._initialize_observers(module)
-                self._calibration_hooks |= self._initialize_hooks(module)
+                hooks.update(self._initialize_hooks(module))
                 apply_calibration_status(module)
         fuse_weight_observers(model, modules)
 

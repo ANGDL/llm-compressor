@@ -1458,6 +1458,7 @@ def execute_expert_region(
                     batch,
                     output,
                     consumed_names=graph.consumed,
+                    reuse_source_aliases=True,
                 )
                 commit_seconds += perf_counter() - commit_started
                 for name in result_names.values():
