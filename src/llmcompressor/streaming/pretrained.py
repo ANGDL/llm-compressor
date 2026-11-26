@@ -533,34 +533,48 @@ def streaming_oneshot_from_pretrained(
             extra_conversions=mtp_wrapper.weight_conversions,
         )
         target_patterns = sequential_targets
-        automatic_gptq_targets = (
+        automatic_expert_targets = (
             target_patterns is None
-            and isinstance(quantizer, GPTQModifier)
             and _has_expert_collection(meta_model)
+            and (
+                isinstance(quantizer, GPTQModifier)
+                or (
+                    bool(ep_devices)
+                    and isinstance(quantizer, QuantizationModifier)
+                )
+            )
         )
-        if automatic_gptq_targets:
+        if automatic_expert_targets:
             target_patterns = ["Linear"]
         target_started = perf_counter()
         sequential_targets = _quantized_sequential_targets(
             meta_model,
             schemes,
             sequential_targets=target_patterns,
-            group_moe_experts=automatic_gptq_targets,
+            group_moe_experts=automatic_expert_targets,
         )
-        if automatic_gptq_targets and sequential_targets_per_subgraph == 1:
+        if automatic_expert_targets and sequential_targets_per_subgraph == 1:
             sequential_targets_per_subgraph = 8 * (len(ep_devices) or 1)
+            grouping = (
+                "Automatic GPTQ MoE target grouping"
+                if isinstance(quantizer, GPTQModifier)
+                else "Automatic RTN MoE target grouping"
+            )
             logger.info(
-                "Automatic GPTQ MoE target grouping: "
+                f"{grouping}: "
                 f"using up to {sequential_targets_per_subgraph} consecutive "
                 "expert-owner targets per subgraph"
             )
-        target_mode = (
-            "automatic GPTQ Linear"
-            if automatic_gptq_targets
-            else "explicit"
-            if target_patterns is not None
-            else "inferred"
-        )
+        if automatic_expert_targets:
+            target_mode = (
+                "automatic GPTQ Linear"
+                if isinstance(quantizer, GPTQModifier)
+                else "automatic RTN Linear"
+            )
+        elif target_patterns is not None:
+            target_mode = "explicit"
+        else:
+            target_mode = "inferred"
         logger.info(
             "Streaming sequential targets: "
             f"{len(sequential_targets)} target(s) ({target_mode}) | "
