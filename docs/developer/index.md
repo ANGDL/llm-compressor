@@ -33,28 +33,3 @@ LLM Compressor is an open-source project that values community contributions. We
     [:octicons-arrow-right-24: Governance](governance.md)
 
 </div>
-
-## Streaming PTQ implementation
-
-- [Streaming PTQ implementation design](streaming-ptq-implementation-design.md):
-  detailed contracts for GPTQ Hessian lifetime, target admission, bounded HIGGS,
-  MTP compatibility, QAD limits, upstream adaptation, recovery, and validation.
-- [Transactional Streaming PTQ implementation plan](transactional-streaming-ptq-plan.md):
-  recovery correctness, bounded activation retention, resource budgets, and
-  extensions for GPTQ, MoE expert parallelism (EP), multimodal models, and
-  modifier integration.
-- [Streaming inference performance plan](streaming-inference-performance-plan.md):
-  CPU packed-weight decoding, staged profiling, prefetch, and explicit weight
-  cache modes.
-- [Streaming EP load balancing design](streaming-ep-load-balancing-design.md):
-  activation-aware expert placement, per-owner token/work scheduling, modifier
-  update parallelism, telemetry, fallback, and staged validation.
-
-## MoE AWQ accuracy
-
-- [MoE AWQ imbalance diagnosis and remediation plan](moe-awq-imbalance-plan.md):
-  transform equivalence, router compensation, expert calibration, bounded scales,
-  and independent quality evaluation.
-- [AutoSmooth adaptive normalization design and validation](autosmooth-adaptive-normalization-design.md):
-  scale-invariant adaptive candidate normalization, implementation constraints,
-  and staged experiments against AWQ.
