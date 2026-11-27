@@ -6,6 +6,7 @@ from collections.abc import Generator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
 from itertools import chain, groupby
+from time import perf_counter
 from typing import Any, Iterator
 
 import torch
@@ -28,14 +29,20 @@ from llmcompressor.utils.helpers import (
     eval_context,
 )
 
+from ._logging import streaming_logger
+from .activations.store import _tensors
+from .activations.transfer import PreparedTreeTransfer, prepare_tree_transfer
+from .admission import DeviceMemoryBudget, DeviceMemoryError
 from .checkpoint import CheckpointWeightSource
+from .data_worker import CalibrationDataWorker, initial_boundary_async_enabled
 from .execution import (
+    FrozenCalibrationInputs,
     StreamingExecutionDescriptor,
     describe_streaming_execution,
     fingerprint_execution_graph,
     streaming_input_contract,
 )
-from .loading import SubgraphWeightSession, TargetWeightLoader
+from .loading import HostMemoryBudget, SubgraphWeightSession, TargetWeightLoader
 from .materialization import StreamingDTypePolicy, WeightMaterializer
 
 __all__ = ["TracedBoundaryAdapter", "trace_streaming_boundaries"]
@@ -166,6 +173,8 @@ class TracedBoundaryAdapter:
     execution: StreamingExecutionDescriptor | None = None
     input_contract: Any = None
     specialized_input_names: tuple[str, ...] = ()
+    _initial_host_budget: HostMemoryBudget | None = None
+    _initial_data_worker: CalibrationDataWorker | None = None
 
     def _input_contract(self, batch):
         return {
@@ -215,22 +224,30 @@ class TracedBoundaryAdapter:
     ) -> Iterator[dict[str, Any]]:
         """Execute the traced prefix without rewriting the model input contract."""
 
-        prefix = self.plan.subgraphs[0]
-        batch_iterator = iter(batches)
-        if self._prefix_runtime_modules is None:
-            try:
-                sample_batch = next(batch_iterator)
-            except StopIteration as error:
-                raise ValueError("Streaming calibration batches are empty") from error
-            self._validate_input_contract(sample_batch)
-            self._prefix_runtime_parameters = self._declared_runtime_parameters(
-                "prefix"
-            )
-            self._prefix_runtime_modules = self._discover_prefix_runtime_modules(
-                prefix, sample_batch
-            )
-            batch_iterator = chain((sample_batch,), batch_iterator)
         with ExitStack() as stack:
+            batches = stack.enter_context(self._prepared_calibration_batches(batches))
+            prefix = self.plan.subgraphs[0]
+            batch_iterator = iter(batches)
+            if self._prefix_runtime_modules is None:
+                try:
+                    sample_batch = next(batch_iterator)
+                except StopIteration as error:
+                    raise ValueError(
+                        "Streaming calibration batches are empty"
+                    ) from error
+                sample_value = (
+                    sample_batch.value
+                    if isinstance(sample_batch, PreparedTreeTransfer)
+                    else sample_batch
+                )
+                self._validate_input_contract(sample_value)
+                self._prefix_runtime_parameters = self._declared_runtime_parameters(
+                    "prefix"
+                )
+                self._prefix_runtime_modules = self._discover_prefix_runtime_modules(
+                    prefix, sample_value
+                )
+                batch_iterator = chain((sample_batch,), batch_iterator)
             stack.enter_context(
                 self.weight_session.loaded(
                     prefix,
@@ -240,17 +257,96 @@ class TracedBoundaryAdapter:
                     include_parameters=self._prefix_runtime_parameters or (),
                 )
             )
+            stream = (
+                torch.cuda.Stream(device=self.device)
+                if self.device.type == "cuda" and initial_boundary_async_enabled()
+                else None
+            )
+            device_budget = DeviceMemoryBudget()
+            if stream is not None:
+                stack.callback(torch.cuda.current_stream(self.device).synchronize)
             with (
                 torch.no_grad(),
                 disable_cache(self.model),
                 eval_context(self.model),
                 disable_hf_kernels(self.model),
             ):
-                for batch in batch_iterator:
-                    self._validate_input_contract(batch)
-                    values = _move_tensors(dict(batch), self.device)
-                    inputs = {name: values[name] for name in prefix.input_names}
-                    yield prefix.forward(self.model, **inputs)
+                for batch_index, batch in enumerate(batch_iterator):
+                    with ExitStack() as transfers:
+                        started = perf_counter()
+                        if isinstance(batch, PreparedTreeTransfer):
+                            try:
+                                transfer = batch.transfer(
+                                    self.device,
+                                    stream=stream,
+                                    device_budget=device_budget,
+                                )
+                            except DeviceMemoryError:
+                                values = _move_tensors(batch.value, self.device)
+                            else:
+                                transfers.enter_context(transfer)
+                                values = transfer.wait()
+                        else:
+                            self._validate_input_contract(batch)
+                            values = _move_tensors(dict(batch), self.device)
+                        inputs = {name: values[name] for name in prefix.input_names}
+                        moved = perf_counter()
+                        result = prefix.forward(self.model, **inputs)
+                        streaming_logger.info(
+                            f"initial boundary | prefix batch={batch_index} | "
+                            f"input_submit_s={moved - started:.2f} | "
+                            f"forward_submit_s={perf_counter() - moved:.2f}"
+                        )
+                        yield result
+                        del result, inputs, values
+
+    @contextmanager
+    def _prepared_calibration_batches(self, batches):
+        """Prepare at most one upcoming frozen batch on a CPU-only worker."""
+        if (
+            not initial_boundary_async_enabled()
+            or not isinstance(batches, FrozenCalibrationInputs)
+            or batches.batch_bytes is None
+        ):
+            yield iter(batches)
+            return
+        packed = self.device.type == "cuda" and batches.batch_transfer_bytes is not None
+
+        def prepare(value):
+            self._validate_input_contract(value)
+            return (
+                prepare_tree_transfer(value)
+                if packed and all(tensor.is_contiguous() for tensor in _tensors(value))
+                else value
+            )
+
+        with CalibrationDataWorker(
+            len(batches),
+            batches.read_owned,
+            batches.estimate_transfer_bytes if packed else batches.estimate_read_bytes,
+            host_budget=self._initial_host_budget or HostMemoryBudget(),
+            prepare=prepare,
+        ) as worker:
+            self._initial_data_worker = worker
+            worker.prefetch()
+
+            def iterate():
+                for _index in range(len(batches)):
+                    with worker.take() as batch:
+                        worker.prefetch()
+                        yield batch.value
+
+            iterator = iterate()
+            try:
+                yield iterator
+            finally:
+                iterator.close()
+                self._initial_data_worker = None
+
+    def discard_initial_prefetch(self) -> None:
+        """Yield speculative input capacity to the current boundary snapshot."""
+        if self._initial_data_worker is not None:
+            self._initial_data_worker.discard_prefetch()
 
     def _discover_prefix_runtime_modules(
         self, prefix: Subgraph, sample_batch: Mapping[str, Any]

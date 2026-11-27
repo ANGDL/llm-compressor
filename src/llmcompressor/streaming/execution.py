@@ -189,10 +189,28 @@ def streaming_input_contract(value: Any, *, specialize_numeric: bool = False) ->
 class FrozenCalibrationInputs(Sequence):
     """Replay the exact CPU batches included in the execution identity."""
 
-    def __init__(self, store, count, fingerprint):
+    def __init__(
+        self, store, count, fingerprint, batch_bytes=None, batch_transfer_bytes=None
+    ):
         self.store = store
         self.count = count
         self.fingerprint = fingerprint
+        self.batch_bytes = tuple(batch_bytes) if batch_bytes is not None else None
+        self.batch_transfer_bytes = (
+            tuple(batch_transfer_bytes) if batch_transfer_bytes is not None else None
+        )
+        for name, sizes in (
+            ("batch_bytes", self.batch_bytes),
+            ("batch_transfer_bytes", self.batch_transfer_bytes),
+        ):
+            if sizes is not None and (
+                len(sizes) != count
+                or any(
+                    isinstance(size, bool) or not isinstance(size, int) or size < 0
+                    for size in sizes
+                )
+            ):
+                raise ValueError(f"{name} must contain non-negative bytes per batch")
 
     def __len__(self):
         return self.count
@@ -202,15 +220,34 @@ class FrozenCalibrationInputs(Sequence):
             raise IndexError(index)
         return self.store.get(0, index)
 
+    def read_owned(self, index):
+        """Read a fresh CPU batch for a worker without a redundant isolation copy."""
+        if not isinstance(index, int) or index < 0 or index >= self.count:
+            raise IndexError(index)
+        return self.store.read_owned(0, index)
+
+    def estimate_read_bytes(self, index):
+        if self.batch_bytes is None:
+            return None
+        return 2 * self.batch_bytes[index]
+
+    def estimate_transfer_bytes(self, index):
+        if self.batch_transfer_bytes is None or self.batch_bytes is None:
+            return None
+        return self.estimate_read_bytes(index) + self.batch_transfer_bytes[index]
+
 
 def freeze_calibration_inputs(batches, root: str | Path) -> FrozenCalibrationInputs:
     from .activations import DiskBoundaryActivationStore
+    from .activations.transfer import packed_transfer_bytes
     from .admission import DiskSpaceBudget
 
     store = DiskBoundaryActivationStore(root)
     store.delete(0)
     count = 0
     contract = None
+    batch_bytes = []
+    batch_transfer_bytes = []
 
     def snapshot():
         nonlocal count, contract
@@ -227,23 +264,23 @@ def freeze_calibration_inputs(batches, root: str | Path) -> FrozenCalibrationInp
                 "calibration input snapshot", _input_bytes(batch) * 2 + 4096
             )
             store.put(0, index, batch)
+            batch_bytes.append(_input_bytes(batch))
+            batch_transfer_bytes.append(packed_transfer_bytes(batch))
             count += 1
             yield (index, batch)
 
     fingerprint = fingerprint_streaming_values(snapshot())
     if not count:
         raise ValueError("Streaming calibration inputs cannot be empty")
-    return FrozenCalibrationInputs(store, count, fingerprint)
+    return FrozenCalibrationInputs(
+        store, count, fingerprint, batch_bytes, batch_transfer_bytes
+    )
 
 
 def _input_bytes(value):
-    if isinstance(value, torch.Tensor):
-        return value.nbytes
-    if isinstance(value, Mapping):
-        return sum(_input_bytes(item) for item in value.values())
-    if isinstance(value, (list, tuple)):
-        return sum(_input_bytes(item) for item in value)
-    return 0
+    from .activations.store import _tensor_bytes
+
+    return _tensor_bytes(value)
 
 
 @dataclass(frozen=True)

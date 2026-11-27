@@ -227,7 +227,14 @@ class BoundaryActivationStore(ABC):
     routing_inputs_are_borrowed = False
 
     @abstractmethod
-    def put(self, boundary: int, batch: int, value: Any) -> None:
+    def put(
+        self,
+        boundary: int,
+        batch: int,
+        value: Any,
+        *,
+        reservation: HostMemoryReservation | None = None,
+    ) -> None:
         """Store one complete batch, replacing an existing batch atomically."""
 
     @abstractmethod
@@ -338,8 +345,15 @@ class InMemoryBoundaryActivationStore(BoundaryActivationStore):
             tuple[int, int, frozenset[str]], frozenset[str]
         ] = {}
 
-    def put(self, boundary: int, batch: int, value: Any) -> None:
-        self._put(boundary, batch, value)
+    def put(
+        self,
+        boundary: int,
+        batch: int,
+        value: Any,
+        *,
+        reservation: HostMemoryReservation | None = None,
+    ) -> None:
+        self._put(boundary, batch, value, reservation=reservation)
 
     def _put(
         self,
@@ -348,11 +362,12 @@ class InMemoryBoundaryActivationStore(BoundaryActivationStore):
         value: Any,
         carried: Mapping[str, Any] | None = None,
         reused: Collection[torch.Tensor] | None = None,
+        reservation: HostMemoryReservation | None = None,
     ) -> None:
         _check_index(boundary, "boundary")
         _check_index(batch, "batch")
         complete_value = value if carried is None else {**carried, **value}
-        reservation = (
+        reservation = reservation or (
             self.host_budget.reserve(
                 f"activation boundary {boundary} batch {batch}",
                 _tensor_bytes(complete_value),
@@ -576,10 +591,17 @@ class DiskBoundaryActivationStore(BoundaryActivationStore):
         _check_index(batch, "batch")
         return self._boundary_dir(boundary) / f"batch-{batch:05d}.pt"
 
-    def put(self, boundary: int, batch: int, value: Any) -> None:
+    def put(
+        self,
+        boundary: int,
+        batch: int,
+        value: Any,
+        *,
+        reservation: HostMemoryReservation | None = None,
+    ) -> None:
         path = self._batch_path(boundary, batch)
         path.parent.mkdir(parents=True, exist_ok=True)
-        reservation = (
+        reservation = reservation or (
             self.host_budget.reserve(
                 f"activation boundary {boundary} batch {batch}",
                 _tensor_bytes(value),
@@ -606,6 +628,10 @@ class DiskBoundaryActivationStore(BoundaryActivationStore):
     def get(
         self, boundary: int, batch: int, *, device: torch.device | str = "cpu"
     ) -> Any:
+        return _move(self.read_owned(boundary, batch), torch.device(device))
+
+    def read_owned(self, boundary: int, batch: int) -> Any:
+        """Deserialize an independently owned CPU value without a second clone."""
         path = self._batch_path(boundary, batch)
         if not path.is_file():
             raise KeyError(f"Boundary {boundary}, batch {batch} is not committed")
@@ -615,7 +641,7 @@ class DiskBoundaryActivationStore(BoundaryActivationStore):
             raise RuntimeError(
                 f"Cannot read committed boundary batch {path}"
             ) from error
-        return _move(value, torch.device(device))
+        return value
 
     def batch_indices(self, boundary: int) -> tuple[int, ...]:
         directory = self._boundary_dir(boundary)

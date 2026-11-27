@@ -582,6 +582,38 @@ for additional modifiers. Such adapters still need validated ownership of
 their mappings and mutable state, preservation of recipe update order, and
 numerical comparisons between sequential and concurrent execution.
 
+Initial boundary collection uses a bounded CPU input worker to read and prepare
+the next frozen batch while the main thread runs the current prefix. Frozen
+inputs record per-batch tensor and aligned transfer sizes so admission happens
+before a background read. Worker reads own freshly deserialized tensors and
+avoid the extra CPU isolation copy required by random-access consumers.
+The model, prefix dependency discovery, and weight installation stay on the
+main thread.
+
+A single output worker commits CPU boundary snapshots in batch order, with at
+most two output batches in flight. CUDA-compatible devices use pinned input
+staging and separate H2D/D2H streams. The compute stream waits for each input
+copy and for the previous output copy before another prefix forward can reuse
+model buffers. This permits input preparation and CPU snapshot/commit to
+overlap forward execution; it deliberately preserves the dependency between
+one batch's D2H and the next forward. Device copy overlap still depends on the
+backend and must be measured with a device trace.
+
+Host and device staging participate in admission. Under memory pressure,
+speculative input can be discarded and reread without skipping a batch, and
+output commits fall back to the serial path. Noncontiguous inputs retain the
+ordinary transfer path. All workers and transfers drain before the initial
+boundary becomes ready, including on early exit or failure. Committed CPU
+boundary storage still grows with the total output bytes across all batches.
+Set `LLMCOMPRESSOR_STREAMING_ASYNC_INITIAL_BOUNDARY=0` to use the original serial
+input and output path for comparisons.
+
+Dataset preprocessing and the complete input fingerprint still finish before
+the traced run. Adding the initial-boundary workers does not make an existing
+eager dataset `map` lazy or run the model in data-loader workers. Logs report
+input preparation/wait, host-side input and forward submission, output copy
+wait, and CPU commit times; submission times are not device kernel durations.
+
 `pipeline_devices` is removed rather than deprecated. It described a bounded
 two-GPU weight-prefetch implementation, not pipeline parallel execution, and it
 would conflict with a future expert-placement API. Callers provide exactly one
