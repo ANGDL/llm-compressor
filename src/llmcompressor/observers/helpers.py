@@ -174,6 +174,13 @@ def fuse_weight_observers(model: Module, modules: list[Module] | None = None):
     """
     from llmcompressor.observers.fusion import FusionHandler
 
+    candidates = modules if modules is not None else model.modules()
+    if not any(
+        getattr(getattr(layer, "weight_observer", None), "args", None) is not None
+        and layer.weight_observer.args.strategy == QuantizationStrategy.TENSOR_GROUP
+        for layer in candidates
+    ):
+        return
     allowed_modules = set(modules) if modules is not None else None
     for submodule in model.modules():
         for fused_layers in get_fused_layers(submodule):

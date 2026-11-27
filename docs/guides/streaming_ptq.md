@@ -613,6 +613,31 @@ partitions of that aggregate. Device transfers follow the owner windows and
 their admission budgets. If host capacity cannot cover current-group headroom
 and the next aggregate, the pipeline prepares weights at the next group boundary.
 
+Layerwise quantization reuses a weak module-name index and matches the current
+resident working set, retaining fully qualified names, scheme priority, and
+ignore rules. KV-cache recipes keep the full-model initialization path. Observer
+fusion skips model-wide fused-layer resolution when the active working set has
+no TENSOR_GROUP weight observers; schemes requiring shared global scales still
+use the existing fusion validation.
+
+Asynchronous weight prefetch allocates one pinned CPU buffer per tensor dtype
+for the next working set, rather than calling `pin_memory()` for every tensor.
+Device weights keep independent storage so compression can release or replace
+them per module. Pinned bytes remain covered by the existing transfer
+reservation, and all staging is released after the transfer event. This does
+not add a persistent pinned buffer pool or an extra GPU copy of the working set.
+CPU preparation and pinned staging can coexist, using up to two copies of the
+decoded working set under the existing host reservations. Faster prefetch can
+make the next group's device weights resident earlier, so the overall GPU peak
+may increase even though device weights remain independently allocated and the
+number of prefetched groups and device admission policy are unchanged.
+
+DeepSeek V4/V4.1 packed FP4 weights use a vectorized CPU byte lookup followed by
+in-place block-scale multiplication. This avoids full-weight scale expansion
+and retains nibble order and model-specific UE8M0 endpoint behavior. Existing
+materialization workspace admission still applies. These preparation changes
+do not alter the serial initial boundary or the checkpoint saving policy.
+
 The advanced boundary-mode API remains available for adapters that provide an
 explicit meta-model factory, target order, calibration boundaries, and exact
 schemes. It follows the same single-device execution and CPU-prefetch contract.

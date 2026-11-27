@@ -56,6 +56,7 @@ from compressed_tensors.quantization.lifecycle.initialize import (
 from compressed_tensors.quantization.utils import KV_CACHE_TARGETS
 from compressed_tensors.quantization.utils.helpers import is_module_quantized
 from compressed_tensors.utils import match_named_modules
+from compressed_tensors.utils.match import match_targets
 from loguru import logger
 from pydantic import Field, PrivateAttr, field_validator, model_validator
 from torch.utils.hooks import RemovableHandle
@@ -75,6 +76,9 @@ from llmcompressor.modifiers.quantization.calibration import (
 )
 from llmcompressor.modifiers.quantization.group_size_validation import (
     validate_group_size_divisibility,
+)
+from llmcompressor.modifiers.quantization.quantization.scoped import (
+    CalibrationModuleIndex,
 )
 from llmcompressor.modifiers.quantization.scale_dtype import validate_scale_dtype
 from llmcompressor.modifiers.utils.hooks import HooksMixin
@@ -176,6 +180,7 @@ class QuantizationMixin(HooksMixin):
 
     _calibration_hooks: set[RemovableHandle] = PrivateAttr(default_factory=set)
     _resolved_config: QuantizationConfig | None = PrivateAttr(None)
+    _layerwise_module_index: CalibrationModuleIndex | None = PrivateAttr(None)
 
     @field_validator("targets", mode="before")
     def validate_targets(cls, value: str | list[str]) -> list[str]:
@@ -288,6 +293,11 @@ class QuantizationMixin(HooksMixin):
 
         # disable quantization until calibration
         model.apply(disable_quantization)
+        self._layerwise_module_index = (
+            CalibrationModuleIndex(model)
+            if getattr(active_session().state, "layerwise_calibration", False)
+            else None
+        )
 
     def _apply_channel_kv_cache_scheme(
         self,
@@ -466,8 +476,44 @@ class QuantizationMixin(HooksMixin):
         :param hook_registry: optional per-window hook collection
         """
         hooks = self._calibration_hooks if hook_registry is None else hook_registry
-        apply_quantization_config(model, self.resolved_config, allowed_modules=modules)
+        config = self.resolved_config
+        scoped_model = model
+        original_scheme_targets = {}
+        previous_schemes = {}
+        if config.kv_cache_scheme is None:
+            if self._layerwise_module_index is None:
+                self._layerwise_module_index = CalibrationModuleIndex(model)
+            scoped_model = self._layerwise_module_index.scoped_model(model, modules)
+            config = deepcopy(config)
+            for scheme in config.config_groups.values():
+                targets = scheme.targets
+                matched_targets = set(
+                    target
+                    for name, module in scoped_model.named_modules()
+                    for target in match_targets(name, module, targets)
+                )
+                scheme.targets = [
+                    target for target in targets if target in matched_targets
+                ]
+                original_scheme_targets[tuple(scheme.targets)] = targets
+            config.config_groups = {
+                name: scheme
+                for name, scheme in config.config_groups.items()
+                if scheme.targets
+            }
+            previous_schemes = {
+                module: getattr(module, "quantization_scheme", None)
+                for module in modules
+            }
+        apply_quantization_config(
+            scoped_model, config, allowed_modules=set(modules), show_progress=False
+        )
         for module in modules:
+            scheme = getattr(module, "quantization_scheme", None)
+            if scheme is not None and scheme is not previous_schemes.get(module):
+                targets = original_scheme_targets.get(tuple(scheme.targets))
+                if targets is not None:
+                    scheme.targets = list(targets)
             if is_module_quantized(module):
                 set_quantization_scale_dtype(module)
                 self._initialize_observers(module)

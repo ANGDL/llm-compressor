@@ -155,3 +155,23 @@ def test_fuse_weight_observers_can_scope_to_subgraph_modules():
     for layer in (scoped_attn.q_proj, scoped_attn.k_proj, scoped_attn.v_proj):
         assert layer.weight_observer.fusion_handler.is_fused
     assert not unrelated_attn.q_proj.weight_observer.fusion_handler.is_fused
+
+
+def test_non_tensor_group_observers_skip_full_model_fused_resolution(monkeypatch):
+    from llmcompressor.observers import helpers
+
+    model = _ToyAttentionModel()
+    scoped_attn = model.layers[0].self_attn
+
+    def unexpected_resolution(_module):
+        raise AssertionError("channel quantization does not need fused global scales")
+
+    monkeypatch.setattr(helpers, "get_fused_layers", unexpected_resolution)
+    for module in (scoped_attn.q_proj, scoped_attn.k_proj):
+        scheme = QuantizationScheme(
+            targets=["Linear"],
+            weights=QuantizationArgs(num_bits=8, strategy="channel"),
+        )
+        initialize_module_for_quantization(module, scheme)
+        initialize_observer(module, base_name="weight")
+    fuse_weight_observers(model, modules=list(scoped_attn.modules()))

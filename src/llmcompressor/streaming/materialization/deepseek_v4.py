@@ -233,6 +233,29 @@ class DeepSeekV4WeightMaterializer(WeightMaterializer):
     ) -> torch.Tensor:
         out_dim, packed_in_dim = weight.shape
         in_dim = packed_in_dim * 2
+        expected = (out_dim, (in_dim + self.fp4_block_size - 1) // self.fp4_block_size)
+        if tuple(scale.shape) != expected:
+            raise ValueError(
+                "DeepSeek-V4 FP4 scale shape does not match weight blocks: "
+                f"weight={tuple(weight.shape)}, scale={tuple(scale.shape)}"
+            )
+        decoded_scale = self._decode_e8m0(scale)
+        if weight.device.type == "cpu":
+            codes = torch.arange(256, dtype=torch.int64, device=weight.device)
+            table = torch.tensor(
+                self._FP4_TABLE, dtype=torch.float32, device=weight.device
+            )
+            pairs = table[torch.stack((codes & 15, codes >> 4), dim=-1)]
+            result = pairs[weight.view(torch.uint8).long()].flatten(1)
+            full_columns = in_dim // self.fp4_block_size * self.fp4_block_size
+            result[:, :full_columns].reshape(
+                out_dim, in_dim // self.fp4_block_size, self.fp4_block_size
+            ).mul_(
+                decoded_scale[:, :in_dim // self.fp4_block_size, None]
+            )
+            if full_columns != in_dim:
+                result[:, full_columns:].mul_(decoded_scale[:, -1:])
+            return result
         packed = weight.to(torch.uint8)
         table = torch.tensor(
             self._FP4_TABLE, dtype=torch.float32, device=weight.device
@@ -240,13 +263,6 @@ class DeepSeekV4WeightMaterializer(WeightMaterializer):
         low = table[(packed & 0x0F).long()]
         high = table[((packed >> 4) & 0x0F).long()]
         unpacked = torch.stack((low, high), dim=-1).flatten(1)
-        decoded_scale = self._decode_e8m0(scale)
-        expected = (out_dim, (in_dim + self.fp4_block_size - 1) // self.fp4_block_size)
-        if tuple(decoded_scale.shape) != expected:
-            raise ValueError(
-                "DeepSeek-V4 FP4 scale shape does not match weight blocks: "
-                f"weight={tuple(weight.shape)}, scale={tuple(scale.shape)}"
-            )
         expanded_scale = decoded_scale.repeat_interleave(
             self.fp4_block_size, dim=-1
         )[:, :in_dim]

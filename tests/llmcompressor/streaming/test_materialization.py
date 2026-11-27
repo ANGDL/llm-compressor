@@ -359,6 +359,89 @@ def test_deepseek_v4_materializer_unpacks_fp4_blocks(tmp_path):
         ),
     )
 
+@pytest.mark.parametrize("materializer_type", [
+    DeepSeekV4WeightMaterializer, DeepSeekV41WeightMaterializer,
+])
+@pytest.mark.parametrize("block_size", [3, 32, 512])
+@pytest.mark.parametrize("dtype", [torch.int8, torch.uint8])
+def test_fp4_cpu_decoding_matches_all_codes_scales_and_partial_blocks(
+    materializer_type, block_size, dtype, monkeypatch
+):
+    materializer = materializer_type()
+    materializer.fp4_block_size = block_size
+    packed = torch.arange(256, dtype=torch.int64).to(torch.uint8).reshape(2, 128)
+    packed = packed.view(dtype)
+    scale_count = (256 + block_size - 1) // block_size
+    scales = torch.arange(2 * scale_count).reshape(2, scale_count)
+    scales = (scales % 9 + 123).to(torch.uint8)
+    table = torch.tensor(materializer._FP4_TABLE)
+    expected = torch.empty(2, 256)
+    raw = packed.to(torch.uint8)
+    expected[:, 0::2] = table[(raw & 15).long()]
+    expected[:, 1::2] = table[(raw >> 4).long()]
+    columns = torch.arange(256) // block_size
+    expected *= materializer._decode_e8m0(scales)[:, columns]
+
+    def unexpected_expansion(*args, **kwargs):
+        raise AssertionError("CPU FP4 scales must not expand to the full weight")
+
+    monkeypatch.setattr(torch.Tensor, "repeat_interleave", unexpected_expansion)
+    actual = materializer._dequantize_fp4(packed, scales)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("materializer_type", [
+    DeepSeekV4WeightMaterializer, DeepSeekV41WeightMaterializer,
+])
+def test_fp4_cpu_decoder_preserves_scale_endpoints_and_noncontiguous_inputs(
+    materializer_type
+):
+    materializer = materializer_type()
+    materializer.fp4_block_size = 2
+    packed = torch.tensor([[0x01, 0x29], [0xF4, 0x98]], dtype=torch.uint8).t()
+    scales = torch.tensor([[0, 255], [127, 128]], dtype=torch.uint8)
+    raw = packed.to(torch.uint8)
+    table = torch.tensor(materializer._FP4_TABLE)
+    expected = torch.empty(2, 4)
+    expected[:, 0::2] = table[(raw & 15).long()]
+    expected[:, 1::2] = table[(raw >> 4).long()]
+    expected *= materializer._decode_e8m0(scales).repeat_interleave(2, -1)
+    actual = materializer._dequantize_fp4(packed, scales)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0, equal_nan=True)
+
+
+@pytest.mark.parametrize("shape", [(0, 4), (2, 0)])
+def test_fp4_cpu_decoder_accepts_empty_weights(shape):
+    materializer = DeepSeekV4WeightMaterializer()
+    actual = materializer._dequantize_fp4(
+        torch.empty(shape, dtype=torch.uint8),
+        torch.empty((shape[0], (shape[1] * 2 + 31) // 32), dtype=torch.uint8),
+    )
+    assert actual.shape == (shape[0], shape[1] * 2)
+    assert actual.dtype == torch.float32
+
+
+def test_fp4_invalid_scale_shape_fails_before_allocating_decode_storage(monkeypatch):
+    materializer = DeepSeekV4WeightMaterializer()
+    packed = torch.zeros(2, 16, dtype=torch.uint8)
+
+    def unexpected_decode(*args, **kwargs):
+        raise AssertionError("invalid shape must fail before scale decode")
+
+    monkeypatch.setattr(materializer, "_decode_e8m0", unexpected_decode)
+    with pytest.raises(ValueError, match="scale shape"):
+        materializer._dequantize_fp4(packed, torch.zeros(2, 2, dtype=torch.uint8))
+
+
+def test_fp4_cpu_decoder_keeps_cpu_storage_under_other_default_device():
+    packed = torch.ones(2, 16, dtype=torch.uint8)
+    scale = torch.full((2, 1), 127, dtype=torch.uint8)
+    with torch.device("meta"):
+        result = DeepSeekV4WeightMaterializer()._dequantize_fp4(packed, scale)
+    assert result.device.type == "cpu"
+    torch.testing.assert_close(result[:, 0::2], torch.full((2, 16), 0.5))
+    torch.testing.assert_close(result[:, 1::2], torch.zeros(2, 16))
+
 
 def test_deepseek_v4_materializer_decodes_ue8m0_endpoints():
     decoded = DeepSeekV4WeightMaterializer._decode_e8m0(

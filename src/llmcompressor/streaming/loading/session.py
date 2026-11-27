@@ -280,24 +280,38 @@ class PreparedSubgraphWeights:
 
         stream = torch.cuda.Stream(device=resolved)
         try:
+            grouped: dict[torch.dtype, list[tuple[dict, str]]] = {}
+            for target in self.targets:
+                for values in (target.parameter_values, target.buffer_values):
+                    for name, value in values.items():
+                        grouped.setdefault(value.dtype, []).append((values, name))
             with torch.cuda.stream(stream):
+                for dtype, members in grouped.items():
+                    numel = sum(values[name].numel() for values, name in members)
+                    pinned = torch.empty(numel, dtype=dtype, pin_memory=True)
+                    transfer_reservation.commit(numel * dtype.itemsize)
+                    transfer_sources.append(pinned)
+                    offset = 0
+                    for values, name in members:
+                        value = values[name]
+                        length = value.numel()
+                        pinned.narrow(0, offset, length).view(value.shape).copy_(value)
+                        offset += length
+                    offset = 0
+                    for values, name in members:
+                        value = values[name]
+                        length = value.numel()
+                        values[name] = (
+                            pinned.narrow(0, offset, length)
+                            .view(value.shape)
+                            .to(device=resolved, non_blocking=True)
+                        )
+                        if self.reservation is not None:
+                            self.reservation.release_committed(length * dtype.itemsize)
+                        offset += length
+                        del value
+                    del pinned
                 for target in self.targets:
-                    for values in (target.parameter_values, target.buffer_values):
-                        for name, value in tuple(values.items()):
-                            size = value.numel() * value.element_size()
-                            pinned = (
-                                value
-                                if value.is_pinned()
-                                else value.pin_memory()
-                            )
-                            transfer_reservation.commit(size)
-                            transfer_sources.append(pinned)
-                            values[name] = pinned.to(
-                                device=resolved, non_blocking=True
-                            )
-                            del value, pinned
-                            if self.reservation is not None:
-                                self.reservation.release_committed(size)
                     target.device = resolved
             self._transfer_sources = transfer_sources
             self._transfer_event = stream.record_event()

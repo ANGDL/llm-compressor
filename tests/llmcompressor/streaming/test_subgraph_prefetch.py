@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+from contextlib import nullcontext
 
 import pytest
 import torch
@@ -142,8 +143,96 @@ def test_prefetch_can_enqueue_bounded_cuda_transfer(tmp_path):
         )
         loaded = prefetcher.take()
         assert loaded.device.type == "cuda"
+        assert len(loaded._transfer_sources) == 1
+        storages = {
+            value.untyped_storage().data_ptr()
+            for target in loaded.targets
+            for values in (target.parameter_values, target.buffer_values)
+            for value in values.values()
+        }
+        assert len(storages) == sum(
+            len(target.parameter_values) + len(target.buffer_values)
+            for target in loaded.targets
+        )
         with session.installed(loaded):
             assert not next(model.layers[0].parameters()).is_meta
+            for name, tensor in reference.layers[0].state_dict().items():
+                torch.testing.assert_close(
+                    model.layers[0].state_dict()[name].cpu(), tensor
+                )
     finally:
         prefetcher.close(suppress_errors=True)
     assert_all_meta(model)
+
+
+@pytest.mark.parametrize("fail_pinning", [False, True])
+def test_async_weight_staging_allocates_per_dtype_and_cleans_up(
+    tmp_path, monkeypatch, fail_pinning
+):
+    def factory():
+        model = SessionModel()
+        model.layers[0].register_buffer("integer", torch.arange(4))
+        return model
+
+    reference = factory()
+    checkpoint = checkpoint_for(reference, tmp_path)
+    session = SubgraphWeightSession(
+        build_meta_model(factory), SafetensorsWeightSource(checkpoint)
+    )
+    plan = session.plan(subgraph_for("layers.0"))
+    budget = HostMemoryBudget(
+        safety_reserve_bytes=0, system_available=lambda: 1 << 30,
+        cgroup_available=lambda: None,
+    )
+    required = session.estimate_preparation(plan, dtype=torch.float32)
+    prepared = session.prepare(
+        plan, dtype=torch.float32, reservation=budget.reserve("prepared", required)
+    )
+    expected = {
+        name: tensor.clone()
+        for target in prepared.targets
+        for values in (target.parameter_values, target.buffer_values)
+        for name, tensor in values.items()
+    }
+    sizes = []
+    waits = []
+    original_empty = torch.empty
+
+    class Stream:
+        def synchronize(self):
+            waits.append("sync")
+
+        def record_event(self):
+            return self
+
+    def empty(*args, **kwargs):
+        if kwargs.pop("pin_memory", False):
+            sizes.append((args[0], kwargs["dtype"]))
+            if fail_pinning and len(sizes) == 2:
+                raise RuntimeError("pinned allocation failed")
+        return original_empty(*args, **kwargs)
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "Stream", lambda **_kwargs: Stream())
+    monkeypatch.setattr(torch.cuda, "stream", lambda _stream: nullcontext())
+    monkeypatch.setattr(torch, "empty", empty)
+    monkeypatch.setattr(torch.Tensor, "to", lambda tensor, **_kwargs: tensor.clone())
+    transfer = budget.reserve("pinned", prepared.nbytes)
+    if fail_pinning:
+        with pytest.raises(RuntimeError, match="pinned allocation"):
+            prepared.move_to_async("cuda:0", transfer_reservation=transfer)
+        assert waits
+    else:
+        prepared.move_to_async("cuda:0", transfer_reservation=transfer)
+        assert {dtype for _numel, dtype in sizes} == {torch.float32, torch.int64}
+        assert len(sizes) == len(prepared._transfer_sources) == 2
+        for target in prepared.targets:
+            for values in (target.parameter_values, target.buffer_values):
+                for name, value in values.items():
+                    torch.testing.assert_close(value, expected[name])
+        prepared.wait_for_transfer()
+        assert transfer.closed
+        prepared.close()
+    assert not prepared.targets
+    assert not budget._reservations
+    assert_all_meta(session.model)

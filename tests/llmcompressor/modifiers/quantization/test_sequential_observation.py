@@ -263,9 +263,15 @@ def test_layerwise_quantization_scopes_apply_config_to_passed_modules():
     ) as apply_config:
         modifier.start_layerwise_calibration(model, modules)
 
-    apply_config.assert_called_once_with(
-        model, modifier.resolved_config, allowed_modules=modules
-    )
+    apply_config.assert_called_once()
+    scoped_model, config = apply_config.call_args.args
+    assert list(scoped_model.named_modules()) == [("0", model[0])]
+    assert scoped_model.get_submodule("1") is model[1]
+    assert config == modifier.resolved_config
+    assert apply_config.call_args.kwargs == {
+        "allowed_modules": set(modules),
+        "show_progress": False,
+    }
     assert model[0].quantization_status == QuantizationStatus.CALIBRATION
     assert not hasattr(model[1], "quantization_scheme")
 
