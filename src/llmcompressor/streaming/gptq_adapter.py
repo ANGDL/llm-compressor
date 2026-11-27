@@ -4,13 +4,11 @@ from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import wraps
-from threading import RLock
 from time import perf_counter
 
 import torch
 from compressed_tensors.offload.dist_utils import is_source_process as is_src
 from loguru import logger
-from torch.utils.hooks import RemovableHandle
 
 from llmcompressor.modifiers.gptq import GPTQModifier
 from llmcompressor.modifiers.gptq.helpers import (
@@ -22,67 +20,21 @@ from llmcompressor.modifiers.gptq.helpers import (
     quantization_peak_bytes,
 )
 from llmcompressor.modifiers.quantization.calibration import (
-    freeze_module_quantization,
     observe,
     update_qparams,
 )
 from llmcompressor.observers import ACTIVATION_OBS
 
 from .calibration import calibration_sample_count
-from .modifier_contract import ModifierContractError
 from .numerics import native_gptq_factorization
-
-_WINDOW_INITIALIZATION_LOCK = RLock()
+from .quantization_adapter import QuantizationWindowAdapter
 
 
 @dataclass
-class GPTQStreamingMemoryAdapter:
+class GPTQStreamingMemoryAdapter(QuantizationWindowAdapter):
     modifier: GPTQModifier
-    owner_update_scope = "owner_local"
-    owner_update_state = "independent"
     _owner_update_baseline: int | None = field(default=None, init=False, repr=False)
     _owner_update_count: int = field(default=0, init=False, repr=False)
-    _window_handles: dict[int, set[RemovableHandle]] = field(
-        default_factory=dict, init=False, repr=False
-    )
-
-    @property
-    def supports_independent_expert_windows(self) -> bool:
-        """Coalesce only schemes whose activation semantics preserve token rows."""
-        return all(
-            args is None or (args.dynamic is True and args.strategy == "token")
-            for scheme in self.modifier.resolved_config.config_groups.values()
-            for args in (scheme.input_activations, scheme.output_activations)
-        )
-
-    def validate_owner_groups(self, groups) -> None:
-        """Reject observer or qparam state shared across owner groups."""
-
-        state_owners: dict[int, torch.device] = {}
-        state_names = (
-            "weight_observer",
-            "input_observer",
-            "output_observer",
-            "q_observer",
-            "k_observer",
-            "v_observer",
-            "weight_scale",
-            "weight_zero_point",
-            "weight_global_scale",
-        )
-        for group in groups:
-            for module in group.modules:
-                for name in state_names:
-                    value = getattr(module, name, None)
-                    if value is None:
-                        continue
-                    identity = id(value)
-                    previous = state_owners.setdefault(identity, group.owner)
-                    if previous != group.owner:
-                        raise ModifierContractError(
-                            f"GPTQ state {name!r} is shared between owner "
-                            f"{previous} and {group.owner}"
-                        )
 
     def estimate_update_memory(self, modules: Sequence[torch.nn.Module]) -> int:
         """Bound compression scratch before admission.
@@ -210,24 +162,6 @@ class GPTQStreamingMemoryAdapter:
             f"total_s={compressed - started:.2f}"
         )
 
-    def after_update(self, modules: Sequence[torch.nn.Module]) -> None:
-        """Stop this owner's calibration hooks before propagation starts.
-
-        GPTQ consumes and deletes weight-observer statistics during compression.
-        The iMatrix observer hook must therefore be detached before the same
-        expert is forwarded again for activation propagation. Hooks belonging to
-        other owner windows remain active.
-        """
-        handles = self._window_handles.pop(id(modules), set())
-        self.modifier.remove_hooks(handles)
-        with _WINDOW_INITIALIZATION_LOCK:
-            self.modifier._calibration_hooks.difference_update(handles)
-        for module in modules:
-            for base_name in ("input", "weight", "output", "q", "k", "v"):
-                observer = getattr(module, f"{base_name}_observer", None)
-                if observer is not None:
-                    observer.detach(module)
-
     def begin_owner_update(self, modules: Sequence[torch.nn.Module]) -> None:
         """Snapshot shared bookkeeping before concurrent compression starts."""
 
@@ -249,28 +183,14 @@ class GPTQStreamingMemoryAdapter:
 
     @contextmanager
     def expert_window(self, model, modules):
-        """Initialize and release only this window's observer hooks."""
-        modifier = self.modifier
-        handles = set()
+        """Release GPTQ statistics when the shared observer window closes."""
         try:
-            modifier.start_layerwise_calibration(
-                model,
-                list(modules),
-                hook_registry=handles,
-            )
-            with _WINDOW_INITIALIZATION_LOCK:
-                modifier._calibration_hooks.update(handles)
-            self._window_handles[id(modules)] = handles
-            yield
+            with super().expert_window(model, modules):
+                yield
         finally:
-            self._window_handles.pop(id(modules), None)
-            modifier.remove_hooks(handles)
-            with _WINDOW_INITIALIZATION_LOCK:
-                modifier._calibration_hooks.difference_update(handles)
             for module in modules:
-                freeze_module_quantization(module)
-                modifier._hessians.pop(module, None)
-                modifier._num_samples.pop(module, None)
+                self.modifier._hessians.pop(module, None)
+                self.modifier._num_samples.pop(module, None)
 
     @contextmanager
     def calibration_context(self):

@@ -15,6 +15,7 @@ from torch.fx import Graph
 from llmcompressor.core import LifecycleCallbacks, create_session
 from llmcompressor.modeling.moe.routing import group_expert_routes, select_expert_routes
 from llmcompressor.modifiers.gptq import GPTQModifier
+from llmcompressor.modifiers.quantization import QuantizationModifier
 from llmcompressor.modifiers.utils.hooks import HooksMixin
 from llmcompressor.pipelines.sequential.helpers import Subgraph, partition_graph
 from llmcompressor.pipelines.sequential.plan import SequentialExecutionPlan
@@ -38,7 +39,10 @@ from llmcompressor.streaming.loading import (
     build_meta_model,
 )
 from llmcompressor.streaming.materialization import CastWeightMaterializer
-from llmcompressor.streaming.memory_adapters import modifier_calibration_context
+from llmcompressor.streaming.memory_adapters import (
+    get_modifier_memory_adapter,
+    modifier_calibration_context,
+)
 from llmcompressor.streaming.parallel.expert import ExpertParallelPlan
 from llmcompressor.streaming.parallel.load_balance import ResidentWindow
 from llmcompressor.streaming.parallel.region import (
@@ -129,19 +133,27 @@ def grouped_values():
         yield batch
 
 
-def quantizer():
-    return GPTQModifier(
-        config_groups={
+def quantizer(kind="gptq"):
+    config_groups = {
+        "weights": {
+            "targets": ["Linear"],
             "weights": {
-                "targets": ["Linear"],
-                "weights": {
-                    "num_bits": 4,
-                    "type": "int",
-                    "symmetric": True,
-                    "strategy": "channel",
-                },
-            }
-        },
+                "num_bits": 4,
+                "type": "int",
+                "symmetric": True,
+                "strategy": "channel",
+            },
+        }
+    }
+    if kind == "imatrix-rtn":
+        config_groups["weights"]["weights"].update(
+            observer="imatrix_mse",
+            observer_kwargs={"grid": 3, "patience": 0},
+        )
+    if kind != "gptq":
+        return QuantizationModifier(config_groups=config_groups)
+    return GPTQModifier(
+        config_groups=config_groups,
         actorder=None,
         block_size=4,
         batched_quantization=None,
@@ -383,11 +395,30 @@ def test_region_coalescing_crosses_fixed_trace_groups():
     assert coalesce_expert_regions(adapter, make_plan(model)) == ((0, 1, 2, 3),)
 
 
-def reference_quantization(model, batches, routed=None):
+def calibration_statistics(model, modifier):
+    if isinstance(modifier, GPTQModifier):
+        return {
+            modifier._module_names[module]: (
+                hessian.clone(),
+                modifier._num_samples[module].clone(),
+            )
+            for module, hessian in modifier._hessians.items()
+        }
+    return {
+        name: (observer._imatrix_sum.clone(), observer._imatrix_count.clone())
+        for name, module in model.named_modules()
+        if (observer := getattr(module, "weight_observer", None)) is not None
+        and getattr(observer, "_imatrix_sum", None) is not None
+    }
+
+
+def reference_quantization(model, batches, routed=None, kind="gptq"):
     routed = subgraph() if routed is None else routed
     with create_session() as session:
         session.state.layerwise_calibration = True
-        session.initialize(model=model, recipe=[quantizer()], start=-1, copy_data=False)
+        session.initialize(
+            model=model, recipe=[quantizer(kind)], start=-1, copy_data=False
+        )
         modifier = session.lifecycle.recipe.modifiers[0]
         LifecycleCallbacks.calibration_start()
         modules = tuple(model.modules())
@@ -395,13 +426,7 @@ def reference_quantization(model, batches, routed=None):
         with torch.no_grad(), DisableQuantization(model):
             for value in batches:
                 routed.forward(model, **value)
-        statistics = {
-            modifier._module_names[module]: (
-                hessian.clone(),
-                modifier._num_samples[module].clone(),
-            )
-            for module, hessian in modifier._hessians.items()
-        }
+        statistics = calibration_statistics(model, modifier)
         LifecycleCallbacks.sequential_epoch_end(list(modules))
         modifier.end_layerwise_calibration(list(modules))
         with (
@@ -433,7 +458,8 @@ def reference_quantization(model, batches, routed=None):
         ),
     ],
 )
-def test_region_matches_serial_gptq_statistics_weights_and_propagation(
+@pytest.mark.parametrize("kind", ["gptq", "rtn", "imatrix-rtn"])
+def test_region_matches_serial_quantization_statistics_weights_and_propagation(
     tmp_path,
     monkeypatch,
     token_budget,
@@ -441,6 +467,7 @@ def test_region_matches_serial_gptq_statistics_weights_and_propagation(
     runtime_memory_bytes,
     routing,
     combine_memory_bytes,
+    kind,
 ):
     torch.manual_seed(19)
     source = MoE().eval()
@@ -448,7 +475,7 @@ def test_region_matches_serial_gptq_statistics_weights_and_propagation(
     batches = list(grouped_values()) if grouped else values()
     routed = subgraph(group_expert_routes if grouped else None)
     expected_statistics, expected_tensors, expected_outputs = reference_quantization(
-        deepcopy(source), deepcopy(batches), routed
+        deepcopy(source), deepcopy(batches), routed, kind
     )
     save_file(source.state_dict(), tmp_path / "model.safetensors")
     (tmp_path / "config.json").write_text("{}")
@@ -556,22 +583,34 @@ def test_region_matches_serial_gptq_statistics_weights_and_propagation(
         if routing == "grouped":
             assert cache.batch(0) and cache.batch(1)
         session.state.layerwise_calibration = True
-        session.initialize(model=model, recipe=[quantizer()], start=-1, copy_data=False)
+        session.initialize(
+            model=model, recipe=[quantizer(kind)], start=-1, copy_data=False
+        )
         modifier = session.lifecycle.recipe.modifiers[0]
         stack.enter_context(modifier_calibration_context([modifier]))
         LifecycleCallbacks.calibration_start()
-        memory_adapter = GPTQStreamingMemoryAdapter(modifier)
+        memory_adapter = get_modifier_memory_adapter(modifier)
         original_update = memory_adapter.update_owner
         update_groups = []
 
         def update(owner, modules):
             update_groups.append((owner, tuple(modules)))
-            for module in modules:
-                if module in modifier._hessians:
-                    statistics[modifier._module_names[module]] = (
-                        modifier._hessians[module].clone(),
-                        modifier._num_samples[module].clone(),
-                    )
+            owner_names = {module: name for name, module in model.named_modules()}
+            if isinstance(modifier, GPTQModifier):
+                for module in modules:
+                    if module in modifier._hessians:
+                        statistics[modifier._module_names[module]] = (
+                            modifier._hessians[module].clone(),
+                            modifier._num_samples[module].clone(),
+                        )
+            else:
+                for module in modules:
+                    observer = getattr(module, "weight_observer", None)
+                    if getattr(observer, "_imatrix_sum", None) is not None:
+                        statistics[owner_names[module]] = (
+                            observer._imatrix_sum.clone(),
+                            observer._imatrix_count.clone(),
+                        )
             return original_update(owner, modules)
 
         memory_adapter.update_owner = update
@@ -628,16 +667,20 @@ def test_region_matches_serial_gptq_statistics_weights_and_propagation(
             assert any(" expert dispatch " in owner for owner in host_reservations)
             assert any(" expert output " in owner for owner in host_reservations)
         expected_policy = (
-            "activation-aware-v1" if memory_bytes == 5000 else "fixed-owner-v1"
+            "activation-aware-v1"
+            if kind == "gptq" and memory_bytes == 5000
+            else "fixed-owner-v1"
         )
         assert result["placement"]["policy"] == expected_policy
-        if memory_bytes == 5000:
+        if kind == "gptq" and memory_bytes == 5000:
             assert len(result["windows"]) >= 4
         if memory_bytes == 10_000:
             assert len(result["windows"]) == 2
             assert set(saved_windows) == {(0, 0), (1, 0)}
             assert len(update_groups) == 2
-            assert sorted(len(modules) for _owner, modules in update_groups) == [3, 6]
+            assert sorted(len(modules) for _owner, modules in update_groups) == (
+                [3, 6] if kind == "gptq" else [6, 6]
+            )
         if runtime_memory_bytes is not None:
             assert any(
                 window.max_dispatch_tokens < planned_windows[key].max_dispatch_tokens
@@ -649,8 +692,9 @@ def test_region_matches_serial_gptq_statistics_weights_and_propagation(
             capacity = saved_windows[plan._owners["experts.0"], 0].max_dispatch_tokens
             assert max(dispatches) <= capacity
         assert not device_budget._reservations
-        assert not modifier._hessians
-        assert not modifier._num_samples
+        if isinstance(modifier, GPTQModifier):
+            assert not modifier._hessians
+            assert not modifier._num_samples
         assert all(parameter.is_meta for parameter in model.parameters())
         LifecycleCallbacks.calibration_end()
         session.finalize()
@@ -718,8 +762,9 @@ class PipelineMoE(MoE):
         ),
     ],
 )
-def test_pipeline_uses_routed_windows_and_preserves_downstream_gptq(
-    tmp_path, monkeypatch, devices, grouped, memory_bytes, skip, defer_prefetch
+@pytest.mark.parametrize("kind", ["gptq", "rtn", "imatrix-rtn"])
+def test_pipeline_uses_routed_windows_and_preserves_downstream_quantization(
+    tmp_path, monkeypatch, devices, grouped, memory_bytes, skip, defer_prefetch, kind
 ):
     import llmcompressor.streaming.pipeline as pipeline
     from llmcompressor.streaming.loading.session import PreparedSubgraphWeights
@@ -884,7 +929,7 @@ def test_pipeline_uses_routed_windows_and_preserves_downstream_gptq(
             checkpoint=checkpoint,
             work_dir=tmp_path / ("parallel" if parallel else "serial"),
             calibration_batches=list(grouped_values()) if grouped else values(),
-            recipe=Recipe.create_instance(quantizer()),
+            recipe=Recipe.create_instance(quantizer(kind)),
             dataset_fingerprint="synthetic-routes",
             materializer=CastWeightMaterializer(),
             device=execution_device,

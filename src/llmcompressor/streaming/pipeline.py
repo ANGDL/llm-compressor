@@ -702,11 +702,13 @@ def _modifier_update(
     adapters: Sequence[StreamingModifierAdapter] = (),
     owner_groups: Sequence[OwnerModuleGroup] | None = None,
     telemetry: EPPhaseLogger | None = None,
+    *,
+    modifiers: Sequence[Any],
 ) -> str:
     with ExitStack() as stack:
         for adapter in adapters:
             stack.enter_context(adapter.update_context(active_session().state.model))
-        owner_update_adapter = _owner_update_adapter(quantizers, adapters)
+        owner_update_adapter = _owner_update_adapter(quantizers, adapters, modifiers)
         if owner_groups is not None and owner_update_adapter is not None:
             validate = getattr(owner_update_adapter, "validate_owner_groups", None)
             if callable(validate):
@@ -742,8 +744,14 @@ def _modifier_update(
 def _owner_update_adapter(
     quantizers: Sequence[QuantizationMixin],
     adapters: Sequence[StreamingModifierAdapter],
+    modifiers: Sequence[Any],
 ):
-    if len(quantizers) != 1 or adapters:
+    if (
+        len(quantizers) != 1
+        or adapters
+        or len(modifiers) != 1
+        or modifiers[0] is not quantizers[0]
+    ):
         return None
     candidate = get_modifier_memory_adapter(quantizers[0])
     return candidate if callable(getattr(candidate, "update_owner", None)) else None
@@ -2310,7 +2318,9 @@ def run_subgraph_streaming_pipeline(
                         )
                     owner_local_update = (
                         owner_update_groups is not None
-                        and _owner_update_adapter(quantizers, runtime_adapters)
+                        and _owner_update_adapter(
+                            quantizers, runtime_adapters, modifiers
+                        )
                         is not None
                     )
                     update_modules = (
@@ -2359,6 +2369,7 @@ def run_subgraph_streaming_pipeline(
                                 runtime_adapters,
                                 owner_groups=owner_update_groups,
                                 telemetry=ep_metrics,
+                                modifiers=modifiers,
                             )
                             streaming_logger.info(
                                 f"{target_label} | modifier update | "

@@ -556,6 +556,18 @@ modifier update, propagation, checkpoint transaction, and output shard
 boundaries. AutoRound remains single target because it independently tunes one
 decoder block at a time.
 
+Expert-parallel recipes containing only `GPTQModifier` or
+`QuantizationModifier` use owner-local modifier updates. Each owner updates its
+own observers and quantization parameters concurrently; RTN with an iMatrix
+weight observer therefore runs its grid searches on the expert's owner device.
+For weight-only or dynamic per-token activation schemes, adjacent experts in
+the same collection are coalesced across traced target groups and executed in
+resident windows sized by the device budget. Expert targets remain independent,
+so larger regions do not require loading every expert on one device.
+Progress checkpoints and static activation schemes retain traced target groups.
+Recipes with additional transforms or training modifiers retain the sequential
+update callback so every modifier runs in recipe order.
+
 `pipeline_devices` is removed rather than deprecated. It described a bounded
 two-GPU weight-prefetch implementation, not pipeline parallel execution, and it
 would conflict with a future expert-placement API. Callers provide exactly one
