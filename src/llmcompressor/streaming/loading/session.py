@@ -171,6 +171,7 @@ class PreparedSubgraphWeights:
     transfer_reservation: HostMemoryReservation | None = None
     _device: torch.device = torch.device("cpu")
     _transfer_event: Any | None = None
+    _transfer_stream: Any | None = None
     _transfer_sources: list[torch.Tensor] | None = None
     _target_devices: dict[str, torch.device] | None = None
 
@@ -192,7 +193,7 @@ class PreparedSubgraphWeights:
 
         if self._device.type != "cpu":
             raise RuntimeError("Only CPU-prepared weights can be partitioned")
-        if self._transfer_event is not None:
+        if self._transfer_event is not None or self._transfer_stream is not None:
             raise RuntimeError("Cannot partition weights during an active transfer")
 
         target_by_name = {target.plan.name: target for target in self.targets}
@@ -247,6 +248,9 @@ class PreparedSubgraphWeights:
             if self.transfer_reservation is not None:
                 self.transfer_reservation.close()
                 self.transfer_reservation = None
+        elif self._transfer_stream is not None:
+            self._transfer_stream.synchronize()
+        self._transfer_stream = None
 
     def move_to_async(
         self,
@@ -269,6 +273,8 @@ class PreparedSubgraphWeights:
             raise RuntimeError(f"Prepared weights are already on {self._device}")
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA is required for asynchronous weight transfer")
+        if self._transfer_event is not None or self._transfer_stream is not None:
+            raise RuntimeError("Prepared weights already have an active transfer")
         if device_reservation is not None:
             self.device_reservation = device_reservation
         if transfer_reservation is None:
@@ -279,6 +285,10 @@ class PreparedSubgraphWeights:
         transfer_sources: list[torch.Tensor] = []
 
         stream = torch.cuda.Stream(device=resolved)
+        self._transfer_stream = stream
+        current_dtype: torch.dtype | None = None
+        current_name: str | None = None
+        current_index = 0
         try:
             grouped: dict[torch.dtype, list[tuple[dict, str]]] = {}
             for target in self.targets:
@@ -287,6 +297,7 @@ class PreparedSubgraphWeights:
                         grouped.setdefault(value.dtype, []).append((values, name))
             with torch.cuda.stream(stream):
                 for dtype, members in grouped.items():
+                    current_dtype = dtype
                     numel = sum(values[name].numel() for values, name in members)
                     pinned = torch.empty(numel, dtype=dtype, pin_memory=True)
                     transfer_reservation.commit(numel * dtype.itemsize)
@@ -298,8 +309,9 @@ class PreparedSubgraphWeights:
                         pinned.narrow(0, offset, length).view(value.shape).copy_(value)
                         offset += length
                     offset = 0
-                    for values, name in members:
+                    for current_index, (values, name) in enumerate(members):
                         value = values[name]
+                        current_name = name
                         length = value.numel()
                         values[name] = (
                             pinned.narrow(0, offset, length)
@@ -321,8 +333,22 @@ class PreparedSubgraphWeights:
                 self.reservation = None
             return self
         except Exception:
-            stream.synchronize()
+            streaming_logger.error(
+                "async H2D failed | "
+                f"device={resolved} | "
+                f"stream={getattr(stream, 'stream_id', None)} | "
+                f"dtype={current_dtype} | tensor={current_name!r} | "
+                f"index={current_index} | "
+                f"allocated={torch.cuda.memory_allocated(resolved)} | "
+                f"reserved={torch.cuda.memory_reserved(resolved)}"
+            )
+            try:
+                stream.synchronize()
+            except Exception:
+                pass
             transfer_sources.clear()
+            self._transfer_event = None
+            self._transfer_stream = None
             self.close()
             raise
 

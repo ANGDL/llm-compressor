@@ -222,15 +222,18 @@ def test_async_weight_staging_allocates_per_dtype_and_cleans_up(
         with pytest.raises(RuntimeError, match="pinned allocation"):
             prepared.move_to_async("cuda:0", transfer_reservation=transfer)
         assert waits
+        assert prepared._transfer_stream is None
     else:
         prepared.move_to_async("cuda:0", transfer_reservation=transfer)
         assert {dtype for _numel, dtype in sizes} == {torch.float32, torch.int64}
         assert len(sizes) == len(prepared._transfer_sources) == 2
+        assert prepared._transfer_stream is not None
         for target in prepared.targets:
             for values in (target.parameter_values, target.buffer_values):
                 for name, value in values.items():
                     torch.testing.assert_close(value, expected[name])
         prepared.wait_for_transfer()
+        assert prepared._transfer_stream is None
         assert transfer.closed
         prepared.close()
     assert not prepared.targets
