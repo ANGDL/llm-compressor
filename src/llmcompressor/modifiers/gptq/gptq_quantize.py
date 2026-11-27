@@ -40,6 +40,8 @@ __all__ = [
     "quantize_weight",
 ]
 
+_ERROR_PROPAGATION_CHUNK = 512
+
 
 def _quantize_weight_batched(
     weights: torch.Tensor,
@@ -142,9 +144,15 @@ def _quantize_weight_batched(
             W[:, :, i1:i2] = Q1
             losses += torch.sum(losses1, 2) / 2
 
-            w_err = torch.bmm(Err1, Hinv[:, i1:i2, i2:])
-            W[:, :, i2:] -= w_err
-            del W1, Q1, Err1, losses1, Hinv1, w_err
+            # Bound the temporary error block. Propagating the whole
+            # remaining width can allocate several GiB for a large batched
+            # window even when enough memory remains fragmented.
+            for start in range(i2, num_columns, _ERROR_PROPAGATION_CHUNK):
+                end = min(start + _ERROR_PROPAGATION_CHUNK, num_columns)
+                W[:, :, start:end] -= torch.bmm(
+                    Err1, Hinv[:, i1:i2, start:end]
+                )
+            del W1, Q1, Err1, losses1, Hinv1
 
     if perm is not None:
         with record_function("gptq.restore_actorder"):

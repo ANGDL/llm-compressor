@@ -543,6 +543,43 @@ def test_quantize_weight_batch_close_to_single(
         ), f"module {idx} loss mismatch"
 
 
+@torch.no_grad()
+def test_quantize_weight_error_propagation_chunking_matches(monkeypatch):
+    import llmcompressor.modifiers.gptq.gptq_quantize as gptq_quantize
+
+    quant_args = QuantizationArgs(
+        num_bits=4,
+        symmetric=True,
+        strategy="group",
+        group_size=16,
+    )
+
+    def run(chunk):
+        module = _make_observed_linear(64, 48, quant_args, seed=7)
+        hessian = _make_spd_hessian(64, "cpu", 101)
+        weights, hessians, scales, zero_points, global_scales = (
+            _quantization_inputs([module], [hessian])
+        )
+        monkeypatch.setattr(
+            gptq_quantize, "_ERROR_PROPAGATION_CHUNK", chunk
+        )
+        return quantize_weight(
+            weights=weights,
+            hessians=hessians,
+            scale=scales,
+            zero_point=zero_points,
+            global_scale=global_scales,
+            quant_args=quant_args,
+        )
+
+    expected_weights, expected_losses, expected_rtn = run(128)
+    actual_weights, actual_losses, actual_rtn = run(4)
+
+    torch.testing.assert_close(actual_weights, expected_weights, rtol=1e-4, atol=1e-5)
+    torch.testing.assert_close(actual_losses, expected_losses, rtol=1e-4, atol=1e-5)
+    assert torch.equal(actual_rtn, expected_rtn)
+
+
 @pytest.mark.parametrize("device", ["cpu", "cuda", "xpu"])
 @torch.no_grad()
 def test_quantize_weight_batch_singular_hessian_uses_rtn(device):
