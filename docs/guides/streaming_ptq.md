@@ -568,6 +568,22 @@ Progress checkpoints and static activation schemes retain traced target groups.
 Recipes with additional transforms or training modifiers retain the sequential
 update callback so every modifier runs in recipe order.
 
+Owner-local updates do not imply identical forward work across execution
+policies. Ordinary RTN groups reuse calibration outputs, whereas the current
+routed resident-window path captures outputs in a separate propagation pass
+when a successor boundary is needed. The global calibration-output reuse log
+does not override that routed-window behavior.
+
+When comparing expert parallelism with single-device execution, align the
+computed model boundaries and count all calibration, propagation, boundary
+handling, and checkpoint work. Decoder targets and expert groups can differ in
+number and cross layer boundaries, and their initial prefixes can produce
+different activation sizes. Measure sequential isolated runs with identical
+frozen inputs, recipe, and saving mode; report elapsed time and GPU-hours through
+final publication. Concurrent-run progress or estimated finish times cannot
+establish final throughput, and combine time need not represent device
+communication when the path uses CPU passthrough.
+
 Streaming support and owner-local updates are separate capabilities:
 
 | Modifier | Streaming support | Owner-local updates |
