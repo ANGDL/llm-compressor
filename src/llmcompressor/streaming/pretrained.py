@@ -67,6 +67,7 @@ from .pipeline import (
     _initialize_run,
     run_subgraph_streaming_pipeline,
 )
+from .propagation import resolve_propagate_error
 from .tracing import trace_streaming_boundaries
 
 __all__ = ["streaming_oneshot_from_pretrained"]
@@ -387,6 +388,7 @@ def streaming_oneshot_from_pretrained(
     expert_parallel_devices: Sequence[torch.device | str] | None = None,
     expert_parallel_token_budget: str | int = "auto",
     processor_identity: Any = None,
+    propagate_error: bool | None = None,
 ) -> Path:
     """Run traced streaming PTQ with an oneshot-like model/dataset interface."""
     validate_token_budget(expert_parallel_token_budget)
@@ -443,6 +445,7 @@ def streaming_oneshot_from_pretrained(
     if not checkpoint.is_dir():
         raise ValueError("Pretrained streaming mode requires a local model directory")
     parsed_recipe = Recipe.create_instance(recipe)
+    resolve_propagate_error(parsed_recipe.modifiers, propagate_error)
     quantizer = _recipe_quantizer(parsed_recipe)
     ep_devices = resolve_expert_parallel_devices(
         expert_parallel_devices, torch.device(device)
@@ -671,6 +674,7 @@ def streaming_oneshot_from_pretrained(
                 expert_parallel=expert_parallel,
                 expert_parallel_token_budget=expert_parallel_token_budget,
                 target_groups=adapter.target_groups,
+                propagate_error=propagate_error,
             )
             _complete_direct_writer_staging(
                 adapter=adapter,
@@ -706,6 +710,7 @@ def streaming_oneshot_from_pretrained(
                     execution=adapter.execution,
                     expert_parallel=expert_parallel,
                     expert_parallel_token_budget=expert_parallel_token_budget,
+                    propagate_error=propagate_error,
                 )
             )
         qconfig = build_quantization_config(quantizer.resolved_config)

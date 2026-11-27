@@ -160,7 +160,7 @@ def _fixture(tmp_path):
     return checkpoint, reference, batches
 
 
-def _run(adapter, checkpoint, work, batches):
+def _run(adapter, checkpoint, work, batches, *, propagate_error=None):
     return run_subgraph_streaming_pipeline(
         adapter=adapter,
         checkpoint=checkpoint,
@@ -184,6 +184,7 @@ def _run(adapter, checkpoint, work, batches):
         max_seq_length=3,
         seed=41,
         checkpoint_progress=True,
+        propagate_error=propagate_error,
     )
 
 
@@ -366,6 +367,37 @@ def test_resume_rejects_changed_nontext_identity(tmp_path, monkeypatch, change):
         adapter.execution = replace(adapter.execution, graph_fingerprint="f" * 64)
     with pytest.raises(ArtifactCompatibilityError):
         _run(adapter, checkpoint, work, batches)
+
+
+@pytest.mark.parametrize("original_policy", [False, True])
+def test_resume_rejects_changed_propagation_policy(
+    tmp_path, monkeypatch, original_policy
+):
+    checkpoint, _reference, batches = _fixture(tmp_path)
+    work = tmp_path / "work"
+    original_commit = _Transaction.commit
+
+    def interrupt(transaction):
+        original_commit(transaction)
+        if transaction.transaction_id == "prefix-00000":
+            raise RuntimeError("prefix interrupted")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(_Transaction, "commit", interrupt)
+        with pytest.raises(RuntimeError, match="prefix interrupted"):
+            _run(
+                _adapter(checkpoint), checkpoint, work, batches,
+                propagate_error=original_policy,
+            )
+    with pytest.raises(ArtifactCompatibilityError):
+        _run(
+            _adapter(checkpoint), checkpoint, work, batches,
+            propagate_error=not original_policy,
+        )
+    _run(
+        _adapter(checkpoint), checkpoint, work, batches,
+        propagate_error=original_policy,
+    )
 
 
 def test_fingerprint_is_framed_and_supports_scalar_bfloat16(tmp_path):

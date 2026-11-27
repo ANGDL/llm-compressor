@@ -412,7 +412,9 @@ def calibration_statistics(model, modifier):
     }
 
 
-def reference_quantization(model, batches, routed=None, kind="gptq"):
+def reference_quantization(
+    model, batches, routed=None, kind="gptq", reuse_calibration_outputs=False
+):
     routed = subgraph() if routed is None else routed
     with create_session() as session:
         session.state.layerwise_calibration = True
@@ -424,8 +426,11 @@ def reference_quantization(model, batches, routed=None, kind="gptq"):
         modules = tuple(model.modules())
         modifier.start_layerwise_calibration(model, list(modules))
         with torch.no_grad(), DisableQuantization(model):
+            calibration_outputs = []
             for value in batches:
-                routed.forward(model, **value)
+                calibration_outputs.append(
+                    routed.forward(model, **value)["result"].clone()
+                )
         statistics = calibration_statistics(model, modifier)
         LifecycleCallbacks.sequential_epoch_end(list(modules))
         modifier.end_layerwise_calibration(list(modules))
@@ -434,7 +439,11 @@ def reference_quantization(model, batches, routed=None, kind="gptq"):
             DisableQuantization(model),
             HooksMixin.disable_hooks_local(),
         ):
-            outputs = [routed.forward(model, **value)["result"] for value in batches]
+            outputs = (
+                calibration_outputs
+                if reuse_calibration_outputs
+                else [routed.forward(model, **value)["result"] for value in batches]
+            )
         tensors = {name: tensor.clone() for name, tensor in model.state_dict().items()}
         LifecycleCallbacks.calibration_end()
         session.finalize()
@@ -459,6 +468,7 @@ def reference_quantization(model, batches, routed=None, kind="gptq"):
     ],
 )
 @pytest.mark.parametrize("kind", ["gptq", "rtn", "imatrix-rtn"])
+@pytest.mark.parametrize("reuse_calibration_outputs", [False, True])
 def test_region_matches_serial_quantization_statistics_weights_and_propagation(
     tmp_path,
     monkeypatch,
@@ -468,6 +478,7 @@ def test_region_matches_serial_quantization_statistics_weights_and_propagation(
     routing,
     combine_memory_bytes,
     kind,
+    reuse_calibration_outputs,
 ):
     torch.manual_seed(19)
     source = MoE().eval()
@@ -475,7 +486,7 @@ def test_region_matches_serial_quantization_statistics_weights_and_propagation(
     batches = list(grouped_values()) if grouped else values()
     routed = subgraph(group_expert_routes if grouped else None)
     expected_statistics, expected_tensors, expected_outputs = reference_quantization(
-        deepcopy(source), deepcopy(batches), routed, kind
+        deepcopy(source), deepcopy(batches), routed, kind, reuse_calibration_outputs
     )
     save_file(source.state_dict(), tmp_path / "model.safetensors")
     (tmp_path / "config.json").write_text("{}")
@@ -655,6 +666,7 @@ def test_region_matches_serial_quantization_statistics_weights_and_propagation(
             label="test",
             save_window=save,
             route_cache=cache,
+            reuse_calibration_outputs=reuse_calibration_outputs,
             destination_input_names=(
                 suffix.input_names | {"forwarded_hidden"}
                 if suffix is not None
@@ -718,7 +730,9 @@ def test_region_matches_serial_quantization_statistics_weights_and_propagation(
             )
         torch.testing.assert_close(propagated["result"], expected)
     if token_budget == 4:
-        assert dispatches == [4, 4, 2, 4, 4, 2]
+        assert dispatches == (
+            [4, 4, 2] if reuse_calibration_outputs else [4, 4, 2, 4, 4, 2]
+        )
     if combine_memory_bytes is not None:
         assert rejected_combines == ["test combine batch 1"]
 
@@ -763,19 +777,23 @@ class PipelineMoE(MoE):
     ],
 )
 @pytest.mark.parametrize("kind", ["gptq", "rtn", "imatrix-rtn"])
+@pytest.mark.parametrize("propagate_error", [None, False, True])
 def test_pipeline_uses_routed_windows_and_preserves_downstream_quantization(
-    tmp_path, monkeypatch, devices, grouped, memory_bytes, skip, defer_prefetch, kind
+    tmp_path, monkeypatch, devices, grouped, memory_bytes, skip, defer_prefetch, kind,
+    propagate_error,
 ):
     import llmcompressor.streaming.pipeline as pipeline
     from llmcompressor.streaming.loading.session import PreparedSubgraphWeights
 
     hardware = devices[0].startswith("cuda")
     if hardware and (
-        os.environ.get("CUDA_VISIBLE_DEVICES") != "4,5,6,7"
+        not os.environ.get("CUDA_VISIBLE_DEVICES")
         or not torch.cuda.is_available()
-        or torch.cuda.device_count() < 4
+        or torch.cuda.device_count() < len(devices)
     ):
-        pytest.skip("This pipeline validation requires physical devices 4-7")
+        pytest.skip(
+            "This pipeline validation requires explicitly selected CUDA devices"
+        )
     with_upstream = grouped and not skip
     check_overlap = with_upstream and not defer_prefetch
     torch.manual_seed(29)
@@ -944,6 +962,7 @@ def test_pipeline_uses_routed_windows_and_preserves_downstream_quantization(
                 else None
             ),
             expert_parallel_token_budget="auto",
+            propagate_error=propagate_error,
         )
         outputs.append(
             {
@@ -967,7 +986,7 @@ def test_pipeline_uses_routed_windows_and_preserves_downstream_quantization(
     assert outputs[0].keys() == outputs[1].keys()
     for name in outputs[0]:
         torch.testing.assert_close(outputs[1][name], outputs[0][name], msg=name)
-    assert bool(staged) == (hardware and memory_bytes == 5000)
+    assert bool(staged) == (hardware and memory_bytes == 5000 and kind == "gptq")
     assert len(denied) == (2 if defer_prefetch else 0)
 
 

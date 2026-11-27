@@ -546,8 +546,9 @@ def execute_expert_region(
     allow_device_prefetch=True,
     prepared_weights=None,
     on_combine_start=None,
+    reuse_calibration_outputs=False,
 ):
-    """Calibrate, update, propagate, and release each owner's admitted windows."""
+    """Calibrate and publish either calibration or post-update expert outputs."""
     planning_started = perf_counter()
     costs = {}
     runtime = {}
@@ -891,6 +892,7 @@ def execute_expert_region(
         capacity,
         *,
         capture,
+        calibrating,
         prepared_inputs=None,
         phase_stats=None,
     ):
@@ -924,7 +926,9 @@ def execute_expert_region(
                 if phase_stats is not None:
                     phase_stats["input_move_s"] += perf_counter() - input_move_started
                 del combined
-                context = HooksMixin.disable_hooks_local() if capture else nullcontext()
+                context = (
+                    nullcontext() if calibrating else HooksMixin.disable_hooks_local()
+                )
                 with context, calibration_batch_context(lengths, sample_count=samples):
                     forward_started = perf_counter()
                     result = adapter.model.get_submodule(name)(*args, **kwargs)
@@ -1216,7 +1220,12 @@ def execute_expert_region(
                 )
             )
             stack.enter_context(modifier_adapter.expert_window(adapter.model, modules))
-            for phase in ("calibration", "update", "propagation"):
+            phases = (
+                ("calibration", "update")
+                if reuse_calibration_outputs
+                else ("calibration", "update", "propagation")
+            )
+            for phase in phases:
                 if phase == "propagation" and not propagate:
                     continue
                 started = perf_counter()
@@ -1260,7 +1269,11 @@ def execute_expert_region(
                                     forward_expert(
                                         name,
                                         window.max_dispatch_tokens,
-                                        capture=phase == "propagation",
+                                        capture=propagate and (
+                                            phase == "propagation"
+                                            or reuse_calibration_outputs
+                                        ),
+                                        calibrating=phase == "calibration",
                                         prepared_inputs=inputs,
                                         phase_stats=phase_stats,
                                     )

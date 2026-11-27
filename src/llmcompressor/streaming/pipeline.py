@@ -116,6 +116,7 @@ from .parallel.token_budget import (
     select_token_capacity,
     validate_token_budget,
 )
+from .propagation import propagation_mode, resolve_propagate_error
 from .recovery import build_resume_plan
 from .tied_weights import infer_transformers_tied_weights
 from .tracing import TracedBoundaryAdapter
@@ -373,8 +374,12 @@ def _initialize_run(
     expert_parallel: ExpertParallelPlan | None = None,
     expert_parallel_token_budget: str | int = "auto",
     target_groups: tuple[tuple[int, ...], ...] = (),
+    propagate_error: bool | None = None,
 ) -> str:
     normalized_recipe = _normalized_recipe_payload(recipe)
+    output_mode = propagation_mode(
+        resolve_propagate_error(recipe.modifiers, propagate_error)
+    )
     source_info = fingerprint_checkpoint(checkpoint)
     modifier_contracts = build_modifier_contracts(recipe.modifiers)
     modifier_contract_sha256 = fingerprint_json(
@@ -397,7 +402,7 @@ def _initialize_run(
             ).config_sha256,
             "output": {"pack_to_int8": pack_to_int8},
             "execution": {
-                "propagation_mode": "sequential-compatible",
+                "propagation_mode": output_mode,
                 "boundary_schema": 1,
                 "modifier_contract_sha256": modifier_contract_sha256,
                 "execution_graph_sha256": fingerprint_json(
@@ -435,6 +440,7 @@ def _initialize_run(
         ),
         software=SoftwareInfo.from_versions({"torch": torch.__version__}),
         execution=ExecutionInfo(
+            propagation_mode=output_mode,
             modifier_contract_sha256=modifier_contract_sha256,
             execution_graph_sha256=fingerprint_json(
                 execution.to_dict() if execution is not None else {}
@@ -1171,10 +1177,14 @@ def run_subgraph_streaming_pipeline(
     targets_per_subgraph: int = 1,
     expert_parallel: ExpertParallelPlan | None = None,
     expert_parallel_token_budget: str | int = "auto",
+    propagate_error: bool | None = None,
 ) -> tuple[Path, Path, str]:
     """Calibrate, modify, propagate, and persist one subgraph at a time."""
 
     device = torch.device(device)
+    effective_propagate_error = resolve_propagate_error(
+        recipe.modifiers, propagate_error
+    )
     validate_token_budget(expert_parallel_token_budget)
     # Quantization observes/modifies weights; no parameter needs autograd.
     adapter.model.requires_grad_(False)
@@ -1260,6 +1270,7 @@ def run_subgraph_streaming_pipeline(
         expert_parallel=expert_parallel,
         expert_parallel_token_budget=expert_parallel_token_budget,
         target_groups=target_groups,
+        propagate_error=propagate_error,
     )
     transaction_writer = (
         StreamingCheckpointWriter(
@@ -1404,7 +1415,7 @@ def run_subgraph_streaming_pipeline(
         if window_adapter is not None:
             window_adapter = get_modifier_memory_adapter(modifiers[0])
         device_budget = DeviceMemoryBudget()
-        reuse_calibration_outputs = _can_reuse_calibration_outputs(recipe)
+        reuse_calibration_outputs = not effective_propagate_error
         streaming_logger.info(
             "setup | activation propagation | "
             + (
@@ -1412,6 +1423,7 @@ def run_subgraph_streaming_pipeline(
                 if reuse_calibration_outputs
                 else "recompute after modifier update"
             )
+            + f" | propagate_error={effective_propagate_error}"
         )
         if async_save:
             if direct_writer_base is None:
@@ -1716,6 +1728,7 @@ def run_subgraph_streaming_pipeline(
                             save_window=save_expert_window,
                             async_save=async_save,
                             propagate=has_next,
+                            reuse_calibration_outputs=reuse_calibration_outputs,
                             route_cache=route_cache,
                             destination_input_names=destination_input_names,
                             allow_device_prefetch=_async_h2d_enabled(),

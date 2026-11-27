@@ -1319,7 +1319,7 @@ def test_rtn_reuses_calibration_forward_and_preserves_quantized_checkpoint(
 
     monkeypatch.setattr(Subgraph, "forward", record_forward)
 
-    def run(name):
+    def run(name, propagate_error=None):
         return streaming_oneshot(
             model=checkpoint,
             dataset=_calibration_data(),
@@ -1332,16 +1332,13 @@ def test_rtn_reuses_calibration_forward_and_preserves_quantized_checkpoint(
             target_dtype=dtype,
             device=device,
             checkpoint_progress=checkpoint_progress,
+            propagate_error=propagate_error,
         )
 
     reused = run("reused")
     assert len(calls) == 4  # Two layers, two batches, one calibration pass.
     calls.clear()
-    monkeypatch.setattr(
-        "llmcompressor.streaming.pipeline._can_reuse_calibration_outputs",
-        lambda _recipe: False,
-    )
-    recomputed = run("recomputed")
+    recomputed = run("recomputed", propagate_error=True)
     assert len(calls) == 6  # Calibration plus propagation for the first layer.
     actual = _checkpoint_tensors(reused)
     expected = _checkpoint_tensors(recomputed)
@@ -1351,7 +1348,8 @@ def test_rtn_reuses_calibration_forward_and_preserves_quantized_checkpoint(
 
 
 def _assert_streaming_matches_oneshot(
-    tmp_path, *, transform, quantizer, fingerprint, targets_per_subgraph=1
+    tmp_path, *, transform, quantizer, fingerprint, targets_per_subgraph=1,
+    propagate_error=None,
 ):
     transform_instance = transform() if transform is not None else None
     transform_name = (
@@ -1390,6 +1388,7 @@ def _assert_streaming_matches_oneshot(
         pipeline="sequential",
         sequential_targets=["Qwen3DecoderLayer"],
         sequential_targets_per_subgraph=targets_per_subgraph,
+        **({"propagate_error": propagate_error} if propagate_error is not None else {}),
     )
     streamed = streaming_oneshot(
         model=checkpoint,
@@ -1406,6 +1405,7 @@ def _assert_streaming_matches_oneshot(
         max_seq_length=4,
         target_dtype=torch.float32,
         sequential_targets_per_subgraph=targets_per_subgraph,
+        propagate_error=propagate_error,
     )
 
     expected = _checkpoint_tensors(baseline)
@@ -1438,6 +1438,22 @@ def _assert_streaming_matches_oneshot(
         actual_logits = actual_model(**sample).logits
     torch.testing.assert_close(
         actual_logits, expected_logits, rtol=2e-2, atol=2e-3
+    )
+
+
+@pytest.mark.parametrize("propagate_error", [False, True])
+@pytest.mark.parametrize("quantizer_type", [QuantizationModifier, GPTQModifier])
+def test_streaming_propagation_switch_matches_sequential_oneshot(
+    tmp_path, propagate_error, quantizer_type
+):
+    _assert_streaming_matches_oneshot(
+        tmp_path,
+        transform=lambda: None,
+        quantizer=lambda: quantizer_type(
+            scheme="W8A8", ignore=["lm_head"]
+        ),
+        fingerprint="9",
+        propagate_error=propagate_error,
     )
 
 

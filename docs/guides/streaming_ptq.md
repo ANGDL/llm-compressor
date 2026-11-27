@@ -568,11 +568,36 @@ Progress checkpoints and static activation schemes retain traced target groups.
 Recipes with additional transforms or training modifiers retain the sequential
 update callback so every modifier runs in recipe order.
 
-Owner-local updates do not imply identical forward work across execution
-policies. Ordinary RTN groups reuse calibration outputs, whereas the current
-routed resident-window path captures outputs in a separate propagation pass
-when a successor boundary is needed. The global calibration-output reuse log
-does not override that routed-window behavior.
+`propagate_error` controls the outputs passed to the next target for a
+pretrained recipe containing one `QuantizationModifier` or `GPTQModifier`,
+using the same option name as sequential `oneshot`:
+
+| Value | Output used by the next target |
+| --- | --- |
+| `False` | The calibration pass output, captured before modifier update |
+| `True` | A second forward after modifier update |
+| `None` (default) | Follow modifier contracts: RTN reuses outputs; GPTQ uses a second forward |
+
+The policy applies to both ordinary groups and routed EP resident windows.
+With `False`, routed windows capture outputs while calibration hooks remain
+active and skip the extra propagation forward. With `True`, propagation hooks
+are disabled before the second forward. The final target has no successor
+boundary and does not need a propagation pass in either mode.
+Propagation retains the existing streaming execution precision; this switch
+does not add fake-quant QDQ to the second pass. For RTN the floating weights
+are unchanged by its qparam update, whereas GPTQ changes weights in place.
+
+Unlike sequential `oneshot`, whose default is `True`, streaming defaults to
+`None` to retain its contract-based policy. Mixed transform/training recipes
+keep their adapter-specific behavior and require `None`; explicit overrides
+and the advanced fixed-boundary mode are not supported for those recipes.
+
+For the DeepSeek V4.1 example, use `--no-propagate-error` to request calibration
+output reuse or `--propagate-error` for the second forward. The resolved policy
+is logged and recorded in the manifest and run fingerprint. Resume and
+`finalize_only` must use the same policy; changing it requires a new work
+directory. Runs recorded before propagation policy was included in the
+fingerprint cannot be resumed with the new execution identity.
 
 When comparing expert parallelism with single-device execution, align the
 computed model boundaries and count all calibration, propagation, boundary

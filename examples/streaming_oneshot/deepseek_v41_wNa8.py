@@ -22,6 +22,10 @@ with FP32 weight scales in every quantization mode.
 Attention ``wo_a`` projections are quantized with the other attention
 projections by default.
 Pass ``--no-quantize-wo-a`` to keep them in execution precision instead.
+RTN reuses calibration outputs by default, including EP runs. Pass
+``--propagate-error`` to run an additional post-update forward, or
+``--no-propagate-error`` to reuse calibration outputs explicitly.
+GPTQ defaults to the post-update forward.
 FP32 weight scales are used by default for all PTQ groups; pass
 ``--no-use-float32-scale-dtype`` to store scales in execution dtype instead.
 Output tensor names and quantization selectors use the original checkpoint
@@ -587,6 +591,14 @@ def main():
     parser.add_argument("--text-calibration-samples", type=int, default=0)
     parser.add_argument("--max-sequence-length", type=int, default=2048)
     parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument(
+        "--propagate-error",
+        "--propagate_error",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Run an updated-weight propagation pass; disable to reuse calibration "
+        "outputs (default: RTN reuses outputs, GPTQ propagates).",
+    )
     parser.add_argument("--device", help="Execution device, e.g. cpu or cuda:0")
     parser.add_argument(
         "--expert-parallel-devices",
@@ -799,6 +811,7 @@ def main():
         materializer=materializer,
         checkpoint_progress=args.checkpoint_progress,
         async_save=args.async_save,
+        propagate_error=args.propagate_error,
         pack_to_int8=True,
     )
     tokenizer.save_pretrained(result)
