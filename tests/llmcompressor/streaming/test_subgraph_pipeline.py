@@ -1338,8 +1338,10 @@ def test_rtn_reuses_calibration_forward_and_preserves_quantized_checkpoint(
     reused = run("reused")
     assert len(calls) == 4  # Two layers, two batches, one calibration pass.
     calls.clear()
-    recomputed = run("recomputed", propagate_error=True)
-    assert len(calls) == 6  # Calibration plus propagation for the first layer.
+    with pytest.warns(UserWarning, match="has no effect for QuantizationModifier"):
+        recomputed = run("recomputed", propagate_error=True)
+    # RTN compression follows propagation, so an explicit True is downgraded.
+    assert len(calls) == 4
     actual = _checkpoint_tensors(reused)
     expected = _checkpoint_tensors(recomputed)
     assert actual.keys() == expected.keys()
@@ -1441,8 +1443,14 @@ def _assert_streaming_matches_oneshot(
     )
 
 
-@pytest.mark.parametrize("propagate_error", [False, True])
-@pytest.mark.parametrize("quantizer_type", [QuantizationModifier, GPTQModifier])
+@pytest.mark.parametrize(
+    "quantizer_type,propagate_error",
+    [
+        (QuantizationModifier, False),
+        (GPTQModifier, False),
+        (GPTQModifier, True),
+    ],
+)
 def test_streaming_propagation_switch_matches_sequential_oneshot(
     tmp_path, propagate_error, quantizer_type
 ):

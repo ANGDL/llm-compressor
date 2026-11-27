@@ -7,6 +7,7 @@ from safetensors.torch import load_file, save_file
 from torch import nn
 from torch.fx import Graph
 
+from llmcompressor.modifiers.gptq import GPTQModifier
 from llmcompressor.modifiers.quantization import QuantizationModifier
 from llmcompressor.pipelines.sequential.helpers import Subgraph, trace_consumed_names
 from llmcompressor.pipelines.sequential.plan import SequentialExecutionPlan
@@ -160,22 +161,23 @@ def _fixture(tmp_path):
     return checkpoint, reference, batches
 
 
-def _run(adapter, checkpoint, work, batches, *, propagate_error=None):
+def _run(
+    adapter, checkpoint, work, batches, *, propagate_error=None, quantizer=None
+):
+    quantizer = quantizer or QuantizationModifier(
+        config_groups={
+            "weights": {
+                "targets": ["layers.0", "layers.1", "mtp"],
+                "weights": {"num_bits": 8, "strategy": "channel"},
+            }
+        }
+    )
     return run_subgraph_streaming_pipeline(
         adapter=adapter,
         checkpoint=checkpoint,
         work_dir=work,
         calibration_batches=batches,
-        recipe=Recipe.create_instance(
-            QuantizationModifier(
-                config_groups={
-                    "weights": {
-                        "targets": ["layers.0", "layers.1", "mtp"],
-                        "weights": {"num_bits": 8, "strategy": "channel"},
-                    }
-                }
-            )
-        ),
+        recipe=Recipe.create_instance(quantizer),
         dataset_fingerprint="b" * 64,
         materializer=CastWeightMaterializer(),
         device=torch.device("cpu"),
@@ -376,6 +378,14 @@ def test_resume_rejects_changed_propagation_policy(
     checkpoint, _reference, batches = _fixture(tmp_path)
     work = tmp_path / "work"
     original_commit = _Transaction.commit
+    quantizer = GPTQModifier(
+        config_groups={
+            "weights": {
+                "targets": ["layers.0", "layers.1", "mtp"],
+                "weights": {"num_bits": 8, "strategy": "channel"},
+            }
+        }
+    )
 
     def interrupt(transaction):
         original_commit(transaction)
@@ -388,15 +398,18 @@ def test_resume_rejects_changed_propagation_policy(
             _run(
                 _adapter(checkpoint), checkpoint, work, batches,
                 propagate_error=original_policy,
+                quantizer=quantizer,
             )
     with pytest.raises(ArtifactCompatibilityError):
         _run(
             _adapter(checkpoint), checkpoint, work, batches,
             propagate_error=not original_policy,
+            quantizer=quantizer,
         )
     _run(
         _adapter(checkpoint), checkpoint, work, batches,
         propagate_error=original_policy,
+        quantizer=quantizer,
     )
 
 

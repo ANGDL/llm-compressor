@@ -20,15 +20,30 @@ from llmcompressor.streaming.propagation import (
     "modifier_type,default",
     [(QuantizationModifier, False), (GPTQModifier, True)],
 )
-@pytest.mark.parametrize("option", [None, False, True])
-def test_propagation_defaults_follow_modifier_and_explicit_switch_overrides(
+@pytest.mark.parametrize("option", [None, False])
+def test_propagation_defaults_follow_modifier_and_explicit_false_overrides(
     modifier_type, default, option
 ):
     actual = resolve_propagate_error([modifier_type(scheme="W8A8")], option)
-    assert actual is (default if option is None else option)
+    assert actual is (default if option is None else False)
     assert propagation_mode(actual) == (
         "post-update" if actual else "calibration-outputs"
     )
+
+
+def test_rtn_explicit_true_downgrades_with_warning():
+    with pytest.warns(UserWarning, match="has no effect for QuantizationModifier"):
+        actual = resolve_propagate_error(
+            [QuantizationModifier(scheme="W8A8")], True
+        )
+    assert actual is False
+    assert propagation_mode(actual) == "calibration-outputs"
+
+
+def test_gptq_explicit_true_is_preserved():
+    actual = resolve_propagate_error([GPTQModifier(scheme="W8A8")], True)
+    assert actual is True
+    assert propagation_mode(actual) == "post-update"
 
 
 @pytest.mark.parametrize("option", [0, 1, "false"])
@@ -112,8 +127,19 @@ def test_propagation_mode_changes_run_identity_and_manifest(tmp_path, monkeypatc
     )
     default = _initialize_run(**kwargs)
     reused = _initialize_run(**kwargs, propagate_error=False)
-    recomputed = _initialize_run(**kwargs, propagate_error=True)
-    assert default == reused
-    assert recomputed != reused
+    with pytest.warns(UserWarning, match="has no effect for QuantizationModifier"):
+        downgraded = _initialize_run(**kwargs, propagate_error=True)
+    assert default == reused == downgraded
+    assert captured[-3].execution.propagation_mode == "calibration-outputs"
     assert captured[-2].execution.propagation_mode == "calibration-outputs"
+    assert captured[-1].execution.propagation_mode == "calibration-outputs"
+
+    propagated = _initialize_run(
+        **{
+            **kwargs,
+            "recipe": Recipe.create_instance(GPTQModifier(scheme="W8A8")),
+        },
+        propagate_error=True,
+    )
+    assert propagated != reused
     assert captured[-1].execution.propagation_mode == "post-update"

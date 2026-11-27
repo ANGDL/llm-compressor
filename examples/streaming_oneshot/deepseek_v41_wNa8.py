@@ -22,10 +22,11 @@ with FP32 weight scales in every quantization mode.
 Attention ``wo_a`` projections are quantized with the other attention
 projections by default.
 Pass ``--no-quantize-wo-a`` to keep them in execution precision instead.
-RTN reuses calibration outputs by default, including EP runs. Pass
-``--propagate-error`` to run an additional post-update forward, or
-``--no-propagate-error`` to reuse calibration outputs explicitly.
-GPTQ defaults to the post-update forward.
+RTN reuses calibration outputs by default, including EP runs. RTN compression
+happens after boundary propagation, so ``--propagate-error`` cannot propagate
+RTN quantization error; an explicit request is downgraded to calibration
+output reuse with a warning. GPTQ defaults to the post-update forward and
+supports both ``--propagate-error`` and ``--no-propagate-error``.
 FP32 weight scales are used by default for all PTQ groups; pass
 ``--no-use-float32-scale-dtype`` to store scales in execution dtype instead.
 Output tensor names and quantization selectors use the original checkpoint
@@ -596,8 +597,9 @@ def main():
         "--propagate_error",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="Run an updated-weight propagation pass; disable to reuse calibration "
-        "outputs (default: RTN reuses outputs, GPTQ propagates).",
+        help="Run an updated-weight propagation pass when supported; RTN requests "
+        "are downgraded to calibration output reuse with a warning "
+        "(default: RTN reuses outputs, GPTQ propagates).",
     )
     parser.add_argument("--device", help="Execution device, e.g. cpu or cuda:0")
     parser.add_argument(

@@ -293,8 +293,10 @@ def streaming_oneshot(
     single RTN/GPTQ recipe: ``False`` reuses calibration outputs, ``True`` runs
     a second forward after modifier update. ``None`` follows modifier contracts:
     RTN reuses outputs, GPTQ recomputes them, with or without expert parallelism.
-    Propagation uses the existing streaming execution precision; this option
-    does not add fake-quant QDQ to the second pass.
+    RTN explicit ``True`` is downgraded to ``False`` with a warning because RTN
+    compresses weights after the propagation pass. Propagation uses the existing
+    streaming execution precision; this option does not add fake-quant QDQ to
+    the second pass.
 
     Set ``finalize_only=True`` to validate and publish completed direct-writer
     shards after a previous normal-mode run failed during finalization.

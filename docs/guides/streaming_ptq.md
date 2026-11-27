@@ -575,7 +575,7 @@ using the same option name as sequential `oneshot`:
 | Value | Output used by the next target |
 | --- | --- |
 | `False` | The calibration pass output, captured before modifier update |
-| `True` | A second forward after modifier update |
+| `True` | A second forward after modifier update (GPTQ only; RTN is downgraded to `False` with a warning) |
 | `None` (default) | Follow modifier contracts: RTN reuses outputs; GPTQ uses a second forward |
 
 The policy applies to both ordinary groups and routed EP resident windows.
@@ -584,8 +584,14 @@ active and skip the extra propagation forward. With `True`, propagation hooks
 are disabled before the second forward. The final target has no successor
 boundary and does not need a propagation pass in either mode.
 Propagation retains the existing streaming execution precision; this switch
-does not add fake-quant QDQ to the second pass. For RTN the floating weights
-are unchanged by its qparam update, whereas GPTQ changes weights in place.
+does not add fake-quant QDQ to the second pass.
+
+RTN cannot propagate quantization error under the streaming ordering: its
+modifier update only computes qparams and leaves floating weights unchanged,
+then compression happens after the boundary propagation pass. An explicit
+`propagate_error=True` for a single `QuantizationModifier` is therefore
+downgraded to `False` at resolution time and emits a warning. GPTQ changes
+weights in place during its update, so its `True` path is meaningful.
 
 Unlike sequential `oneshot`, whose default is `True`, streaming defaults to
 `None` to retain its contract-based policy. Mixed transform/training recipes
@@ -593,11 +599,13 @@ keep their adapter-specific behavior and require `None`; explicit overrides
 and the advanced fixed-boundary mode are not supported for those recipes.
 
 For the DeepSeek V4.1 example, use `--no-propagate-error` to request calibration
-output reuse or `--propagate-error` for the second forward. The resolved policy
-is logged and recorded in the manifest and run fingerprint. Resume and
-`finalize_only` must use the same policy; changing it requires a new work
-directory. Runs recorded before propagation policy was included in the
-fingerprint cannot be resumed with the new execution identity.
+output reuse or `--propagate-error` to request the second forward. With RTN the
+explicit `True` request is downgraded with a warning; with GPTQ it remains
+`True`. The resolved policy is logged and recorded in the manifest and run
+fingerprint. Resume and `finalize_only` must use the same resolved policy;
+changing it requires a new work directory. Runs recorded before propagation
+policy was included in the fingerprint cannot be resumed with the new
+execution identity.
 
 When comparing expert parallelism with single-device execution, align the
 computed model boundaries and count all calibration, propagation, boundary
