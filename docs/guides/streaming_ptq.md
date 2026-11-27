@@ -568,6 +568,20 @@ Progress checkpoints and static activation schemes retain traced target groups.
 Recipes with additional transforms or training modifiers retain the sequential
 update callback so every modifier runs in recipe order.
 
+Streaming support and owner-local updates are separate capabilities:
+
+| Modifier | Streaming support | Owner-local updates |
+| --- | --- | --- |
+| GPTQ, RTN (`QuantizationModifier`) | Supported | Supported for a single-modifier recipe |
+| AWQ, SmoothQuant | Supported through the sequential callback | Not implemented |
+| AutoSmooth, QAD, AutoRound | Supported with their adapter-specific recipe and target restrictions | Not implemented |
+| SpinQuant, QuIP | Rejected by the streaming validator | Not implemented |
+
+Sharing the quantization-window lifecycle does not enable owner-local updates
+for additional modifiers. Such adapters still need validated ownership of
+their mappings and mutable state, preservation of recipe update order, and
+numerical comparisons between sequential and concurrent execution.
+
 `pipeline_devices` is removed rather than deprecated. It described a bounded
 two-GPU weight-prefetch implementation, not pipeline parallel execution, and it
 would conflict with a future expert-placement API. Callers provide exactly one
