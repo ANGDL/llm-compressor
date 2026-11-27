@@ -62,14 +62,12 @@ from .checkpoint import (
     StreamingCheckpointWriter,
 )
 from .compaction import BoundaryCompactor
-from .data_worker import initial_boundary_async_enabled
 from .execution import (
     FrozenCalibrationInputs,
     StreamingExecutionDescriptor,
     describe_streaming_execution,
     freeze_calibration_inputs,
 )
-from .initial_boundary import InitialBoundaryWriter, initial_boundary_cleanup
 from .loading import HostMemoryBudget, HostMemoryError, SubgraphPrefetcher
 from .materialization import (
     StreamingDTypePolicy,
@@ -1321,63 +1319,28 @@ def run_subgraph_streaming_pipeline(
         committed_transaction_ids.insert(0, "prefix-00000")
     if transaction_writer is None or not resume_plan.transaction_ids:
         streaming_logger.info("setup | collecting initial calibration boundary")
-        with (
-            _stage_logger(adapter.model, "[setup] initial boundary", device),
-            initial_boundary_cleanup(boundaries),
-        ):
+        with _stage_logger(adapter.model, "[setup] initial boundary", device):
             boundaries.delete(0)
             prefix_metadata = resume_plan.prefix_metadata if resume_plan else None
-            initial_source = (
+            initial = (
                 transaction_writer.iter_committed_boundary(
                     "prefix-00000", metadata=prefix_metadata
                 )
                 if prefix_metadata is not None
-                else adapter.calibration_boundaries(calibration_batches)
+                else enumerate(adapter.calibration_boundaries(calibration_batches))
             )
-            initial = (
-                initial_source
-                if prefix_metadata is not None
-                else enumerate(initial_source)
-            )
-            with ExitStack() as initial_stack:
-                if isinstance(adapter, TracedBoundaryAdapter):
-                    previous_budget = adapter._initial_host_budget
-                    adapter._initial_host_budget = host_budget
-                    initial_stack.callback(
-                        setattr, adapter, "_initial_host_budget", previous_budget
+            for batch_index, boundary in initial:
+                boundaries.put(0, batch_index, boundary)
+                if batch_index == 0:
+                    _debug_boundary(
+                        "initial",
+                        boundary=0,
+                        batch=batch_index,
+                        producer="<dataset>",
+                        consumer=adapter.targets[0],
+                        value=boundary,
                     )
-                initial_iterator = iter(initial)
-                close_initial = getattr(initial_source, "close", None)
-                if callable(close_initial):
-                    initial_stack.callback(close_initial)
-                initial_writer = initial_stack.enter_context(
-                    InitialBoundaryWriter(
-                        boundaries,
-                        host_budget=host_budget,
-                        device=device,
-                        enabled=initial_boundary_async_enabled(),
-                        release_input_prefetch=getattr(
-                            adapter, "discard_initial_prefetch", None
-                        ),
-                    )
-                )
-                while True:
-                    initial_writer.wait_for_slot()
-                    try:
-                        batch_index, boundary = next(initial_iterator)
-                    except StopIteration:
-                        break
-                    if batch_index == 0:
-                        _debug_boundary(
-                            "initial",
-                            boundary=0,
-                            batch=batch_index,
-                            producer="<dataset>",
-                            consumer=adapter.targets[0],
-                            value=boundary,
-                        )
-                    initial_writer.submit(batch_index, boundary)
-                    del boundary
+                del boundary
         streaming_logger.info(
             "setup | initial boundary ready | "
             f"batches={len(boundaries.batch_indices(0))}"

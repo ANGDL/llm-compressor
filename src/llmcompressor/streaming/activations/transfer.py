@@ -115,103 +115,17 @@ class TreeTransferToCPU:
                 self._reservations = None
 
 
-@dataclass
-class PreparedTreeTransfer:
-    """A CPU-only packed input that can be prepared by a data worker."""
-
-    value: Any
-    cpu_buffer: torch.Tensor
-    plan: _TransferPlan
-    allocate_seconds: float
-    pack_seconds: float
-
-    def transfer(
-        self,
-        device: torch.device,
-        *,
-        stream: torch.cuda.Stream | None,
-        device_budget: DeviceMemoryBudget,
-    ) -> TreeTransfer:
-        reservations = ExitStack()
-        try:
-            reservations.enter_context(
-                device_budget.reserve(
-                    "initial boundary packed input",
-                    self.plan.total_bytes,
-                    device=device,
-                )
-            )
-            started = perf_counter()
-            device_buffer = torch.empty(
-                self.plan.total_bytes, dtype=torch.uint8, device=device
-            )
-            reconstructed = _unpack(self.value, device_buffer, self.plan, {})
-            event = None
-            if stream is not None and self.cpu_buffer.is_pinned():
-                with torch.cuda.stream(stream):
-                    event = torch.cuda.Event()
-                    try:
-                        device_buffer.copy_(self.cpu_buffer, non_blocking=True)
-                        event.record(stream)
-                    except BaseException:
-                        stream.synchronize()
-                        raise
-            else:
-                device_buffer.copy_(self.cpu_buffer)
-            return TreeTransfer(
-                reconstructed,
-                self.cpu_buffer,
-                device_buffer,
-                event,
-                len(self.plan.slots),
-                self.plan.total_bytes,
-                self.allocate_seconds,
-                self.pack_seconds,
-                perf_counter() - started,
-                reservations.pop_all(),
-            )
-        finally:
-            reservations.close()
-
-
-def packed_transfer_bytes(value: Any) -> int:
-    """Estimate aligned CPU staging without reading tensor contents."""
-    plan = _TransferPlan({})
-    _collect(value, plan, expected_device=None)
-    return plan.total_bytes
-
-
-def prepare_tree_transfer(value: Any) -> PreparedTreeTransfer:
-    """Pack CPU tensors into independently owned pinned staging."""
-    plan = _TransferPlan({})
-    _collect(value, plan, expected_device=torch.device("cpu"))
-    started = perf_counter()
-    try:
-        cpu_buffer = torch.empty(
-            plan.total_bytes,
-            dtype=torch.uint8,
-            pin_memory=torch.cuda.is_available(),
-        )
-    except RuntimeError:
-        cpu_buffer = torch.empty(plan.total_bytes, dtype=torch.uint8)
-    allocated = perf_counter()
-    _pack(value, cpu_buffer, plan, set())
-    return PreparedTreeTransfer(
-        value, cpu_buffer, plan, allocated - started, perf_counter() - allocated
-    )
-
-
 def _collect(
     value: Any,
     plan: _TransferPlan,
     *,
-    expected_device: torch.device | None,
+    expected_device: torch.device,
 ) -> None:
     if isinstance(value, torch.Tensor):
         identity = id(value)
         if identity in plan.slots:
             return
-        if expected_device is not None and value.device != expected_device:
+        if value.device != expected_device:
             raise TypeError("coalesced transfers require tensors on one common device")
         nbytes = value.numel() * value.element_size()
         offset = _align(plan.total_bytes)
