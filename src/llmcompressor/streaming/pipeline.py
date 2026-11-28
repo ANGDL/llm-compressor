@@ -2343,10 +2343,6 @@ def run_subgraph_streaming_pipeline(
                                         "boundary", perf_counter() - publish_started_at
                                     )
                                     ep_metrics.advance(len(batch_indices))
-                    if copy_gate is not None:
-                        copy_gate.record_compute_done(
-                            torch.cuda.current_stream(device)
-                        )
                     owner_update_groups = None
                     if expert_parallel is not None:
                         ep_executor.synchronize()
@@ -2561,6 +2557,10 @@ def run_subgraph_streaming_pipeline(
                                     host_budget=host_budget,
                                 )
                             )
+                    if copy_gate is not None:
+                        copy_gate.record_compute_done(
+                            torch.cuda.current_stream(device)
+                        )
                 finally:
                     with _stage_logger(
                         adapter.model,
