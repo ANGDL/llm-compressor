@@ -2282,7 +2282,6 @@ def run_subgraph_streaming_pipeline(
                         ) as ep_metrics,
                     ):
                         with DisableQuantization(adapter.model), torch.no_grad():
-                            gate_recorded = False
                             for batch_indices, values in _iter_execution_batches(
                                 boundaries,
                                 group_start,
@@ -2301,11 +2300,6 @@ def run_subgraph_streaming_pipeline(
                                     values,
                                     ep_executor,
                                 )
-                                if copy_gate is not None and not gate_recorded:
-                                    copy_gate.record_compute_done(
-                                        torch.cuda.current_stream(device)
-                                    )
-                                    gate_recorded = True
                                 publish_started_at = perf_counter()
                                 if ep_metrics is not None:
                                     ep_metrics.activity(
@@ -2349,6 +2343,10 @@ def run_subgraph_streaming_pipeline(
                                         "boundary", perf_counter() - publish_started_at
                                     )
                                     ep_metrics.advance(len(batch_indices))
+                    if copy_gate is not None:
+                        copy_gate.record_compute_done(
+                            torch.cuda.current_stream(device)
+                        )
                     owner_update_groups = None
                     if expert_parallel is not None:
                         ep_executor.synchronize()
