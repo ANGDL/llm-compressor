@@ -237,7 +237,8 @@ implementation. Cast and DeepSeek-V4 materializers implement the same CPU-only
 The class contracts fix the following ownership decisions:
 
 1. `SubgraphPrefetcher` always calls `prepare` for CPU and owns at most one
-   future. CUDA mode may attach a bounded transfer reservation to that future.
+   future. CUDA mode may attach a bounded transfer reservation and one
+   persistent per-device copy stream to that future.
 2. The pipeline reserves host memory before `submit`. Ownership of that
    reservation moves to the prefetch task and then to
    `PreparedSubgraphWeights`; every failure path closes it.
@@ -304,6 +305,16 @@ transfer path. When capacity allows, the steady-state schedule is:
 ```text
 target N execution || target N+1 CPU preparation and H2D || target N-1 write
 ```
+
+`SubgraphPrefetcher` owns one persistent copy stream per execution device. The
+pipeline thread creates that stream and reuses it for every target on the
+device; the prefetch worker only enqueues work onto it. Creating a stream per
+target, or creating it inside the prefetch worker, is not allowed: stream
+lifetime must not depend on worker scheduling, and the dedicated copy lane must
+stay stable for the complete pipeline. Each transfer still records its own
+completion event. Immediately before installation the execution stream calls
+`wait_event()` on that completion event, then the pipeline waits for the event
+before releasing the pinned staging buffer.
 
 The device-transfer stage is capacity-gated. It may temporarily hold the
 current and next target on the execution device, so devices that cannot fit both

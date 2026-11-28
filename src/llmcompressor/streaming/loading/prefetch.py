@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import AbstractContextManager
+from threading import Lock
 from time import perf_counter
 
 import torch
@@ -28,7 +29,28 @@ class SubgraphPrefetcher(AbstractContextManager):
         self._pending: tuple[
             str, Future[PreparedSubgraphWeights]
         ] | None = None
+        self._transfer_streams: dict[torch.device, torch.cuda.Stream] = {}
+        self._transfer_stream_lock = Lock()
         self._closed = False
+
+    def _transfer_stream_for(self, device: torch.device | str) -> torch.cuda.Stream:
+        """Return the persistent copy stream for one execution device.
+
+        The stream is created on the caller thread (the pipeline thread) and
+        reused for every target on that device. Creating a fresh stream inside
+        the prefetch worker for every target makes stream lifetime depend on
+        worker scheduling and defeats the single dedicated-copy-stream design.
+        """
+
+        resolved = torch.device(device)
+        if resolved.type == "cuda" and resolved.index is None:
+            resolved = torch.device("cuda", torch.cuda.current_device())
+        with self._transfer_stream_lock:
+            stream = self._transfer_streams.get(resolved)
+            if stream is None:
+                stream = torch.cuda.Stream(device=resolved)
+                self._transfer_streams[resolved] = stream
+            return stream
 
     def _prepare(
         self,
@@ -39,6 +61,7 @@ class SubgraphPrefetcher(AbstractContextManager):
         device: torch.device | str | None,
         device_reservation,
         transfer_reservation: HostMemoryReservation | None,
+        transfer_stream: torch.cuda.Stream | None,
     ) -> PreparedSubgraphWeights:
         started_at = perf_counter()
         streaming_logger.info(f"{label} | started | device=cpu")
@@ -52,6 +75,7 @@ class SubgraphPrefetcher(AbstractContextManager):
                     device,
                     device_reservation=device_reservation,
                     transfer_reservation=transfer_reservation,
+                    transfer_stream=transfer_stream,
                 )
                 device_reservation = None
                 transfer_reservation = None
@@ -68,10 +92,16 @@ class SubgraphPrefetcher(AbstractContextManager):
                 transfer_reservation.close()
             raise
         transfer_seconds = perf_counter() - prepared_at
+        stream_id = (
+            getattr(transfer_stream, "stream_id", None)
+            if transfer_stream is not None
+            else None
+        )
         streaming_logger.info(
             f"{label} | complete | device={prepared.device.type} | "
             f"prepare={prepared_at - started_at:.2f}s | "
-            f"transfer_enqueue={transfer_seconds:.2f}s"
+            f"transfer_enqueue={transfer_seconds:.2f}s | "
+            f"copy_stream={stream_id}"
         )
         return prepared
 
@@ -102,6 +132,11 @@ class SubgraphPrefetcher(AbstractContextManager):
             if transfer_reservation is not None:
                 transfer_reservation.close()
             raise RuntimeError("A subgraph prefetch is already pending")
+        transfer_stream = None
+        if device is not None and transfer_reservation is not None:
+            resolved = torch.device(device)
+            if resolved.type == "cuda":
+                transfer_stream = self._transfer_stream_for(resolved)
         try:
             future = self._executor.submit(
                 self._prepare,
@@ -112,6 +147,7 @@ class SubgraphPrefetcher(AbstractContextManager):
                 device,
                 device_reservation,
                 transfer_reservation,
+                transfer_stream,
             )
         except Exception:
             reservation.close()
@@ -153,6 +189,13 @@ class SubgraphPrefetcher(AbstractContextManager):
             except Exception as caught:
                 error = caught
         self._executor.shutdown(wait=True)
+        for stream in self._transfer_streams.values():
+            try:
+                stream.synchronize()
+            except Exception as caught:
+                if error is None:
+                    error = caught
+        self._transfer_streams.clear()
         if error is not None and not suppress_errors:
             raise error
 

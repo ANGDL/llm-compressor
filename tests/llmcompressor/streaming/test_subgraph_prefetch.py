@@ -102,6 +102,29 @@ def test_prefetch_allows_only_one_pending_result(tmp_path):
         assert second.closed
 
 
+def test_prefetch_reuses_one_transfer_stream_per_device(monkeypatch):
+    created = []
+
+    class Stream:
+        def __init__(self, *, device):
+            self.device = torch.device(device)
+            created.append(self)
+
+    monkeypatch.setattr(torch.cuda, "Stream", Stream)
+    prefetcher = SubgraphPrefetcher(session=None)
+    try:
+        first = prefetcher._transfer_stream_for("cuda:0")
+        second = prefetcher._transfer_stream_for("cuda:0")
+        other = prefetcher._transfer_stream_for("cuda:1")
+    finally:
+        prefetcher._transfer_streams.clear()
+        prefetcher._executor.shutdown(wait=True)
+
+    assert first is second
+    assert first is not other
+    assert len(created) == 2
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_prefetch_can_enqueue_bounded_cuda_transfer(tmp_path):
     reference = SessionModel()
@@ -198,12 +221,19 @@ def test_async_weight_staging_allocates_per_dtype_and_cleans_up(
     waits = []
     original_empty = torch.empty
 
+    class Event:
+        def synchronize(self):
+            waits.append("event-sync")
+
     class Stream:
         def synchronize(self):
-            waits.append("sync")
+            waits.append("stream-sync")
 
         def record_event(self):
-            return self
+            return Event()
+
+        def wait_event(self, event):
+            waits.append(("wait-event", event))
 
     def empty(*args, **kwargs):
         if kwargs.pop("pin_memory", False):
@@ -214,6 +244,10 @@ def test_async_weight_staging_allocates_per_dtype_and_cleans_up(
 
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "Stream", lambda **_kwargs: Stream())
+    execution_stream = Stream()
+    monkeypatch.setattr(
+        torch.cuda, "current_stream", lambda _device=None: execution_stream
+    )
     monkeypatch.setattr(torch.cuda, "stream", lambda _stream: nullcontext())
     monkeypatch.setattr(torch, "empty", empty)
     monkeypatch.setattr(torch.Tensor, "to", lambda tensor, **_kwargs: tensor.clone())
@@ -233,6 +267,10 @@ def test_async_weight_staging_allocates_per_dtype_and_cleans_up(
                 for name, value in values.items():
                     torch.testing.assert_close(value, expected[name])
         prepared.wait_for_transfer()
+        assert any(
+            isinstance(item, tuple) and item[0] == "wait-event" for item in waits
+        )
+        assert waits[-1] == "event-sync"
         assert prepared._transfer_stream is None
         assert transfer.closed
         prepared.close()

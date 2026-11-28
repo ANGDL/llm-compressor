@@ -236,6 +236,9 @@ class PreparedSubgraphWeights:
 
         if self._transfer_event is not None:
             started_at = perf_counter()
+            if self._device.type == "cuda":
+                execution_stream = torch.cuda.current_stream(self._device)
+                execution_stream.wait_event(self._transfer_event)
             self._transfer_event.synchronize()
             streaming_logger.info(
                 f"prepared weights | transfer wait | device={self._device} | "
@@ -258,6 +261,7 @@ class PreparedSubgraphWeights:
         *,
         device_reservation: Any | None = None,
         transfer_reservation: HostMemoryReservation | None = None,
+        transfer_stream: torch.cuda.Stream | None = None,
     ) -> PreparedSubgraphWeights:
         """Enqueue a bounded CPU-to-CUDA transfer without installing the model."""
 
@@ -284,7 +288,11 @@ class PreparedSubgraphWeights:
         self.transfer_reservation = transfer_reservation
         transfer_sources: list[torch.Tensor] = []
 
-        stream = torch.cuda.Stream(device=resolved)
+        stream = (
+            transfer_stream
+            if transfer_stream is not None
+            else torch.cuda.Stream(device=resolved)
+        )
         self._transfer_stream = stream
         current_dtype: torch.dtype | None = None
         current_name: str | None = None
