@@ -307,9 +307,9 @@ target N execution || target N+1 CPU preparation and H2D || target N-1 write
 ```
 
 `SubgraphPrefetcher` owns one persistent copy stream per execution device. The
-pipeline thread creates that stream and reuses it for every target on the
-device; the prefetch worker only enqueues work onto it. Creating a stream per
-target, or creating it inside the prefetch worker, is not allowed: stream
+pipeline thread creates that stream during setup and reuses it for every target
+on the device; the prefetch worker only enqueues work onto it. Creating a stream
+per target, or creating it inside the prefetch worker, is not allowed: stream
 lifetime must not depend on worker scheduling, and the dedicated copy lane must
 stay stable for the complete pipeline. Each transfer still records its own
 completion event. Immediately before installation the execution stream calls

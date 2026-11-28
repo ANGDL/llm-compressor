@@ -1435,7 +1435,10 @@ def run_subgraph_streaming_pipeline(
             direct_writer = async_direct_writer
         ep_prefetch = expert_parallel is not None and not checkpoint_progress
         prefetcher = (
-            SubgraphPrefetcher(adapter.weight_session)
+            SubgraphPrefetcher(
+                adapter.weight_session,
+                device=device if _async_h2d_enabled() else None,
+            )
             if expert_parallel is None or ep_prefetch
             else None
         )

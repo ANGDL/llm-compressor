@@ -125,6 +125,24 @@ def test_prefetch_reuses_one_transfer_stream_per_device(monkeypatch):
     assert len(created) == 2
 
 
+def test_prefetch_creates_copy_stream_during_setup(monkeypatch):
+    created = []
+
+    class Stream:
+        def __init__(self, *, device):
+            self.device = torch.device(device)
+            created.append(self)
+
+    monkeypatch.setattr(torch.cuda, "Stream", Stream)
+    prefetcher = SubgraphPrefetcher(session=None, device="cuda:0")
+    try:
+        assert len(created) == 1
+        assert prefetcher._transfer_stream_for("cuda:0") is created[0]
+    finally:
+        prefetcher._transfer_streams.clear()
+        prefetcher._executor.shutdown(wait=True)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_prefetch_can_enqueue_bounded_cuda_transfer(tmp_path):
     reference = SessionModel()

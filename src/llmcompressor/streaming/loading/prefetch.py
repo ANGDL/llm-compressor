@@ -21,7 +21,12 @@ from .session import (
 class SubgraphPrefetcher(AbstractContextManager):
     """Own at most one background subgraph materialization task."""
 
-    def __init__(self, session: SubgraphWeightSession):
+    def __init__(
+        self,
+        session: SubgraphWeightSession,
+        *,
+        device: torch.device | str | None = None,
+    ):
         self.session = session
         self._executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="streaming-weight-prefetch"
@@ -32,6 +37,8 @@ class SubgraphPrefetcher(AbstractContextManager):
         self._transfer_streams: dict[torch.device, torch.cuda.Stream] = {}
         self._transfer_stream_lock = Lock()
         self._closed = False
+        if device is not None and torch.device(device).type == "cuda":
+            self._transfer_stream_for(device)
 
     def _transfer_stream_for(self, device: torch.device | str) -> torch.cuda.Stream:
         """Return the persistent copy stream for one execution device.
