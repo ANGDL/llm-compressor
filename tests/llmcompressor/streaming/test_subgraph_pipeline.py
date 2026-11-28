@@ -42,7 +42,6 @@ from llmcompressor.streaming.pipeline import (
     _debug_value_summary,
     _empty_device_cache,
     _initialize_run,
-    _is_mtp_target,
     _iter_execution_batches,
     _stage_logger,
     _write_loaded_target_direct,
@@ -61,14 +60,12 @@ def test_async_h2d_env_switch(monkeypatch, value, expected):
     assert _async_h2d_enabled() is expected
 
 
-def test_mtp_targets_use_synchronous_h2d(monkeypatch):
+def test_async_h2d_policy_is_target_agnostic(monkeypatch):
     monkeypatch.setenv("LLMCOMPRESSOR_STREAMING_ASYNC_H2D", "1")
     device = torch.device("cuda:0")
 
-    assert _is_mtp_target("model.mtp.0")
-    assert not _is_mtp_target("model.layers.0")
     assert _async_h2d_for_targets(device, ("model.layers.0",))
-    assert not _async_h2d_for_targets(device, ("model.layers.39", "model.mtp.0"))
+    assert _async_h2d_for_targets(device, ("model.layers.39", "model.mtp.0"))
 
     monkeypatch.setenv("LLMCOMPRESSOR_STREAMING_ASYNC_H2D", "0")
     assert not _async_h2d_for_targets(device, ("model.layers.0",))

@@ -39,6 +39,7 @@ class SubgraphPrefetcher(AbstractContextManager):
         device: torch.device | str | None,
         device_reservation,
         transfer_reservation: HostMemoryReservation | None,
+        copy_gate,
     ) -> PreparedSubgraphWeights:
         started_at = perf_counter()
         streaming_logger.info(f"{label} | started | device=cpu")
@@ -52,6 +53,7 @@ class SubgraphPrefetcher(AbstractContextManager):
                     device,
                     device_reservation=device_reservation,
                     transfer_reservation=transfer_reservation,
+                    copy_gate=copy_gate,
                 )
                 device_reservation = None
                 transfer_reservation = None
@@ -85,6 +87,7 @@ class SubgraphPrefetcher(AbstractContextManager):
         device: torch.device | str | None = None,
         device_reservation=None,
         transfer_reservation: HostMemoryReservation | None = None,
+        copy_gate=None,
     ) -> None:
         """Schedule one plan after the previous result has been consumed."""
 
@@ -112,6 +115,7 @@ class SubgraphPrefetcher(AbstractContextManager):
                 device,
                 device_reservation,
                 transfer_reservation,
+                copy_gate,
             )
         except Exception:
             reservation.close()

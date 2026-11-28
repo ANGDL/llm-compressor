@@ -69,6 +69,7 @@ from .execution import (
     freeze_calibration_inputs,
 )
 from .loading import HostMemoryBudget, HostMemoryError, SubgraphPrefetcher
+from .loading.copy_gate import CopyGate
 from .materialization import (
     StreamingDTypePolicy,
     WeightMaterializer,
@@ -146,20 +147,13 @@ def _async_h2d_enabled() -> bool:
     return value not in {"0", "false", "no", "off"}
 
 
-def _is_mtp_target(name: str) -> bool:
-    """Return whether a traced target belongs to the MTP block."""
-
-    return "mtp" in name.split(".")
-
-
-def _async_h2d_for_targets(device: torch.device, names: Sequence[str]) -> bool:
+def _async_h2d_for_targets(
+    device: torch.device, names: Sequence[str] = ()
+) -> bool:
     """Return whether a target group may use the background H2D path."""
 
-    return (
-        device.type == "cuda"
-        and _async_h2d_enabled()
-        and not any(_is_mtp_target(name) for name in names)
-    )
+    del names
+    return device.type == "cuda" and _async_h2d_enabled()
 
 
 def _stage_logger(
@@ -2115,6 +2109,7 @@ def run_subgraph_streaming_pipeline(
                             adapter.weight_session.installed(prepared)
                         )
 
+                    copy_gate = None
                     if next_ep_plan is not None:
                         submit_ep_prefetch(
                             group_index + 1,
@@ -2165,9 +2160,6 @@ def run_subgraph_streaming_pipeline(
                             next_device_reservation = None
                             next_transfer_reservation = None
                             next_async_h2d = False
-                            next_is_mtp = any(
-                                _is_mtp_target(name) for name in next_names
-                            )
                             try:
                                 completion_reservation = host_budget.reserve(
                                     f"{target_label} completion headroom",
@@ -2212,16 +2204,6 @@ def run_subgraph_streaming_pipeline(
                                             f"{next_label} | async H2D deferred | "
                                             "pinned host staging does not fit"
                                         )
-                                elif (
-                                    next_device_reservation is not None
-                                    and device.type == "cuda"
-                                    and _async_h2d_enabled()
-                                    and next_is_mtp
-                                ):
-                                    streaming_logger.info(
-                                        f"{next_label} | async H2D disabled | "
-                                        "MTP target uses synchronous transfer"
-                                    )
                             except HostMemoryError:
                                 if next_device_reservation is not None:
                                     next_device_reservation.close()
@@ -2237,6 +2219,13 @@ def run_subgraph_streaming_pipeline(
                                 )
                         if next_reservation is not None:
                             weight_stack.callback(completion_reservation.close)
+                            if next_async_h2d:
+                                copy_gate = CopyGate(
+                                    torch.cuda.current_stream(device)
+                                )
+                                weight_stack.callback(
+                                    copy_gate.open_without_event
+                                )
                             prefetcher.submit(
                                 next_plan,
                                 dtype=target_dtype,
@@ -2245,14 +2234,13 @@ def run_subgraph_streaming_pipeline(
                                 device=device if next_async_h2d else None,
                                 device_reservation=next_device_reservation,
                                 transfer_reservation=next_transfer_reservation,
+                                copy_gate=copy_gate,
                             )
                             streaming_logger.info(
                                 f"{next_label} | prefetch submitted | "
                                 + (
                                     "prepare + pinned async H2D"
                                     if next_transfer_reservation is not None
-                                    else "prepare only (MTP synchronous H2D)"
-                                    if next_is_mtp
                                     else "prepare"
                                 )
                             )
@@ -2294,6 +2282,7 @@ def run_subgraph_streaming_pipeline(
                         ) as ep_metrics,
                     ):
                         with DisableQuantization(adapter.model), torch.no_grad():
+                            gate_recorded = False
                             for batch_indices, values in _iter_execution_batches(
                                 boundaries,
                                 group_start,
@@ -2312,6 +2301,11 @@ def run_subgraph_streaming_pipeline(
                                     values,
                                     ep_executor,
                                 )
+                                if copy_gate is not None and not gate_recorded:
+                                    copy_gate.record_compute_done(
+                                        torch.cuda.current_stream(device)
+                                    )
+                                    gate_recorded = True
                                 publish_started_at = perf_counter()
                                 if ep_metrics is not None:
                                     ep_metrics.activity(

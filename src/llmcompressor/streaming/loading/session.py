@@ -258,6 +258,7 @@ class PreparedSubgraphWeights:
         *,
         device_reservation: Any | None = None,
         transfer_reservation: HostMemoryReservation | None = None,
+        copy_gate: Any | None = None,
     ) -> PreparedSubgraphWeights:
         """Enqueue a bounded CPU-to-CUDA transfer without installing the model."""
 
@@ -275,6 +276,16 @@ class PreparedSubgraphWeights:
             raise RuntimeError("CUDA is required for asynchronous weight transfer")
         if self._transfer_event is not None or self._transfer_stream is not None:
             raise RuntimeError("Prepared weights already have an active transfer")
+        compute_event = None
+        if copy_gate is not None:
+            streaming_logger.info(
+                f"async H2D | gate wait | device={resolved} | "
+                "reason=first calibration forward"
+            )
+            compute_event = copy_gate.wait_for_compute()
+            streaming_logger.info(
+                f"async H2D | gate released | device={resolved}"
+            )
         if device_reservation is not None:
             self.device_reservation = device_reservation
         if transfer_reservation is None:
@@ -286,6 +297,8 @@ class PreparedSubgraphWeights:
 
         stream = torch.cuda.Stream(device=resolved)
         self._transfer_stream = stream
+        if compute_event is not None:
+            stream.wait_event(compute_event)
         current_dtype: torch.dtype | None = None
         current_name: str | None = None
         current_index = 0
