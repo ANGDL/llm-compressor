@@ -50,7 +50,7 @@ from llmcompressor.streaming.pipeline import (
 
 @pytest.mark.parametrize(
     ("value", "expected"),
-    [(None, True), ("1", True), ("true", True), ("0", False), ("off", False)],
+    [(None, False), ("1", True), ("true", True), ("0", False), ("off", False)],
 )
 def test_async_h2d_env_switch(monkeypatch, value, expected):
     if value is None:

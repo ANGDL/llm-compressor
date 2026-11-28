@@ -142,7 +142,7 @@ _ASYNC_H2D_ENV = "LLMCOMPRESSOR_STREAMING_ASYNC_H2D"
 def _async_h2d_enabled() -> bool:
     """Return whether prefetch may enqueue a background CPU-to-CUDA copy."""
 
-    value = os.environ.get(_ASYNC_H2D_ENV, "1").strip().lower()
+    value = os.environ.get(_ASYNC_H2D_ENV, "0").strip().lower()
     return value not in {"0", "false", "no", "off"}
 
 
