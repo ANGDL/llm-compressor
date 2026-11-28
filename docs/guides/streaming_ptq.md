@@ -316,6 +316,13 @@ completion event. Immediately before installation the execution stream calls
 `wait_event()` on that completion event, then the pipeline waits for the event
 before releasing the pinned staging buffer.
 
+The routed EP window scheduler follows the same rule for buffered CUDA owners.
+It creates one persistent copy stream per owner before starting the window
+workers and reuses it for every resident window on that owner. The window
+worker only enqueues transfers and keeps each prepared object's completion event
+until activation. Copy streams are drained after all owner windows finish,
+including cleanup after a failed window.
+
 The device-transfer stage is capacity-gated. It may temporarily hold the
 current and next target on the execution device, so devices that cannot fit both
 working sets retain the one-target memory-minimal behavior. There is still one

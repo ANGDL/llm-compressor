@@ -810,11 +810,18 @@ def test_pipeline_uses_routed_windows_and_preserves_downstream_quantization(
         lambda: DeviceMemoryBudget(available_bytes=memory_bytes),
     )
     staged = []
+    staged_streams = {}
     original_transfer = PreparedSubgraphWeights.move_to_async
 
     def transfer(prepared, device, **kwargs):
         if prepared.plan.module_names[0].startswith("experts."):
             staged.append(prepared.plan.module_names)
+            stream = kwargs.get("transfer_stream")
+            if torch.device(device).type == "cuda":
+                assert stream is not None
+            if stream is not None:
+                previous = staged_streams.setdefault(torch.device(device), stream)
+                assert previous is stream
         return original_transfer(prepared, device, **kwargs)
 
     monkeypatch.setattr(PreparedSubgraphWeights, "move_to_async", transfer)

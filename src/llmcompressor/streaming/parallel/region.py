@@ -115,6 +115,18 @@ def _move(value, device):
     return tree_map(move, value)
 
 
+def _create_persistent_copy_streams(
+    devices: tuple[torch.device, ...],
+) -> dict[torch.device, torch.cuda.Stream]:
+    """Create one host-to-device copy stream for each CUDA execution device."""
+
+    streams = {}
+    for device in dict.fromkeys(devices):
+        if device.type == "cuda":
+            streams[device] = torch.cuda.Stream(device=device)
+    return streams
+
+
 @dataclass
 class ExpertRegionGraph:
     """An original FX graph and the pure dependency slices of its expert calls."""
@@ -794,6 +806,7 @@ def execute_expert_region(
         begin(all_modules)
 
     buffered_owners = set()
+    copy_streams = {}
     prepared_windows = {}
     prepared_windows_lock = Lock()
     window_plans = tuple(
@@ -867,7 +880,11 @@ def execute_expert_region(
                 raise
             else:
                 try:
-                    prepared.move_to_async(device, transfer_reservation=transfer)
+                    prepared.move_to_async(
+                        device,
+                        transfer_reservation=transfer,
+                        transfer_stream=copy_streams[device],
+                    )
                     staged = True
                 except BaseException:
                     transfer.close()
@@ -1396,6 +1413,9 @@ def execute_expert_region(
                 else:
                     buffers.enter_context(reservation)
                     buffered_owners.add(owner)
+            copy_streams = _create_persistent_copy_streams(
+                tuple(parallel.devices[owner] for owner in sorted(buffered_owners))
+            )
             try:
                 completed_windows = AsyncResidentWindowScheduler(max_prefetch=1).run(
                     windows,
@@ -1409,6 +1429,8 @@ def execute_expert_region(
                     prepared_windows.clear()
                 for prepared in leftovers:
                     prepared.close()
+            for stream in copy_streams.values():
+                stream.synchronize()
         borrowed_boundaries.clear()
         windows = tuple(
             actual for _planned, results in completed_windows for actual in results
@@ -1707,6 +1729,13 @@ def execute_expert_region(
         result_store.clear()
         for reservation in result_reservations:
             reservation.close()
+        for stream in copy_streams.values():
+            try:
+                stream.synchronize()
+            except Exception:
+                streaming_logger.exception(
+                    f"{label} | EP copy stream drain failed"
+                )
     return {
         "placement": placement.to_dict(),
         "windows": [window.to_dict() for window in windows],
