@@ -280,7 +280,7 @@ class PreparedSubgraphWeights:
         if copy_gate is not None:
             streaming_logger.info(
                 f"async H2D | gate wait | device={resolved} | "
-                "reason=checkpoint complete"
+                "reason=unload complete"
             )
             compute_event = copy_gate.wait_for_compute()
             streaming_logger.info(

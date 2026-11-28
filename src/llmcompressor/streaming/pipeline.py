@@ -1467,6 +1467,7 @@ def run_subgraph_streaming_pipeline(
         )
         pipeline_failed = True
         ep_executor = None
+        copy_gate = None
         try:
             available_operators = available_hardware_ops()
             operator_names = {operator["name"] for operator in available_operators}
@@ -2223,9 +2224,6 @@ def run_subgraph_streaming_pipeline(
                                 copy_gate = CopyGate(
                                     torch.cuda.current_stream(device)
                                 )
-                                weight_stack.callback(
-                                    copy_gate.open_without_event
-                                )
                             prefetcher.submit(
                                 next_plan,
                                 dtype=target_dtype,
@@ -2557,10 +2555,6 @@ def run_subgraph_streaming_pipeline(
                                     host_budget=host_budget,
                                 )
                             )
-                    if copy_gate is not None:
-                        copy_gate.record_compute_done(
-                            torch.cuda.current_stream(device)
-                        )
                 finally:
                     with _stage_logger(
                         adapter.model,
@@ -2575,6 +2569,13 @@ def run_subgraph_streaming_pipeline(
                         if expert_parallel is not None:
                             for owner_device in expert_parallel.devices[1:]:
                                 _empty_device_cache(owner_device)
+                        if copy_gate is not None:
+                            try:
+                                copy_gate.record_compute_done(
+                                    torch.cuda.current_stream(device)
+                                )
+                            except Exception:
+                                copy_gate.open_without_event()
                 peak_allocated = (
                     torch.get_device_module(device).max_memory_allocated(device)
                     if device.type == "cuda"
@@ -2608,6 +2609,8 @@ def run_subgraph_streaming_pipeline(
             try:
                 if ep_executor is not None:
                     ep_executor.close()
+                if copy_gate is not None and not copy_gate.is_open:
+                    copy_gate.open_without_event()
                 if prefetcher is not None:
                     prefetcher.close(suppress_errors=pipeline_failed)
                 with _stage_logger(
