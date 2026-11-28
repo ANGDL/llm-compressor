@@ -35,8 +35,8 @@ def test_copy_gate_open_without_event_is_idempotent():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
 def test_copy_gate_records_cuda_event():
-    gate = CopyGate(torch.cuda.current_stream())
+    event = torch.cuda.Event()
+    gate = CopyGate(event)
     gate.record_compute_done()
-    event = gate.wait_for_compute()
-    assert event is not None
+    assert gate.wait_for_compute() is event
     event.synchronize()

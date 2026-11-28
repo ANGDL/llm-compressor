@@ -69,7 +69,6 @@ from .execution import (
     freeze_calibration_inputs,
 )
 from .loading import HostMemoryBudget, HostMemoryError, SubgraphPrefetcher
-from .loading.copy_gate import CopyGate
 from .materialization import (
     StreamingDTypePolicy,
     WeightMaterializer,
@@ -2221,9 +2220,7 @@ def run_subgraph_streaming_pipeline(
                         if next_reservation is not None:
                             weight_stack.callback(completion_reservation.close)
                             if next_async_h2d:
-                                copy_gate = CopyGate(
-                                    torch.cuda.current_stream(device)
-                                )
+                                copy_gate = prefetcher.gate_for(device)
                             prefetcher.submit(
                                 next_plan,
                                 dtype=target_dtype,

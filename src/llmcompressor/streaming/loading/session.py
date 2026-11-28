@@ -260,6 +260,7 @@ class PreparedSubgraphWeights:
         transfer_reservation: HostMemoryReservation | None = None,
         copy_gate: Any | None = None,
         transfer_stream: Any | None = None,
+        transfer_event: Any | None = None,
     ) -> PreparedSubgraphWeights:
         """Enqueue a bounded CPU-to-CUDA transfer without installing the model."""
 
@@ -344,7 +345,11 @@ class PreparedSubgraphWeights:
                 for target in self.targets:
                     target.device = resolved
             self._transfer_sources = transfer_sources
-            self._transfer_event = stream.record_event()
+            if transfer_event is None:
+                self._transfer_event = stream.record_event()
+            else:
+                transfer_event.record(stream)
+                self._transfer_event = transfer_event
             self._device = resolved
             if self.reservation is not None:
                 self.reservation.close()

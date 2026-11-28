@@ -259,3 +259,23 @@ def test_prefetcher_reuses_one_transfer_stream_per_device(monkeypatch):
         assert len(streams) == 1
     finally:
         prefetcher.close()
+
+
+def test_prefetcher_reuses_compute_event_for_gates(monkeypatch):
+    events = []
+
+    def make_event():
+        event = object()
+        events.append(event)
+        return event
+
+    monkeypatch.setattr(torch.cuda, "Event", make_event)
+    prefetcher = SubgraphPrefetcher(None)
+    device = torch.device("cuda:0")
+    try:
+        first = prefetcher.gate_for(device)
+        second = prefetcher.gate_for(device)
+        assert first.cuda_event is second.cuda_event
+        assert len(events) == 1
+    finally:
+        prefetcher.close()

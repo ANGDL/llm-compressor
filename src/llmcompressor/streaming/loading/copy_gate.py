@@ -5,8 +5,6 @@ from __future__ import annotations
 from threading import Event, Lock
 from typing import Any
 
-import torch
-
 
 class CopyGate:
     """Signal when the consumer compute stream has reached a safe copy point.
@@ -17,10 +15,9 @@ class CopyGate:
     stream from overlapping the first-forward/boundary-transfer window.
     """
 
-    def __init__(self, consumer_stream: Any | None = None):
-        self.consumer_stream = consumer_stream
+    def __init__(self, cuda_event: Any | None = None):
+        self.cuda_event = cuda_event
         self._ready = Event()
-        self._compute_event: Any | None = None
         self._lock = Lock()
 
     @property
@@ -33,11 +30,8 @@ class CopyGate:
         with self._lock:
             if self._ready.is_set():
                 return
-            stream = stream if stream is not None else self.consumer_stream
-            if stream is not None:
-                event = torch.cuda.Event()
-                event.record(stream)
-                self._compute_event = event
+            if stream is not None and self.cuda_event is not None:
+                self.cuda_event.record(stream)
             self._ready.set()
 
     def open_without_event(self) -> None:
@@ -51,4 +45,4 @@ class CopyGate:
 
         if not self._ready.wait(timeout):
             raise TimeoutError("Timed out waiting for the copy compute gate")
-        return self._compute_event
+        return self.cuda_event

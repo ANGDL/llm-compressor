@@ -10,6 +10,7 @@ from time import perf_counter
 import torch
 
 from .._logging import streaming_logger
+from .copy_gate import CopyGate
 from .host_memory import HostMemoryReservation
 from .session import (
     PreparedSubgraphWeights,
@@ -30,6 +31,8 @@ class SubgraphPrefetcher(AbstractContextManager):
             str, Future[PreparedSubgraphWeights]
         ] | None = None
         self._transfer_streams: dict[torch.device, torch.cuda.Stream] = {}
+        self._transfer_events: dict[torch.device, torch.cuda.Event] = {}
+        self._compute_events: dict[torch.device, torch.cuda.Event] = {}
         self._stream_lock = Lock()
         self._closed = False
 
@@ -40,6 +43,20 @@ class SubgraphPrefetcher(AbstractContextManager):
                 stream = torch.cuda.Stream(device=device)
                 self._transfer_streams[device] = stream
             return stream
+
+    def _event_for(
+        self, device: torch.device, cache: dict[torch.device, torch.cuda.Event]
+    ) -> torch.cuda.Event:
+        with self._stream_lock:
+            event = cache.get(device)
+            if event is None:
+                event = torch.cuda.Event()
+                cache[device] = event
+            return event
+
+    def gate_for(self, device: torch.device | str) -> CopyGate:
+        device = torch.device(device)
+        return CopyGate(self._event_for(device, self._compute_events))
 
     def _prepare(
         self,
@@ -63,12 +80,16 @@ class SubgraphPrefetcher(AbstractContextManager):
                 transfer_stream = self._transfer_stream_for(
                     torch.device(device)
                 )
+                transfer_event = self._event_for(
+                    torch.device(device), self._transfer_events
+                )
                 prepared.move_to_async(
                     device,
                     device_reservation=device_reservation,
                     transfer_reservation=transfer_reservation,
                     copy_gate=copy_gate,
                     transfer_stream=transfer_stream,
+                    transfer_event=transfer_event,
                 )
                 device_reservation = None
                 transfer_reservation = None
