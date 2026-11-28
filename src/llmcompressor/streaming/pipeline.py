@@ -142,17 +142,8 @@ _ASYNC_H2D_ENV = "LLMCOMPRESSOR_STREAMING_ASYNC_H2D"
 def _async_h2d_enabled() -> bool:
     """Return whether prefetch may enqueue a background CPU-to-CUDA copy."""
 
-    value = os.environ.get(_ASYNC_H2D_ENV, "0").strip().lower()
+    value = os.environ.get(_ASYNC_H2D_ENV, "1").strip().lower()
     return value not in {"0", "false", "no", "off"}
-
-
-def _async_h2d_for_targets(
-    device: torch.device, names: Sequence[str] = ()
-) -> bool:
-    """Return whether a target group may use the background H2D path."""
-
-    del names
-    return device.type == "cuda" and _async_h2d_enabled()
 
 
 def _stage_logger(
@@ -1466,7 +1457,6 @@ def run_subgraph_streaming_pipeline(
         )
         pipeline_failed = True
         ep_executor = None
-        copy_gate = None
         try:
             available_operators = available_hardware_ops()
             operator_names = {operator["name"] for operator in available_operators}
@@ -2109,7 +2099,6 @@ def run_subgraph_streaming_pipeline(
                             adapter.weight_session.installed(prepared)
                         )
 
-                    copy_gate = None
                     if next_ep_plan is not None:
                         submit_ep_prefetch(
                             group_index + 1,
@@ -2159,7 +2148,6 @@ def run_subgraph_streaming_pipeline(
                             next_reservation = None
                             next_device_reservation = None
                             next_transfer_reservation = None
-                            next_async_h2d = False
                             try:
                                 completion_reservation = host_budget.reserve(
                                     f"{target_label} completion headroom",
@@ -2185,12 +2173,10 @@ def run_subgraph_streaming_pipeline(
                                         f"{next_label} | async H2D deferred | "
                                         "device working set does not fit"
                                     )
-                                next_async_h2d = (
-                                    next_device_reservation is not None
-                                    and _async_h2d_for_targets(device, next_names)
-                                )
                                 if (
-                                    next_async_h2d
+                                    next_device_reservation is not None
+                                    and device.type == "cuda"
+                                    and _async_h2d_enabled()
                                 ):
                                     try:
                                         next_transfer_reservation = host_budget.reserve(
@@ -2219,17 +2205,14 @@ def run_subgraph_streaming_pipeline(
                                 )
                         if next_reservation is not None:
                             weight_stack.callback(completion_reservation.close)
-                            if next_async_h2d:
-                                copy_gate = prefetcher.gate_for(device)
                             prefetcher.submit(
                                 next_plan,
                                 dtype=target_dtype,
                                 reservation=next_reservation,
                                 label=f"{next_label} | prepare weights",
-                                device=device if next_async_h2d else None,
+                                device=device,
                                 device_reservation=next_device_reservation,
                                 transfer_reservation=next_transfer_reservation,
-                                copy_gate=copy_gate,
                             )
                             streaming_logger.info(
                                 f"{next_label} | prefetch submitted | "
@@ -2566,13 +2549,6 @@ def run_subgraph_streaming_pipeline(
                         if expert_parallel is not None:
                             for owner_device in expert_parallel.devices[1:]:
                                 _empty_device_cache(owner_device)
-                        if copy_gate is not None:
-                            try:
-                                copy_gate.record_compute_done(
-                                    torch.cuda.current_stream(device)
-                                )
-                            except Exception:
-                                copy_gate.open_without_event()
                 peak_allocated = (
                     torch.get_device_module(device).max_memory_allocated(device)
                     if device.type == "cuda"
@@ -2606,8 +2582,6 @@ def run_subgraph_streaming_pipeline(
             try:
                 if ep_executor is not None:
                     ep_executor.close()
-                if copy_gate is not None and not copy_gate.is_open:
-                    copy_gate.open_without_event()
                 if prefetcher is not None:
                     prefetcher.close(suppress_errors=pipeline_failed)
                 with _stage_logger(

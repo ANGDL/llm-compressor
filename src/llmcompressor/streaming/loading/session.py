@@ -258,9 +258,6 @@ class PreparedSubgraphWeights:
         *,
         device_reservation: Any | None = None,
         transfer_reservation: HostMemoryReservation | None = None,
-        copy_gate: Any | None = None,
-        transfer_stream: Any | None = None,
-        transfer_event: Any | None = None,
     ) -> PreparedSubgraphWeights:
         """Enqueue a bounded CPU-to-CUDA transfer without installing the model."""
 
@@ -278,16 +275,6 @@ class PreparedSubgraphWeights:
             raise RuntimeError("CUDA is required for asynchronous weight transfer")
         if self._transfer_event is not None or self._transfer_stream is not None:
             raise RuntimeError("Prepared weights already have an active transfer")
-        compute_event = None
-        if copy_gate is not None:
-            streaming_logger.info(
-                f"async H2D | gate wait | device={resolved} | "
-                "reason=unload complete"
-            )
-            compute_event = copy_gate.wait_for_compute()
-            streaming_logger.info(
-                f"async H2D | gate released | device={resolved}"
-            )
         if device_reservation is not None:
             self.device_reservation = device_reservation
         if transfer_reservation is None:
@@ -297,14 +284,8 @@ class PreparedSubgraphWeights:
         self.transfer_reservation = transfer_reservation
         transfer_sources: list[torch.Tensor] = []
 
-        stream = (
-            transfer_stream
-            if transfer_stream is not None
-            else torch.cuda.Stream(device=resolved)
-        )
+        stream = torch.cuda.Stream(device=resolved)
         self._transfer_stream = stream
-        if compute_event is not None:
-            stream.wait_event(compute_event)
         current_dtype: torch.dtype | None = None
         current_name: str | None = None
         current_index = 0
@@ -345,11 +326,7 @@ class PreparedSubgraphWeights:
                 for target in self.targets:
                     target.device = resolved
             self._transfer_sources = transfer_sources
-            if transfer_event is None:
-                self._transfer_event = stream.record_event()
-            else:
-                transfer_event.record(stream)
-                self._transfer_event = transfer_event
+            self._transfer_event = stream.record_event()
             self._device = resolved
             if self.reservation is not None:
                 self.reservation.close()

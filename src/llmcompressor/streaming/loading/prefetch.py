@@ -4,13 +4,11 @@ from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import AbstractContextManager
-from threading import Lock
 from time import perf_counter
 
 import torch
 
 from .._logging import streaming_logger
-from .copy_gate import CopyGate
 from .host_memory import HostMemoryReservation
 from .session import (
     PreparedSubgraphWeights,
@@ -30,33 +28,7 @@ class SubgraphPrefetcher(AbstractContextManager):
         self._pending: tuple[
             str, Future[PreparedSubgraphWeights]
         ] | None = None
-        self._transfer_streams: dict[torch.device, torch.cuda.Stream] = {}
-        self._transfer_events: dict[torch.device, torch.cuda.Event] = {}
-        self._compute_events: dict[torch.device, torch.cuda.Event] = {}
-        self._stream_lock = Lock()
         self._closed = False
-
-    def _transfer_stream_for(self, device: torch.device) -> torch.cuda.Stream:
-        with self._stream_lock:
-            stream = self._transfer_streams.get(device)
-            if stream is None:
-                stream = torch.cuda.Stream(device=device)
-                self._transfer_streams[device] = stream
-            return stream
-
-    def _event_for(
-        self, device: torch.device, cache: dict[torch.device, torch.cuda.Event]
-    ) -> torch.cuda.Event:
-        with self._stream_lock:
-            event = cache.get(device)
-            if event is None:
-                event = torch.cuda.Event()
-                cache[device] = event
-            return event
-
-    def gate_for(self, device: torch.device | str) -> CopyGate:
-        device = torch.device(device)
-        return CopyGate(self._event_for(device, self._compute_events))
 
     def _prepare(
         self,
@@ -67,7 +39,6 @@ class SubgraphPrefetcher(AbstractContextManager):
         device: torch.device | str | None,
         device_reservation,
         transfer_reservation: HostMemoryReservation | None,
-        copy_gate,
     ) -> PreparedSubgraphWeights:
         started_at = perf_counter()
         streaming_logger.info(f"{label} | started | device=cpu")
@@ -77,19 +48,10 @@ class SubgraphPrefetcher(AbstractContextManager):
             )
             prepared_at = perf_counter()
             if device is not None and transfer_reservation is not None:
-                transfer_stream = self._transfer_stream_for(
-                    torch.device(device)
-                )
-                transfer_event = self._event_for(
-                    torch.device(device), self._transfer_events
-                )
                 prepared.move_to_async(
                     device,
                     device_reservation=device_reservation,
                     transfer_reservation=transfer_reservation,
-                    copy_gate=copy_gate,
-                    transfer_stream=transfer_stream,
-                    transfer_event=transfer_event,
                 )
                 device_reservation = None
                 transfer_reservation = None
@@ -123,7 +85,6 @@ class SubgraphPrefetcher(AbstractContextManager):
         device: torch.device | str | None = None,
         device_reservation=None,
         transfer_reservation: HostMemoryReservation | None = None,
-        copy_gate=None,
     ) -> None:
         """Schedule one plan after the previous result has been consumed."""
 
@@ -151,7 +112,6 @@ class SubgraphPrefetcher(AbstractContextManager):
                 device,
                 device_reservation,
                 transfer_reservation,
-                copy_gate,
             )
         except Exception:
             reservation.close()
