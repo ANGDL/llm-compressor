@@ -239,3 +239,23 @@ def test_async_weight_staging_allocates_per_dtype_and_cleans_up(
     assert not prepared.targets
     assert not budget._reservations
     assert_all_meta(session.model)
+
+
+def test_prefetcher_reuses_one_transfer_stream_per_device(monkeypatch):
+    streams = []
+
+    def make_stream(**kwargs):
+        stream = object()
+        streams.append((kwargs, stream))
+        return stream
+
+    monkeypatch.setattr(torch.cuda, "Stream", make_stream)
+    prefetcher = SubgraphPrefetcher(None)
+    device = torch.device("cuda:0")
+    try:
+        first = prefetcher._transfer_stream_for(device)
+        second = prefetcher._transfer_stream_for(device)
+        assert first is second
+        assert len(streams) == 1
+    finally:
+        prefetcher.close()

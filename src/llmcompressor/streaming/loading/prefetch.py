@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import AbstractContextManager
+from threading import Lock
 from time import perf_counter
 
 import torch
@@ -28,7 +29,17 @@ class SubgraphPrefetcher(AbstractContextManager):
         self._pending: tuple[
             str, Future[PreparedSubgraphWeights]
         ] | None = None
+        self._transfer_streams: dict[torch.device, torch.cuda.Stream] = {}
+        self._stream_lock = Lock()
         self._closed = False
+
+    def _transfer_stream_for(self, device: torch.device) -> torch.cuda.Stream:
+        with self._stream_lock:
+            stream = self._transfer_streams.get(device)
+            if stream is None:
+                stream = torch.cuda.Stream(device=device)
+                self._transfer_streams[device] = stream
+            return stream
 
     def _prepare(
         self,
@@ -49,11 +60,15 @@ class SubgraphPrefetcher(AbstractContextManager):
             )
             prepared_at = perf_counter()
             if device is not None and transfer_reservation is not None:
+                transfer_stream = self._transfer_stream_for(
+                    torch.device(device)
+                )
                 prepared.move_to_async(
                     device,
                     device_reservation=device_reservation,
                     transfer_reservation=transfer_reservation,
                     copy_gate=copy_gate,
+                    transfer_stream=transfer_stream,
                 )
                 device_reservation = None
                 transfer_reservation = None
